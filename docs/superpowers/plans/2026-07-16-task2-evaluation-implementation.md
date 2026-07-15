@@ -163,7 +163,7 @@ Run: `uv run mypy src/paper_search/evaluation`
 
 Expected: `Success: no issues found`.
 
-- [ ] **Step 6: Commit Task 1**
+- [x] **Step 6: Commit Task 1**
 
 ```powershell
 git add src/paper_search/evaluation/__init__.py src/paper_search/evaluation/dataset.py tests/evaluation/test_dataset.py

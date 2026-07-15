@@ -1,0 +1,4 @@
+budget_profile: balanced
+llm_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+llm_model_primary: qwen3.7-plus
+llm_model_fallback: qwen3.6-flash

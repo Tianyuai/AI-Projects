@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-15T08:41:50Z",
+  "config": {
+    "budget_profiles": {
+      "balanced": "configs/budget_balanced.yaml",
+      "low": "configs/budget_low.yaml"
+    },
+    "llm": {
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "fallback": "qwen3.6-flash",
+      "primary": "qwen3.7-plus"
+    },
+    "providers": {
+      "openalex": "/works?search=transformer&per_page=1",
+      "semantic_scholar": "/graph/v1/paper/search?query=transformer&limit=1"
+    },
+    "year_range": {
+      "maximum": 2027,
+      "minimum": 1900
+    }
+  },
+  "config_hash": "sha256:0b40a00011d2ee821580142cf9a27af5bf187b0faf6f5e80c123ed61badde31b",
+  "providers": {
+    "openalex": {
+      "ready": true,
+      "http_status": 200,
+      "latency_ms": 2225,
+      "result_count": 1,
+      "rate_limit_headers": {
+        "x-ratelimit-cost-usd": "0.001",
+        "x-ratelimit-credits-used": "10",
+        "x-ratelimit-limit": "10000",
+        "x-ratelimit-limit-usd": "1",
+        "x-ratelimit-onetime-remaining": "0",
+        "x-ratelimit-prepaid-remaining-usd": "0",
+        "x-ratelimit-remaining": "9959",
+        "x-ratelimit-remaining-usd": "0.9959",
+        "x-ratelimit-reset": "59001"
+      }
+    },
+    "semantic_scholar": {
+      "ready": true,
+      "http_status": 200,
+      "latency_ms": 1426,
+      "result_count": 1,
+      "rate_limit_headers": {}
+    },
+    "llm": {
+      "endpoint": "/chat/completions",
+      "models": {
+        "qwen3.7-plus": {
+          "ready": true,
+          "http_status": 200,
+          "latency_ms": 900,
+          "structured_json": true,
+          "usage": {
+            "prompt_tokens": 31,
+            "completion_tokens": 5
+          },
+          "rate_limit_headers": {}
+        },
+        "qwen3.6-flash": {
+          "ready": true,
+          "http_status": 200,
+          "latency_ms": 280,
+          "structured_json": true,
+          "usage": {
+            "prompt_tokens": 31,
+            "completion_tokens": 5
+          },
+          "rate_limit_headers": {}
+        }
+      }
+    }
+  },
+  "security": {
+    "secrets_recorded": false
+  }
+}

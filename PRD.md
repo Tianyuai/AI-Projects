@@ -799,14 +799,14 @@ Streamlit 前端包含：
 **主负责人文件：** `retrieval/openalex.py`、`storage/cache.py`、`processing/normalize.py`  
 **测试文件：** `tests/unit/test_openalex.py`、`tests/unit/test_cache.py`、`tests/unit/test_normalize.py`
 
-- [ ] 用固定 JSON fixture 编写成功、空结果、429、5xx、超时和缺失摘要测试。
-- [ ] 实现 OpenAlex `search`、字段选择、年份过滤和分页上限。
-- [ ] 实现 SQLite 缓存、TTL、缓存键和响应元数据。
-- [ ] 实现从缓存导出不可变实验快照及 SHA-256 manifest；同一 run 的指标只能引用该 manifest 中的响应。
-- [ ] 实现 OpenAlex 响应到统一 `Paper` 的映射。
-- [ ] 实现限次重试和错误分类，不允许无限重试。
+- [x] 用固定 JSON fixture 编写成功、空结果、429、5xx、超时和缺失摘要测试。
+- [x] 实现 OpenAlex `search`、字段选择、年份过滤和分页上限。
+- [x] 实现 SQLite 缓存、TTL、缓存键和响应元数据。
+- [x] 实现从缓存导出不可变实验快照及 SHA-256 manifest；同一 run 的指标只能引用该 manifest 中的响应。
+- [x] 实现 OpenAlex 响应到统一 `Paper` 的映射。
+- [x] 实现限次重试和错误分类，不允许无限重试。
 - [ ] 使用 3 条真实查询做冒烟测试，保存原始响应快照。
-- [ ] 运行 `uv run pytest -m "not online" tests/unit/test_openalex.py tests/unit/test_cache.py tests/unit/test_normalize.py -v`；fixture 测试必须通过。
+- [x] 运行 `uv run pytest -m "not online" tests/unit/test_openalex.py tests/unit/test_cache.py tests/unit/test_normalize.py -v`；fixture 测试必须通过。
 - [ ] 运行 `uv run pytest -m online tests/integration/test_openalex_live.py -v`；只有已配置 key 时执行，结果写入 `experiments/smoke/provider.json`。
 
 **验收产物：** 输入查询可得到统一论文对象；断网时可回放缓存 fixture。

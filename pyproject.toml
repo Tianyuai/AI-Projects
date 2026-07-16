@@ -38,6 +38,9 @@ packages = ["src/paper_search"]
 addopts = "-ra -p no:cacheprovider --import-mode=importlib"
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "online: requires explicit external provider credentials and network",
+]
 
 [tool.ruff]
 line-length = 100

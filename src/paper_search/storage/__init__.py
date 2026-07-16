@@ -5,6 +5,7 @@ from paper_search.storage.cache import (
     SQLiteResponseCache,
     canonical_request_params,
     make_cache_key,
+    validate_snapshot_manifest,
 )
 
 
@@ -13,4 +14,5 @@ __all__ = [
     "SQLiteResponseCache",
     "canonical_request_params",
     "make_cache_key",
+    "validate_snapshot_manifest",
 ]

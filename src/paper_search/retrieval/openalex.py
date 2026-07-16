@@ -51,6 +51,8 @@ def _sha256(value: bytes) -> str:
 
 
 def _aggregate_hash(hashes: list[str]) -> str:
+    if len(hashes) == 1:
+        return hashes[0]
     encoded = json.dumps(hashes, separators=(",", ":")).encode("utf-8")
     return _sha256(encoded)
 
@@ -198,6 +200,12 @@ class OpenAlexProvider:
                 response = await self._client.get(_ENDPOINT, params=params)
             except httpx.TimeoutException:
                 last_error = _provider_error("timeout", "OpenAlex request timed out", retryable=True)
+            except httpx.RequestError:
+                last_error = _provider_error(
+                    "network_error",
+                    "OpenAlex network request failed",
+                    retryable=True,
+                )
             else:
                 request_id = _request_id(response)
                 if response.status_code == 200:
@@ -292,8 +300,19 @@ class OpenAlexProvider:
         response_hashes: list[str] = []
         successful_pages = 0
         cached_pages = 0
+        seen_cursors: set[str] = set()
 
         while len(papers) < limit:
+            if cursor in seen_cursors:
+                errors.append(
+                    _provider_error(
+                        "pagination_cycle",
+                        "OpenAlex returned a repeated page cursor",
+                        retryable=False,
+                    )
+                )
+                break
+            seen_cursors.add(cursor)
             remaining = limit - len(papers)
             params: dict[str, QueryValue] = {
                 "api_key": self._api_key,

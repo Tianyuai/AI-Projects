@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -125,6 +126,21 @@ def test_empty_search_returns_successful_empty_result(tmp_path: Path) -> None:
     assert result.usage.search_api_calls == 1
 
 
+def test_single_page_response_hash_is_the_raw_response_hash(tmp_path: Path) -> None:
+    raw = fixture_bytes("works_empty.json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=raw, request=request)
+
+    result = asyncio.run(
+        run_search(SQLiteResponseCache(tmp_path / "cache.sqlite3"), handler, limit=5)
+    )
+
+    assert result.provenance["response_hash"] == (
+        "sha256:" + hashlib.sha256(raw).hexdigest()
+    )
+
+
 def test_search_replays_cache_without_network_call(tmp_path: Path) -> None:
     cache = SQLiteResponseCache(tmp_path / "cache.sqlite3")
 
@@ -242,6 +258,54 @@ def test_timeout_then_success_counts_both_attempts(tmp_path: Path) -> None:
     assert len(result.data) == 2
 
 
+def test_connection_failure_is_bounded_and_structured(tmp_path: Path) -> None:
+    scripted = ScriptedHandler(
+        [httpx.ConnectError("offline"), httpx.ConnectError("offline")]
+    )
+
+    async def no_wait(delay: float) -> None:
+        assert delay == 1.0
+
+    result = asyncio.run(
+        run_search(
+            SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            scripted,
+            calls=2,
+            sleep=no_wait,
+        )
+    )
+
+    assert scripted.attempts == 2
+    assert result.data == []
+    assert result.errors[-1].code == "network_error"
+    assert result.errors[-1].retryable is True
+    assert API_KEY not in result.model_dump_json()
+
+
+def test_repeated_cursor_stops_before_replaying_same_page(tmp_path: Path) -> None:
+    class GuardedCache(SQLiteResponseCache):
+        reads = 0
+
+        def get_response(self, key: str) -> Any:
+            self.reads += 1
+            if self.reads > 1:
+                raise AssertionError("repeated cursor must stop before a second cache read")
+            return super().get_response(key)
+
+    payload = json.dumps(
+        {"meta": {"next_cursor": "*"}, "results": [{"id": None, "title": None}]}
+    ).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=payload, request=request)
+
+    result = asyncio.run(run_search(GuardedCache(tmp_path / "cache.sqlite3"), handler))
+
+    assert result.data == []
+    assert result.errors[-1].code == "pagination_cycle"
+    assert result.usage.search_api_calls == 1
+
+
 def test_second_page_failure_returns_first_page_and_structured_error(tmp_path: Path) -> None:
     scripted = ScriptedHandler([fixture_bytes("works_page_1.json"), 500, 500, 500])
 
@@ -311,3 +375,14 @@ def test_invalid_work_is_skipped_without_losing_valid_sibling(tmp_path: Path) ->
 
     assert [paper.openalex_id for paper in result.data] == ["W127"]
     assert result.errors[0].code == "invalid_work"
+
+
+def test_task3_public_api_exports() -> None:
+    import paper_search.processing as processing
+    import paper_search.retrieval as retrieval
+    import paper_search.storage as storage
+
+    assert retrieval.OpenAlexProvider is OpenAlexProvider
+    assert processing.normalize_openalex_work.__name__ == "normalize_openalex_work"
+    assert storage.SQLiteResponseCache is SQLiteResponseCache
+    assert storage.validate_snapshot_manifest.__name__ == "validate_snapshot_manifest"

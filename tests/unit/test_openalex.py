@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -40,12 +40,21 @@ async def run_search(
     filters: dict[str, object] | None = None,
     limit: int = 2,
     calls: int = 1,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> ProviderResult[list[Any]]:
     async with httpx.AsyncClient(
         base_url="https://api.openalex.org",
         transport=httpx.MockTransport(handler),
     ) as client:
-        provider = OpenAlexProvider(client=client, cache=cache, api_key=API_KEY)
+        provider_kwargs: dict[str, object] = {}
+        if sleep is not None:
+            provider_kwargs.update(sleep=sleep, jitter=lambda: 0.0)
+        provider = OpenAlexProvider(
+            client=client,
+            cache=cache,
+            api_key=API_KEY,
+            **provider_kwargs,
+        )
         return await provider.search(query, filters or {}, limit, reservation(calls))
 
 
@@ -163,3 +172,142 @@ def test_search_rejects_invalid_inputs(
                 limit=limit,
             )
         )
+
+
+class ScriptedHandler:
+    def __init__(self, outcomes: list[bytes | int | Exception]) -> None:
+        self.outcomes = outcomes
+        self.attempts = 0
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        outcome = self.outcomes[self.attempts]
+        self.attempts += 1
+        if isinstance(outcome, Exception):
+            raise outcome
+        if isinstance(outcome, int):
+            return httpx.Response(
+                outcome,
+                json={"error": f"status-{outcome}"},
+                headers={"x-request-id": "request-error"},
+                request=request,
+            )
+        return httpx.Response(200, content=outcome, request=request)
+
+
+def test_429_retries_three_times_sets_cooldown_and_then_uses_zero_calls(
+    tmp_path: Path,
+) -> None:
+    cache = SQLiteResponseCache(tmp_path / "cache.sqlite3")
+    scripted = ScriptedHandler([429, 429, 429])
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    result = asyncio.run(run_search(cache, scripted, calls=3, sleep=fake_sleep))
+
+    assert scripted.attempts == 3
+    assert sleeps == [1.0, 2.0]
+    assert result.errors[-1].code == "rate_limited"
+    assert result.errors[-1].request_id == "request-error"
+    assert result.usage.search_api_calls == 3
+
+    def forbidden(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"cooldown must prevent network: {request.url}")
+
+    cooled = asyncio.run(run_search(cache, forbidden, calls=0, sleep=fake_sleep))
+    assert cooled.errors[-1].code == "rate_limited"
+    assert cooled.usage.search_api_calls == 0
+
+
+def test_timeout_then_success_counts_both_attempts(tmp_path: Path) -> None:
+    scripted = ScriptedHandler(
+        [httpx.ReadTimeout("slow"), fixture_bytes("works_page_1.json")]
+    )
+
+    async def no_wait(delay: float) -> None:
+        assert delay == 1.0
+
+    result = asyncio.run(
+        run_search(
+            SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            scripted,
+            calls=2,
+            sleep=no_wait,
+        )
+    )
+
+    assert scripted.attempts == 2
+    assert result.usage.search_api_calls == 2
+    assert len(result.data) == 2
+
+
+def test_second_page_failure_returns_first_page_and_structured_error(tmp_path: Path) -> None:
+    scripted = ScriptedHandler([fixture_bytes("works_page_1.json"), 500, 500, 500])
+
+    async def no_wait(delay: float) -> None:
+        assert delay in {1.0, 2.0}
+
+    result = asyncio.run(
+        run_search(
+            SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            scripted,
+            limit=3,
+            calls=4,
+            sleep=no_wait,
+        )
+    )
+
+    assert [paper.openalex_id for paper in result.data] == ["W123", "W124"]
+    assert result.errors[-1].code == "server_error"
+    assert result.usage.search_api_calls == 4
+
+
+def test_budget_exhaustion_returns_error_without_network(tmp_path: Path) -> None:
+    def forbidden(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"budget exhaustion must prevent network: {request.url}")
+
+    result = asyncio.run(
+        run_search(SQLiteResponseCache(tmp_path / "cache.sqlite3"), forbidden, calls=0)
+    )
+
+    assert result.data == []
+    assert result.errors[-1].code == "budget_exhausted"
+    assert result.usage.search_api_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("outcome", "expected_code"),
+    [
+        (400, "invalid_request"),
+        (403, "authentication_error"),
+        (b"not-json", "invalid_response"),
+        (b'{"meta": {}}', "invalid_response"),
+    ],
+)
+def test_nonretryable_failures_return_structured_errors(
+    tmp_path: Path,
+    outcome: bytes | int,
+    expected_code: str,
+) -> None:
+    scripted = ScriptedHandler([outcome])
+
+    result = asyncio.run(
+        run_search(SQLiteResponseCache(tmp_path / "cache.sqlite3"), scripted, calls=1)
+    )
+
+    assert scripted.attempts == 1
+    assert result.data == []
+    assert result.errors[-1].code == expected_code
+    assert API_KEY not in result.model_dump_json()
+
+
+def test_invalid_work_is_skipped_without_losing_valid_sibling(tmp_path: Path) -> None:
+    scripted = ScriptedHandler([fixture_bytes("works_invalid_record.json")])
+
+    result = asyncio.run(
+        run_search(SQLiteResponseCache(tmp_path / "cache.sqlite3"), scripted, calls=1)
+    )
+
+    assert [paper.openalex_id for paper in result.data] == ["W127"]
+    assert result.errors[0].code == "invalid_work"

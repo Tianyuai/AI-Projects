@@ -1,0 +1,25 @@
+{
+  "meta": {"count": 2, "per_page": 2, "next_cursor": null},
+  "results": [
+    {
+      "id": "https://openalex.org/W127",
+      "doi": null,
+      "title": "One Valid Work",
+      "display_name": "One Valid Work",
+      "abstract_inverted_index": null,
+      "authorships": [],
+      "publication_year": 2020,
+      "primary_location": null,
+      "cited_by_count": 0,
+      "is_retracted": false
+    },
+    {
+      "id": null,
+      "doi": null,
+      "title": null,
+      "display_name": null,
+      "abstract_inverted_index": null,
+      "authorships": []
+    }
+  ]
+}

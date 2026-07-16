@@ -1,0 +1,17 @@
+{
+  "meta": {"count": 1, "per_page": 1, "next_cursor": null},
+  "results": [
+    {
+      "id": "https://openalex.org/W125",
+      "doi": null,
+      "title": "A Paper Without an Abstract",
+      "display_name": "A Paper Without an Abstract",
+      "abstract_inverted_index": null,
+      "authorships": [],
+      "publication_year": 2021,
+      "primary_location": null,
+      "cited_by_count": 0,
+      "is_retracted": false
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+{
+  "meta": {
+    "count": 3,
+    "per_page": 2,
+    "next_cursor": "cursor-page-2"
+  },
+  "results": [
+    {
+      "id": "https://openalex.org/W123",
+      "doi": "https://doi.org/10.1000/EXAMPLE",
+      "title": "Retrieval Augmented Generation",
+      "display_name": "Retrieval Augmented Generation",
+      "abstract_inverted_index": {
+        "retrieval": [0],
+        "augmented": [1],
+        "generation": [2]
+      },
+      "authorships": [
+        {"author": {"display_name": "Ada Lovelace"}},
+        {"author": {"display_name": "Grace Hopper"}}
+      ],
+      "publication_year": 2023,
+      "primary_location": {
+        "landing_page_url": "https://example.org/paper",
+        "source": {"display_name": "Journal of Safe Fixtures"}
+      },
+      "cited_by_count": 12,
+      "is_retracted": false
+    },
+    {
+      "id": "https://openalex.org/W124",
+      "doi": null,
+      "title": "Dense Retrieval Evaluation",
+      "display_name": "Dense Retrieval Evaluation",
+      "abstract_inverted_index": {"evaluation": [1], "dense": [0]},
+      "authorships": [],
+      "publication_year": 2022,
+      "primary_location": null,
+      "cited_by_count": 4,
+      "is_retracted": false
+    }
+  ]
+}

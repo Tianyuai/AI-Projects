@@ -135,14 +135,39 @@ def _adapt_records(
     ]
 
 
-def _sample_queries(records: Sequence[EvaluationQuery], size: int) -> list[EvaluationQuery]:
+def _sample_queries(
+    records: Sequence[EvaluationQuery],
+    size: int,
+    *,
+    seed: int = RANDOM_SEED,
+) -> list[EvaluationQuery]:
     return stratified_sample(
         records,
         size,
-        seed=RANDOM_SEED,
+        seed=seed,
         key=lambda record: record.query_id,
         stratum=lambda record: answer_count_bucket(len(record.relevant_paper_ids)),
     )
+
+
+def _annotation_source_bytes(records: Sequence[EvaluationQuery]) -> bytes:
+    ordered = sorted(records, key=lambda record: record.query_id)
+    query_ids = [record.query_id for record in ordered]
+    if len(query_ids) != len(set(query_ids)):
+        raise ValueError("annotation source contains duplicate query IDs")
+    rows = [
+        {
+            "query_id": record.query_id,
+            "query": record.query,
+            "split": record.metadata.get("split"),
+        }
+        for record in ordered
+    ]
+    lines = [
+        json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        for row in rows
+    ]
+    return (("\n".join(lines) + "\n") if lines else "").encode()
 
 
 def prepare(
@@ -154,6 +179,8 @@ def prepare(
     dev_size: int = 60,
     validation_size: int = 30,
     simulated_test_size: int = 50,
+    constraint_annotation_size: int = 40,
+    overlap_annotation_size: int = 20,
 ) -> dict[str, object]:
     """Download, validate, sample, and freeze the approved PaSa inputs."""
     if token is None or not token.strip():
@@ -198,6 +225,20 @@ def prepare(
         "validation": _sample_queries(validation_candidates, validation_size),
         "simulated_test": simulated_test,
     }
+    constraint_records = _sample_queries(
+        partitions["dev"],
+        constraint_annotation_size,
+        seed=RANDOM_SEED + 1,
+    )
+    overlap_records = _sample_queries(
+        constraint_records,
+        overlap_annotation_size,
+        seed=RANDOM_SEED + 2,
+    )
+    type_domain_records = sorted(
+        [*partitions["dev"], *partitions["validation"]],
+        key=lambda record: record.query_id,
+    )
 
     source_files: list[dict[str, object]] = []
     for path in PASA_FILES:
@@ -231,6 +272,39 @@ def prepare(
             "ids_sha256": _sha256_bytes(ids_content),
         }
 
+    work_package_records = {
+        "type_domain": type_domain_records,
+        "constraints": constraint_records,
+    }
+    work_package_manifest: dict[str, dict[str, object]] = {}
+    for name, records in work_package_records.items():
+        source_path = output_root / "annotation_work" / f"{name}_source.jsonl"
+        ids_stem = "constraint" if name == "constraints" else name
+        ids_path = output_root / "splits" / f"{ids_stem}_annotation.ids.json"
+        source_content = _annotation_source_bytes(records)
+        ids_content = _json_bytes([record.query_id for record in records])
+        output_payloads.extend(
+            [(source_path, source_content), (ids_path, ids_content)]
+        )
+        work_package_manifest[name] = {
+            "count": len(records),
+            "source_path": f"annotation_work/{name}_source.jsonl",
+            "source_sha256": _sha256_bytes(source_content),
+            "ids_path": f"splits/{ids_stem}_annotation.ids.json",
+            "ids_sha256": _sha256_bytes(ids_content),
+        }
+
+    overlap_ids_content = _json_bytes(
+        [record.query_id for record in overlap_records]
+    )
+    overlap_ids_path = output_root / "splits" / "overlap_annotation.ids.json"
+    output_payloads.append((overlap_ids_path, overlap_ids_content))
+    work_package_manifest["overlap"] = {
+        "count": len(overlap_records),
+        "ids_path": "splits/overlap_annotation.ids.json",
+        "ids_sha256": _sha256_bytes(overlap_ids_content),
+    }
+
     manifest: dict[str, object] = {
         "repo_id": PASA_REPO_ID,
         "revision": PASA_REVISION,
@@ -241,12 +315,14 @@ def prepare(
         "status": HUMAN_LABEL_STATUS,
         "source_files": source_files,
         "partitions": partition_manifest,
+        "work_package_sampling": "answer-count-largest-remainder-v1-seeded-offsets",
+        "work_packages": work_package_manifest,
     }
 
-    for source_path in PASA_FILES:
+    for pasa_path in PASA_FILES:
         write_frozen_bytes(
-            output_root / "raw" / source_path,
-            downloaded[source_path],
+            output_root / "raw" / pasa_path,
+            downloaded[pasa_path],
         )
     for output_path, content in output_payloads:
         write_frozen_bytes(output_path, content)

@@ -68,6 +68,8 @@ def _prepare_with_fixtures(output_root: Path) -> dict[str, object]:
         dev_size=1,
         validation_size=1,
         simulated_test_size=2,
+        constraint_annotation_size=1,
+        overlap_annotation_size=1,
     )
 
 
@@ -107,6 +109,8 @@ def test_prepare_requests_only_fixed_files_and_revision(tmp_path: Path) -> None:
         dev_size=1,
         validation_size=1,
         simulated_test_size=2,
+        constraint_annotation_size=1,
+        overlap_annotation_size=1,
     )
 
     assert calls == [
@@ -133,6 +137,30 @@ def test_prepare_manifest_is_reproducible_and_idempotent(tmp_path: Path) -> None
     assert (tmp_path / "splits" / "simulated_test.ids.json").is_file()
 
 
+def test_prepare_generates_private_annotation_sources_and_safe_id_lists(
+    tmp_path: Path,
+) -> None:
+    manifest = _prepare_with_fixtures(tmp_path)
+
+    assert (tmp_path / "annotation_work" / "type_domain_source.jsonl").is_file()
+    assert (tmp_path / "annotation_work" / "constraints_source.jsonl").is_file()
+    constraint_ids = json.loads(
+        (tmp_path / "splits" / "constraint_annotation.ids.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    overlap_ids = json.loads(
+        (tmp_path / "splits" / "overlap_annotation.ids.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert len(constraint_ids) == 1
+    assert overlap_ids == constraint_ids
+    assert manifest["work_packages"]["type_domain"]["count"] == 2
+    assert manifest["work_packages"]["constraints"]["count"] == 1
+    assert manifest["work_packages"]["overlap"]["count"] == 1
+
+
 def test_prepare_rejects_inconsistent_frozen_rerun(tmp_path: Path) -> None:
     _prepare_with_fixtures(tmp_path)
 
@@ -155,4 +183,6 @@ def test_prepare_rejects_inconsistent_frozen_rerun(tmp_path: Path) -> None:
             dev_size=1,
             validation_size=1,
             simulated_test_size=2,
+            constraint_annotation_size=1,
+            overlap_annotation_size=1,
         )

@@ -377,6 +377,45 @@ def test_invalid_work_is_skipped_without_losing_valid_sibling(tmp_path: Path) ->
     assert result.errors[0].code == "invalid_work"
 
 
+def test_limit_counts_raw_records_even_when_normalization_fails(tmp_path: Path) -> None:
+    seen_cursors: list[str] = []
+    invalid_page = json.dumps(
+        {
+            "meta": {"next_cursor": "cursor-page-2"},
+            "results": [
+                {
+                    "id": None,
+                    "doi": None,
+                    "title": None,
+                    "display_name": None,
+                    "abstract_inverted_index": None,
+                    "authorships": [],
+                }
+            ],
+        }
+    ).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params["cursor"]
+        seen_cursors.append(cursor)
+        content = invalid_page if cursor == "*" else fixture_bytes("works_page_2.json")
+        return httpx.Response(200, content=content, request=request)
+
+    result = asyncio.run(
+        run_search(
+            SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            handler,
+            limit=1,
+            calls=2,
+        )
+    )
+
+    assert seen_cursors == ["*"]
+    assert result.data == []
+    assert result.errors[0].code == "invalid_work"
+    assert result.usage.search_api_calls == 1
+
+
 def test_task3_public_api_exports() -> None:
     import paper_search.processing as processing
     import paper_search.retrieval as retrieval

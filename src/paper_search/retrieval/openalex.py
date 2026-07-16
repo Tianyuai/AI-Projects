@@ -302,8 +302,9 @@ class OpenAlexProvider:
         successful_pages = 0
         cached_pages = 0
         seen_cursors: set[str] = set()
+        raw_records_seen = 0
 
-        while len(papers) < limit:
+        while raw_records_seen < limit:
             if cursor in seen_cursors:
                 errors.append(
                     _provider_error(
@@ -314,7 +315,7 @@ class OpenAlexProvider:
                 )
                 break
             seen_cursors.add(cursor)
-            remaining = limit - len(papers)
+            remaining = limit - raw_records_seen
             params: dict[str, QueryValue] = {
                 "api_key": self._api_key,
                 "cursor": cursor,
@@ -343,7 +344,9 @@ class OpenAlexProvider:
             cache_keys.append(key)
             response_hashes.append(response_hash)
             successful_pages += 1
-            for raw_work in raw_works:
+            page_records = raw_works[:remaining]
+            raw_records_seen += len(page_records)
+            for raw_work in page_records:
                 if not isinstance(raw_work, Mapping):
                     errors.append(
                         ErrorDetail(
@@ -365,9 +368,7 @@ class OpenAlexProvider:
                             provider="openalex",
                         )
                     )
-                if len(papers) >= limit:
-                    break
-            if not raw_works or next_cursor is None or len(papers) >= limit:
+            if not raw_works or next_cursor is None or raw_records_seen >= limit:
                 break
             cursor = next_cursor
 

@@ -229,6 +229,7 @@ class OpenAlexProvider:
                         key=key,
                         provider="openalex",
                         endpoint=_ENDPOINT,
+                        cache_version=self._cache_version,
                         params=params,
                         raw_response=raw_response,
                         requested_at=self._clock(),

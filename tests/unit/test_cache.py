@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -51,6 +52,7 @@ def test_success_response_round_trips_safe_metadata(tmp_path: Path) -> None:
         key="key-1",
         provider="openalex",
         endpoint="/works",
+        cache_version="v2",
         params={"search": "rag", "api_key": "secret-value"},
         raw_response=b'{"results":[]}',
         requested_at=now,
@@ -60,6 +62,7 @@ def test_success_response_round_trips_safe_metadata(tmp_path: Path) -> None:
 
     cached = cache.get_response("key-1")
     assert cached is not None
+    assert cached.cache_version == "v2"
     assert cached.raw_response == b'{"results":[]}'
     assert cached.params == {"search": "rag"}
     assert cached.safe_headers == {"x-request-id": "request-1"}
@@ -74,6 +77,7 @@ def test_success_response_expires_after_seven_days(tmp_path: Path) -> None:
         key="key-1",
         provider="openalex",
         endpoint="/works",
+        cache_version="v1",
         params={"search": "rag"},
         raw_response=b"{}",
         requested_at=clock(),
@@ -115,6 +119,35 @@ def test_cache_connections_do_not_lock_database_file(tmp_path: Path) -> None:
     path.rename(tmp_path / "renamed-cache.sqlite3")
 
 
+def test_initialization_migrates_legacy_response_table(tmp_path: Path) -> None:
+    path = tmp_path / "legacy-cache.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE responses (
+                cache_key TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                status_code INTEGER NOT NULL,
+                raw_response BLOB NOT NULL,
+                response_hash TEXT NOT NULL,
+                safe_headers_json TEXT NOT NULL,
+                requested_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+            """
+        )
+
+    SQLiteResponseCache(path)
+
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(responses)")
+        }
+    assert "cache_version" in columns
+
+
 def populated_cache(tmp_path: Path) -> SQLiteResponseCache:
     now = datetime(2026, 7, 16, tzinfo=UTC)
     cache = SQLiteResponseCache(tmp_path / "cache.sqlite3", clock=lambda: now)
@@ -123,6 +156,7 @@ def populated_cache(tmp_path: Path) -> SQLiteResponseCache:
             key=key,
             provider="openalex",
             endpoint="/works",
+            cache_version="v1",
             params={"search": "rag", "cursor": f"cursor-{index}"},
             raw_response=json.dumps({"page": index}, sort_keys=True).encode(),
             requested_at=now + timedelta(seconds=index),
@@ -140,6 +174,7 @@ def test_snapshot_export_is_deterministic_and_validated(tmp_path: Path) -> None:
     payload = json.loads(first)
     assert payload["contract_version"] == "provider-snapshot-v1"
     assert [entry["cache_key"] for entry in payload["entries"]] == ["page-1", "page-2"]
+    assert [entry["cache_version"] for entry in payload["entries"]] == ["v1", "v1"]
     validate_snapshot_manifest(manifest)
 
     repeated = cache.export_snapshot(["page-1", "page-2"], tmp_path / "run")

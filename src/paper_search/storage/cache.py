@@ -84,6 +84,7 @@ class CachedResponse:
     cache_key: str
     provider: str
     endpoint: str
+    cache_version: str
     params: dict[str, str]
     status_code: int
     raw_response: bytes
@@ -116,6 +117,7 @@ class SQLiteResponseCache:
                         cache_key TEXT PRIMARY KEY,
                         provider TEXT NOT NULL,
                         endpoint TEXT NOT NULL,
+                        cache_version TEXT NOT NULL DEFAULT 'legacy',
                         params_json TEXT NOT NULL,
                         status_code INTEGER NOT NULL,
                         raw_response BLOB NOT NULL,
@@ -130,6 +132,15 @@ class SQLiteResponseCache:
                     );
                     """
                 )
+                columns = {
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(responses)")
+                }
+                if "cache_version" not in columns:
+                    connection.execute(
+                        "ALTER TABLE responses ADD COLUMN "
+                        "cache_version TEXT NOT NULL DEFAULT 'legacy'"
+                    )
 
     def put_response(
         self,
@@ -137,6 +148,7 @@ class SQLiteResponseCache:
         key: str,
         provider: str,
         endpoint: str,
+        cache_version: str,
         params: Mapping[str, object],
         raw_response: bytes,
         requested_at: datetime,
@@ -154,15 +166,16 @@ class SQLiteResponseCache:
                 connection.execute(
                     """
                     INSERT OR REPLACE INTO responses (
-                        cache_key, provider, endpoint, params_json, status_code,
-                        raw_response, response_hash, safe_headers_json,
-                        requested_at, expires_at
-                    ) VALUES (?, ?, ?, ?, 200, ?, ?, ?, ?, ?)
+                        cache_key, provider, endpoint, cache_version, params_json,
+                        status_code, raw_response, response_hash,
+                        safe_headers_json, requested_at, expires_at
+                    ) VALUES (?, ?, ?, ?, ?, 200, ?, ?, ?, ?, ?)
                     """,
                     (
                         key,
                         provider,
                         endpoint,
+                        cache_version,
                         _canonical_json_bytes(canonical_request_params(params)).decode(
                             "utf-8"
                         ),
@@ -194,6 +207,7 @@ class SQLiteResponseCache:
             cache_key=row["cache_key"],
             provider=row["provider"],
             endpoint=row["endpoint"],
+            cache_version=row["cache_version"],
             params=json.loads(row["params_json"]),
             status_code=row["status_code"],
             raw_response=row["raw_response"],
@@ -242,6 +256,7 @@ class SQLiteResponseCache:
             entries.append(
                 {
                     "cache_key": cached.cache_key,
+                    "cache_version": cached.cache_version,
                     "endpoint": cached.endpoint,
                     "params": cached.params,
                     "provider": cached.provider,

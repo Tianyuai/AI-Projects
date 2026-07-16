@@ -19,3 +19,6 @@ data/dev/gold.jsonl
 data/validation/gold.jsonl
 data/simulated_test/
 data/annotation_work/
+
+# Local provider smoke artifacts
+/experiments/smoke/

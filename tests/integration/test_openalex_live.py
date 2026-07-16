@@ -22,6 +22,8 @@ LIVE_QUERIES = (
 )
 FIXTURE_ROOT = Path(__file__).resolve().parents[1] / "fixtures" / "openalex"
 SMOKE_CONTRACT_VERSION = "openalex-smoke-v1"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SMOKE_ROOT = PROJECT_ROOT / "experiments" / "smoke"
 
 
 def fixture_transport(filename: str) -> httpx.MockTransport:
@@ -163,16 +165,23 @@ def test_failed_smoke_does_not_replace_last_accepted_summary(tmp_path: Path) -> 
     assert provider.read_bytes() == accepted
 
 
+def test_live_smoke_root_is_repository_local() -> None:
+    assert SMOKE_ROOT == PROJECT_ROOT / "experiments" / "smoke"
+
+
 @pytest.mark.online
-def test_three_live_queries_produce_safe_snapshot(tmp_path: Path) -> None:
+def test_three_live_queries_produce_safe_snapshot() -> None:
     api_key = os.environ.get("OPENALEX_API_KEY")
     if not api_key:
         pytest.skip("OPENALEX_API_KEY is not set in the process environment")
 
-    provider_path = asyncio.run(run_live_queries(api_key, tmp_path))
+    provider_path = asyncio.run(run_live_queries(api_key, SMOKE_ROOT))
 
     serialized = provider_path.read_text(encoding="utf-8")
     summary = json.loads(serialized)
+    manifest = SMOKE_ROOT / summary["manifest"]
+    assert provider_path == SMOKE_ROOT / "provider.json"
     assert api_key not in serialized
     assert len(summary["queries"]) == 3
-    validate_snapshot_manifest(tmp_path / summary["manifest"])
+    assert all(item["paper_count"] > 0 for item in summary["queries"])
+    validate_snapshot_manifest(manifest)

@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+import argparse
+import json
+import os
+import sys
+import tempfile
 from collections.abc import Sequence
+from pathlib import Path
+from typing import Any
 
 from pydantic import Field
 
 from paper_search.domain.models import DomainModel, NonEmptyStr, NonNegativeInt
-from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap, PredictionRecord
+from paper_search.evaluation.dataset import (
+    EvaluationQuery,
+    IdentifierMap,
+    PredictionRecord,
+    read_jsonl,
+    sha256_file,
+)
+from paper_search.evaluation.official_adapter import (
+    InternalPredictionRecord,
+    adapt_prediction_record,
+)
+
+
+CONTRACT_VERSION = "task2-evaluation-v1"
 
 
 class QueryMetrics(DomainModel):
@@ -205,3 +225,85 @@ def evaluate(
         micro_f1=micro_f1,
     )
     return EvaluationResult(summary=summary, per_query=per_query)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(
+                payload,
+                temporary,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        temporary_path.replace(path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Evaluate ranked paper predictions")
+    parser.add_argument("--gold", type=Path, required=True)
+    parser.add_argument("--pred", type=Path, required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--id-map", type=Path)
+    return parser
+
+
+def _run_cli(args: argparse.Namespace) -> None:
+    gold = read_jsonl(args.gold, EvaluationQuery)
+    external_predictions = read_jsonl(args.pred, InternalPredictionRecord)
+    predictions = [adapt_prediction_record(record) for record in external_predictions]
+    identifier_map = IdentifierMap.from_path(args.id_map) if args.id_map else None
+    result = evaluate(gold, predictions, id_map=identifier_map)
+
+    input_hashes = {
+        "gold": sha256_file(args.gold),
+        "predictions": sha256_file(args.pred),
+    }
+    if args.id_map:
+        input_hashes["id_map"] = sha256_file(args.id_map)
+
+    payload: dict[str, Any] = {
+        "contract_version": CONTRACT_VERSION,
+        "input_hashes": input_hashes,
+        "summary": result.summary.model_dump(mode="json"),
+        "per_query": {
+            query_id: result.per_query[query_id].model_dump(mode="json")
+            for query_id in sorted(result.per_query)
+        },
+    }
+    _write_json_atomic(args.out, payload)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        _run_cli(args)
+    except (OSError, ValueError) as error:
+        print(f"evaluation failed: {error}", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

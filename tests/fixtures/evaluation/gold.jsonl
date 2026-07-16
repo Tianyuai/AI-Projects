@@ -1,0 +1,2 @@
+{"metadata":{},"query":"Find two synthetic papers","query_id":"q1","relevant_paper_ids":["doi:10.1000/a","openalex:W2"]}
+{"metadata":{},"query":"Synthetic empty-answer query","query_id":"q2","relevant_paper_ids":[]}

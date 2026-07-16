@@ -12,3 +12,10 @@ htmlcov/
 .env
 .env.*
 !.env.example
+
+# Restricted Task 2 data and human work products
+data/raw/
+data/dev/gold.jsonl
+data/validation/gold.jsonl
+data/simulated_test/
+data/annotation_work/

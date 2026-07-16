@@ -1,0 +1,30 @@
+{
+  "access": "gated-hugging-face-dataset",
+  "license": "CC-BY-NC-SA-4.0",
+  "partitions": {
+    "dev": {
+      "count": 60,
+      "gold_path": "dev/gold.jsonl",
+      "ids_path": "splits/dev.ids.json",
+      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "simulated_test": {
+      "count": 50,
+      "gold_path": "simulated_test/gold.jsonl",
+      "ids_path": "splits/simulated_test.ids.json",
+      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "validation": {
+      "count": 30,
+      "gold_path": "validation/gold.jsonl",
+      "ids_path": "splits/validation.ids.json",
+      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  },
+  "random_seed": 20260714,
+  "repo_id": "CarlanLark/pasa-dataset",
+  "revision": "232428b0c867268c3b8ded90db4d98c1b30501d6",
+  "sampling_algorithm": "answer-count-largest-remainder-v1",
+  "source_files": [],
+  "status": "waiting_for_human_label_freeze"
+}

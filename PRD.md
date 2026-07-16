@@ -777,17 +777,19 @@ Streamlit 前端包含：
 **协作者文件：** `data/README.md`、开发集样例  
 **测试文件：** `tests/evaluation/test_metrics.py`、`tests/evaluation/test_dataset.py`
 
-- [ ] 定义包含 `query_id`、`query`、`relevant_paper_ids` 和元数据的 JSONL 格式。
-- [ ] 实现 DOI、OpenAlex ID、Semantic Scholar ID 和标题的答案归一化。
-- [ ] 实现 `OfficialEvaluationAdapter`；官方评分器未发布时使用第 14.0 节契约，并通过固定 fixture 验证预测文件字段、ID、去重和空答案行为。
-- [ ] 实现 Precision、Recall、F1、Recall@5、Recall@10、Recall@20。
-- [ ] 为零预测、零标准答案、重复预测和 ID 映射编写边界测试。
+**当前状态：** `waiting_for_human_label_freeze`。评测内核、数据准备脚本、工作包生成、标注校验与安全压力集已完成；真实受限数据冻结和人工标注仍待协作者按固定 revision 完成。
+
+- [x] 定义包含 `query_id`、`query`、`relevant_paper_ids` 和元数据的 JSONL 格式。
+- [x] 实现 DOI、OpenAlex ID、Semantic Scholar ID 和标题的答案归一化。
+- [x] 实现 `OfficialEvaluationAdapter`；官方评分器未发布时使用第 14.0 节契约，并通过固定 fixture 验证预测文件字段、ID、去重和空答案行为。
+- [x] 实现 Precision、Recall、F1、Recall@5、Recall@10、Recall@20。
+- [x] 为零预测、零标准答案、重复预测和 ID 映射编写边界测试。
 - [ ] 按第 14.1 节准备 60 条开发、30 条验证和 50 条模拟测试样本，记录 dataset revision、文件哈希、访问条件、抽样脚本和随机种子。
 - [ ] 协作者在第 7 天前完成开发/验证样本的查询类型与领域标记；模拟测试集只保存 ID 清单，第 14 天冻结后不再查看标签。
-- [ ] 建立 24 条覆盖七类查询及中英文改写的压力集；该压力集只用于鲁棒性，不参与 F1 调参。
+- [x] 建立 24 条覆盖七类查询及中英文改写的压力集；该压力集只用于鲁棒性，不参与 F1 调参。
 - [ ] 协作者在第 7 天前交付 40 条查询约束标注 JSONL，字段固定为 `query_id, research_goal, must_have, should_have, exclusions, year_from, year_to, venues, query_type, domain, annotator`；主负责人复核 10 条。
 - [ ] 两人独立标注同一批 20 条并计算一致性；关键离散字段 Cohen's kappa 低于 0.80 时，先修订 `data/annotation_guide.md`，再重标分歧样本。
-- [ ] 运行 `uv run pytest tests/evaluation -v`，预期全部通过。
+- [x] 运行 `uv run pytest tests/evaluation -v`，预期全部通过。
 - [ ] 运行 `uv run python -m paper_search.evaluation.metrics --gold data/dev/gold.jsonl --pred tests/fixtures/predictions.jsonl --out experiments/smoke/metrics.json`，预期退出码 0 并生成宏平均 F1 与逐查询结果。
 
 **验收产物：** 一条命令可以对静态预测文件计算指标；数据格式有清晰说明。

@@ -37,6 +37,7 @@ def test_cli_writes_stable_metrics(tmp_path: Path) -> None:
 
     first = _run_cli(output)
     assert first.returncode == 0, first.stderr
+    assert first.stderr == ""
     first_bytes = output.read_bytes()
 
     second = _run_cli(output)
@@ -64,6 +65,36 @@ def test_cli_hashes_optional_identifier_map(tmp_path: Path) -> None:
     payload = json.loads(output.read_bytes())
     assert set(payload["input_hashes"]) == {"gold", "predictions", "id_map"}
     assert payload["per_query"]["q1"]["gold_ids"][0] == "openalex:W1"
+
+
+def test_package_metric_exports_are_lazy_and_public() -> None:
+    script = """
+import sys
+import paper_search.evaluation as evaluation
+
+assert "paper_search.evaluation.metrics" not in sys.modules
+from paper_search.evaluation import metrics
+
+for name in (
+    "EvaluationResult",
+    "MetricSummary",
+    "QueryMetrics",
+    "deduplicate_ranked",
+    "evaluate",
+    "score_query",
+):
+    assert getattr(evaluation, name) is getattr(metrics, name)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=SUBPROCESS_ENV,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_cli_fails_without_replacing_existing_output(tmp_path: Path) -> None:

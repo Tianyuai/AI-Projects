@@ -1,0 +1,24 @@
+{"language":"en","query":"Find papers that evaluate retrieval-augmented generation systems for factual consistency.","query_id":"stress-001","tags":["topic"]}
+{"language":"zh","query":"查找研究图结构信息如何改进学术论文检索的工作。","query_id":"stress-002","tags":["topic"]}
+{"language":"en","query":"Find scholarly search methods that use sparse attention to process long queries efficiently.","query_id":"stress-003","tags":["method"]}
+{"language":"zh","query":"查找使用对比学习训练论文重排序模型的方法。","query_id":"stress-004","tags":["method"]}
+{"language":"en","query":"Find dense retrieval studies evaluated across multiple BEIR datasets.","query_id":"stress-005","tags":["dataset"]}
+{"language":"zh","query":"查找在 MS MARCO 上评测多阶段文档检索的论文。","query_id":"stress-006","tags":["dataset"]}
+{"language":"en","query":"Find ACL papers published from 2022 through 2025 on citation-aware retrieval.","query_id":"stress-007","tags":["time_venue"]}
+{"language":"zh","query":"查找 2021 年以来 NeurIPS 发表的高效向量检索研究。","query_id":"stress-008","tags":["time_venue"]}
+{"language":"en","query":"Find biomedical question-answering papers that use retrieval augmentation, report evidence attribution, and were published after 2020.","query_id":"stress-009","tags":["combined"]}
+{"language":"zh","query":"查找面向法律文书的混合检索研究，要求支持中文并排除依赖专有全文数据库的方法。","query_id":"stress-010","tags":["combined","exclusion"]}
+{"language":"en","query":"Find follow-up work that extends Dense Passage Retrieval with explicit multi-hop evidence selection.","query_id":"stress-011","tags":["relationship"]}
+{"language":"zh","query":"查找检索增强生成出现之前、直接影响该路线形成的代表性前置研究。","query_id":"stress-012","tags":["relationship"]}
+{"language":"en","query":"Find lexical document retrieval methods for low-resource languages, excluding dense embedding approaches.","query_id":"stress-013","tags":["exclusion"]}
+{"language":"zh","query":"查找不使用大语言模型的学术查询扩展方法。","query_id":"stress-014","tags":["exclusion"]}
+{"language":"en","query":"Which papers measure whether retrieval augmentation reduces unsupported statements in generated answers?","query_id":"stress-015","tags":["topic","paraphrase"]}
+{"language":"en","query":"Find evaluations of hallucination reduction achieved by grounding generated answers in retrieved documents.","query_id":"stress-016","tags":["topic","paraphrase"]}
+{"language":"zh","query":"哪些研究评估了查询分解对复杂论文检索召回率的影响？","query_id":"stress-017","tags":["method","paraphrase"]}
+{"language":"zh","query":"查找分析把复杂学术问题拆成子查询后能否提高召回的论文。","query_id":"stress-018","tags":["method","paraphrase"]}
+{"language":"en","query":"Find work on academic paper recommendation that jointly handles explicit year constraints, venue constraints, negative topic constraints, author disambiguation, and transparent evidence for every recommended item, while remaining usable without full-text access.","query_id":"stress-019","tags":["combined","long_query"]}
+{"language":"en","query":"Find papers about alignment in retrieval systems.","query_id":"stress-020","tags":["ambiguity","topic"]}
+{"language":"en","query":"Find early neural ranking papers that can still be identified reliably when provider records omit abstracts or venue metadata.","query_id":"stress-021","tags":["missing_metadata","topic"]}
+{"language":"zh","query":"查找同时研究跨语言学术检索、时间范围过滤、引文扩展和成本约束的系统，并要求论文解释每个候选为何满足或不满足原查询中的硬约束。","query_id":"stress-022","tags":["combined","long_query"]}
+{"language":"en","query":"Find descendants of ColBERT that were evaluated on BEIR and explicitly compare late interaction against single-vector dense retrieval.","query_id":"stress-023","tags":["combined","dataset","relationship"]}
+{"language":"zh","query":"查找 2020 至 2024 年在 TREC Deep Learning Track 数据上评测、且报告缺失文档元数据处理方式的检索研究。","query_id":"stress-024","tags":["dataset","missing_metadata","time_venue"]}

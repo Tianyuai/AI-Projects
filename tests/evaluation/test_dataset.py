@@ -420,3 +420,25 @@ def test_frozen_write_allows_identical_rerun_and_rejects_overwrite(
 
     assert path.read_bytes() == b"same\n"
     assert list(path.parent.glob("*.tmp")) == []
+
+
+def test_stress_set_has_24_unique_original_queries() -> None:
+    path = Path("data/stress/queries.jsonl")
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+    assert len(rows) == 24
+    assert len({row["query_id"] for row in rows}) == 24
+    assert all(set(row) == {"query_id", "query", "tags", "language"} for row in rows)
+    assert all(row["query"].strip() for row in rows)
+    all_tags = {tag for row in rows for tag in row["tags"]}
+    assert {
+        "topic",
+        "method",
+        "dataset",
+        "time_venue",
+        "combined",
+        "relationship",
+        "exclusion",
+    } <= all_tags
+    assert {"paraphrase", "long_query", "ambiguity", "missing_metadata"} <= all_tags
+    assert {"zh", "en"} <= {row["language"] for row in rows}

@@ -122,8 +122,9 @@ def test_provider_readiness_hash_matches_embedded_config() -> None:
     assert readiness["security"]["secrets_recorded"] is False
 
 
-def test_env_example_has_only_prd_variables() -> None:
+def test_env_example_has_only_documented_variables() -> None:
     expected = {
+        "HF_TOKEN",
         "OPENALEX_API_KEY",
         "SEMANTIC_SCHOLAR_API_KEY",
         "LLM_API_KEY",

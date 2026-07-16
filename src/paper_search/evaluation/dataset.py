@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
+import tempfile
 import unicodedata
+from collections.abc import Sequence
+from pathlib import Path
+from typing import TypeVar
 
-from pydantic import Field, JsonValue, field_validator
+from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator
 
 from paper_search.domain.models import DomainModel, NonEmptyStr
+
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 _DOI_PATTERN = re.compile(r"^10\.\d{4,9}/\S+$", re.IGNORECASE)
@@ -138,3 +148,174 @@ class PredictionRecord(DomainModel):
     @classmethod
     def normalize_prediction_ids(cls, values: list[str]) -> list[str]:
         return [normalize_paper_id(value) for value in values]
+
+
+def _format_validation_error(error: ValidationError) -> str:
+    error_types = sorted(
+        {
+            str(detail["type"])
+            for detail in error.errors(include_url=False, include_input=False)
+        }
+    )
+    return f"record validation failed ({', '.join(error_types)})"
+
+
+def read_jsonl(path: Path, model_type: type[ModelT]) -> list[ModelT]:
+    """Load strict JSONL records and reject duplicate query identifiers."""
+    records: list[ModelT] = []
+    seen_query_ids: set[str] = set()
+
+    with path.open("rb") as source:
+        for line_number, raw_line in enumerate(source, start=1):
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                raise ValueError(
+                    f"{path}:{line_number}: invalid UTF-8"
+                ) from None
+            if not line.strip():
+                raise ValueError(f"{path}:{line_number}: blank line is not allowed")
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"{path}:{line_number}: invalid JSON: {error.msg}"
+                ) from None
+            if not isinstance(payload, dict):
+                raise ValueError(f"{path}:{line_number}: expected a JSON object")
+
+            try:
+                record = model_type.model_validate(payload)
+            except ValidationError as error:
+                reason = _format_validation_error(error)
+                raise ValueError(f"{path}:{line_number}: {reason}") from None
+
+            query_id = getattr(record, "query_id", None)
+            if isinstance(query_id, str):
+                if query_id in seen_query_ids:
+                    raise ValueError(
+                        f"{path}:{line_number}: duplicate query_id: {query_id}"
+                    )
+                seen_query_ids.add(query_id)
+            records.append(record)
+
+    return records
+
+
+def write_jsonl_atomic(path: Path, records: Sequence[BaseModel]) -> None:
+    """Write deterministic JSONL through a flushed sibling temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            for record in records:
+                payload = json.dumps(
+                    record.model_dump(mode="json"),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                temporary.write(payload.encode("utf-8") + b"\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+
+        temporary_path.replace(path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def sha256_file(path: Path) -> str:
+    """Return a namespaced SHA-256 digest of the exact file bytes."""
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
+
+
+class _JsonObjectPairs(list[tuple[str, object]]):
+    """Distinguish JSON objects from arrays while preserving duplicate keys."""
+
+
+class IdentifierMap:
+    """Resolve normalized paper identifier aliases to their terminal identifier."""
+
+    def __init__(self, resolved: dict[str, str]) -> None:
+        self._resolved = resolved.copy()
+
+    @classmethod
+    def from_path(cls, path: Path) -> IdentifierMap:
+        """Load, validate, and fully resolve an identifier mapping JSON object."""
+        try:
+            payload: object = json.loads(
+                path.read_text(encoding="utf-8"),
+                object_pairs_hook=_JsonObjectPairs,
+            )
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{path}: invalid JSON: {error.msg}") from None
+
+        if not isinstance(payload, _JsonObjectPairs):
+            raise ValueError(f"{path}: expected a JSON object")
+
+        direct: dict[str, str] = {}
+        for raw_alias, raw_target in payload:
+            if not isinstance(raw_target, str):
+                raise ValueError(
+                    f"{path}: identifier map keys and values must be strings"
+                )
+            try:
+                alias = normalize_paper_id(raw_alias)
+                target = normalize_paper_id(raw_target)
+            except ValueError as error:
+                raise ValueError(f"{path}: {error}") from None
+
+            existing = direct.get(alias)
+            if existing is not None and existing != target:
+                raise ValueError(f"{path}: identifier map conflict for {alias}")
+            direct[alias] = target
+
+        resolved: dict[str, str] = {}
+
+        def resolve_chain(identifier: str) -> str:
+            chain: list[str] = []
+            positions: dict[str, int] = {}
+            current = identifier
+
+            while current not in resolved:
+                if current in positions:
+                    raise ValueError(
+                        f"{path}: identifier map cycle involving {current}"
+                    )
+                positions[current] = len(chain)
+                chain.append(current)
+
+                target = direct.get(current)
+                if target is None:
+                    resolved[current] = current
+                    break
+                current = target
+
+            terminal = resolved[current]
+            for member in reversed(chain):
+                resolved[member] = terminal
+            return terminal
+
+        for alias in direct:
+            resolve_chain(alias)
+
+        return cls({alias: resolved[alias] for alias in direct})
+
+    def resolve(self, value: str) -> str:
+        """Normalize an identifier and return its terminal mapped value."""
+        normalized = normalize_paper_id(value)
+        return self._resolved.get(normalized, normalized)

@@ -184,7 +184,7 @@ git commit -m "feat: add evaluation data models and identifier normalization"
 - Produces: `sha256_file(path: Path) -> str`
 - Produces: `IdentifierMap.from_path(path: Path) -> IdentifierMap` and `resolve(value: str) -> str`.
 
-- [ ] **Step 1: Write failing JSONL and duplicate-query tests**
+- [x] **Step 1: Write failing JSONL and duplicate-query tests**
 
 ```python
 def test_read_jsonl_reports_line_and_rejects_unknown_fields(tmp_path: Path) -> None:
@@ -202,7 +202,7 @@ def test_read_jsonl_rejects_duplicate_query_ids(tmp_path: Path) -> None:
         read_jsonl(path, EvaluationQuery)
 ```
 
-- [ ] **Step 2: Verify RED, then implement strict line-by-line loading**
+- [x] **Step 2: Verify RED, then implement strict line-by-line loading**
 
 Run: `uv run pytest tests/evaluation/test_dataset.py -k "jsonl" -v`
 
@@ -210,7 +210,7 @@ Expected: failures because `read_jsonl` is missing.
 
 Implementation rules: reject blank lines, JSON values other than objects, Pydantic validation failures, and duplicate `query_id`; wrap every error as `ValueError(f"{path}:{line_number}: {reason}")` without including secrets.
 
-- [ ] **Step 3: Add atomic-write determinism test and implementation**
+- [x] **Step 3: Add atomic-write determinism test and implementation**
 
 ```python
 def test_write_jsonl_atomic_is_deterministic(tmp_path: Path) -> None:
@@ -225,31 +225,31 @@ def test_write_jsonl_atomic_is_deterministic(tmp_path: Path) -> None:
 
 Serialize each model with `model_dump(mode="json")`, `ensure_ascii=False`, `sort_keys=True`, and compact separators; write a sibling temporary file, flush and `os.fsync`, then use `Path.replace`.
 
-- [ ] **Step 4: Add ID-map chain, conflict, and cycle tests**
+- [x] **Step 4: Add ID-map chain, conflict, and cycle tests**
 
 ```python
 def test_identifier_map_resolves_normalized_chains(tmp_path: Path) -> None:
     path = tmp_path / "map.json"
     path.write_text(
-        '{"https://doi.org/10.1/A":"arxiv:2501.10120",'
+        '{"https://doi.org/10.1000/A":"arxiv:2501.10120",'
         '"arxiv:2501.10120":"openalex:W1"}',
         encoding="utf-8",
     )
     mapping = IdentifierMap.from_path(path)
-    assert mapping.resolve("doi:10.1/a") == "openalex:W1"
+    assert mapping.resolve("doi:10.1000/a") == "openalex:W1"
 
 
 def test_identifier_map_rejects_normalized_conflicts_and_cycles(tmp_path: Path) -> None:
     conflict = tmp_path / "conflict.json"
     conflict.write_text(
-        '{"doi:10.1/A":"openalex:W1","https://doi.org/10.1/a":"openalex:W2"}',
+        '{"doi:10.1000/A":"openalex:W1","https://doi.org/10.1000/a":"openalex:W2"}',
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="conflict"):
         IdentifierMap.from_path(conflict)
     cycle = tmp_path / "cycle.json"
     cycle.write_text(
-        '{"doi:10.1/a":"openalex:W1","openalex:W1":"doi:10.1/a"}',
+        '{"doi:10.1000/a":"openalex:W1","openalex:W1":"doi:10.1000/a"}',
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="cycle"):
@@ -258,7 +258,7 @@ def test_identifier_map_rejects_normalized_conflicts_and_cycles(tmp_path: Path) 
 
 Parse maps with `json.loads(..., object_pairs_hook=list)` so duplicate raw keys are observable, normalize both endpoints, reject one normalized alias targeting different canonical IDs, detect cycles with depth-first color states, and path-compress successful resolutions.
 
-- [ ] **Step 5: Run GREEN, full regression, and commit**
+- [x] **Step 5: Run GREEN, full regression, and commit**
 
 Run: `uv run pytest tests/evaluation/test_dataset.py -v`
 

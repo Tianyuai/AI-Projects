@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import hashlib
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
 
-from pydantic import BaseModel
+import httpx
+from pydantic import BaseModel, ValidationError
 
-from paper_search.config import RuntimeConfig
+from paper_search.config import RuntimeConfig, load_runtime_config
 from paper_search.control import HardBudgetController
 from paper_search.domain.models import (
     BudgetReservation,
@@ -28,6 +32,7 @@ from paper_search.evaluation.dataset import (
     EvaluationQuery,
     IdentifierMap,
     PredictionRecord,
+    read_jsonl,
     write_frozen_bytes,
     write_jsonl_atomic,
 )
@@ -39,6 +44,7 @@ from paper_search.processing import (
     deduplicate_papers,
 )
 from paper_search.ranking import SCORING_VERSION, LexicalScore, rank_lexically
+from paper_search.retrieval import OpenAlexProvider
 from paper_search.storage import SQLiteResponseCache, validate_snapshot_manifest
 
 
@@ -81,6 +87,58 @@ class SearchProvider(Protocol):
         limit: int,
         reservation: BudgetReservation,
     ) -> ProviderResult[list[Paper]]: ...
+
+
+class _CliInputError(ValueError):
+    """A validation failure whose fixed message is safe to show to users."""
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the frozen Week-1 evaluation split")
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--split", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def _resolve_frozen_gold(data_root: Path, split: str) -> Path:
+    manifest_path = data_root / "manifest.json"
+    try:
+        manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise _CliInputError("data manifest is invalid") from error
+    if not isinstance(manifest, dict):
+        raise _CliInputError("data manifest is invalid")
+    if manifest.get("status") != "frozen":
+        raise _CliInputError("data manifest is not frozen")
+
+    partitions = manifest.get("partitions")
+    if not isinstance(partitions, dict) or split not in partitions:
+        raise _CliInputError("unknown data split")
+    partition = partitions[split]
+    if not isinstance(partition, dict):
+        raise _CliInputError("data split manifest is invalid")
+    raw_gold_path = partition.get("gold_path")
+    if not isinstance(raw_gold_path, str) or not raw_gold_path.strip():
+        raise _CliInputError("data split manifest is invalid")
+
+    relative_path = Path(raw_gold_path)
+    resolved_root = data_root.resolve()
+    if relative_path.is_absolute():
+        raise _CliInputError("gold path must stay under data")
+    gold_path = (resolved_root / relative_path).resolve()
+    if not gold_path.is_relative_to(resolved_root):
+        raise _CliInputError("gold path must stay under data")
+    if not gold_path.is_file():
+        raise _CliInputError("gold file does not exist")
+
+    declared_hash = partition.get("gold_sha256", partition.get("sha256"))
+    if declared_hash is not None:
+        if not isinstance(declared_hash, str) or declared_hash != _sha256_bytes(
+            gold_path.read_bytes()
+        ):
+            raise _CliInputError("gold file SHA-256 mismatch")
+    return gold_path
 
 
 def process_candidates(
@@ -418,3 +476,58 @@ async def run_evaluation(
     )
     _write_artifacts(gold, result, cache=cache, config=config, output=output)
     return result
+
+
+async def _run_cli_evaluation(
+    gold: Sequence[EvaluationQuery],
+    *,
+    config: RuntimeConfig,
+    api_key: str,
+    output: Path,
+) -> None:
+    timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        cache = SQLiteResponseCache(output.parent / ".cache" / "openalex.sqlite3")
+        provider = OpenAlexProvider(client=client, cache=cache, api_key=api_key)
+        await run_evaluation(
+            gold,
+            provider=provider,
+            cache=cache,
+            config=config,
+            output=output,
+        )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        gold_path = _resolve_frozen_gold(Path("data"), args.split)
+        gold = read_jsonl(gold_path, EvaluationQuery)
+        config = load_runtime_config(args.config, env_file=None)
+        if config.openalex_api_key is None:
+            raise _CliInputError("OPENALEX_API_KEY is required")
+        asyncio.run(
+            _run_cli_evaluation(
+                gold,
+                config=config,
+                api_key=config.openalex_api_key.get_secret_value(),
+                output=args.output.resolve(),
+            )
+        )
+    except _CliInputError as error:
+        print(f"evaluation failed: {error}", file=sys.stderr)
+        return 2
+    except FileExistsError:
+        print("evaluation failed: output artifacts already differ", file=sys.stderr)
+        return 2
+    except ValidationError:
+        print("evaluation failed: invalid evaluation input", file=sys.stderr)
+        return 2
+    except (OSError, ValueError, KeyError):
+        print("evaluation failed", file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

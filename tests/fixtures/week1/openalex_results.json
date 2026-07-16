@@ -1,0 +1,60 @@
+{
+  "graph retrieval": [
+    {
+      "canonical_id": "openalex:W199",
+      "title": "Retracted Graph Retrieval Survey",
+      "publication_year": 2021,
+      "openalex_id": "W199",
+      "is_retracted": true,
+      "sources": ["openalex"]
+    },
+    {
+      "canonical_id": "openalex:W101",
+      "title": "Graph Retrieval for Scientific Papers",
+      "abstract": "Graph retrieval methods for scientific paper search.",
+      "authors": ["Ada Chen", "Bo Li"],
+      "publication_year": 2024,
+      "doi": "10.1000/graph-retrieval",
+      "openalex_id": "W101",
+      "is_retracted": false,
+      "sources": ["openalex"]
+    },
+    {
+      "canonical_id": "s2:S101",
+      "title": "Graph Retrieval for Scientific Papers",
+      "authors": ["Ada Chen"],
+      "publication_year": 2024,
+      "doi": "https://doi.org/10.1000/graph-retrieval",
+      "semantic_scholar_id": "S101",
+      "is_retracted": false,
+      "sources": ["semantic_scholar"]
+    },
+    {
+      "canonical_id": "openalex:W102",
+      "title": "Classical Botany Field Notes",
+      "publication_year": 2018,
+      "openalex_id": "W102",
+      "is_retracted": false,
+      "sources": ["openalex"]
+    }
+  ],
+  "unknown year retrieval": [
+    {
+      "canonical_id": "openalex:W201",
+      "title": "Unknown Year Retrieval Benchmark",
+      "abstract": "A retrieval benchmark whose publication year is unavailable.",
+      "publication_year": null,
+      "openalex_id": "W201",
+      "is_retracted": false,
+      "sources": ["openalex"]
+    },
+    {
+      "canonical_id": "openalex:W202",
+      "title": "Marine Biology Observations",
+      "publication_year": 2020,
+      "openalex_id": "W202",
+      "is_retracted": false,
+      "sources": ["openalex"]
+    }
+  ]
+}

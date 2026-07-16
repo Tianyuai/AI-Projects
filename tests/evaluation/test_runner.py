@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import paper_search.evaluation.runner as runner_module
-from paper_search.config import RuntimeConfig, load_budget
+from paper_search.config import RuntimeConfig, load_budget, load_runtime_config
 from paper_search.domain.models import (
     BudgetReservation,
     ErrorDetail,
@@ -24,6 +24,9 @@ from paper_search.evaluation.runner import process_candidates, run_evaluation
 from paper_search.ranking import SCORING_VERSION
 from paper_search.storage import SQLiteResponseCache
 from paper_search.storage.cache import validate_snapshot_manifest
+
+
+CONFIG = Path(__file__).parents[2] / "configs" / "base.yaml"
 
 
 def _paper(
@@ -136,6 +139,231 @@ def _canonical_jsonl_bytes(records: list[EvaluationQuery | PredictionRecord]) ->
 
 def _sha256(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def _write_cli_manifest(
+    root: Path,
+    *,
+    status: str = "frozen",
+    gold_path: str = "dev/gold.jsonl",
+    gold_sha256: str | None = None,
+) -> Path:
+    data = root / "data"
+    gold = data / "dev" / "gold.jsonl"
+    gold.parent.mkdir(parents=True)
+    gold.write_text(
+        '{"query_id":"query-1","query":"graph retrieval"}\n',
+        encoding="utf-8",
+    )
+    partition: dict[str, object] = {"gold_path": gold_path}
+    if gold_sha256 is not None:
+        partition["gold_sha256"] = gold_sha256
+    (data / "manifest.json").write_text(
+        json.dumps(
+            {
+                "status": status,
+                "partitions": {"dev": partition},
+            }
+        ),
+        encoding="utf-8",
+    )
+    return gold
+
+
+def _run_cli_from(root: Path, *, split: str = "dev") -> int:
+    return runner_module.main(
+        [
+            "--config",
+            str(CONFIG),
+            "--split",
+            split,
+            "--output",
+            "out",
+        ]
+    )
+
+
+def test_cli_refuses_unfrozen_dev_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path, status="waiting_for_human_label_freeze")
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "data manifest is not frozen" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_rejects_unknown_split_without_creating_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path, split="not-a-split") == 2
+
+    assert "unknown data split" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_rejects_missing_gold_without_creating_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gold = _write_cli_manifest(tmp_path)
+    gold.unlink()
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "gold file does not exist" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("gold_path", ["../outside.jsonl", "C:/outside.jsonl"])
+def test_cli_rejects_gold_path_outside_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    gold_path: str,
+) -> None:
+    _write_cli_manifest(tmp_path, gold_path=gold_path)
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "gold path must stay under data" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_rejects_gold_hash_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path, gold_sha256=f"sha256:{'0' * 64}")
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "gold file SHA-256 mismatch" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_parser_exposes_only_required_week1_options() -> None:
+    parser = runner_module._build_parser()
+
+    options = {
+        option
+        for action in parser._actions
+        for option in action.option_strings
+        if option != "--help" and option != "-h"
+    }
+    assert options == {"--config", "--split", "--output"}
+    assert all(action.required for action in parser._actions if action.dest != "help")
+
+
+def test_cli_loads_process_environment_and_builds_provider_without_secret_leak(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+    load_calls: list[tuple[Path, object]] = []
+    provider_calls: list[dict[str, object]] = []
+
+    def recording_loader(path: Path, *, env_file: object) -> RuntimeConfig:
+        load_calls.append((path, env_file))
+        return load_runtime_config(path, env_file=env_file)
+
+    def fake_provider_factory(**kwargs: object) -> FakeProvider:
+        provider_calls.append(kwargs)
+        cache = kwargs["cache"]
+        assert isinstance(cache, SQLiteResponseCache)
+        assert cache.path == tmp_path / ".cache" / "openalex.sqlite3"
+        client = kwargs["client"]
+        assert client.timeout.connect is not None
+        assert client.timeout.read is not None
+        assert client.timeout.write is not None
+        assert client.timeout.pool is not None
+        return FakeProvider(
+            {
+                "graph retrieval": _provider_result(
+                    [_paper("openalex:W1", title="graph retrieval")],
+                    calls=1,
+                    latency_ms=1,
+                )
+            }
+        )
+
+    monkeypatch.setattr(runner_module, "load_runtime_config", recording_loader, raising=False)
+    monkeypatch.setattr(runner_module, "OpenAlexProvider", fake_provider_factory, raising=False)
+
+    assert _run_cli_from(tmp_path) == 0
+
+    captured = capsys.readouterr()
+    assert load_calls == [(CONFIG, None)]
+    assert len(provider_calls) == 1
+    assert provider_calls[0]["api_key"] == SENTINEL_API_KEY
+    assert SENTINEL_API_KEY not in captured.out
+    assert SENTINEL_API_KEY not in captured.err
+    for artifact in (tmp_path / "out").rglob("*"):
+        if artifact.is_file():
+            assert SENTINEL_API_KEY.encode() not in artifact.read_bytes()
+
+
+def test_cli_requires_openalex_key_from_process_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENALEX_API_KEY", raising=False)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert capsys.readouterr().err.strip().endswith("OPENALEX_API_KEY is required")
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_redacts_expected_provider_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+
+    def failing_provider_factory(**kwargs: object) -> None:
+        del kwargs
+        raise ValueError(f"provider rejected {SENTINEL_API_KEY}")
+
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        failing_provider_factory,
+        raising=False,
+    )
+
+    assert _run_cli_from(tmp_path) == 2
+
+    captured = capsys.readouterr()
+    assert "evaluation failed" in captured.err
+    assert SENTINEL_API_KEY not in captured.out
+    assert SENTINEL_API_KEY not in captured.err
+    for artifact in tmp_path.rglob("*"):
+        if artifact.is_file():
+            assert SENTINEL_API_KEY.encode() not in artifact.read_bytes()
 
 
 def _artifact_inputs(

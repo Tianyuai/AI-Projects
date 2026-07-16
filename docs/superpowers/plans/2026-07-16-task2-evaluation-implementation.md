@@ -287,7 +287,7 @@ git commit -m "feat: add strict evaluation file contracts"
 - Produces: `adapt_pasa_record(record, *, source, split, revision) -> EvaluationQuery`.
 - Produces: `adapt_prediction_record(record) -> PredictionRecord`.
 
-- [ ] **Step 1: Write failing PaSa conversion tests**
+- [x] **Step 1: Write failing PaSa conversion tests**
 
 ```python
 def test_pasa_prefers_arxiv_ids_and_copies_provenance() -> None:
@@ -320,7 +320,7 @@ def test_pasa_uses_title_only_when_corresponding_arxiv_id_is_missing() -> None:
     assert result.relevant_paper_ids == ["arxiv:2501.10120", "title:paper b"]
 ```
 
-- [ ] **Step 2: Verify RED and implement strict source models**
+- [x] **Step 2: Verify RED and implement strict source models**
 
 Run: `uv run pytest tests/evaluation/test_official_adapter.py -v`
 
@@ -328,7 +328,7 @@ Expected: module import fails.
 
 `PaSaRecord` uses `extra="forbid"` and a before-validator that converts a single string in `answer` or `answer_arxiv_id` to a one-item list. It rejects unequal non-empty list lengths. `adapt_pasa_record` pairs each answer with its arXiv ID and only uses `title:` when that position has no formal ID.
 
-- [ ] **Step 3: Write and implement prediction-boundary tests**
+- [x] **Step 3: Write and implement prediction-boundary tests**
 
 ```python
 def test_fixed_prediction_schema_maps_selected_ids_without_deduplication() -> None:
@@ -347,7 +347,7 @@ def test_prediction_schema_rejects_unknown_fields() -> None:
         )
 ```
 
-- [ ] **Step 4: Run GREEN, regression, and commit**
+- [x] **Step 4: Run GREEN, regression, and commit**
 
 Run: `uv run pytest tests/evaluation/test_official_adapter.py -v`
 

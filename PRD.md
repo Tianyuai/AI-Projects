@@ -805,9 +805,9 @@ Streamlit 前端包含：
 - [x] 实现从缓存导出不可变实验快照及 SHA-256 manifest；同一 run 的指标只能引用该 manifest 中的响应。
 - [x] 实现 OpenAlex 响应到统一 `Paper` 的映射。
 - [x] 实现限次重试和错误分类，不允许无限重试。
-- [ ] 使用 3 条真实查询做冒烟测试，保存原始响应快照。
+- [x] 使用 3 条真实查询做冒烟测试，保存原始响应快照。
 - [x] 运行 `uv run pytest -m "not online" tests/unit/test_openalex.py tests/unit/test_cache.py tests/unit/test_normalize.py -v`；fixture 测试必须通过。
-- [ ] 运行 `uv run pytest -m online tests/integration/test_openalex_live.py -v`；只有已配置 key 时执行，结果写入 `experiments/smoke/provider.json`。
+- [x] 运行 `uv run pytest -m online tests/integration/test_openalex_live.py -v`；只有已配置 key 时执行，结果写入 `experiments/smoke/provider.json`。
 
 **验收产物：** 输入查询可得到统一论文对象；断网时可回放缓存 fixture。
 

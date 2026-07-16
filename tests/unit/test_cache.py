@@ -105,6 +105,16 @@ def test_missing_cache_entries_return_none(tmp_path: Path) -> None:
     assert cache.get_cooldown("missing") is None
 
 
+def test_cache_connections_do_not_lock_database_file(tmp_path: Path) -> None:
+    path = tmp_path / "cache.sqlite3"
+    cache = SQLiteResponseCache(path)
+
+    assert cache.get_response("missing") is None
+    cache.set_cooldown("key-1", datetime(2026, 7, 16, tzinfo=UTC))
+
+    path.rename(tmp_path / "renamed-cache.sqlite3")
+
+
 def populated_cache(tmp_path: Path) -> SQLiteResponseCache:
     now = datetime(2026, 7, 16, tzinfo=UTC)
     cache = SQLiteResponseCache(tmp_path / "cache.sqlite3", clock=lambda: now)

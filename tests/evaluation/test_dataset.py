@@ -1,5 +1,7 @@
 import hashlib
 import json
+from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -336,3 +338,85 @@ def test_identifier_map_rejects_invalid_files(
 
     with pytest.raises(ValueError, match=reason):
         dataset_module.IdentifierMap.from_path(path)
+
+
+@dataclass(frozen=True)
+class SampleRecord:
+    query_id: str
+    bucket: str
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [(1, "1"), (2, "2-3"), (3, "2-3"), (4, "4-7"), (7, "4-7"), (8, "8+")],
+)
+def test_answer_count_bucket(count: int, expected: str) -> None:
+    assert dataset_module.answer_count_bucket(count) == expected
+
+
+@pytest.mark.parametrize("count", [-1, 0])
+def test_answer_count_bucket_rejects_non_positive_counts(count: int) -> None:
+    with pytest.raises(ValueError, match="positive"):
+        dataset_module.answer_count_bucket(count)
+
+
+def test_stratified_sample_is_deterministic_and_proportional() -> None:
+    records = [
+        SampleRecord(f"q{index}", "1" if index < 6 else "2-3")
+        for index in range(10)
+    ]
+
+    first = dataset_module.stratified_sample(
+        records,
+        5,
+        seed=20260714,
+        key=lambda record: record.query_id,
+        stratum=lambda record: record.bucket,
+    )
+    second = dataset_module.stratified_sample(
+        list(reversed(records)),
+        5,
+        seed=20260714,
+        key=lambda record: record.query_id,
+        stratum=lambda record: record.bucket,
+    )
+
+    assert [record.query_id for record in first] == [
+        record.query_id for record in second
+    ]
+    assert Counter(record.bucket for record in first) == {"1": 3, "2-3": 2}
+
+
+def test_stratified_sample_rejects_invalid_size() -> None:
+    records = [SampleRecord("q1", "1")]
+
+    with pytest.raises(ValueError, match="non-negative"):
+        dataset_module.stratified_sample(
+            records,
+            -1,
+            seed=1,
+            key=lambda record: record.query_id,
+            stratum=lambda record: record.bucket,
+        )
+    with pytest.raises(ValueError, match="exceeds"):
+        dataset_module.stratified_sample(
+            records,
+            2,
+            seed=1,
+            key=lambda record: record.query_id,
+            stratum=lambda record: record.bucket,
+        )
+
+
+def test_frozen_write_allows_identical_rerun_and_rejects_overwrite(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "nested" / "frozen.json"
+
+    assert dataset_module.write_frozen_bytes(path, b"same\n") == "created"
+    assert dataset_module.write_frozen_bytes(path, b"same\n") == "matched"
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        dataset_module.write_frozen_bytes(path, b"different\n")
+
+    assert path.read_bytes() == b"same\n"
+    assert list(path.parent.glob("*.tmp")) == []

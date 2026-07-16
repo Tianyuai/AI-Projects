@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import re
 import tempfile
 import unicodedata
-from collections.abc import Sequence
+from collections import defaultdict
+from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import TypeVar
+from typing import Literal, TypeVar
 
 from pydantic import BaseModel, Field, JsonValue, ValidationError, field_validator
 
@@ -16,6 +18,7 @@ from paper_search.domain.models import DomainModel, NonEmptyStr
 
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+RecordT = TypeVar("RecordT")
 
 
 _DOI_PATTERN = re.compile(r"^10\.\d{4,9}/\S+$", re.IGNORECASE)
@@ -319,3 +322,106 @@ class IdentifierMap:
         """Normalize an identifier and return its terminal mapped value."""
         normalized = normalize_paper_id(value)
         return self._resolved.get(normalized, normalized)
+
+
+def answer_count_bucket(count: int) -> Literal["1", "2-3", "4-7", "8+"]:
+    """Return the approved PaSa answer-count stratum."""
+    if count <= 0:
+        raise ValueError("answer count must be positive")
+    if count == 1:
+        return "1"
+    if count <= 3:
+        return "2-3"
+    if count <= 7:
+        return "4-7"
+    return "8+"
+
+
+def stratified_sample(
+    records: Sequence[RecordT],
+    size: int,
+    *,
+    seed: int,
+    key: Callable[[RecordT], str],
+    stratum: Callable[[RecordT], str],
+) -> list[RecordT]:
+    """Select a stable largest-remainder sample across named strata."""
+    if size < 0:
+        raise ValueError("sample size must be non-negative")
+    if size > len(records):
+        raise ValueError("sample size exceeds available records")
+    if not records:
+        return []
+
+    ordered = sorted(records, key=key)
+    stable_keys = [key(record) for record in ordered]
+    if len(stable_keys) != len(set(stable_keys)):
+        raise ValueError("sample keys must be unique")
+
+    grouped: dict[str, list[RecordT]] = defaultdict(list)
+    for record in ordered:
+        stratum_name = stratum(record)
+        if not stratum_name:
+            raise ValueError("sample stratum must be non-empty")
+        grouped[stratum_name].append(record)
+
+    total = len(records)
+    quotas: dict[str, int] = {}
+    remainders: dict[str, int] = {}
+    for stratum_name, members in grouped.items():
+        quota, remainder = divmod(size * len(members), total)
+        quotas[stratum_name] = quota
+        remainders[stratum_name] = remainder
+
+    remaining = size - sum(quotas.values())
+    remainder_order = sorted(
+        grouped,
+        key=lambda name: (-remainders[name], name),
+    )
+    for stratum_name in remainder_order[:remaining]:
+        quotas[stratum_name] += 1
+
+    randomizer = random.Random(seed)
+    selected: list[RecordT] = []
+    for stratum_name in sorted(grouped):
+        members = grouped[stratum_name].copy()
+        quota = quotas[stratum_name]
+        if quota > len(members):
+            raise ValueError(f"allocated quota exceeds stratum {stratum_name!r}")
+        randomizer.shuffle(members)
+        selected.extend(members[:quota])
+
+    return sorted(selected, key=key)
+
+
+def write_frozen_bytes(
+    path: Path,
+    content: bytes,
+) -> Literal["created", "matched"]:
+    """Create immutable content, allowing only byte-identical reruns."""
+    if path.exists():
+        if path.read_bytes() == content:
+            return "matched"
+        raise FileExistsError(f"refusing to overwrite frozen file: {path}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        temporary_path.replace(path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+    return "created"

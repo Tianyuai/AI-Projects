@@ -139,3 +139,29 @@ def test_exclusion_phrase_does_not_match_across_title_and_abstract() -> None:
 
     assert [item.paper.canonical_id for item in result.accepted] == ["openalex:W1"]
     assert result.rejected == []
+
+
+@pytest.mark.parametrize("venue", ["", "   ", "---"])
+def test_ambiguous_venue_is_downweighted_not_removed(venue: str) -> None:
+    result = apply_hard_filters(
+        [_paper(venue=venue)],
+        _query(venues=["NeurIPS"]),
+    )
+
+    accepted = result.accepted[0]
+    assert result.rejected == []
+    assert accepted.uncertainty_reasons == ["missing_venue"]
+    assert accepted.score_multiplier == pytest.approx(0.9)
+
+
+@pytest.mark.parametrize("abstract", ["", "   ", "---"])
+def test_ambiguous_abstract_is_downweighted_not_removed(abstract: str) -> None:
+    result = apply_hard_filters(
+        [_paper(abstract=abstract)],
+        _query(exclusions=["survey"]),
+    )
+
+    accepted = result.accepted[0]
+    assert result.rejected == []
+    assert accepted.uncertainty_reasons == ["missing_abstract_for_exclusion"]
+    assert accepted.score_multiplier == pytest.approx(0.9)

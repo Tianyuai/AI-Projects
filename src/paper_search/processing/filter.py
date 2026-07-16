@@ -42,6 +42,15 @@ def _has_stable_id(paper: Paper) -> bool:
     return canonical_id.startswith(("doi:", "openalex:", "s2:", "arxiv:"))
 
 
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        return normalize_title(value)
+    except ValueError:
+        return None
+
+
 def _rejection_reason(paper: Paper, query: QuerySpec) -> tuple[str, str] | None:
     if paper.is_retracted is True:
         return "retracted", "Paper is marked as retracted."
@@ -53,13 +62,16 @@ def _rejection_reason(paper: Paper, query: QuerySpec) -> tuple[str, str] | None:
     ):
         return "year_out_of_range", "Paper publication year is outside the requested range."
     if paper.venue is not None and query.venues:
-        normalized_venue = normalize_title(paper.venue)
-        if all(normalized_venue != normalize_title(venue) for venue in query.venues):
+        normalized_venue = _normalize_optional_text(paper.venue)
+        if normalized_venue is not None and all(
+            normalized_venue != normalize_title(venue) for venue in query.venues
+        ):
             return "venue_mismatch", "Paper venue does not match the requested venues."
     if query.exclusions:
         searchable_fields = [normalize_title(paper.title)]
-        if paper.abstract:
-            searchable_fields.append(normalize_title(paper.abstract))
+        normalized_abstract = _normalize_optional_text(paper.abstract)
+        if normalized_abstract is not None:
+            searchable_fields.append(normalized_abstract)
         if any(
             normalize_title(term) in field
             for term in query.exclusions
@@ -75,11 +87,11 @@ def _uncertainty_reasons(paper: Paper, query: QuerySpec) -> list[str]:
         query.year_from is not None or query.year_to is not None
     ):
         reasons.append("missing_year")
-    if paper.venue is None and query.venues:
+    if _normalize_optional_text(paper.venue) is None and query.venues:
         reasons.append("missing_venue")
     if paper.is_retracted is None:
         reasons.append("unknown_retraction_status")
-    if paper.abstract is None and query.exclusions:
+    if _normalize_optional_text(paper.abstract) is None and query.exclusions:
         reasons.append("missing_abstract_for_exclusion")
     return reasons
 

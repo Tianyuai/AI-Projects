@@ -37,6 +37,7 @@ OPENALEX_SELECT_FIELDS = (
     "primary_location,cited_by_count,is_retracted"
 )
 _ENDPOINT = "/works"
+_REQUEST_URL = "https://api.openalex.org/works"
 _CACHE_TTL = timedelta(days=7)
 _COOLDOWN = timedelta(seconds=60)
 _MAX_ATTEMPTS = 3
@@ -197,7 +198,11 @@ class OpenAlexProvider:
         last_error: ErrorDetail | None = None
         for attempt in range(attempts_allowed):
             try:
-                response = await self._client.get(_ENDPOINT, params=params)
+                response = await self._client.get(
+                    _REQUEST_URL,
+                    params=params,
+                    follow_redirects=False,
+                )
             except httpx.TimeoutException:
                 last_error = _provider_error("timeout", "OpenAlex request timed out", retryable=True)
             except httpx.RequestError:

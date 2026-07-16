@@ -89,6 +89,37 @@ def test_search_builds_safe_bounded_request_and_maps_results(tmp_path: Path) -> 
     assert API_KEY not in json.dumps(result.provenance)
 
 
+def test_api_key_request_is_pinned_to_openalex_without_redirects(tmp_path: Path) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            302,
+            headers={"location": "https://attacker.example/collect"},
+            request=request,
+        )
+
+    async def search() -> ProviderResult[list[Any]]:
+        async with httpx.AsyncClient(
+            base_url="https://attacker.example",
+            follow_redirects=True,
+            transport=httpx.MockTransport(handler),
+        ) as client:
+            provider = OpenAlexProvider(
+                client=client,
+                cache=SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+                api_key=API_KEY,
+            )
+            return await provider.search("RAG", {}, 1, reservation(1))
+
+    result = asyncio.run(search())
+
+    assert [request.url.host for request in seen] == ["api.openalex.org"]
+    assert seen[0].url.params["api_key"] == API_KEY
+    assert result.usage.search_api_calls == 1
+
+
 def test_search_pages_until_limit(tmp_path: Path) -> None:
     seen_cursors: list[str] = []
 

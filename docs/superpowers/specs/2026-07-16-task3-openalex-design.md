@@ -271,6 +271,8 @@ canonical ID 优先级：
 - `requested_at`；
 - `response_hash`。
 
+另包含 `cache_keys`：按页面顺序排列的缓存键 JSON 数组字符串。runner 使用该字段导出本次搜索实际引用的快照，避免 Provider 保存并发不安全的“最后一次搜索”状态。
+
 单页 `response_hash` 为原始响应 SHA-256。多页时，按页序列化各页原始哈希后再计算聚合 SHA-256。没有成功页面时，使用空哈希列表的确定性 SHA-256。
 
 `cache_hit` 只有在本次搜索的所有成功页面都来自缓存且没有外部请求时为 true。混合缓存/在线分页为 false。

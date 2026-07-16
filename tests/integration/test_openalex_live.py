@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -40,6 +41,21 @@ def fixture_transport(filename: str) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
+def reflected_key_transport(api_key: str) -> httpx.MockTransport:
+    payload = json.loads((FIXTURE_ROOT / "works_page_1.json").read_bytes())
+    payload["reflected_api_key"] = api_key
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=payload,
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    return httpx.MockTransport(handler)
+
+
 def reservation(index: int) -> BudgetReservation:
     return BudgetReservation(
         reservation_id=f"live-{index}",
@@ -54,12 +70,23 @@ def new_run_id() -> str:
     return f"{timestamp}-{uuid4().hex[:8]}"
 
 
-def publish_summary(path: Path, value: dict[str, object]) -> None:
-    content = json.dumps(value, indent=2, sort_keys=True) + "\n"
+def serialize_summary(value: dict[str, object]) -> bytes:
+    return (json.dumps(value, indent=2, sort_keys=True) + "\n").encode("utf-8")
+
+
+def publish_summary(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8")
+    temporary.write_bytes(content)
     os.replace(temporary, path)
+
+
+def reject_secret_artifacts(api_key: str, run_dir: Path, summary: bytes) -> None:
+    secret = api_key.encode("utf-8")
+    run_files = (path for path in run_dir.rglob("*") if path.is_file())
+    if secret in summary or any(secret in path.read_bytes() for path in run_files):
+        shutil.rmtree(run_dir)
+        raise ValueError("OpenAlex API key appeared in smoke artifacts")
 
 
 async def run_live_queries(
@@ -99,8 +126,10 @@ async def run_live_queries(
         "manifest": manifest.relative_to(smoke_root).as_posix(),
         "queries": summaries,
     }
+    summary_content = serialize_summary(summary)
+    reject_secret_artifacts(api_key, run_dir, summary_content)
     provider_path = smoke_root / "provider.json"
-    publish_summary(provider_path, summary)
+    publish_summary(provider_path, summary_content)
     return provider_path
 
 
@@ -163,6 +192,33 @@ def test_failed_smoke_does_not_replace_last_accepted_summary(tmp_path: Path) -> 
         )
 
     assert provider.read_bytes() == accepted
+
+
+def test_reflected_key_is_removed_before_summary_publication(tmp_path: Path) -> None:
+    smoke_root = tmp_path / "experiments" / "smoke"
+    key = "sentinel-openalex-key"
+    provider = asyncio.run(
+        run_live_queries(
+            key,
+            smoke_root,
+            transport=fixture_transport("works_page_1.json"),
+        )
+    )
+    accepted = provider.read_bytes()
+
+    with pytest.raises(ValueError, match="API key"):
+        asyncio.run(
+            run_live_queries(
+                key,
+                smoke_root,
+                transport=reflected_key_transport(key),
+            )
+        )
+
+    assert provider.read_bytes() == accepted
+    assert key.encode() not in b"".join(
+        path.read_bytes() for path in smoke_root.rglob("*") if path.is_file()
+    )
 
 
 def test_live_smoke_root_is_repository_local() -> None:

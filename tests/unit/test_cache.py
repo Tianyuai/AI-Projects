@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from paper_search.storage.cache import SQLiteResponseCache, make_cache_key
+import pytest
+
+from paper_search.storage.cache import (
+    SQLiteResponseCache,
+    make_cache_key,
+    validate_snapshot_manifest,
+)
 
 
 class MutableClock:
@@ -96,3 +103,60 @@ def test_missing_cache_entries_return_none(tmp_path: Path) -> None:
 
     assert cache.get_response("missing") is None
     assert cache.get_cooldown("missing") is None
+
+
+def populated_cache(tmp_path: Path) -> SQLiteResponseCache:
+    now = datetime(2026, 7, 16, tzinfo=UTC)
+    cache = SQLiteResponseCache(tmp_path / "cache.sqlite3", clock=lambda: now)
+    for index, key in enumerate(("page-1", "page-2"), start=1):
+        cache.put_response(
+            key=key,
+            provider="openalex",
+            endpoint="/works",
+            params={"search": "rag", "cursor": f"cursor-{index}"},
+            raw_response=json.dumps({"page": index}, sort_keys=True).encode(),
+            requested_at=now + timedelta(seconds=index),
+            ttl=timedelta(days=7),
+            safe_headers={"x-request-id": f"request-{index}"},
+        )
+    return cache
+
+
+def test_snapshot_export_is_deterministic_and_validated(tmp_path: Path) -> None:
+    cache = populated_cache(tmp_path)
+    manifest = cache.export_snapshot(["page-1", "page-2"], tmp_path / "run")
+    first = manifest.read_bytes()
+
+    payload = json.loads(first)
+    assert payload["contract_version"] == "provider-snapshot-v1"
+    assert [entry["cache_key"] for entry in payload["entries"]] == ["page-1", "page-2"]
+    validate_snapshot_manifest(manifest)
+
+    repeated = cache.export_snapshot(["page-1", "page-2"], tmp_path / "run")
+    assert repeated.read_bytes() == first
+
+
+def test_snapshot_preserves_exact_response_bytes(tmp_path: Path) -> None:
+    cache = populated_cache(tmp_path)
+    manifest = cache.export_snapshot(["page-1"], tmp_path / "run")
+    entry = json.loads(manifest.read_bytes())["entries"][0]
+
+    assert (manifest.parent / entry["snapshot_path"]).read_bytes() == b'{"page": 1}'
+
+
+def test_snapshot_refuses_different_existing_content(tmp_path: Path) -> None:
+    cache = populated_cache(tmp_path)
+    cache.export_snapshot(["page-1"], tmp_path / "run")
+
+    with pytest.raises(FileExistsError):
+        cache.export_snapshot(["page-2"], tmp_path / "run")
+
+
+def test_snapshot_validation_detects_tampering(tmp_path: Path) -> None:
+    cache = populated_cache(tmp_path)
+    manifest = cache.export_snapshot(["page-1"], tmp_path / "run")
+    entry = json.loads(manifest.read_bytes())["entries"][0]
+    (manifest.parent / entry["snapshot_path"]).write_bytes(b"tampered")
+
+    with pytest.raises(ValueError, match="hash"):
+        validate_snapshot_manifest(manifest)

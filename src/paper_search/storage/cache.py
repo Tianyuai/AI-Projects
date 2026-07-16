@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,17 @@ def _canonical_json_bytes(value: object) -> bytes:
 
 def _sha256(value: bytes) -> str:
     return f"sha256:{hashlib.sha256(value).hexdigest()}"
+
+
+def _frozen_write(path: Path, content: bytes) -> None:
+    if path.exists():
+        if path.read_bytes() == content:
+            return
+        raise FileExistsError(f"refusing to overwrite frozen file: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_bytes(content)
+    os.replace(temporary, path)
 
 
 def canonical_request_params(params: Mapping[str, object]) -> dict[str, str]:
@@ -159,6 +171,12 @@ class SQLiteResponseCache:
 
     def get_response(self, key: str) -> CachedResponse | None:
         """Return an unexpired response without deleting expired history."""
+        cached = self._get_response_any(key)
+        if cached is None or cached.expires_at <= self._clock():
+            return None
+        return cached
+
+    def _get_response_any(self, key: str) -> CachedResponse | None:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM responses WHERE cache_key = ?",
@@ -167,8 +185,6 @@ class SQLiteResponseCache:
         if row is None:
             return None
         expires_at = datetime.fromisoformat(row["expires_at"])
-        if expires_at <= self._clock():
-            return None
         return CachedResponse(
             cache_key=row["cache_key"],
             provider=row["provider"],
@@ -201,3 +217,79 @@ class SQLiteResponseCache:
             return None
         until = datetime.fromisoformat(row["cooldown_until"])
         return until if until > self._clock() else None
+
+    def export_snapshot(self, cache_keys: Sequence[str], run_dir: Path) -> Path:
+        """Freeze exact cached response bytes and an ordered manifest."""
+        if len(set(cache_keys)) != len(cache_keys):
+            raise ValueError("snapshot cache keys must be unique")
+
+        entries: list[dict[str, object]] = []
+        files: list[tuple[Path, bytes]] = []
+        for index, key in enumerate(cache_keys, start=1):
+            cached = self._get_response_any(key)
+            if cached is None:
+                raise KeyError(f"unknown cache key: {key}")
+            relative_path = Path("snapshots") / f"openalex-{index:04d}.json"
+            snapshot_path = run_dir / relative_path
+            files.append((snapshot_path, cached.raw_response))
+            entries.append(
+                {
+                    "cache_key": cached.cache_key,
+                    "endpoint": cached.endpoint,
+                    "params": cached.params,
+                    "provider": cached.provider,
+                    "requested_at": cached.requested_at.isoformat(),
+                    "response_hash": cached.response_hash,
+                    "snapshot_path": relative_path.as_posix(),
+                    "snapshot_sha256": _sha256(cached.raw_response),
+                }
+            )
+
+        manifest_content = json.dumps(
+            {"contract_version": "provider-snapshot-v1", "entries": entries},
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8") + b"\n"
+        manifest_path = run_dir / "snapshot_manifest.json"
+
+        for path, content in [*files, (manifest_path, manifest_content)]:
+            if path.exists() and path.read_bytes() != content:
+                raise FileExistsError(f"refusing to overwrite frozen file: {path}")
+        for path, content in files:
+            _frozen_write(path, content)
+        _frozen_write(manifest_path, manifest_content)
+        return manifest_path
+
+
+def validate_snapshot_manifest(path: Path) -> None:
+    """Verify every frozen response referenced by a snapshot manifest."""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError("invalid snapshot manifest") from error
+    if not isinstance(payload, dict) or payload.get("contract_version") != (
+        "provider-snapshot-v1"
+    ):
+        raise ValueError("invalid snapshot manifest contract")
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("snapshot manifest entries must be a list")
+
+    root = path.parent.resolve()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError("snapshot manifest entry must be an object")
+        relative = entry.get("snapshot_path")
+        expected = entry.get("snapshot_sha256")
+        if not isinstance(relative, str) or not isinstance(expected, str):
+            raise ValueError("snapshot manifest entry is incomplete")
+        snapshot = (root / relative).resolve()
+        if root not in snapshot.parents:
+            raise ValueError("snapshot path escapes the run directory")
+        try:
+            actual = _sha256(snapshot.read_bytes())
+        except OSError as error:
+            raise ValueError("snapshot file is missing") from error
+        if actual != expected or actual != entry.get("response_hash"):
+            raise ValueError("snapshot hash mismatch")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -88,6 +89,28 @@ def test_success_response_expires_after_seven_days(tmp_path: Path) -> None:
     assert cache.get_response("key-1") is not None
     clock.advance(timedelta(days=7, microseconds=1))
     assert cache.get_response("key-1") is None
+
+
+def test_snapshot_response_reads_expired_history(tmp_path: Path) -> None:
+    clock = MutableClock(datetime(2026, 7, 16, tzinfo=UTC))
+    cache = SQLiteResponseCache(tmp_path / "cache.sqlite3", clock=clock)
+    cache.put_response(
+        key="key-1",
+        provider="openalex",
+        endpoint="/works",
+        cache_version="v1",
+        params={"search": "rag"},
+        raw_response=b"{}",
+        requested_at=clock(),
+        ttl=timedelta(days=7),
+        safe_headers={},
+    )
+    clock.advance(timedelta(days=8))
+
+    cached = cache.get_snapshot_response("key-1")
+
+    assert cached is not None
+    assert cached.raw_response == b"{}"
 
 
 def test_cooldown_expires_at_boundary(tmp_path: Path) -> None:
@@ -205,3 +228,16 @@ def test_snapshot_validation_detects_tampering(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="hash"):
         validate_snapshot_manifest(manifest)
+
+
+@pytest.mark.parametrize("relative", [Path("../outside.json"), Path("C:/outside.json")])
+def test_prepared_snapshot_write_rejects_paths_outside_run_directory(
+    tmp_path: Path,
+    relative: Path,
+) -> None:
+    cache = populated_cache(tmp_path)
+    prepared = cache.prepare_snapshot(["page-1"])
+    malicious = replace(prepared, files=((relative, b"malicious"),))
+
+    with pytest.raises(ValueError, match="snapshot path"):
+        cache.write_snapshot(malicious, tmp_path / "run")

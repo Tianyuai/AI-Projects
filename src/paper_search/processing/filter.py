@@ -8,7 +8,12 @@ from typing import Annotated
 from pydantic import Field
 
 from paper_search.domain.models import DomainModel, NonEmptyStr, Paper, QuerySpec
-from paper_search.evaluation.dataset import normalize_title
+from paper_search.evaluation.dataset import normalize_paper_id, normalize_title
+
+
+FILTERING_VERSION = "week1-filter-v1"
+UNCERTAINTY_REASON_MULTIPLIER = 0.9
+MINIMUM_UNCERTAINTY_MULTIPLIER = 0.7
 
 
 class AcceptedPaper(DomainModel):
@@ -35,11 +40,23 @@ class FilterResult(DomainModel):
 
 
 def _has_stable_id(paper: Paper) -> bool:
-    direct_ids = (paper.doi, paper.openalex_id, paper.semantic_scholar_id)
-    if any(identifier is not None and identifier.strip() for identifier in direct_ids):
+    for identifier, kind in (
+        (paper.doi, "doi"),
+        (paper.openalex_id, "openalex"),
+        (paper.semantic_scholar_id, "semantic_scholar"),
+    ):
+        if identifier is None:
+            continue
+        try:
+            normalize_paper_id(identifier, kind=kind)
+        except ValueError:
+            continue
         return True
-    canonical_id = paper.canonical_id.casefold()
-    return canonical_id.startswith(("doi:", "openalex:", "s2:", "arxiv:"))
+    try:
+        normalized = normalize_paper_id(paper.canonical_id)
+    except ValueError:
+        return False
+    return not normalized.startswith("title:")
 
 
 def _normalize_optional_text(value: str | None) -> str | None:
@@ -111,7 +128,10 @@ def apply_hard_filters(papers: Sequence[Paper], query: QuerySpec) -> FilterResul
             AcceptedPaper(
                 paper=paper,
                 uncertainty_reasons=uncertainty_reasons,
-                score_multiplier=max(0.7, 0.9 ** len(uncertainty_reasons)),
+                score_multiplier=max(
+                    MINIMUM_UNCERTAINTY_MULTIPLIER,
+                    UNCERTAINTY_REASON_MULTIPLIER ** len(uncertainty_reasons),
+                ),
             )
         )
     return FilterResult(accepted=accepted, rejected=rejected)

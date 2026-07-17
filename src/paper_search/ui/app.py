@@ -79,7 +79,13 @@ def _render_results(query: str, result: PipelineResult) -> str:
         "<li>"
         f"<h2>{_escaped(score.paper.title)}</h2>"
         f"{_paper_metadata(score.paper)}"
+        "<details><summary>Scoring breakdown</summary>"
+        f"<p>Raw BM25: {_escaped(str(score.bm25_score))}</p>"
+        f"<p>Normalized BM25: {_escaped(str(score.normalized_bm25))}</p>"
+        f"<p>Keyword coverage: {_escaped(str(score.keyword_coverage))}</p>"
+        f"<p>Uncertainty multiplier: {_escaped(str(score.uncertainty_multiplier))}</p>"
         f"<p>Final score: {_escaped(str(score.final_score))}</p>"
+        "</details>"
         "</li>"
         for score in result.ranked
     )

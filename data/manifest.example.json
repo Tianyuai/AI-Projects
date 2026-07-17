@@ -5,20 +5,29 @@
     "dev": {
       "count": 60,
       "gold_path": "dev/gold.jsonl",
+      "gold_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "ids_path": "splits/dev.ids.json",
-      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "labels_complete": true,
+      "zero_answer_policy": "reject"
     },
     "simulated_test": {
       "count": 50,
       "gold_path": "simulated_test/gold.jsonl",
+      "gold_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "ids_path": "splits/simulated_test.ids.json",
-      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "labels_complete": true,
+      "zero_answer_policy": "reject"
     },
     "validation": {
       "count": 30,
       "gold_path": "validation/gold.jsonl",
+      "gold_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "ids_path": "splits/validation.ids.json",
-      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "labels_complete": true,
+      "zero_answer_policy": "reject"
     }
   },
   "random_seed": 20260714,

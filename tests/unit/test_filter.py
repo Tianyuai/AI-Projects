@@ -87,6 +87,41 @@ def test_hard_filter_uses_first_matching_rule() -> None:
     assert result.rejected[0].reason_code == "retracted"
 
 
+@pytest.mark.parametrize(
+    "paper",
+    [
+        _paper(canonical_id="title:unstable", doi="not-a-doi"),
+        _paper(canonical_id="title:unstable", openalex_id="not-openalex"),
+        _paper(canonical_id="title:unstable", semantic_scholar_id="bad id"),
+        _paper(canonical_id="openalex:not-a-work"),
+    ],
+)
+def test_malformed_nonblank_identifiers_do_not_count_as_stable(paper: Paper) -> None:
+    result = apply_hard_filters([paper], _query())
+
+    assert result.accepted == []
+    assert result.rejected[0].reason_code == "missing_stable_id"
+
+
+@pytest.mark.parametrize(
+    "paper",
+    [
+        _paper(canonical_id="title:unstable", doi="10.1000/valid"),
+        _paper(canonical_id="title:unstable", openalex_id="W123"),
+        _paper(canonical_id="title:unstable", semantic_scholar_id="Corpus_123"),
+        _paper(canonical_id="doi:10.1000/canonical"),
+        _paper(canonical_id="openalex:W456"),
+        _paper(canonical_id="s2:Corpus.456"),
+        _paper(canonical_id="arxiv:2401.01234"),
+    ],
+)
+def test_valid_supported_identifiers_count_as_stable(paper: Paper) -> None:
+    result = apply_hard_filters([paper], _query())
+
+    assert [item.paper for item in result.accepted] == [paper]
+    assert result.rejected == []
+
+
 def test_missing_constrained_fields_are_downweighted_not_removed() -> None:
     result = apply_hard_filters(
         [

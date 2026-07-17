@@ -14,7 +14,7 @@ from paper_search.domain.models import (
     UsageActual,
 )
 from paper_search.evaluation.dataset import EvaluationQuery, read_jsonl
-from paper_search.evaluation.runner import run_evaluation
+from paper_search.evaluation.runner import RunIdentity, run_evaluation
 from paper_search.storage import SQLiteResponseCache
 from paper_search.storage.cache import validate_snapshot_manifest
 
@@ -108,6 +108,16 @@ def test_fixed_week1_fixture_runs_full_pipeline_and_snapshot(tmp_path: Path) -> 
     result = asyncio.run(
         run_evaluation(
             gold,
+            identity=RunIdentity(
+                split="dev",
+                git_sha="a" * 40,
+                gold_sha256=(
+                    f"sha256:{hashlib.sha256((FIXTURES / 'gold.jsonl').read_bytes()).hexdigest()}"
+                ),
+                manifest_sha256=f"sha256:{'b' * 64}",
+                dataset_revision="fixture-r1",
+                zero_answer_policy="reject",
+            ),
             provider=provider,
             cache=cache,
             config=_runtime_config(),

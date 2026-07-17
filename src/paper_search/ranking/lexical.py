@@ -14,6 +14,9 @@ from paper_search.processing import AcceptedPaper
 
 
 SCORING_VERSION = "week1-lexical-v1"
+TOKENIZER_VERSION = "unicode-nfkc-alnum-v1"
+BM25_WEIGHT = 0.7
+KEYWORD_COVERAGE_WEIGHT = 0.3
 
 
 class LexicalScore(DomainModel):
@@ -84,7 +87,9 @@ def rank_lexically(
             if unique_query_tokens
             else 0.0
         )
-        final_score = (0.7 * normalized_score + 0.3 * coverage) * candidate.score_multiplier
+        final_score = (
+            BM25_WEIGHT * normalized_score + KEYWORD_COVERAGE_WEIGHT * coverage
+        ) * candidate.score_multiplier
         indexed_scores.append(
             (
                 index,

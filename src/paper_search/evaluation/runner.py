@@ -6,10 +6,12 @@ import argparse
 import asyncio
 import hashlib
 import json
+import re
+import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -38,14 +40,27 @@ from paper_search.evaluation.dataset import (
 )
 from paper_search.evaluation.metrics import CONTRACT_VERSION, EvaluationResult, evaluate
 from paper_search.processing import (
+    DEDUPLICATION_VERSION,
     DeduplicationResult,
+    FUZZY_TITLE_THRESHOLD,
+    FILTERING_VERSION,
     FilterResult,
+    MINIMUM_UNCERTAINTY_MULTIPLIER,
+    UNCERTAINTY_REASON_MULTIPLIER,
     apply_hard_filters,
     deduplicate_papers,
 )
-from paper_search.ranking import SCORING_VERSION, LexicalScore, rank_lexically
+from paper_search.ranking import (
+    BM25_WEIGHT,
+    KEYWORD_COVERAGE_WEIGHT,
+    SCORING_VERSION,
+    TOKENIZER_VERSION,
+    LexicalScore,
+    rank_lexically,
+)
 from paper_search.retrieval import OpenAlexProvider
 from paper_search.storage import SQLiteResponseCache, validate_snapshot_manifest
+from paper_search.storage.cache import PreparedSnapshot
 
 
 class PipelineResult(DomainModel):
@@ -64,17 +79,41 @@ class QueryRunRecord(DomainModel):
     pipeline: PipelineResult
     usage: UsageActual
     latency_ms: NonNegativeInt
+    provider: NonEmptyStr
+    endpoint: NonEmptyStr
     cache_keys: list[NonEmptyStr]
+    page_hashes: list[NonEmptyStr]
+    response_hash: NonEmptyStr
     errors: list[ErrorDetail]
+
+
+class RunIdentity(DomainModel):
+    """Exact frozen inputs and source revision that authorize a formal run."""
+
+    split: NonEmptyStr
+    git_sha: NonEmptyStr
+    gold_sha256: NonEmptyStr
+    manifest_sha256: NonEmptyStr
+    dataset_revision: NonEmptyStr
+    zero_answer_policy: Literal["reject", "allow"]
 
 
 class RunResult(DomainModel):
     """Evaluation result and reproducibility data for an ordered split run."""
 
     evaluation: EvaluationResult
+    identity: RunIdentity
     query_runs: list[QueryRunRecord]
     usage: UsageActual
     snapshot_manifest: NonEmptyStr
+
+
+class FrozenSplit(DomainModel):
+    """A fully validated frozen partition and its formal run identity."""
+
+    gold_path: Path
+    gold: list[EvaluationQuery]
+    identity: RunIdentity
 
 
 class SearchProvider(Protocol):
@@ -93,6 +132,28 @@ class _CliInputError(ValueError):
     """A validation failure whose fixed message is safe to show to users."""
 
 
+def _current_git_sha() -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise _CliInputError("Git SHA is unavailable") from error
+    if completed.returncode != 0:
+        raise _CliInputError("Git SHA is unavailable")
+    return completed.stdout.strip()
+
+
+def _validate_git_sha(value: str) -> str:
+    if re.fullmatch(r"[0-9a-fA-F]{40}", value) is None:
+        raise _CliInputError("Git SHA is invalid")
+    return value.casefold()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the frozen Week-1 evaluation split")
     parser.add_argument("--config", type=Path, required=True)
@@ -101,16 +162,35 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _resolve_frozen_gold(data_root: Path, split: str) -> Path:
+def _resolve_data_file(data_root: Path, raw_path: object, label: str) -> Path:
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise _CliInputError("data split manifest is invalid")
+    relative_path = Path(raw_path)
+    resolved_root = data_root.resolve()
+    if relative_path.is_absolute():
+        raise _CliInputError(f"{label} path must stay under data")
+    resolved = (resolved_root / relative_path).resolve()
+    if not resolved.is_relative_to(resolved_root):
+        raise _CliInputError(f"{label} path must stay under data")
+    if not resolved.is_file():
+        raise _CliInputError(f"{label} file does not exist")
+    return resolved
+
+
+def _resolve_frozen_split(data_root: Path, split: str, git_sha: str) -> FrozenSplit:
     manifest_path = data_root / "manifest.json"
     try:
-        manifest: object = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as error:
+        manifest_bytes = manifest_path.read_bytes()
+        manifest: object = json.loads(manifest_bytes)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise _CliInputError("data manifest is invalid") from error
     if not isinstance(manifest, dict):
         raise _CliInputError("data manifest is invalid")
     if manifest.get("status") != "frozen":
         raise _CliInputError("data manifest is not frozen")
+    revision = manifest.get("revision")
+    if not isinstance(revision, str) or not revision.strip():
+        raise _CliInputError("dataset revision is invalid")
 
     partitions = manifest.get("partitions")
     if not isinstance(partitions, dict) or split not in partitions:
@@ -118,27 +198,61 @@ def _resolve_frozen_gold(data_root: Path, split: str) -> Path:
     partition = partitions[split]
     if not isinstance(partition, dict):
         raise _CliInputError("data split manifest is invalid")
-    raw_gold_path = partition.get("gold_path")
-    if not isinstance(raw_gold_path, str) or not raw_gold_path.strip():
+    count = partition.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
         raise _CliInputError("data split manifest is invalid")
+    if partition.get("labels_complete") is not True:
+        raise _CliInputError("data split labels must be complete")
+    zero_answer_policy = partition.get("zero_answer_policy")
+    if zero_answer_policy not in {"reject", "allow"}:
+        raise _CliInputError("data split zero-answer policy is invalid")
+    if any(
+        not isinstance(partition.get(field), str) or not partition[field].strip()
+        for field in ("gold_sha256", "ids_sha256")
+    ):
+        raise _CliInputError("data split manifest is invalid")
+    gold_path = _resolve_data_file(data_root, partition.get("gold_path"), "gold")
+    ids_path = _resolve_data_file(data_root, partition.get("ids_path"), "ID")
 
-    relative_path = Path(raw_gold_path)
-    resolved_root = data_root.resolve()
-    if relative_path.is_absolute():
-        raise _CliInputError("gold path must stay under data")
-    gold_path = (resolved_root / relative_path).resolve()
-    if not gold_path.is_relative_to(resolved_root):
-        raise _CliInputError("gold path must stay under data")
-    if not gold_path.is_file():
-        raise _CliInputError("gold file does not exist")
-
-    declared_hash = partition.get("gold_sha256", partition.get("sha256"))
-    if declared_hash is not None:
-        if not isinstance(declared_hash, str) or declared_hash != _sha256_bytes(
-            gold_path.read_bytes()
-        ):
-            raise _CliInputError("gold file SHA-256 mismatch")
-    return gold_path
+    gold_bytes = gold_path.read_bytes()
+    declared_hash = partition["gold_sha256"]
+    if declared_hash != _sha256_bytes(gold_bytes):
+        raise _CliInputError("gold file SHA-256 mismatch")
+    ids_bytes = ids_path.read_bytes()
+    if partition["ids_sha256"] != _sha256_bytes(ids_bytes):
+        raise _CliInputError("ID file SHA-256 mismatch")
+    try:
+        ids: object = json.loads(ids_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise _CliInputError("ID list is invalid") from error
+    if (
+        not isinstance(ids, list)
+        or any(not isinstance(value, str) or not value.strip() for value in ids)
+        or len(ids) != len(set(ids))
+    ):
+        raise _CliInputError("ID list is invalid")
+    if len(ids) != count:
+        raise _CliInputError("ID count mismatch")
+    if not gold_bytes.strip():
+        raise _CliInputError("gold file must not be empty")
+    gold = read_jsonl(gold_path, EvaluationQuery)
+    if len(gold) != count:
+        raise _CliInputError("gold record count mismatch")
+    if [record.query_id for record in gold] != ids:
+        raise _CliInputError("gold ordered query IDs do not match ID list")
+    if zero_answer_policy == "reject" and any(
+        not record.relevant_paper_ids for record in gold
+    ):
+        raise _CliInputError("zero-answer gold record is not allowed")
+    identity = RunIdentity(
+        split=split,
+        git_sha=_validate_git_sha(git_sha),
+        gold_sha256=declared_hash,
+        manifest_sha256=_sha256_bytes(manifest_bytes),
+        dataset_revision=revision,
+        zero_answer_policy=zero_answer_policy,
+    )
+    return FrozenSplit(gold_path=gold_path, gold=gold, identity=identity)
 
 
 def process_candidates(
@@ -175,6 +289,63 @@ def _parse_cache_keys(provenance: dict[str, str]) -> list[str]:
     ):
         raise ValueError("provider provenance cache_keys must be a JSON string list")
     return list(parsed)
+
+
+def _required_provenance(provenance: dict[str, str], key: str) -> str:
+    value = provenance.get(key)
+    if value is None or not value.strip():
+        raise ValueError(f"provider provenance {key} is required")
+    return value
+
+
+def _aggregate_response_hashes(hashes: Sequence[str]) -> str:
+    if len(hashes) == 1:
+        return hashes[0]
+    return _sha256_bytes(json.dumps(list(hashes), separators=(",", ":")).encode("utf-8"))
+
+
+def _validate_query_snapshot_provenance(
+    provenance: dict[str, str],
+    cache: SQLiteResponseCache,
+) -> tuple[str, str, list[str], list[str], str]:
+    provider = _required_provenance(provenance, "provider")
+    endpoint = _required_provenance(provenance, "endpoint")
+    declared_hash = _required_provenance(provenance, "response_hash")
+    cache_keys = _parse_cache_keys(provenance)
+    page_hashes: list[str] = []
+    for key in cache_keys:
+        cached = cache.get_snapshot_response(key)
+        if cached is None:
+            raise ValueError("provider snapshot cache key is missing")
+        if _sha256_bytes(cached.raw_response) != cached.response_hash:
+            raise ValueError("provider snapshot cached response bytes do not match hash")
+        if cached.provider != provider or cached.endpoint != endpoint:
+            raise ValueError("provider snapshot provenance mismatch")
+        page_hashes.append(cached.response_hash)
+    if _aggregate_response_hashes(page_hashes) != declared_hash:
+        raise ValueError("provider snapshot response hash mismatch")
+    return provider, endpoint, cache_keys, page_hashes, declared_hash
+
+
+def _validate_prepared_query_snapshot_provenance(
+    records: Sequence[QueryRunRecord],
+    prepared: PreparedSnapshot,
+) -> None:
+    responses = {response.cache_key: response for response in prepared.responses}
+    for record in records:
+        current_hashes: list[str] = []
+        for key in record.cache_keys:
+            cached = responses.get(key)
+            if cached is None:
+                raise ValueError("provider snapshot cache key changed after query")
+            if cached.provider != record.provider or cached.endpoint != record.endpoint:
+                raise ValueError("provider snapshot provenance changed after query")
+            current_hashes.append(cached.response_hash)
+        if (
+            current_hashes != record.page_hashes
+            or _aggregate_response_hashes(current_hashes) != record.response_hash
+        ):
+            raise ValueError("provider snapshot response hash changed after query")
 
 
 def _aggregate_usage(records: Sequence[QueryRunRecord]) -> UsageActual:
@@ -246,6 +417,7 @@ def _artifact_payloads(
     gold: Sequence[EvaluationQuery],
     result: RunResult,
     config: RuntimeConfig,
+    snapshot_manifest_sha256: str,
 ) -> tuple[
     list[PredictionRecord],
     bytes,
@@ -255,16 +427,18 @@ def _artifact_payloads(
     list[dict[str, object]],
     list[dict[str, object]],
 ]:
+    del gold
     predictions = [record.prediction for record in result.query_runs]
-    gold_bytes = _jsonl_bytes(list(gold))
     prediction_bytes = _jsonl_bytes(predictions)
     input_hashes = {
-        "gold": _sha256_bytes(gold_bytes),
+        "gold": result.identity.gold_sha256,
         "predictions": _sha256_bytes(prediction_bytes),
     }
     metrics_payload: dict[str, object] = {
         "contract_version": CONTRACT_VERSION,
         "input_hashes": input_hashes,
+        "snapshot_manifest": result.snapshot_manifest,
+        "snapshot_manifest_sha256": snapshot_manifest_sha256,
         "per_query": {
             query_id: result.evaluation.per_query[query_id].model_dump(mode="json")
             for query_id in sorted(result.evaluation.per_query)
@@ -301,14 +475,40 @@ def _artifact_payloads(
     run_payload: dict[str, object] = {
         "artifacts": artifact_paths,
         "config_hash": config.config_hash(),
-        "contract_version": "week1-run-v1",
+        "contract_version": "week1-run-v2",
+        "identity": result.identity.model_dump(mode="json"),
         "input_hashes": input_hashes,
         "rules": {
-            "deduplication": {"fuzzy_title_threshold": 0.98},
-            "filtering": {"minimum_uncertainty_multiplier": 0.7},
+            "deduplication": {
+                "fuzzy_title_threshold": FUZZY_TITLE_THRESHOLD,
+                "version": DEDUPLICATION_VERSION,
+            },
+            "filtering": {
+                "minimum_uncertainty_multiplier": MINIMUM_UNCERTAINTY_MULTIPLIER,
+                "uncertainty_reason_multiplier": UNCERTAINTY_REASON_MULTIPLIER,
+                "version": FILTERING_VERSION,
+            },
+            "scoring": {
+                "bm25_weight": BM25_WEIGHT,
+                "keyword_coverage_weight": KEYWORD_COVERAGE_WEIGHT,
+                "scoring_version": SCORING_VERSION,
+                "tokenizer_version": TOKENIZER_VERSION,
+            },
         },
+        "query_snapshots": [
+            {
+                "cache_keys": record.cache_keys,
+                "endpoint": record.endpoint,
+                "page_hashes": record.page_hashes,
+                "provider": record.provider,
+                "query_id": record.query_id,
+                "response_hash": record.response_hash,
+            }
+            for record in result.query_runs
+        ],
         "scoring_version": SCORING_VERSION,
         "snapshot_manifest": result.snapshot_manifest,
+        "snapshot_manifest_sha256": snapshot_manifest_sha256,
     }
     deduplication_records: list[dict[str, object]] = [
         {
@@ -374,6 +574,13 @@ def _write_artifacts(
     config: RuntimeConfig,
     output: Path,
 ) -> None:
+    cache_keys = _ordered_unique([key for record in result.query_runs for key in record.cache_keys])
+    try:
+        prepared_snapshot = cache.prepare_snapshot(cache_keys)
+    except KeyError as error:
+        raise ValueError("provider snapshot cache key changed after query") from error
+    _validate_prepared_query_snapshot_provenance(result.query_runs, prepared_snapshot)
+    snapshot_manifest_sha256 = _sha256_bytes(prepared_snapshot.manifest_content)
     (
         predictions,
         prediction_bytes,
@@ -382,7 +589,7 @@ def _write_artifacts(
         run_payload,
         deduplication_records,
         filtering_records,
-    ) = _artifact_payloads(gold, result, config)
+    ) = _artifact_payloads(gold, result, config, snapshot_manifest_sha256)
     prepared = {
         output / "predictions.jsonl": prediction_bytes,
         output / "metrics.json": _frozen_json_bytes(metrics_payload),
@@ -393,10 +600,8 @@ def _write_artifacts(
     }
     existing = {path: _preflight_frozen(path, content) for path, content in prepared.items()}
 
-    cache_keys = _ordered_unique([key for record in result.query_runs for key in record.cache_keys])
-    manifest_path = cache.export_snapshot(cache_keys, output)
+    manifest_path = cache.write_snapshot(prepared_snapshot, output)
     validate_snapshot_manifest(manifest_path)
-
     predictions_path = output / "predictions.jsonl"
     if not existing[predictions_path]:
         write_jsonl_atomic(predictions_path, predictions)
@@ -419,6 +624,7 @@ def _write_artifacts(
 async def run_evaluation(
     gold: Sequence[EvaluationQuery],
     *,
+    identity: RunIdentity,
     provider: SearchProvider,
     cache: SQLiteResponseCache,
     config: RuntimeConfig,
@@ -443,6 +649,9 @@ async def run_evaluation(
             reservation,
         )
         budget.settle(reservation, provider_result.usage)
+        provider_name, endpoint, cache_keys, page_hashes, response_hash = (
+            _validate_query_snapshot_provenance(provider_result.provenance, cache)
+        )
         pipeline = process_candidates(
             _fallback_query_spec(gold_record),
             provider_result.data,
@@ -462,7 +671,11 @@ async def run_evaluation(
                 pipeline=pipeline,
                 usage=provider_result.usage,
                 latency_ms=provider_result.latency_ms,
-                cache_keys=_parse_cache_keys(provider_result.provenance),
+                provider=provider_name,
+                endpoint=endpoint,
+                cache_keys=cache_keys,
+                page_hashes=page_hashes,
+                response_hash=response_hash,
                 errors=provider_result.errors,
             )
         )
@@ -470,6 +683,7 @@ async def run_evaluation(
     predictions = [record.prediction for record in query_runs]
     result = RunResult(
         evaluation=evaluate(gold, predictions, id_map=id_map),
+        identity=identity,
         query_runs=query_runs,
         usage=_aggregate_usage(query_runs),
         snapshot_manifest="snapshot_manifest.json",
@@ -481,6 +695,7 @@ async def run_evaluation(
 async def _run_cli_evaluation(
     gold: Sequence[EvaluationQuery],
     *,
+    identity: RunIdentity,
     config: RuntimeConfig,
     api_key: str,
     output: Path,
@@ -491,6 +706,7 @@ async def _run_cli_evaluation(
         provider = OpenAlexProvider(client=client, cache=cache, api_key=api_key)
         await run_evaluation(
             gold,
+            identity=identity,
             provider=provider,
             cache=cache,
             config=config,
@@ -501,14 +717,14 @@ async def _run_cli_evaluation(
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        gold_path = _resolve_frozen_gold(Path("data"), args.split)
-        gold = read_jsonl(gold_path, EvaluationQuery)
+        frozen_split = _resolve_frozen_split(Path("data"), args.split, _current_git_sha())
         config = load_runtime_config(args.config, env_file=None)
         if config.openalex_api_key is None:
             raise _CliInputError("OPENALEX_API_KEY is required")
         asyncio.run(
             _run_cli_evaluation(
-                gold,
+                frozen_split.gold,
+                identity=frozen_split.identity,
                 config=config,
                 api_key=config.openalex_api_key.get_secret_value(),
                 output=args.output.resolve(),

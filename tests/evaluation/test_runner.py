@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
+import importlib
 import json
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,13 +23,24 @@ from paper_search.domain.models import (
 )
 from paper_search.evaluation.dataset import EvaluationQuery, PredictionRecord
 from paper_search.evaluation.metrics import CONTRACT_VERSION
-from paper_search.evaluation.runner import process_candidates, run_evaluation
-from paper_search.ranking import SCORING_VERSION
+from paper_search.evaluation.runner import RunIdentity, process_candidates, run_evaluation
+from paper_search.processing import (
+    FUZZY_TITLE_THRESHOLD,
+    MINIMUM_UNCERTAINTY_MULTIPLIER,
+    UNCERTAINTY_REASON_MULTIPLIER,
+)
+from paper_search.ranking import (
+    BM25_WEIGHT,
+    KEYWORD_COVERAGE_WEIGHT,
+    SCORING_VERSION,
+    TOKENIZER_VERSION,
+)
 from paper_search.storage import SQLiteResponseCache
 from paper_search.storage.cache import validate_snapshot_manifest
 
 
 CONFIG = Path(__file__).parents[2] / "configs" / "base.yaml"
+GIT_SHA = "a" * 40
 
 
 def _paper(
@@ -34,12 +48,13 @@ def _paper(
     *,
     title: str = "Graph retrieval",
     doi: str | None = None,
+    is_retracted: bool | None = False,
 ) -> Paper:
     return Paper(
         canonical_id=canonical_id,
         title=title,
         doi=doi,
-        is_retracted=False,
+        is_retracted=is_retracted,
     )
 
 
@@ -67,17 +82,27 @@ def _provider_result(
     calls: int,
     latency_ms: int,
     cache_keys: str = "[]",
+    provider: str = "openalex",
+    endpoint: str = "/works",
+    response_hash: str | None = None,
+    cost_cny: float | None = None,
     errors: list[ErrorDetail] | None = None,
 ) -> ProviderResult[list[Paper]]:
+    if response_hash is None:
+        response_hash = _aggregate_hash([])
     return ProviderResult(
         data=papers,
-        usage=UsageActual(search_api_calls=calls, elapsed_ms=latency_ms),
+        usage=UsageActual(
+            search_api_calls=calls,
+            cost_cny=cost_cny,
+            elapsed_ms=latency_ms,
+        ),
         provenance={
-            "provider": "openalex",
-            "endpoint": "/works",
+            "provider": provider,
+            "endpoint": endpoint,
             "model_id": "openalex-api",
             "requested_at": "2026-07-17T00:00:00+00:00",
-            "response_hash": f"sha256:{'0' * 64}",
+            "response_hash": response_hash,
             "cache_keys": cache_keys,
         },
         cache_hit=False,
@@ -141,26 +166,63 @@ def _sha256(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
+def _aggregate_hash(hashes: list[str]) -> str:
+    if len(hashes) == 1:
+        return hashes[0]
+    return _sha256(json.dumps(hashes, separators=(",", ":")).encode("utf-8"))
+
+
+def _run_identity(gold: list[EvaluationQuery] | None = None) -> RunIdentity:
+    del gold
+    return RunIdentity(
+        split="dev",
+        git_sha=GIT_SHA,
+        gold_sha256=f"sha256:{'c' * 64}",
+        manifest_sha256=f"sha256:{'b' * 64}",
+        dataset_revision="dataset-r1",
+        zero_answer_policy="allow",
+    )
+
+
 def _write_cli_manifest(
     root: Path,
     *,
     status: str = "frozen",
+    revision: str = "dataset-r1",
     gold_path: str = "dev/gold.jsonl",
     gold_sha256: str | None = None,
+    gold_content: str = (
+        '{"query_id":"query-1","query":"graph retrieval",'
+        '"relevant_paper_ids":["openalex:W1"]}\n'
+    ),
+    ids: object = None,
+    partition_updates: dict[str, object] | None = None,
+    omit_partition_fields: set[str] | None = None,
 ) -> Path:
     data = root / "data"
     gold = data / "dev" / "gold.jsonl"
     gold.parent.mkdir(parents=True)
-    gold.write_text(
-        '{"query_id":"query-1","query":"graph retrieval"}\n',
-        encoding="utf-8",
-    )
-    partition: dict[str, object] = {"gold_path": gold_path}
-    if gold_sha256 is not None:
-        partition["gold_sha256"] = gold_sha256
+    gold.write_text(gold_content, encoding="utf-8")
+    id_values = ["query-1"] if ids is None else ids
+    ids_file = data / "dev" / "ids.json"
+    ids_file.write_text(json.dumps(id_values), encoding="utf-8")
+    partition: dict[str, object] = {
+        "count": 1,
+        "gold_path": gold_path,
+        "gold_sha256": _sha256(gold.read_bytes()) if gold_sha256 is None else gold_sha256,
+        "ids_path": "dev/ids.json",
+        "ids_sha256": _sha256(ids_file.read_bytes()),
+        "labels_complete": True,
+        "zero_answer_policy": "reject",
+    }
+    if partition_updates is not None:
+        partition.update(partition_updates)
+    for field in omit_partition_fields or set():
+        partition.pop(field, None)
     (data / "manifest.json").write_text(
         json.dumps(
             {
+                "revision": revision,
                 "status": status,
                 "partitions": {"dev": partition},
             }
@@ -168,6 +230,11 @@ def _write_cli_manifest(
         encoding="utf-8",
     )
     return gold
+
+
+@pytest.fixture(autouse=True)
+def _fixed_git_sha(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner_module, "_current_git_sha", lambda: GIT_SHA, raising=False)
 
 
 def _run_cli_from(root: Path, *, split: str = "dev") -> int:
@@ -254,6 +321,283 @@ def test_cli_rejects_gold_hash_mismatch(
 
     assert "gold file SHA-256 mismatch" in capsys.readouterr().err
     assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("field", ["gold_sha256", "ids_sha256"])
+def test_cli_rejects_missing_mandatory_partition_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    field: str,
+) -> None:
+    _write_cli_manifest(tmp_path, omit_partition_fields={field})
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "data split manifest is invalid" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_rejects_empty_frozen_gold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path, gold_content="")
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "gold file must not be empty" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("count", [0, -1, True, "1"])
+def test_cli_requires_positive_integer_partition_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    count: object,
+) -> None:
+    _write_cli_manifest(tmp_path, partition_updates={"count": count})
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "data split manifest is invalid" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("ids_path", ["../outside.json", "C:/outside.json"])
+def test_cli_rejects_ids_path_outside_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    ids_path: str,
+) -> None:
+    _write_cli_manifest(tmp_path, partition_updates={"ids_path": ids_path})
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "ID path must stay under data" in capsys.readouterr().err
+
+
+def test_cli_rejects_id_file_hash_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(
+        tmp_path,
+        partition_updates={"ids_sha256": f"sha256:{'0' * 64}"},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "ID file SHA-256 mismatch" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("labels_complete", [False, None, "true"])
+def test_cli_requires_complete_labels(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    labels_complete: object,
+) -> None:
+    _write_cli_manifest(
+        tmp_path,
+        partition_updates={"labels_complete": labels_complete},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "labels must be complete" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("policy", [None, "", "ignore", True])
+def test_cli_rejects_invalid_zero_answer_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    policy: object,
+) -> None:
+    _write_cli_manifest(tmp_path, partition_updates={"zero_answer_policy": policy})
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "zero-answer policy is invalid" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("revision", ["", "   "])
+def test_cli_requires_nonempty_dataset_revision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    revision: str,
+) -> None:
+    _write_cli_manifest(tmp_path, revision=revision)
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "dataset revision is invalid" in capsys.readouterr().err
+
+
+def test_cli_rejects_gold_count_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(
+        tmp_path,
+        ids=["query-1", "query-2"],
+        partition_updates={"count": 2},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "gold record count mismatch" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "ids",
+    [{"query-1": True}, ["query-1", "query-1"], [""], [1]],
+)
+def test_cli_rejects_invalid_or_duplicate_id_list(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    ids: object,
+) -> None:
+    _write_cli_manifest(tmp_path, ids=ids)
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "ID list is invalid" in capsys.readouterr().err
+
+
+def test_cli_rejects_id_count_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path, ids=["query-1", "query-2"])
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "ID count mismatch" in capsys.readouterr().err
+
+
+def test_cli_rejects_ordered_gold_id_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    gold_content = (
+        '{"query_id":"query-1","query":"one",'
+        '"relevant_paper_ids":["openalex:W1"]}\n'
+        '{"query_id":"query-2","query":"two",'
+        '"relevant_paper_ids":["openalex:W2"]}\n'
+    )
+    _write_cli_manifest(
+        tmp_path,
+        gold_content=gold_content,
+        ids=["query-2", "query-1"],
+        partition_updates={"count": 2},
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "ordered query IDs do not match" in capsys.readouterr().err
+
+
+def test_cli_rejects_zero_answer_record_under_reject_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(
+        tmp_path,
+        gold_content='{"query_id":"query-1","query":"graph retrieval"}\n',
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "zero-answer gold record is not allowed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("git_sha", ["", "not-a-sha", "a" * 39, "g" * 40])
+def test_cli_rejects_invalid_git_sha_before_runtime_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    git_sha: str,
+) -> None:
+    _write_cli_manifest(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(runner_module, "_current_git_sha", lambda: git_sha, raising=False)
+
+    def fail_loader(*args: object, **kwargs: object) -> RuntimeConfig:
+        raise AssertionError(f"runtime config constructed: {args} {kwargs}")
+
+    monkeypatch.setattr(runner_module, "load_runtime_config", fail_loader)
+
+    assert _run_cli_from(tmp_path) == 2
+
+    assert "Git SHA is invalid" in capsys.readouterr().err
+
+
+def test_frozen_split_returns_complete_typed_run_identity(tmp_path: Path) -> None:
+    gold = _write_cli_manifest(
+        tmp_path,
+        gold_content='{"query_id":"query-1","query":"graph retrieval"}\n',
+        partition_updates={"zero_answer_policy": "allow"},
+    )
+    manifest = tmp_path / "data" / "manifest.json"
+
+    assert hasattr(runner_module, "_resolve_frozen_split")
+    frozen = runner_module._resolve_frozen_split(tmp_path / "data", "dev", GIT_SHA)
+
+    assert frozen.gold_path == gold.resolve()
+    assert [record.query_id for record in frozen.gold] == ["query-1"]
+    assert frozen.identity.model_dump(mode="json") == {
+        "dataset_revision": "dataset-r1",
+        "git_sha": GIT_SHA,
+        "gold_sha256": _sha256(gold.read_bytes()),
+        "manifest_sha256": _sha256(manifest.read_bytes()),
+        "split": "dev",
+        "zero_answer_policy": "allow",
+    }
+
+
+def test_run_evaluation_requires_explicit_run_identity() -> None:
+    parameter = inspect.signature(run_evaluation).parameters.get("identity")
+
+    assert parameter is not None
+    assert parameter.default is inspect.Parameter.empty
+
+
+def test_behavior_constants_are_publicly_exported() -> None:
+    deduplication = importlib.import_module("paper_search.processing.deduplicate")
+    filtering = importlib.import_module("paper_search.processing.filter")
+    lexical = importlib.import_module("paper_search.ranking.lexical")
+
+    assert deduplication.FUZZY_TITLE_THRESHOLD == 0.98
+    assert deduplication.DEDUPLICATION_VERSION == "week1-dedup-v1"
+    assert filtering.UNCERTAINTY_REASON_MULTIPLIER == 0.9
+    assert filtering.MINIMUM_UNCERTAINTY_MULTIPLIER == 0.7
+    assert filtering.FILTERING_VERSION == "week1-filter-v1"
+    assert lexical.BM25_WEIGHT == 0.7
+    assert lexical.KEYWORD_COVERAGE_WEIGHT == 0.3
+    assert lexical.TOKENIZER_VERSION == "unicode-nfkc-alnum-v1"
 
 
 def test_cli_parser_exposes_only_required_week1_options() -> None:
@@ -381,6 +725,10 @@ def _artifact_inputs(
             relevant_paper_ids=["openalex:W1"],
         )
     ]
+    cache = _populated_cache(tmp_path)
+    first = cache.get_snapshot_response("page-1")
+    second = cache.get_snapshot_response("page-2")
+    assert first is not None and second is not None
     provider = FakeProvider(
         {
             "q1": _provider_result(
@@ -388,13 +736,16 @@ def _artifact_inputs(
                 calls=2,
                 latency_ms=19,
                 cache_keys='["page-1","page-2","page-1"]',
+                response_hash=_aggregate_hash(
+                    [first.response_hash, second.response_hash, first.response_hash]
+                ),
             )
         }
     )
     return (
         gold,
         provider,
-        _populated_cache(tmp_path),
+        cache,
         _runtime_config(with_secret=True),
         tmp_path / "run",
     )
@@ -410,6 +761,7 @@ def _run_artifact_evaluation(
     return asyncio.run(
         run_evaluation(
             gold,
+            identity=_run_identity(gold),
             provider=provider,
             cache=cache,
             config=config,
@@ -469,6 +821,7 @@ def test_run_evaluation_preserves_order_and_isolates_structured_failure(
     result = asyncio.run(
         run_evaluation(
             gold,
+            identity=_run_identity(gold),
             provider=provider,
             cache=SQLiteResponseCache(tmp_path / "cache.sqlite3"),
             config=_runtime_config(),
@@ -512,6 +865,7 @@ def test_run_evaluation_rejects_malformed_cache_key_provenance(tmp_path: Path) -
         asyncio.run(
             run_evaluation(
                 [EvaluationQuery(query_id="query-1", query="q1")],
+                identity=_run_identity(),
                 provider=provider,
                 cache=SQLiteResponseCache(tmp_path / "cache.sqlite3"),
                 config=_runtime_config(),
@@ -537,6 +891,7 @@ def test_run_evaluation_requires_cache_key_provenance(tmp_path: Path) -> None:
         asyncio.run(
             run_evaluation(
                 [EvaluationQuery(query_id="query-1", query="q1")],
+                identity=_run_identity(),
                 provider=provider,
                 cache=SQLiteResponseCache(tmp_path / "cache.sqlite3"),
                 config=_runtime_config(),
@@ -545,10 +900,424 @@ def test_run_evaluation_requires_cache_key_provenance(tmp_path: Path) -> None:
         )
 
 
+def test_run_evaluation_rejects_snapshot_response_hash_mismatch(tmp_path: Path) -> None:
+    cache = _populated_cache(tmp_path)
+    provider = FakeProvider(
+        {
+            "q1": _provider_result(
+                [],
+                calls=1,
+                latency_ms=1,
+                cache_keys='["page-1"]',
+                response_hash=f"sha256:{'0' * 64}",
+            )
+        }
+    )
+    output = tmp_path / "run"
+
+    with pytest.raises(ValueError, match="response hash"):
+        asyncio.run(
+            run_evaluation(
+                [EvaluationQuery(query_id="query-1", query="q1")],
+                identity=_run_identity(),
+                provider=provider,
+                cache=cache,
+                config=_runtime_config(),
+                output=output,
+            )
+        )
+
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "endpoint"),
+    [("semantic_scholar", "/works"), ("openalex", "/different")],
+)
+def test_run_evaluation_rejects_snapshot_provider_or_endpoint_mismatch(
+    tmp_path: Path,
+    provider_name: str,
+    endpoint: str,
+) -> None:
+    cache = _populated_cache(tmp_path)
+    cached = cache.get_snapshot_response("page-1")
+    assert cached is not None
+    provider = FakeProvider(
+        {
+            "q1": _provider_result(
+                [],
+                calls=1,
+                latency_ms=1,
+                cache_keys='["page-1"]',
+                provider=provider_name,
+                endpoint=endpoint,
+                response_hash=cached.response_hash,
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="provenance mismatch"):
+        asyncio.run(
+            run_evaluation(
+                [EvaluationQuery(query_id="query-1", query="q1")],
+                identity=_run_identity(),
+                provider=provider,
+                cache=cache,
+                config=_runtime_config(),
+                output=tmp_path / "run",
+            )
+        )
+
+
+def test_run_evaluation_rejects_missing_snapshot_cache_key_safely(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        {
+            "q1": _provider_result(
+                [],
+                calls=1,
+                latency_ms=1,
+                cache_keys='["missing"]',
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="cache key is missing"):
+        asyncio.run(
+            run_evaluation(
+                [EvaluationQuery(query_id="query-1", query="q1")],
+                identity=_run_identity(),
+                provider=provider,
+                cache=SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+                config=_runtime_config(),
+                output=tmp_path / "run",
+            )
+        )
+
+
+def test_run_evaluation_validates_multi_page_hash_order(tmp_path: Path) -> None:
+    cache = _populated_cache(tmp_path)
+    first = cache.get_snapshot_response("page-1")
+    second = cache.get_snapshot_response("page-2")
+    assert first is not None and second is not None
+    provider = FakeProvider(
+        {
+            "q1": _provider_result(
+                [],
+                calls=1,
+                latency_ms=1,
+                cache_keys='["page-1","page-2"]',
+                response_hash=_aggregate_hash([second.response_hash, first.response_hash]),
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="response hash"):
+        asyncio.run(
+            run_evaluation(
+                [EvaluationQuery(query_id="query-1", query="q1")],
+                identity=_run_identity(),
+                provider=provider,
+                cache=cache,
+                config=_runtime_config(),
+                output=tmp_path / "run",
+            )
+        )
+
+
+def test_run_evaluation_records_valid_shared_cache_key_associations(tmp_path: Path) -> None:
+    cache = _populated_cache(tmp_path)
+    cached = cache.get_snapshot_response("page-1")
+    assert cached is not None
+    provider = FakeProvider(
+        {
+            query: _provider_result(
+                [],
+                calls=0,
+                latency_ms=1,
+                cache_keys='["page-1"]',
+                response_hash=cached.response_hash,
+            )
+            for query in ("q1", "q2")
+        }
+    )
+    gold = [
+        EvaluationQuery(query_id="query-1", query="q1"),
+        EvaluationQuery(query_id="query-2", query="q2"),
+    ]
+    output = tmp_path / "run"
+
+    _run_artifact_evaluation(gold, provider, cache, _runtime_config(), output)
+
+    run = json.loads((output / "run.json").read_bytes())
+    assert run["query_snapshots"] == [
+        {
+            "cache_keys": ["page-1"],
+            "endpoint": "/works",
+            "page_hashes": [cached.response_hash],
+            "provider": "openalex",
+            "query_id": query_id,
+            "response_hash": cached.response_hash,
+        }
+        for query_id in ("query-1", "query-2")
+    ]
+    assert len(list((output / "snapshots").glob("*.json"))) == 1
+
+
+def test_run_evaluation_revalidates_shared_key_immediately_before_export(
+    tmp_path: Path,
+) -> None:
+    cache = _populated_cache(tmp_path)
+    original = cache.get_snapshot_response("page-1")
+    assert original is not None
+
+    class MutatingProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def search(
+            self,
+            query: str,
+            filters: dict[str, object],
+            limit: int,
+            reservation: BudgetReservation,
+        ) -> ProviderResult[list[Paper]]:
+            del query, filters, limit, reservation
+            self.calls += 1
+            if self.calls == 1:
+                response_hash = original.response_hash
+            else:
+                cache.put_response(
+                    key="page-1",
+                    provider="openalex",
+                    endpoint="/works",
+                    cache_version="v1",
+                    params={"search": "q2"},
+                    raw_response=b'{"page":"replaced","results":[]}',
+                    requested_at=datetime(2026, 7, 17, 1, tzinfo=UTC),
+                    ttl=timedelta(days=7),
+                    safe_headers={},
+                )
+                replaced = cache.get_snapshot_response("page-1")
+                assert replaced is not None
+                response_hash = replaced.response_hash
+            return _provider_result(
+                [],
+                calls=0,
+                latency_ms=1,
+                cache_keys='["page-1"]',
+                response_hash=response_hash,
+            )
+
+    gold = [
+        EvaluationQuery(query_id="query-1", query="q1"),
+        EvaluationQuery(query_id="query-2", query="q2"),
+    ]
+    output = tmp_path / "run"
+
+    with pytest.raises(ValueError, match="changed after query"):
+        asyncio.run(
+            run_evaluation(
+                gold,
+                identity=_run_identity(gold),
+                provider=MutatingProvider(),
+                cache=cache,
+                config=_runtime_config(),
+                output=output,
+            )
+        )
+
+    assert not output.exists()
+
+
+def test_run_evaluation_rejects_key_deleted_after_query_with_safe_error(
+    tmp_path: Path,
+) -> None:
+    cache = _populated_cache(tmp_path)
+    original = cache.get_snapshot_response("page-1")
+    assert original is not None
+
+    class DeletingProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def search(
+            self,
+            query: str,
+            filters: dict[str, object],
+            limit: int,
+            reservation: BudgetReservation,
+        ) -> ProviderResult[list[Paper]]:
+            del query, filters, limit, reservation
+            self.calls += 1
+            if self.calls == 1:
+                return _provider_result(
+                    [],
+                    calls=0,
+                    latency_ms=1,
+                    cache_keys='["page-1"]',
+                    response_hash=original.response_hash,
+                )
+            with sqlite3.connect(cache.path) as connection:
+                connection.execute(
+                    "DELETE FROM responses WHERE cache_key = ?",
+                    ("page-1",),
+                )
+            return _provider_result([], calls=0, latency_ms=1)
+
+    gold = [
+        EvaluationQuery(query_id="query-1", query="q1"),
+        EvaluationQuery(query_id="query-2", query="q2"),
+    ]
+    output = tmp_path / "run"
+
+    with pytest.raises(ValueError, match="cache key changed after query"):
+        asyncio.run(
+            run_evaluation(
+                gold,
+                identity=_run_identity(gold),
+                provider=DeletingProvider(),
+                cache=cache,
+                config=_runtime_config(),
+                output=output,
+            )
+        )
+
+    assert not output.exists()
+
+
+def test_run_evaluation_rejects_cached_hash_not_matching_raw_bytes(
+    tmp_path: Path,
+) -> None:
+    cache = _populated_cache(tmp_path)
+    stale_hash = f"sha256:{'0' * 64}"
+    with sqlite3.connect(cache.path) as connection:
+        connection.execute(
+            "UPDATE responses SET response_hash = ? WHERE cache_key = ?",
+            (stale_hash, "page-1"),
+        )
+    provider = FakeProvider(
+        {
+            "q1": _provider_result(
+                [],
+                calls=0,
+                latency_ms=1,
+                cache_keys='["page-1"]',
+                response_hash=stale_hash,
+            )
+        }
+    )
+    gold = [EvaluationQuery(query_id="query-1", query="q1")]
+    output = tmp_path / "run"
+
+    with pytest.raises(ValueError, match="cached response bytes"):
+        asyncio.run(
+            run_evaluation(
+                gold,
+                identity=_run_identity(gold),
+                provider=provider,
+                cache=cache,
+                config=_runtime_config(),
+                output=output,
+            )
+        )
+
+    assert not output.exists()
+
+
+def test_run_evaluation_serializes_nonempty_audit_jsonl_records(tmp_path: Path) -> None:
+    cache = _populated_cache(tmp_path)
+    cached = cache.get_snapshot_response("page-1")
+    assert cached is not None
+    provider = FakeProvider(
+        {
+            "q1": _provider_result(
+                [
+                    _paper("openalex:W70", doi="10.1000/shared"),
+                    _paper("s2:S70", doi="10.1000/shared"),
+                    _paper("openalex:W71", title="Retracted paper", is_retracted=True),
+                    _paper("openalex:W72", title="Uncertain paper", is_retracted=None),
+                ],
+                calls=0,
+                latency_ms=1,
+                cache_keys='["page-1"]',
+                response_hash=cached.response_hash,
+            )
+        }
+    )
+    gold = [EvaluationQuery(query_id="query-1", query="q1")]
+    output = tmp_path / "run"
+
+    _run_artifact_evaluation(gold, provider, cache, _runtime_config(), output)
+
+    deduplication = json.loads((output / "deduplication.jsonl").read_text().strip())
+    filtering = json.loads((output / "filtering.jsonl").read_text().strip())
+    assert deduplication["merge_decisions"][0]["match_rule"] == "doi"
+    assert filtering["rejected"] == [
+        {"paper_id": "openalex:W71", "reason_code": "retracted"}
+    ]
+    assert {
+        item["paper_id"]: item["uncertainty_reasons"]
+        for item in filtering["accepted"]
+    }["openalex:W72"] == ["unknown_retraction_status"]
+
+
+def test_run_evaluation_sums_all_known_costs(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        {
+            "q1": _provider_result([], calls=0, latency_ms=1, cost_cny=0.01),
+            "q2": _provider_result([], calls=0, latency_ms=1, cost_cny=0.02),
+        }
+    )
+    gold = [
+        EvaluationQuery(query_id="query-1", query="q1"),
+        EvaluationQuery(query_id="query-2", query="q2"),
+    ]
+
+    result = asyncio.run(
+        run_evaluation(
+            gold,
+            identity=_run_identity(gold),
+            provider=provider,
+            cache=SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            config=_runtime_config(),
+            output=tmp_path / "run",
+        )
+    )
+
+    assert result.usage.cost_cny == pytest.approx(0.03)
+
+
+def test_run_evaluation_preserves_unknown_mixed_cost(tmp_path: Path) -> None:
+    provider = FakeProvider(
+        {
+            "q1": _provider_result([], calls=0, latency_ms=1, cost_cny=0.01),
+            "q2": _provider_result([], calls=0, latency_ms=1, cost_cny=None),
+        }
+    )
+    gold = [
+        EvaluationQuery(query_id="query-1", query="q1"),
+        EvaluationQuery(query_id="query-2", query="q2"),
+    ]
+
+    result = asyncio.run(
+        run_evaluation(
+            gold,
+            identity=_run_identity(gold),
+            provider=provider,
+            cache=SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            config=_runtime_config(),
+            output=tmp_path / "run",
+        )
+    )
+
+    assert result.usage.cost_cny is None
+
+
 def test_empty_evaluation_preserves_unknown_cost(tmp_path: Path) -> None:
     result = asyncio.run(
         run_evaluation(
             [],
+            identity=_run_identity([]),
             provider=FakeProvider({}),
             cache=SQLiteResponseCache(tmp_path / "cache.sqlite3"),
             config=_runtime_config(),
@@ -588,20 +1357,45 @@ def test_run_evaluation_writes_deterministic_secret_safe_artifacts(
     assert (output / "snapshots/openalex-0001.json").read_bytes() == (b'{"page":1,"results":[]}\n')
 
     predictions = [item.prediction for item in result.query_runs]
+    exact_identity_hash = _run_identity(gold).gold_sha256
+    assert exact_identity_hash != _sha256(_canonical_jsonl_bytes(gold))
     expected_hashes = {
-        "gold": _sha256(_canonical_jsonl_bytes(gold)),
+        "gold": exact_identity_hash,
         "predictions": _sha256(_canonical_jsonl_bytes(predictions)),
     }
     metrics = json.loads((output / "metrics.json").read_text(encoding="utf-8"))
     assert metrics["contract_version"] == CONTRACT_VERSION
     assert metrics["input_hashes"] == expected_hashes
+    snapshot_hash = _sha256(artifacts["snapshot_manifest.json"])
+    assert metrics["snapshot_manifest"] == "snapshot_manifest.json"
+    assert metrics["snapshot_manifest_sha256"] == snapshot_hash
     assert metrics["summary"] == result.evaluation.summary.model_dump(mode="json")
 
     run = json.loads((output / "run.json").read_text(encoding="utf-8"))
+    assert run["contract_version"] == "week1-run-v2"
     assert run["config_hash"] == config.config_hash()
     assert run["input_hashes"] == expected_hashes
+    assert run["identity"] == _run_identity(gold).model_dump(mode="json")
+    assert run["rules"] == {
+        "deduplication": {
+            "fuzzy_title_threshold": FUZZY_TITLE_THRESHOLD,
+            "version": "week1-dedup-v1",
+        },
+        "filtering": {
+            "minimum_uncertainty_multiplier": MINIMUM_UNCERTAINTY_MULTIPLIER,
+            "uncertainty_reason_multiplier": UNCERTAINTY_REASON_MULTIPLIER,
+            "version": "week1-filter-v1",
+        },
+        "scoring": {
+            "bm25_weight": BM25_WEIGHT,
+            "keyword_coverage_weight": KEYWORD_COVERAGE_WEIGHT,
+            "scoring_version": SCORING_VERSION,
+            "tokenizer_version": TOKENIZER_VERSION,
+        },
+    }
     assert run["scoring_version"] == SCORING_VERSION
     assert run["snapshot_manifest"] == "snapshot_manifest.json"
+    assert run["snapshot_manifest_sha256"] == snapshot_hash
     assert all(not Path(value).is_absolute() for value in run["artifacts"].values())
     assert str(output) not in json.dumps(run)
 
@@ -672,3 +1466,17 @@ def test_run_evaluation_refuses_nonidentical_formal_artifact_before_prediction_w
     monkeypatch.setattr(runner_module, "write_jsonl_atomic", fail_if_called)
     with pytest.raises(FileExistsError):
         _run_artifact_evaluation(gold, provider, cache, config, output)
+
+
+def test_run_evaluation_preflights_existing_artifacts_before_snapshot_write(
+    tmp_path: Path,
+) -> None:
+    gold, provider, cache, config, output = _artifact_inputs(tmp_path)
+    output.mkdir()
+    (output / "metrics.json").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        _run_artifact_evaluation(gold, provider, cache, config, output)
+
+    assert not (output / "snapshot_manifest.json").exists()
+    assert not (output / "snapshots").exists()

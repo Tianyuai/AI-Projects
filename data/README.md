@@ -50,6 +50,18 @@ uv run python -m paper_search.evaluation.metrics `
 
 对本地开发集评测时，将 `--gold` 指向 `data/dev/gold.jsonl`，将 `--pred` 指向符合固定预测 Schema 的本地文件。不要提交受限输入或由其生成的逐查询内容。
 
+## Frozen partition contract
+
+Do not change the manifest status to `frozen` until human labeling and the data freeze are complete. Each frozen partition must contain:
+
+- a positive integer `count`;
+- confined relative `gold_path` and `ids_path` values under `data/`;
+- exact-byte `gold_sha256` and `ids_sha256` values using the `sha256:<hex>` form;
+- `labels_complete: true`;
+- `zero_answer_policy` set explicitly to `reject` or `allow`.
+
+The manifest must retain a nonempty dataset `revision`. Gold JSONL must be nonempty, contain exactly `count` records, and list query IDs in exactly the same order as the unique nonempty strings in the JSON ID list. Under `reject`, every gold record needs at least one relevant paper ID. Under `allow`, zero-answer records are permitted and the policy becomes part of formal run identity.
+
 ## Git 边界
 
 | 路径 | Git 状态 | 内容 |

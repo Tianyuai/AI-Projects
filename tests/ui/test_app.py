@@ -140,7 +140,24 @@ def test_result_renders_ranked_papers_and_audit_details() -> None:
     ):
         assert expected in response.text
     assert response.text.index("Auditable Search") < response.text.index("Merge decisions")
-    assert response.text.count("<details>") == 3
+    assert response.text.count("<details>") == 4
+
+
+def test_result_renders_collapsible_score_breakdown() -> None:
+    response = asyncio.run(_request_result(FakeSearchService(_pipeline_result())))
+
+    for expected in (
+        "Scoring breakdown",
+        "Raw BM25: 1.25",
+        "Normalized BM25: 1.0",
+        "Keyword coverage: 0.5",
+        "Uncertainty multiplier: 0.9",
+        "Final score: 0.765",
+    ):
+        assert expected in response.text
+    scoring_summary = response.text.index("<summary>Scoring breakdown</summary>")
+    assert response.text.rfind("<details>", 0, scoring_summary) != -1
+    assert response.text.find("</details>", scoring_summary) != -1
 
 
 def test_result_escapes_external_values() -> None:

@@ -8,11 +8,15 @@ from collections.abc import Sequence
 from difflib import SequenceMatcher
 from typing import Literal
 
+from pydantic import Field
+
 from paper_search.domain.models import DomainModel, NonEmptyStr, Paper
 from paper_search.evaluation.dataset import IdentifierMap, normalize_paper_id, normalize_title
 
 
 MatchRule = Literal["doi", "external_id", "exact_title", "fuzzy_title"]
+DEDUPLICATION_VERSION = "week1-dedup-v1"
+FUZZY_TITLE_THRESHOLD = 0.98
 _RULE_PRIORITY: dict[MatchRule, int] = {
     "doi": 0,
     "external_id": 1,
@@ -28,6 +32,7 @@ class MergeDecision(DomainModel):
     member_ids: list[NonEmptyStr]
     match_rule: MatchRule
     match_value: NonEmptyStr
+    conflict_fields: list[NonEmptyStr] = Field(default_factory=list)
 
 
 class DeduplicationResult(DomainModel):
@@ -63,6 +68,13 @@ def _try_normalize(value: str | None, *, kind: str | None = None) -> str | None:
         return None
     try:
         return normalize_paper_id(value, kind=kind)
+    except ValueError:
+        return None
+
+
+def _try_normalize_title(value: str) -> str | None:
+    try:
+        return normalize_title(value)
     except ValueError:
         return None
 
@@ -143,7 +155,9 @@ def _representative_index(members: Sequence[int], papers: Sequence[Paper]) -> in
     )
 
 
-def _merge_cluster(members: Sequence[int], papers: Sequence[Paper]) -> tuple[Paper, int]:
+def _merge_cluster(
+    members: Sequence[int], papers: Sequence[Paper]
+) -> tuple[Paper, int, list[str]]:
     representative_index = _representative_index(members, papers)
     representative = papers[representative_index]
     data = representative.model_dump()
@@ -156,7 +170,6 @@ def _merge_cluster(members: Sequence[int], papers: Sequence[Paper]) -> tuple[Pap
         "semantic_scholar_id",
         "url",
         "citation_count",
-        "is_retracted",
     ):
         if data[field] is not None:
             continue
@@ -166,33 +179,43 @@ def _merge_cluster(members: Sequence[int], papers: Sequence[Paper]) -> tuple[Pap
                 data[field] = value
                 break
 
+    retraction_values = {papers[index].is_retracted for index in members}
+    data["is_retracted"] = (
+        True if True in retraction_values else False if False in retraction_values else None
+    )
+    conflict_fields = (
+        ["is_retracted"] if True in retraction_values and False in retraction_values else []
+    )
+
     normalized_doi = _try_normalize(data["doi"], kind="doi")
     if normalized_doi is not None:
         data["doi"] = normalized_doi.removeprefix("doi:")
     ordered_members = [representative_index, *(index for index in members if index != representative_index)]
     data["authors"] = _ordered_union([papers[index].authors for index in ordered_members])
     data["sources"] = _ordered_union([papers[index].sources for index in ordered_members])
-    return Paper.model_validate(data), representative_index
+    return Paper.model_validate(data), representative_index, conflict_fields
 
 
 def deduplicate_papers(
     papers: Sequence[Paper],
     *,
     id_map: IdentifierMap | None = None,
-    fuzzy_title_threshold: float = 0.98,
+    fuzzy_title_threshold: float = FUZZY_TITLE_THRESHOLD,
 ) -> DeduplicationResult:
     """Merge duplicate papers while preserving stable cluster order."""
     fuzzy_title_threshold = _validate_fuzzy_title_threshold(fuzzy_title_threshold)
     disjoint_set = _DisjointSet(len(papers))
     doi_identifiers = [_doi_identifier(paper) for paper in papers]
     external_identifiers = [_external_identifiers(paper, id_map) for paper in papers]
-    normalized_titles = [normalize_title(paper.title) for paper in papers]
+    normalized_titles = [_try_normalize_title(paper.title) for paper in papers]
     author_surnames = [_author_surnames(paper) for paper in papers]
     edges: list[tuple[int, int, MatchRule, str]] = []
 
     for left in range(len(papers)):
         for right in range(left + 1, len(papers)):
             left_doi = doi_identifiers[left]
+            left_title = normalized_titles[left]
+            right_title = normalized_titles[right]
             if left_doi is not None and left_doi == doi_identifiers[right]:
                 rule: MatchRule = "doi"
                 value = left_doi
@@ -201,10 +224,12 @@ def deduplicate_papers(
                 if shared_identifiers:
                     rule = "external_id"
                     value = min(shared_identifiers)
-                elif normalized_titles[left] == normalized_titles[right]:
+                elif left_title is not None and left_title == right_title:
                     rule = "exact_title"
-                    value = normalized_titles[left]
+                    value = left_title
                 else:
+                    if left_title is None or right_title is None:
+                        continue
                     same_known_year = (
                         papers[left].publication_year is not None
                         and papers[left].publication_year == papers[right].publication_year
@@ -214,8 +239,8 @@ def deduplicate_papers(
                         continue
                     ratio = SequenceMatcher(
                         None,
-                        normalized_titles[left],
-                        normalized_titles[right],
+                        left_title,
+                        right_title,
                     ).ratio()
                     if ratio < fuzzy_title_threshold:
                         continue
@@ -231,7 +256,7 @@ def deduplicate_papers(
     merged_papers: list[Paper] = []
     decisions: list[MergeDecision] = []
     for members in clusters.values():
-        merged, representative_index = _merge_cluster(members, papers)
+        merged, representative_index, conflict_fields = _merge_cluster(members, papers)
         merged_papers.append(merged)
         if len(members) == 1:
             continue
@@ -243,6 +268,7 @@ def deduplicate_papers(
                 member_ids=[papers[index].canonical_id for index in members],
                 match_rule=best_edge[2],
                 match_value=best_edge[3],
+                conflict_fields=conflict_fields,
             )
         )
 

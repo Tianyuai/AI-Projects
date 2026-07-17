@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import pytest
 
-from paper_search.domain.models import Paper
-from paper_search.evaluation.dataset import IdentifierMap
+from paper_search.domain.models import Paper, QuerySpec
+from paper_search.evaluation.dataset import IdentifierMap, normalize_title
+from paper_search.processing import apply_hard_filters
 from paper_search.processing.deduplicate import deduplicate_papers
 
 
@@ -60,6 +62,7 @@ def test_same_doi_merges_and_preserves_first_cluster_position() -> None:
     assert result.papers[0].doi == "10.1000/a"
     assert result.papers[0].sources == ["semantic_scholar", "openalex"]
     assert result.decisions[0].match_rule == "doi"
+    assert result.decisions[0].match_value == "doi:10.1000/a"
     assert result.decisions[0].member_ids == ["openalex:W1", "s2:S1"]
 
 
@@ -72,6 +75,7 @@ def test_identifier_map_merges_cross_source_aliases(tmp_path: Path) -> None:
     )
     assert len(result.papers) == 1
     assert result.decisions[0].match_rule == "external_id"
+    assert result.decisions[0].match_value == "s2:S2"
 
 
 def test_normalized_exact_title_merges() -> None:
@@ -82,6 +86,7 @@ def test_normalized_exact_title_merges() -> None:
         ]
     )
     assert result.decisions[0].match_rule == "exact_title"
+    assert result.decisions[0].match_value == "graph based retrieval"
 
 
 def test_fuzzy_title_requires_same_year_and_author_surname() -> None:
@@ -104,7 +109,11 @@ def test_fuzzy_title_requires_same_year_and_author_surname() -> None:
         publication_year=2023,
     )
 
-    assert len(deduplicate_papers([left, close], fuzzy_title_threshold=0.80).papers) == 1
+    accepted = deduplicate_papers([left, close], fuzzy_title_threshold=0.80)
+    assert len(accepted.papers) == 1
+    assert accepted.decisions[0].match_value == (
+        f"{SequenceMatcher(None, normalize_title(left.title), normalize_title(close.title)).ratio():.6f}"
+    )
     assert len(deduplicate_papers([left, wrong_year], fuzzy_title_threshold=0.80).papers) == 2
 
 
@@ -214,6 +223,60 @@ def test_representative_identifiers_win_conflicts() -> None:
     assert result.papers[0].semantic_scholar_id == "S30-left"
 
 
+def test_representative_ranking_prefers_abstract_in_isolation() -> None:
+    result = deduplicate_papers(
+        [
+            _paper("openalex:W32", title="Ranking tie"),
+            _paper("s2:S32", title="ranking tie", abstract="only richer field"),
+        ]
+    )
+
+    assert result.decisions[0].representative_id == "s2:S32"
+
+
+def test_representative_exact_rank_tie_uses_first_member() -> None:
+    result = deduplicate_papers(
+        [
+            _paper("openalex:W33", title="Exact rank tie"),
+            _paper("s2:S33", title="exact rank tie"),
+        ]
+    )
+
+    assert result.decisions[0].representative_id == "openalex:W33"
+
+
+def test_retracted_duplicate_overrides_richer_false_representative() -> None:
+    result = deduplicate_papers(
+        [
+            _paper(
+                "openalex:W50",
+                doi="10.1000/retracted",
+                abstract="rich record",
+                authors=["Ada Lovelace"],
+                is_retracted=False,
+            ),
+            _paper(
+                "s2:S50",
+                doi="10.1000/retracted",
+                is_retracted=True,
+            ),
+        ]
+    )
+
+    merged = result.papers[0]
+    decision = result.decisions[0]
+    assert merged.canonical_id == "openalex:W50"
+    assert merged.is_retracted is True
+    assert hasattr(decision, "conflict_fields")
+    assert decision.conflict_fields == ["is_retracted"]
+    filtered = apply_hard_filters(
+        [merged],
+        QuerySpec(original_query="graph", research_goal="graph"),
+    )
+    assert filtered.accepted == []
+    assert filtered.rejected[0].reason_code == "retracted"
+
+
 def test_cluster_output_uses_first_member_position() -> None:
     result = deduplicate_papers(
         [
@@ -233,3 +296,23 @@ def test_output_is_deterministic_and_singletons_have_no_decision() -> None:
     second = deduplicate_papers(papers).model_dump(mode="json")
     assert first == second
     assert first["decisions"] == []
+
+
+def test_punctuation_only_title_singleton_is_preserved() -> None:
+    result = deduplicate_papers([_paper("openalex:W60", title="---")])
+
+    assert [paper.canonical_id for paper in result.papers] == ["openalex:W60"]
+    assert result.decisions == []
+
+
+def test_punctuation_only_titles_can_merge_by_doi() -> None:
+    result = deduplicate_papers(
+        [
+            _paper("openalex:W61", title="---", doi="10.1000/punctuation"),
+            _paper("s2:S61", title="???", doi="10.1000/punctuation"),
+        ]
+    )
+
+    assert len(result.papers) == 1
+    assert result.decisions[0].match_rule == "doi"
+    assert result.decisions[0].match_value == "doi:10.1000/punctuation"

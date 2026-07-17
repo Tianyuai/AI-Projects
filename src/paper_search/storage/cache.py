@@ -94,6 +94,15 @@ class CachedResponse:
     expires_at: datetime
 
 
+@dataclass(frozen=True)
+class PreparedSnapshot:
+    """Validated cached rows and exact bytes ready for one formal snapshot write."""
+
+    responses: tuple[CachedResponse, ...]
+    files: tuple[tuple[Path, bytes], ...]
+    manifest_content: bytes
+
+
 class SQLiteResponseCache:
     """Store replayable successful responses and short provider cooldowns."""
 
@@ -194,6 +203,10 @@ class SQLiteResponseCache:
             return None
         return cached
 
+    def get_snapshot_response(self, key: str) -> CachedResponse | None:
+        """Return a stored response for formal snapshot validation, regardless of TTL."""
+        return self._get_response_any(key)
+
     def _get_response_any(self, key: str) -> CachedResponse | None:
         with closing(self._connect()) as connection:
             row = connection.execute(
@@ -239,20 +252,23 @@ class SQLiteResponseCache:
         until = datetime.fromisoformat(row["cooldown_until"])
         return until if until > self._clock() else None
 
-    def export_snapshot(self, cache_keys: Sequence[str], run_dir: Path) -> Path:
-        """Freeze exact cached response bytes and an ordered manifest."""
+    def prepare_snapshot(self, cache_keys: Sequence[str]) -> PreparedSnapshot:
+        """Load and validate exact cached bytes without writing formal artifacts."""
         if len(set(cache_keys)) != len(cache_keys):
             raise ValueError("snapshot cache keys must be unique")
 
         entries: list[dict[str, object]] = []
         files: list[tuple[Path, bytes]] = []
+        responses: list[CachedResponse] = []
         for index, key in enumerate(cache_keys, start=1):
             cached = self._get_response_any(key)
             if cached is None:
                 raise KeyError(f"unknown cache key: {key}")
+            if _sha256(cached.raw_response) != cached.response_hash:
+                raise ValueError("cached response bytes do not match response hash")
             relative_path = Path("snapshots") / f"openalex-{index:04d}.json"
-            snapshot_path = run_dir / relative_path
-            files.append((snapshot_path, cached.raw_response))
+            files.append((relative_path, cached.raw_response))
+            responses.append(cached)
             entries.append(
                 {
                     "cache_key": cached.cache_key,
@@ -273,15 +289,38 @@ class SQLiteResponseCache:
             indent=2,
             sort_keys=True,
         ).encode("utf-8") + b"\n"
-        manifest_path = run_dir / "snapshot_manifest.json"
+        return PreparedSnapshot(
+            responses=tuple(responses),
+            files=tuple(files),
+            manifest_content=manifest_content,
+        )
 
-        for path, content in [*files, (manifest_path, manifest_content)]:
+    def write_snapshot(self, prepared: PreparedSnapshot, run_dir: Path) -> Path:
+        """Freeze one previously prepared snapshot without re-reading the cache."""
+        root = run_dir.resolve()
+        manifest_path = root / "snapshot_manifest.json"
+        files: list[tuple[Path, bytes]] = []
+        seen_paths: set[Path] = set()
+        for relative, content in prepared.files:
+            if relative.is_absolute():
+                raise ValueError("snapshot path must stay under the run directory")
+            path = (root / relative).resolve()
+            if root not in path.parents or path == manifest_path or path in seen_paths:
+                raise ValueError("snapshot path must stay under the run directory")
+            seen_paths.add(path)
+            files.append((path, content))
+
+        for path, content in [*files, (manifest_path, prepared.manifest_content)]:
             if path.exists() and path.read_bytes() != content:
                 raise FileExistsError(f"refusing to overwrite frozen file: {path}")
         for path, content in files:
             _frozen_write(path, content)
-        _frozen_write(manifest_path, manifest_content)
+        _frozen_write(manifest_path, prepared.manifest_content)
         return manifest_path
+
+    def export_snapshot(self, cache_keys: Sequence[str], run_dir: Path) -> Path:
+        """Freeze exact cached response bytes and an ordered manifest."""
+        return self.write_snapshot(self.prepare_snapshot(cache_keys), run_dir)
 
 
 def validate_snapshot_manifest(path: Path) -> None:

@@ -11,8 +11,13 @@ from typing import cast
 
 import pytest
 
+import paper_search.evaluation.freeze as freeze_module
+
 from paper_search.evaluation.freeze import (
+    FreezeApprovalPlan,
+    approve_freeze,
     audit_freeze_candidate,
+    build_approval_plan,
     main,
     parse_zero_answer_policies,
 )
@@ -244,6 +249,13 @@ def _cli_args(fixture: PreparedFixture) -> list[str]:
         "--zero-answer-policy",
         "simulated_test=allow",
     ]
+
+def _approval_plan(fixture: PreparedFixture) -> FreezeApprovalPlan:
+    audit = _audit(fixture)
+    return build_approval_plan(
+        audit,
+        report_relative_path="freeze_reports/synthetic-freeze.json",
+    )
 
 def test_audit_candidate_builds_safe_result_without_writing(tmp_path: Path) -> None:
     fixture = _prepared_tree(tmp_path)
@@ -621,3 +633,180 @@ def test_cli_rejects_report_path_outside_freeze_reports(
     assert captured.out == ""
     assert captured.err.rstrip() == "freeze approval failed"
     assert not outside_report.exists()
+
+def test_build_approval_plan_binds_complete_report_without_mutating_audit(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    audit = _audit(fixture)
+
+    plan = build_approval_plan(
+        audit,
+        report_relative_path="freeze_reports/synthetic-freeze.json",
+    )
+
+    frozen = json.loads(plan.frozen_manifest_bytes)
+    assert audit.report.approval_requested is False
+    assert plan.report.approval_requested is True
+    assert plan.report_bytes[-1:] == bytes([10])
+    assert frozen["status"] == "frozen"
+    assert frozen["freeze_report_path"] == "freeze_reports/synthetic-freeze.json"
+    assert frozen["freeze_report_sha256"] == _sha256(plan.report_bytes)
+
+
+def test_build_approval_plan_rejects_report_path_escape(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    audit = _audit(fixture)
+
+    with pytest.raises(ValueError, match="freeze approval failed"):
+        build_approval_plan(audit, report_relative_path="../outside.json")
+
+
+def test_approve_writes_report_then_manifest_and_is_idempotent(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    report_path = fixture.data_root / "freeze_reports" / "synthetic-freeze.json"
+
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    assert report_path.read_bytes() == plan.report_bytes
+    assert (fixture.data_root / "manifest.json").read_bytes() == plan.frozen_manifest_bytes
+    assert not list(fixture.data_root.rglob("*.tmp"))
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
+
+
+def test_approve_rejects_manifest_changed_after_audit(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    (fixture.data_root / "manifest.json").write_bytes(b"changed")
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    assert not (fixture.data_root / "freeze_reports").exists()
+
+
+def test_approve_rejects_different_existing_report(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    report_path = fixture.data_root / "freeze_reports" / "synthetic-freeze.json"
+    report_path.parent.mkdir()
+    report_path.write_bytes(b"different")
+
+    with pytest.raises(FileExistsError):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    assert (fixture.data_root / "manifest.json").read_bytes() == (
+        plan.prepared_manifest_bytes
+    )
+
+
+def test_approve_reuses_identical_orphan_report(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    report_path = fixture.data_root / "freeze_reports" / "synthetic-freeze.json"
+    report_path.parent.mkdir()
+    report_path.write_bytes(plan.report_bytes)
+
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    assert report_path.read_bytes() == plan.report_bytes
+
+
+def test_approve_rejects_mutation_at_pre_replace_boundary(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    manifest_path = fixture.data_root / "manifest.json"
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(
+            data_root=fixture.data_root,
+            plan=plan,
+            before_manifest_replace=lambda: manifest_path.write_bytes(b"changed"),
+        )
+
+    report_path = fixture.data_root / "freeze_reports" / "synthetic-freeze.json"
+    assert report_path.read_bytes() == plan.report_bytes
+    assert manifest_path.read_bytes() == b"changed"
+    assert not list(fixture.data_root.rglob("*.tmp"))
+
+
+def test_approve_leaves_complete_report_if_manifest_replace_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+
+    def fail_replace(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("synthetic replace failure")
+
+    monkeypatch.setattr(freeze_module, "_replace_manifest_guarded", fail_replace)
+    with pytest.raises(OSError, match="synthetic replace failure"):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    report_path = fixture.data_root / "freeze_reports" / "synthetic-freeze.json"
+    assert report_path.read_bytes() == plan.report_bytes
+    assert (fixture.data_root / "manifest.json").read_bytes() == (
+        plan.prepared_manifest_bytes
+    )
+
+
+def test_cli_approve_writes_bound_report_and_frozen_manifest(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    report_path = fixture.data_root / "freeze_reports" / "cli-freeze.json"
+
+    exit_code = main(
+        [*_cli_args(fixture), "--approve", "--report", str(report_path)]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert json.loads(captured.out)["approval_requested"] is True
+    manifest = json.loads((fixture.data_root / "manifest.json").read_bytes())
+    assert manifest["status"] == "frozen"
+    assert report_path.is_file()
+
+def test_approve_report_write_failure_leaves_manifest_prepared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+
+    def fail_report_write(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError("synthetic report failure")
+
+    monkeypatch.setattr(freeze_module, "write_frozen_bytes", fail_report_write)
+    with pytest.raises(OSError, match="synthetic report failure"):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    assert (fixture.data_root / "manifest.json").read_bytes() == (
+        plan.prepared_manifest_bytes
+    )
+    assert not (fixture.data_root / "freeze_reports").exists()
+
+
+def test_approve_rejects_different_plan_after_manifest_is_frozen(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    audit = _audit(fixture)
+    first = build_approval_plan(
+        audit,
+        report_relative_path="freeze_reports/first.json",
+    )
+    different = build_approval_plan(
+        audit,
+        report_relative_path="freeze_reports/different.json",
+    )
+    approve_freeze(data_root=fixture.data_root, plan=first)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(data_root=fixture.data_root, plan=different)
+
+    assert not (fixture.data_root / "freeze_reports" / "different.json").exists()

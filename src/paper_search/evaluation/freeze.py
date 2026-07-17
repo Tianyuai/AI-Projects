@@ -4,8 +4,10 @@ import argparse
 
 import hashlib
 import json
+import os
 import sys
-from collections.abc import Collection, Mapping, Sequence
+import tempfile
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -19,7 +21,11 @@ from paper_search.evaluation.annotation import (
     TypeDomainAnnotationRecord,
     compare_annotations,
 )
-from paper_search.evaluation.dataset import EvaluationQuery, read_jsonl
+from paper_search.evaluation.dataset import (
+    EvaluationQuery,
+    read_jsonl,
+    write_frozen_bytes,
+)
 
 
 PASA_REPO_ID = "CarlanLark/pasa-dataset"
@@ -94,9 +100,30 @@ class FreezeAuditResult:
     report: FreezeAuditReport
 
 
+@dataclass(frozen=True)
+class FreezeApprovalPlan:
+    """Exact report and manifest bytes authorized for one approval attempt."""
+
+    prepared_manifest_bytes: bytes
+    frozen_manifest_bytes: bytes
+    report_bytes: bytes
+    report: FreezeAuditReport
+
 def _sha256_bytes(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
+
+def _json_bytes(payload: object) -> bytes:
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+        + chr(10)
+    ).encode("utf-8")
 
 def _load_json_bytes(content: bytes) -> object:
     try:
@@ -393,6 +420,136 @@ def audit_freeze_candidate(
     )
 
 
+def _normalized_report_relative_path(value: str) -> str:
+    candidate = Path(value)
+    if (
+        candidate.is_absolute()
+        or len(candidate.parts) < 2
+        or candidate.parts[0] != "freeze_reports"
+        or ".." in candidate.parts
+    ):
+        raise ValueError("freeze approval failed")
+    return candidate.as_posix()
+
+
+def build_approval_plan(
+    audit: FreezeAuditResult,
+    *,
+    report_relative_path: str,
+) -> FreezeApprovalPlan:
+    """Bind an approved safe report to exact final frozen-manifest bytes."""
+    relative_path = _normalized_report_relative_path(report_relative_path)
+    report = audit.report.model_copy(update={"approval_requested": True})
+    report_bytes = _json_bytes(report.model_dump(mode="json"))
+    frozen_manifest = _mapping(
+        _load_json_bytes(_json_bytes(audit.frozen_manifest_payload))
+    )
+    frozen_manifest["freeze_report_path"] = relative_path
+    frozen_manifest["freeze_report_sha256"] = _sha256_bytes(report_bytes)
+    return FreezeApprovalPlan(
+        prepared_manifest_bytes=audit.prepared_manifest_bytes,
+        frozen_manifest_bytes=_json_bytes(frozen_manifest),
+        report_bytes=report_bytes,
+        report=report,
+    )
+
+
+def _validated_plan_report_path(
+    data_root: Path,
+    plan: FreezeApprovalPlan,
+) -> Path:
+    frozen_manifest = _mapping(_load_json_bytes(plan.frozen_manifest_bytes))
+    if _json_bytes(frozen_manifest) != plan.frozen_manifest_bytes:
+        raise RuntimeError("freeze approval failed")
+    relative_path = _normalized_report_relative_path(
+        _nonempty_string(frozen_manifest.get("freeze_report_path"))
+    )
+    if frozen_manifest.get("freeze_report_sha256") != _sha256_bytes(plan.report_bytes):
+        raise RuntimeError("freeze approval failed")
+    if _json_bytes(plan.report.model_dump(mode="json")) != plan.report_bytes:
+        raise RuntimeError("freeze approval failed")
+    if plan.report.approval_requested is not True:
+        raise RuntimeError("freeze approval failed")
+    if frozen_manifest.get("prepared_manifest_sha256") != _sha256_bytes(
+        plan.prepared_manifest_bytes
+    ):
+        raise RuntimeError("freeze approval failed")
+    report_path = data_root / relative_path
+    if _confined_report_relative_path(data_root, report_path) != relative_path:
+        raise RuntimeError("freeze approval failed")
+    return report_path
+
+
+def _replace_manifest_guarded(
+    manifest_path: Path,
+    prepared_bytes: bytes,
+    frozen_bytes: bytes,
+    *,
+    before_manifest_replace: Callable[[], object] | None = None,
+) -> None:
+    try:
+        if manifest_path.read_bytes() != prepared_bytes:
+            raise RuntimeError("freeze approval failed")
+    except OSError:
+        raise RuntimeError("freeze approval failed") from None
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=manifest_path.parent,
+        prefix=f".{manifest_path.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as temporary:
+            temporary.write(frozen_bytes)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        if before_manifest_replace is not None:
+            before_manifest_replace()
+        try:
+            if manifest_path.read_bytes() != prepared_bytes:
+                raise RuntimeError("freeze approval failed")
+        except OSError:
+            raise RuntimeError("freeze approval failed") from None
+        os.replace(temporary_path, manifest_path)
+        temporary_path = Path()
+    finally:
+        if temporary_path != Path():
+            temporary_path.unlink(missing_ok=True)
+
+
+def approve_freeze(
+    *,
+    data_root: Path,
+    plan: FreezeApprovalPlan,
+    before_manifest_replace: Callable[[], object] | None = None,
+) -> Literal["created", "matched"]:
+    """Write the complete report, then atomically transition the manifest."""
+    report_path = _validated_plan_report_path(data_root, plan)
+    manifest_path = data_root / "manifest.json"
+    try:
+        current_manifest = manifest_path.read_bytes()
+    except OSError:
+        raise RuntimeError("freeze approval failed") from None
+
+    if current_manifest == plan.frozen_manifest_bytes:
+        if report_path.is_file() and report_path.read_bytes() == plan.report_bytes:
+            return "matched"
+        raise RuntimeError("freeze approval failed")
+    if current_manifest != plan.prepared_manifest_bytes:
+        raise RuntimeError("freeze approval failed")
+    if report_path.exists() and report_path.read_bytes() != plan.report_bytes:
+        raise FileExistsError("freeze approval failed")
+
+    write_frozen_bytes(report_path, plan.report_bytes)
+    _replace_manifest_guarded(
+        manifest_path,
+        plan.prepared_manifest_bytes,
+        plan.frozen_manifest_bytes,
+        before_manifest_replace=before_manifest_replace,
+    )
+    return "created"
+
 def _prepared_partition_names(data_root: Path) -> set[str]:
     try:
         manifest_bytes = (data_root / "manifest.json").read_bytes()
@@ -473,12 +630,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     except ValueError as error:
         print(_audit_error_message(error), file=sys.stderr)
         return 2
+    output_report = result.report
     if args.approve:
-        print("freeze approval failed", file=sys.stderr)
-        return 2
+        if args.report is None:
+            print("freeze approval failed", file=sys.stderr)
+            return 2
+        try:
+            report_relative_path = _confined_report_relative_path(
+                args.data_root,
+                args.report,
+            )
+            plan = build_approval_plan(
+                result,
+                report_relative_path=report_relative_path,
+            )
+            approve_freeze(data_root=args.data_root, plan=plan)
+        except (OSError, RuntimeError, ValueError):
+            print("freeze approval failed", file=sys.stderr)
+            return 2
+        output_report = plan.report
     print(
         json.dumps(
-            result.report.model_dump(mode="json"),
+            output_report.model_dump(mode="json"),
             ensure_ascii=False,
             sort_keys=True,
             indent=2,

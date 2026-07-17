@@ -13,8 +13,20 @@ from paper_search.domain.models import (
     ProviderResult,
     UsageActual,
 )
+from paper_search.evaluation.annotation import AgreementReport, FieldAgreement
 from paper_search.evaluation.dataset import EvaluationQuery, read_jsonl
-from paper_search.evaluation.runner import RunIdentity, run_evaluation
+from paper_search.evaluation.freeze import (
+    FreezeAuditReport,
+    FreezeAuditResult,
+    PartitionFreezeAudit,
+    approve_freeze,
+    build_approval_plan,
+)
+from paper_search.evaluation.runner import (
+    RunIdentity,
+    _resolve_frozen_split,
+    run_evaluation,
+)
 from paper_search.storage import SQLiteResponseCache
 from paper_search.storage.cache import validate_snapshot_manifest
 
@@ -141,3 +153,88 @@ def test_fixed_week1_fixture_runs_full_pipeline_and_snapshot(tmp_path: Path) -> 
         for accepted in result.query_runs[1].pipeline.filtering.accepted
     )
     validate_snapshot_manifest(output / "snapshot_manifest.json")
+
+
+def test_approved_synthetic_manifest_is_accepted_by_week1_runner(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    gold_path = data_root / "dev" / "gold.jsonl"
+    ids_path = data_root / "splits" / "dev.ids.json"
+    gold_path.parent.mkdir(parents=True)
+    ids_path.parent.mkdir(parents=True)
+    query = EvaluationQuery(
+        query_id="q1",
+        query="Synthetic integration query",
+        relevant_paper_ids=["arxiv:1706.03762"],
+    )
+    gold_bytes = (
+        json.dumps(query.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+        + chr(10)
+    ).encode()
+    ids_bytes = (json.dumps(["q1"], indent=2) + chr(10)).encode()
+    gold_path.write_bytes(gold_bytes)
+    ids_path.write_bytes(ids_bytes)
+
+    prepared_bytes = (
+        json.dumps({"status": "waiting_for_human_label_freeze"}, separators=(",", ":"))
+        + chr(10)
+    ).encode()
+    (data_root / "manifest.json").write_bytes(prepared_bytes)
+    partition = PartitionFreezeAudit(
+        count=1,
+        gold_path="dev/gold.jsonl",
+        gold_sha256=f"sha256:{hashlib.sha256(gold_bytes).hexdigest()}",
+        ids_path="splits/dev.ids.json",
+        ids_sha256=f"sha256:{hashlib.sha256(ids_bytes).hexdigest()}",
+        zero_answer_policy="reject",
+        labels_complete=True,
+    )
+    agreement = AgreementReport(
+        compared_query_count=1,
+        fields={
+            field: FieldAgreement(kappa=1.0, threshold=0.8, accepted=True)
+            for field in ("query_type", "domain")
+        },
+    )
+    prepared_hash = f"sha256:{hashlib.sha256(prepared_bytes).hexdigest()}"
+    report = FreezeAuditReport(
+        prepared_manifest_sha256=prepared_hash,
+        dataset_revision="fixture-r1",
+        source_file_count=1,
+        type_domain_count=1,
+        type_domain_sha256=f"sha256:{'1' * 64}",
+        constraint_count=1,
+        constraint_sha256=f"sha256:{'2' * 64}",
+        overlap_count=1,
+        overlap_sha256=f"sha256:{'3' * 64}",
+        agreement=agreement,
+        partitions={"dev": partition},
+        approval_requested=False,
+    )
+    audit = FreezeAuditResult(
+        prepared_manifest_bytes=prepared_bytes,
+        frozen_manifest_payload={
+            "status": "frozen",
+            "revision": "fixture-r1",
+            "prepared_manifest_sha256": prepared_hash,
+            "partitions": {"dev": partition.model_dump(mode="json")},
+        },
+        report=report,
+    )
+    plan = build_approval_plan(
+        audit,
+        report_relative_path="freeze_reports/integration.json",
+    )
+
+    approve_freeze(data_root=data_root, plan=plan)
+    frozen = _resolve_frozen_split(data_root, "dev", "a" * 40)
+
+    assert frozen.identity.split == "dev"
+    assert frozen.identity.git_sha == "a" * 40
+    assert frozen.identity.gold_sha256 == partition.gold_sha256
+    assert frozen.identity.manifest_sha256 == (
+        f"sha256:{hashlib.sha256(plan.frozen_manifest_bytes).hexdigest()}"
+    )
+    assert frozen.identity.dataset_revision == "fixture-r1"
+    assert frozen.identity.zero_answer_policy == "reject"

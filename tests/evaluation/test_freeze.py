@@ -15,6 +15,7 @@ import paper_search.evaluation.freeze as freeze_module
 
 from paper_search.evaluation.freeze import (
     FreezeApprovalPlan,
+    OFFICIAL_EXPECTATIONS,
     approve_freeze,
     audit_freeze_candidate,
     build_approval_plan,
@@ -37,31 +38,27 @@ def _load_preparation_module() -> ModuleType:
 preparation = _load_preparation_module()
 
 
-def _source_bytes(prefix: str) -> bytes:
+def _source_bytes(prefix: str, count: int) -> bytes:
     rows = [
         {
-            "qid": f"{prefix}-q1",
-            "question": f"Synthetic question one for {prefix}",
-            "answer": ["Synthetic Paper One"],
-            "answer_arxiv_id": ["2501.10120"],
+            "qid": f"{prefix}-q{index:04d}",
+            "question": f"Synthetic question {index} for {prefix}",
+            "answer": [f"Synthetic Paper {index}"],
+            "answer_arxiv_id": ["2501.10120" if index % 2 == 0 else "1706.03762"],
             "source_meta": {"published_time": "2025-01-01"},
-        },
-        {
-            "qid": f"{prefix}-q2",
-            "question": f"Synthetic question two for {prefix}",
-            "answer": ["Synthetic Paper Two"],
-            "answer_arxiv_id": ["1706.03762"],
-            "source_meta": {"published_time": "2024-01-01"},
-        },
+        }
+        for index in range(count)
     ]
     return ("\n".join(json.dumps(row, sort_keys=True) for row in rows) + "\n").encode()
 
 
 FIXTURE_FILES = {
-    "AutoScholarQuery/dev.jsonl": _source_bytes("auto-dev"),
-    "AutoScholarQuery/test.jsonl": _source_bytes("auto-test"),
-    "RealScholarQuery/test.jsonl": _source_bytes("real-test"),
+    "AutoScholarQuery/dev.jsonl": _source_bytes("auto-dev", 1000),
+    "AutoScholarQuery/test.jsonl": _source_bytes("auto-test", 1000),
+    "RealScholarQuery/test.jsonl": _source_bytes("real-test", 50),
 }
+
+REDUCED_FIXTURE_FILES = {path: _source_bytes(path.replace("/", "-"), 2) for path in FIXTURE_FILES}
 
 
 @dataclass(frozen=True)
@@ -74,44 +71,45 @@ class PreparedFixture:
 
 def _jsonl(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    content = "\n".join(
-        json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows
-    )
+    content = "\n".join(json.dumps(row, sort_keys=True, separators=(",", ":")) for row in rows)
     path.write_text(content + "\n", encoding="utf-8")
 
 
-def _prepared_tree(tmp_path: Path) -> PreparedFixture:
+def _prepared_tree(
+    tmp_path: Path,
+    *,
+    reduced: bool = False,
+) -> PreparedFixture:
     data_root = tmp_path / "data"
+    fixture_files = REDUCED_FIXTURE_FILES if reduced else FIXTURE_FILES
 
     def downloader(repo_id: str, revision: str, path: str, token: str) -> bytes:
         assert repo_id == preparation.PASA_REPO_ID
         assert revision == preparation.PASA_REVISION
         assert token == "test-token"
-        return FIXTURE_FILES[path]
+        return fixture_files[path]
 
     manifest = preparation.prepare(
         output_root=data_root,
         token="test-token",
         downloader=downloader,
-        expected_counts={path: 2 for path in FIXTURE_FILES},
-        dev_size=1,
-        validation_size=1,
-        simulated_test_size=2,
-        constraint_annotation_size=1,
-        overlap_annotation_size=1,
+        expected_counts={
+            path: len(content.splitlines()) for path, content in fixture_files.items()
+        },
+        dev_size=1 if reduced else 60,
+        validation_size=1 if reduced else 30,
+        simulated_test_size=2 if reduced else 50,
+        constraint_annotation_size=1 if reduced else 40,
+        overlap_annotation_size=1 if reduced else 20,
     )
     work_packages = manifest["work_packages"]
     assert isinstance(work_packages, dict)
 
     type_domain_ids = json.loads(
-        (data_root / work_packages["type_domain"]["ids_path"]).read_text(
-            encoding="utf-8"
-        )
+        (data_root / work_packages["type_domain"]["ids_path"]).read_text(encoding="utf-8")
     )
     constraint_ids = json.loads(
-        (data_root / work_packages["constraints"]["ids_path"]).read_text(
-            encoding="utf-8"
-        )
+        (data_root / work_packages["constraints"]["ids_path"]).read_text(encoding="utf-8")
     )
     overlap_ids = json.loads(
         (data_root / work_packages["overlap"]["ids_path"]).read_text(encoding="utf-8")
@@ -168,17 +166,13 @@ def _prepared_tree(tmp_path: Path) -> PreparedFixture:
 
 
 def _manifest(fixture: PreparedFixture) -> dict[str, object]:
-    payload = json.loads(
-        (fixture.data_root / "manifest.json").read_text(encoding="utf-8")
-    )
+    payload = json.loads((fixture.data_root / "manifest.json").read_text(encoding="utf-8"))
     assert isinstance(payload, dict)
     return cast(dict[str, object], payload)
 
 
 def _write_manifest(fixture: PreparedFixture, payload: dict[str, object]) -> None:
-    content = (
-        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    ).encode()
+    content = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode()
     (fixture.data_root / "manifest.json").write_bytes(content)
 
 
@@ -219,6 +213,7 @@ def _audit(fixture: PreparedFixture) -> object:
         policies={"dev": "reject", "validation": "reject", "simulated_test": "allow"},
     )
 
+
 def _label_path(fixture: PreparedFixture, name: str) -> Path:
     return {
         "type_domain": fixture.type_domain_labels,
@@ -231,6 +226,11 @@ def _label_rows(path: Path) -> list[dict[str, object]]:
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert all(isinstance(row, dict) for row in rows)
     return cast(list[dict[str, object]], rows)
+
+
+def _run_cli(args: list[str]) -> int:
+    return main(args)
+
 
 def _cli_args(fixture: PreparedFixture) -> list[str]:
     return [
@@ -250,12 +250,14 @@ def _cli_args(fixture: PreparedFixture) -> list[str]:
         "simulated_test=allow",
     ]
 
+
 def _approval_plan(fixture: PreparedFixture) -> FreezeApprovalPlan:
     audit = _audit(fixture)
     return build_approval_plan(
         audit,
         report_relative_path="freeze_reports/synthetic-freeze.json",
     )
+
 
 def test_audit_candidate_builds_safe_result_without_writing(tmp_path: Path) -> None:
     fixture = _prepared_tree(tmp_path)
@@ -355,10 +357,9 @@ def test_partition_rejects_duplicate_ids(tmp_path: Path) -> None:
     partition = _partition(manifest, "simulated_test")
     ids_path = fixture.data_root / cast(str, partition["ids_path"])
     identifiers = json.loads(ids_path.read_text(encoding="utf-8"))
-    assert isinstance(identifiers, list) and len(identifiers) == 2
-    duplicate_content = (
-        json.dumps([identifiers[0], identifiers[0]], indent=2) + "\n"
-    ).encode()
+    assert isinstance(identifiers, list) and len(identifiers) >= 2
+    identifiers[1] = identifiers[0]
+    duplicate_content = (json.dumps(identifiers, indent=2) + "\n").encode()
     ids_path.write_bytes(duplicate_content)
     partition["ids_sha256"] = _sha256(duplicate_content)
     _write_manifest(fixture, manifest)
@@ -374,9 +375,7 @@ def test_partition_rejects_ordered_id_mismatch(tmp_path: Path) -> None:
     ids_path = fixture.data_root / cast(str, partition["ids_path"])
     identifiers = json.loads(ids_path.read_text(encoding="utf-8"))
     assert isinstance(identifiers, list)
-    reversed_content = (
-        json.dumps(list(reversed(identifiers)), indent=2) + "\n"
-    ).encode()
+    reversed_content = (json.dumps(list(reversed(identifiers)), indent=2) + "\n").encode()
     ids_path.write_bytes(reversed_content)
     partition["ids_sha256"] = _sha256(reversed_content)
     _write_manifest(fixture, manifest)
@@ -400,13 +399,11 @@ def test_work_package_rejects_invalid_overlap_subset(tmp_path: Path) -> None:
     manifest = _manifest(fixture)
     overlap = _work_package(manifest, "overlap")
     validation_ids = json.loads(
-        (fixture.data_root / "splits" / "validation.ids.json").read_text(
-            encoding="utf-8"
-        )
+        (fixture.data_root / "splits" / "validation.ids.json").read_text(encoding="utf-8")
     )
-    assert isinstance(validation_ids, list) and len(validation_ids) == 1
+    assert isinstance(validation_ids, list) and len(validation_ids) >= 20
     overlap_path = fixture.data_root / cast(str, overlap["ids_path"])
-    overlap_content = (json.dumps(validation_ids, indent=2) + "\n").encode()
+    overlap_content = (json.dumps(validation_ids[:20], indent=2) + "\n").encode()
     overlap_path.write_bytes(overlap_content)
     overlap["ids_sha256"] = _sha256(overlap_content)
     _write_manifest(fixture, manifest)
@@ -423,6 +420,7 @@ def test_work_package_rejects_source_hash_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="prepared data is invalid"):
         _audit(fixture)
+
 
 @pytest.mark.parametrize("label_name", ["type_domain", "constraints", "overlap"])
 @pytest.mark.parametrize("mutation", ["missing", "duplicate", "extra", "wrong-set"])
@@ -523,14 +521,14 @@ def test_partition_policy_controls_zero_answer_acceptance(tmp_path: Path) -> Non
 def test_audit_report_is_content_safe(tmp_path: Path) -> None:
     fixture = _prepared_tree(tmp_path)
     sentinel = "PRIVATE-SENTINEL-DO-NOT-EMIT"
-    for path in (
-        fixture.type_domain_labels,
-        fixture.constraint_labels,
-        fixture.overlap_labels,
+    for path, annotator in (
+        (fixture.type_domain_labels, f"{sentinel}-type-domain"),
+        (fixture.constraint_labels, f"{sentinel}-first"),
+        (fixture.overlap_labels, f"{sentinel}-second"),
     ):
         rows = _label_rows(path)
         for row in rows:
-            row["annotator"] = sentinel
+            row["annotator"] = annotator
             if "research_goal" in row:
                 row["research_goal"] = sentinel
         _jsonl(path, rows)
@@ -542,6 +540,7 @@ def test_audit_report_is_content_safe(tmp_path: Path) -> None:
     assert "Synthetic question" not in report_text
     assert str(fixture.type_domain_labels) not in report_text
 
+
 def test_cli_audit_only_prints_safe_report_without_writing(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -549,7 +548,7 @@ def test_cli_audit_only_prints_safe_report_without_writing(
     fixture = _prepared_tree(tmp_path)
     original_manifest = (fixture.data_root / "manifest.json").read_bytes()
 
-    exit_code = main(_cli_args(fixture))
+    exit_code = _run_cli(_cli_args(fixture))
 
     captured = capsys.readouterr()
     report = json.loads(captured.out)
@@ -574,7 +573,7 @@ def test_cli_rejects_unpaired_approval_arguments(
 ) -> None:
     fixture = _prepared_tree(tmp_path)
 
-    exit_code = main([*_cli_args(fixture), *extra_args])
+    exit_code = _run_cli([*_cli_args(fixture), *extra_args])
 
     captured = capsys.readouterr()
     assert exit_code == 2
@@ -582,11 +581,13 @@ def test_cli_rejects_unpaired_approval_arguments(
     assert captured.err.rstrip() == "freeze approval failed"
 
 
-def test_cli_requires_all_explicit_inputs() -> None:
-    with pytest.raises(SystemExit) as error:
-        main([])
-
-    assert error.value.code == 2
+def test_cli_requires_all_explicit_inputs(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _run_cli([]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.rstrip() == "freeze approval failed"
 
 
 def test_cli_redacts_private_validation_failures(
@@ -601,16 +602,14 @@ def test_cli_redacts_private_validation_failures(
     args = _cli_args(fixture)
     args[args.index(str(fixture.overlap_labels))] = str(private_path)
 
-    exit_code = main(args)
+    exit_code = _run_cli(args)
 
     captured = capsys.readouterr()
     assert exit_code == 2
     assert captured.out == ""
-    assert (
-        captured.err.rstrip()
-        == "freeze audit failed: private annotations are invalid"
-    )
+    assert captured.err.rstrip() == "freeze audit failed: private annotations are invalid"
     assert sentinel not in captured.err
+
 
 def test_cli_rejects_report_path_outside_freeze_reports(
     tmp_path: Path,
@@ -619,7 +618,7 @@ def test_cli_rejects_report_path_outside_freeze_reports(
     fixture = _prepared_tree(tmp_path)
     outside_report = tmp_path / "outside-report.json"
 
-    exit_code = main(
+    exit_code = _run_cli(
         [
             *_cli_args(fixture),
             "--approve",
@@ -633,6 +632,7 @@ def test_cli_rejects_report_path_outside_freeze_reports(
     assert captured.out == ""
     assert captured.err.rstrip() == "freeze approval failed"
     assert not outside_report.exists()
+
 
 def test_build_approval_plan_binds_complete_report_without_mutating_audit(
     tmp_path: Path,
@@ -695,9 +695,7 @@ def test_approve_rejects_different_existing_report(tmp_path: Path) -> None:
     with pytest.raises(FileExistsError):
         approve_freeze(data_root=fixture.data_root, plan=plan)
 
-    assert (fixture.data_root / "manifest.json").read_bytes() == (
-        plan.prepared_manifest_bytes
-    )
+    assert (fixture.data_root / "manifest.json").read_bytes() == (plan.prepared_manifest_bytes)
 
 
 def test_approve_reuses_identical_orphan_report(tmp_path: Path) -> None:
@@ -746,9 +744,7 @@ def test_approve_leaves_complete_report_if_manifest_replace_fails(
 
     report_path = fixture.data_root / "freeze_reports" / "synthetic-freeze.json"
     assert report_path.read_bytes() == plan.report_bytes
-    assert (fixture.data_root / "manifest.json").read_bytes() == (
-        plan.prepared_manifest_bytes
-    )
+    assert (fixture.data_root / "manifest.json").read_bytes() == (plan.prepared_manifest_bytes)
 
 
 def test_cli_approve_writes_bound_report_and_frozen_manifest(
@@ -758,9 +754,7 @@ def test_cli_approve_writes_bound_report_and_frozen_manifest(
     fixture = _prepared_tree(tmp_path)
     report_path = fixture.data_root / "freeze_reports" / "cli-freeze.json"
 
-    exit_code = main(
-        [*_cli_args(fixture), "--approve", "--report", str(report_path)]
-    )
+    exit_code = _run_cli([*_cli_args(fixture), "--approve", "--report", str(report_path)])
 
     captured = capsys.readouterr()
     assert exit_code == 0
@@ -769,6 +763,7 @@ def test_cli_approve_writes_bound_report_and_frozen_manifest(
     manifest = json.loads((fixture.data_root / "manifest.json").read_bytes())
     assert manifest["status"] == "frozen"
     assert report_path.is_file()
+
 
 def test_approve_report_write_failure_leaves_manifest_prepared(
     tmp_path: Path,
@@ -785,9 +780,7 @@ def test_approve_report_write_failure_leaves_manifest_prepared(
     with pytest.raises(OSError, match="synthetic report failure"):
         approve_freeze(data_root=fixture.data_root, plan=plan)
 
-    assert (fixture.data_root / "manifest.json").read_bytes() == (
-        plan.prepared_manifest_bytes
-    )
+    assert (fixture.data_root / "manifest.json").read_bytes() == (plan.prepared_manifest_bytes)
     assert not (fixture.data_root / "freeze_reports").exists()
 
 
@@ -810,3 +803,331 @@ def test_approve_rejects_different_plan_after_manifest_is_frozen(
         approve_freeze(data_root=fixture.data_root, plan=different)
 
     assert not (fixture.data_root / "freeze_reports" / "different.json").exists()
+
+
+def test_official_contract_rejects_reduced_self_consistent_tree(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_tree(tmp_path, reduced=True)
+
+    with pytest.raises(ValueError, match="prepared data is invalid"):
+        audit_freeze_candidate(
+            data_root=fixture.data_root,
+            type_domain_labels_path=fixture.type_domain_labels,
+            constraint_labels_path=fixture.constraint_labels,
+            overlap_labels_path=fixture.overlap_labels,
+            policies={
+                "dev": "reject",
+                "validation": "reject",
+                "simulated_test": "allow",
+            },
+        )
+
+
+def test_small_contract_rejects_missing_source_entry(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    manifest = _manifest(fixture)
+    source_files = manifest["source_files"]
+    assert isinstance(source_files, list)
+    source_files.pop()
+    _write_manifest(fixture, manifest)
+
+    with pytest.raises(ValueError, match="prepared data is invalid"):
+        _audit(fixture)
+
+
+def test_audit_rejects_same_annotator_for_overlap(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    rows = _label_rows(fixture.overlap_labels)
+    for row in rows:
+        row["annotator"] = "member-a"
+    _jsonl(fixture.overlap_labels, rows)
+
+    with pytest.raises(ValueError, match="private annotations are invalid"):
+        _audit(fixture)
+
+
+@pytest.mark.parametrize("location", ["top", "source", "work_package"])
+def test_audit_rejects_unknown_manifest_fields(
+    tmp_path: Path,
+    location: str,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    manifest = _manifest(fixture)
+    if location == "top":
+        target = manifest
+    elif location == "source":
+        target = _source_entry(manifest)
+    else:
+        target = _work_package(manifest, "constraints")
+    target["PRIVATE-SENTINEL"] = "must-not-survive"
+    _write_manifest(fixture, manifest)
+
+    with pytest.raises(ValueError, match="prepared data is invalid"):
+        _audit(fixture)
+
+
+def test_approve_rejects_gold_changed_after_audit(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    gold_path = fixture.data_root / "dev" / "gold.jsonl"
+    gold_path.write_bytes(gold_path.read_bytes() + b"\n")
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    assert not (fixture.data_root / "freeze_reports").exists()
+
+
+@pytest.mark.parametrize("label_name", ["type_domain", "constraints", "overlap"])
+def test_approve_rejects_private_labels_changed_after_audit(
+    tmp_path: Path,
+    label_name: str,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    label_path = _label_path(fixture, label_name)
+    label_path.write_bytes(label_path.read_bytes() + b"\n")
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    assert not (fixture.data_root / "freeze_reports").exists()
+
+
+def test_approve_rejects_evidence_mutation_at_pre_replace_boundary(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(
+            data_root=fixture.data_root,
+            plan=plan,
+            before_manifest_replace=lambda: fixture.overlap_labels.write_bytes(b"changed"),
+        )
+
+    assert (fixture.data_root / "manifest.json").read_bytes() == (plan.prepared_manifest_bytes)
+    assert not list(fixture.data_root.rglob("*.tmp"))
+
+
+def test_cli_approve_is_idempotent_across_invocations(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    report_path = fixture.data_root / "freeze_reports" / "cli-freeze.json"
+    args = [*_cli_args(fixture), "--approve", "--report", str(report_path)]
+
+    assert _run_cli(args) == 0
+    first = capsys.readouterr()
+    assert first.err == ""
+    assert _run_cli(args) == 0
+    second = capsys.readouterr()
+    assert second.err == ""
+    assert json.loads(second.out)["approval_requested"] is True
+
+
+def test_cli_redacts_unknown_argument(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    sentinel = "PRIVATE-ARG-SENTINEL"
+
+    exit_code = _run_cli([*_cli_args(fixture), f"--{sentinel}"])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert captured.err.rstrip() == "freeze approval failed"
+    assert sentinel not in captured.err
+
+
+def test_approve_rejects_existing_freeze_lock(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    lock_path = fixture.data_root / ".task2-freeze.lock"
+    lock_path.write_text("busy", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    assert not (fixture.data_root / "freeze_reports").exists()
+    assert lock_path.read_text(encoding="utf-8") == "busy"
+
+
+def test_cli_approve_accepts_relative_data_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    args = _cli_args(fixture)
+    args[args.index(str(fixture.data_root))] = "data"
+    report_path = Path("data/freeze_reports/relative-freeze.json")
+
+    exit_code = _run_cli([*args, "--approve", "--report", str(report_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert captured.err == ""
+    assert report_path.is_file()
+
+
+def test_production_main_rejects_expectation_override(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+
+    with pytest.raises(TypeError):
+        main(_cli_args(fixture), expectations=OFFICIAL_EXPECTATIONS)
+
+
+def test_approve_never_writes_through_swapped_report_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    report_root = fixture.data_root / "freeze_reports"
+    moved_root = fixture.data_root / "freeze_reports-original"
+    outside_root = tmp_path / "outside"
+    report_root.mkdir()
+    outside_root.mkdir()
+
+    def swap_then_write(path: Path, content: bytes) -> None:
+        report_root.rename(moved_root)
+        (outside_root / path.name).write_bytes(content)
+
+    monkeypatch.setattr(freeze_module, "write_frozen_bytes", swap_then_write)
+    with pytest.raises((OSError, RuntimeError)):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    assert not (outside_root / "synthetic-freeze.json").exists()
+
+
+def test_approve_never_overwrites_manifest_inserted_at_publish_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    manifest_path = fixture.data_root / "manifest.json"
+    boundary_bytes = b"changed-at-publish-boundary"
+    original_replace = freeze_module.os.replace
+    original_link = freeze_module.os.link
+    injected = False
+
+    def inject() -> None:
+        nonlocal injected
+        if not injected:
+            manifest_path.write_bytes(boundary_bytes)
+            injected = True
+
+    def replace(source: object, target: object) -> None:
+        if Path(target) == manifest_path:
+            inject()
+        original_replace(source, target)
+
+    def link(source: object, target: object) -> None:
+        if Path(target) == manifest_path:
+            inject()
+        original_link(source, target)
+
+    monkeypatch.setattr(freeze_module.os, "replace", replace)
+    monkeypatch.setattr(freeze_module.os, "link", link)
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    assert manifest_path.read_bytes() == boundary_bytes
+
+
+def test_approve_locks_evidence_through_manifest_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    manifest_path = fixture.data_root / "manifest.json"
+    original_link = freeze_module.os.link
+
+    def mutate_then_link(source: object, target: object) -> None:
+        if Path(target) == manifest_path:
+            fixture.overlap_labels.write_bytes(b"changed-at-publish-boundary")
+        original_link(source, target)
+
+    monkeypatch.setattr(freeze_module.os, "link", mutate_then_link)
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    assert manifest_path.read_bytes() == plan.prepared_manifest_bytes
+
+
+def test_audit_binds_agreement_threshold_to_point_eight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    original_compare = freeze_module.compare_annotations
+
+    def lowered_threshold(*args: object, **kwargs: object) -> object:
+        report = original_compare(*args, **kwargs)
+        fields = {
+            name: field.model_copy(update={"threshold": 0.7, "accepted": True})
+            for name, field in report.fields.items()
+        }
+        return report.model_copy(update={"fields": fields})
+
+    monkeypatch.setattr(freeze_module, "compare_annotations", lowered_threshold)
+    with pytest.raises(ValueError, match="human annotation agreement is below threshold"):
+        _audit(fixture)
+
+
+def test_backup_cleanup_failure_does_not_misreport_committed_freeze(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    original_unlink = Path.unlink
+
+    def fail_backup_unlink(
+        path: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        if ".manifest.json.prepared." in path.name:
+            raise OSError("synthetic backup cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_backup_unlink)
+
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    assert (fixture.data_root / "manifest.json").read_bytes() == plan.frozen_manifest_bytes
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
+    assert not list(fixture.data_root.glob(".manifest.json.prepared.*.tmp"))
+
+
+def test_failed_publish_and_restore_preserve_prepared_recovery_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    manifest_path = fixture.data_root / "manifest.json"
+    original_link = freeze_module.os.link
+
+    def fail_manifest_links(source: object, target: object) -> None:
+        if Path(target) == manifest_path:
+            raise OSError("synthetic manifest link failure")
+        original_link(source, target)
+
+    monkeypatch.setattr(freeze_module.os, "link", fail_manifest_links)
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        approve_freeze(data_root=fixture.data_root, plan=plan)
+
+    recovery = list(fixture.data_root.glob(".manifest.json.prepared.*.tmp"))
+    assert not manifest_path.exists()
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == plan.prepared_manifest_bytes

@@ -7,12 +7,13 @@ import json
 import os
 import sys
 import tempfile
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, NoReturn, TypeVar, cast
 
-from pydantic import PositiveInt
+from pydantic import BaseModel, PositiveInt, ValidationError
 
 from paper_search.domain.models import DomainModel, NonEmptyStr
 from paper_search.evaluation.annotation import (
@@ -23,7 +24,6 @@ from paper_search.evaluation.annotation import (
 )
 from paper_search.evaluation.dataset import (
     EvaluationQuery,
-    read_jsonl,
     write_frozen_bytes,
 )
 
@@ -33,8 +33,50 @@ PASA_REVISION = "232428b0c867268c3b8ded90db4d98c1b30501d6"
 RANDOM_SEED = 20260714
 SAMPLING_ALGORITHM = "answer-count-largest-remainder-v1"
 PREPARED_STATUS = "waiting_for_human_label_freeze"
+AGREEMENT_THRESHOLD = 0.80
+
+
+@dataclass(frozen=True)
+class FreezeExpectations:
+    """Exact production data shape required before approval."""
+
+    source_row_counts: tuple[tuple[str, int], ...]
+    partition_counts: tuple[tuple[str, int], ...]
+    work_package_counts: tuple[tuple[str, int], ...]
+
+
+OFFICIAL_EXPECTATIONS = FreezeExpectations(
+    source_row_counts=(
+        ("AutoScholarQuery/dev.jsonl", 1000),
+        ("AutoScholarQuery/test.jsonl", 1000),
+        ("RealScholarQuery/test.jsonl", 50),
+    ),
+    partition_counts=(
+        ("dev", 60),
+        ("validation", 30),
+        ("simulated_test", 50),
+    ),
+    work_package_counts=(
+        ("type_domain", 90),
+        ("constraints", 40),
+        ("overlap", 20),
+    ),
+)
+
+
+def _expectation_map(pairs: tuple[tuple[str, int], ...]) -> dict[str, int]:
+    expected: dict[str, int] = {}
+    for name, count in pairs:
+        if not name.strip() or count <= 0 or name in expected:
+            raise ValueError("prepared data is invalid")
+        expected[name] = count
+    if not expected:
+        raise ValueError("prepared data is invalid")
+    return expected
+
 
 ZeroAnswerPolicy = Literal["reject", "allow"]
+
 
 def parse_zero_answer_policies(
     values: Sequence[str],
@@ -49,12 +91,7 @@ def parse_zero_answer_policies(
         if value.count("=") != 1:
             raise ValueError("zero-answer policies are invalid")
         name, policy = value.split("=", maxsplit=1)
-        if (
-            not name
-            or name not in expected
-            or name in parsed
-            or policy not in ("reject", "allow")
-        ):
+        if not name or name not in expected or name in parsed or policy not in ("reject", "allow"):
             raise ValueError("zero-answer policies are invalid")
         parsed[name] = cast(ZeroAnswerPolicy, policy)
     if set(parsed) != expected:
@@ -92,12 +129,19 @@ class FreezeAuditReport(DomainModel):
 
 
 @dataclass(frozen=True)
+class _EvidenceIdentity:
+    path: Path
+    sha256: str
+
+
+@dataclass(frozen=True)
 class FreezeAuditResult:
     """Pure audit output; it contains no approved report path or final bytes."""
 
     prepared_manifest_bytes: bytes
     frozen_manifest_payload: dict[str, object]
     report: FreezeAuditReport
+    evidence: tuple[_EvidenceIdentity, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -108,6 +152,8 @@ class FreezeApprovalPlan:
     frozen_manifest_bytes: bytes
     report_bytes: bytes
     report: FreezeAuditReport
+    evidence: tuple[_EvidenceIdentity, ...]
+
 
 def _sha256_bytes(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
@@ -125,11 +171,49 @@ def _json_bytes(payload: object) -> bytes:
         + chr(10)
     ).encode("utf-8")
 
+
 def _load_json_bytes(content: bytes) -> object:
     try:
         return json.loads(content.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise ValueError("prepared data is invalid") from None
+
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
+def _read_jsonl_evidence(
+    path: Path,
+    model_type: type[ModelT],
+    *,
+    private: bool = False,
+) -> tuple[list[ModelT], bytes, _EvidenceIdentity]:
+    error_message = "private annotations are invalid" if private else "prepared data is invalid"
+    try:
+        content = path.read_bytes()
+        text = content.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        raise ValueError(error_message) from None
+    records: list[ModelT] = []
+    seen_query_ids: set[str] = set()
+    try:
+        for line in text.splitlines():
+            if not line.strip():
+                raise ValueError
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError
+            record = model_type.model_validate(payload)
+            query_id = getattr(record, "query_id", None)
+            if isinstance(query_id, str):
+                if query_id in seen_query_ids:
+                    raise ValueError
+                seen_query_ids.add(query_id)
+            records.append(record)
+    except (json.JSONDecodeError, ValidationError, ValueError):
+        raise ValueError(error_message) from None
+    identity = _EvidenceIdentity(path=path.resolve(), sha256=_sha256_bytes(content))
+    return records, content, identity
 
 
 def _mapping(value: object) -> dict[str, object]:
@@ -164,7 +248,10 @@ def _confined_path(data_root: Path, relative_path: object) -> tuple[str, Path]:
     return value, resolved
 
 
-def _read_ids(data_root: Path, path_value: object) -> tuple[str, list[str], bytes]:
+def _read_ids(
+    data_root: Path,
+    path_value: object,
+) -> tuple[str, list[str], bytes, _EvidenceIdentity]:
     relative_path, path = _confined_path(data_root, path_value)
     try:
         content = path.read_bytes()
@@ -180,58 +267,94 @@ def _read_ids(data_root: Path, path_value: object) -> tuple[str, list[str], byte
     identifiers = cast(list[str], payload)
     if len(identifiers) != len(set(identifiers)):
         raise ValueError("prepared data is invalid")
-    return relative_path, identifiers, content
+    identity = _EvidenceIdentity(path=path.resolve(), sha256=_sha256_bytes(content))
+    return relative_path, identifiers, content, identity
 
 
-def _validate_source_files(data_root: Path, value: object) -> int:
-    if not isinstance(value, list) or not value:
+def _validate_source_files(
+    data_root: Path,
+    value: object,
+    expected_row_counts: Mapping[str, int],
+) -> tuple[int, list[_EvidenceIdentity]]:
+    if not isinstance(value, list) or len(value) != len(expected_row_counts):
         raise ValueError("prepared data is invalid")
+    seen_paths: set[str] = set()
+    evidence: list[_EvidenceIdentity] = []
+    allowed_fields = {"path", "raw_path", "row_count", "byte_count", "sha256"}
     for raw_item in value:
         item = _mapping(raw_item)
-        _, path = _confined_path(data_root, item.get("raw_path"))
-        expected_rows = _positive_integer(item.get("row_count"))
+        if set(item) != allowed_fields:
+            raise ValueError("prepared data is invalid")
+        source_path = _nonempty_string(item.get("path"))
+        if source_path in seen_paths or source_path not in expected_row_counts:
+            raise ValueError("prepared data is invalid")
+        seen_paths.add(source_path)
+        raw_relative, path = _confined_path(data_root, item.get("raw_path"))
+        expected_rows = expected_row_counts[source_path]
+        if raw_relative != f"raw/{source_path}" or item.get("row_count") != expected_rows:
+            raise ValueError("prepared data is invalid")
         expected_bytes = _positive_integer(item.get("byte_count"))
         expected_hash = _nonempty_string(item.get("sha256"))
         try:
             content = path.read_bytes()
         except OSError:
             raise ValueError("prepared data is invalid") from None
+        content_hash = _sha256_bytes(content)
         row_count = len(content.splitlines())
         if (
             len(content) != expected_bytes
             or row_count != expected_rows
-            or _sha256_bytes(content) != expected_hash
+            or content_hash != expected_hash
         ):
             raise ValueError("prepared data is invalid")
-    return len(value)
+        evidence.append(_EvidenceIdentity(path=path.resolve(), sha256=content_hash))
+    if seen_paths != set(expected_row_counts):
+        raise ValueError("prepared data is invalid")
+    return len(value), evidence
 
 
 def _validate_partitions(
     data_root: Path,
     value: object,
     policies: Mapping[str, ZeroAnswerPolicy],
-) -> tuple[dict[str, PartitionFreezeAudit], dict[str, dict[str, object]], dict[str, list[str]]]:
+    expected_counts: Mapping[str, int],
+) -> tuple[
+    dict[str, PartitionFreezeAudit],
+    dict[str, dict[str, object]],
+    dict[str, list[str]],
+    list[_EvidenceIdentity],
+]:
     partitions = _mapping(value)
-    if not partitions or set(policies) != set(partitions):
+    if set(partitions) != set(expected_counts) or set(policies) != set(partitions):
         raise ValueError("prepared data is invalid")
     audits: dict[str, PartitionFreezeAudit] = {}
     frozen: dict[str, dict[str, object]] = {}
     ids_by_partition: dict[str, list[str]] = {}
+    evidence: list[_EvidenceIdentity] = []
+    allowed_fields = {"count", "gold_path", "gold_sha256", "ids_path", "ids_sha256"}
     for name, raw_partition in partitions.items():
         partition = _mapping(raw_partition)
+        if not set(partition).issubset(allowed_fields) or not {
+            "count",
+            "gold_path",
+            "ids_path",
+            "ids_sha256",
+        }.issubset(partition):
+            raise ValueError("prepared data is invalid")
         count = _positive_integer(partition.get("count"))
+        if count != expected_counts[name]:
+            raise ValueError("prepared data is invalid")
         policy = policies[name]
         if policy not in ("reject", "allow"):
             raise ValueError("prepared data is invalid")
         gold_relative, gold_path = _confined_path(data_root, partition.get("gold_path"))
-        ids_relative, identifiers, ids_content = _read_ids(
+        ids_relative, identifiers, ids_content, ids_identity = _read_ids(
             data_root, partition.get("ids_path")
         )
-        try:
-            gold_content = gold_path.read_bytes()
-            records = read_jsonl(gold_path, EvaluationQuery)
-        except (OSError, ValueError):
-            raise ValueError("prepared data is invalid") from None
+        records, gold_content, gold_identity = _read_jsonl_evidence(
+            gold_path,
+            EvaluationQuery,
+        )
         if not records or len(records) != count or len(identifiers) != count:
             raise ValueError("prepared data is invalid")
         if [record.query_id for record in records] != identifiers:
@@ -257,35 +380,50 @@ def _validate_partitions(
         audits[name] = audit
         frozen[name] = audit.model_dump(mode="json")
         ids_by_partition[name] = identifiers
-    return audits, frozen, ids_by_partition
+        evidence.extend((gold_identity, ids_identity))
+    return audits, frozen, ids_by_partition, evidence
 
 
 def _validate_work_packages(
     data_root: Path,
     value: object,
     partition_ids: Mapping[str, list[str]],
-) -> tuple[list[str], list[str], list[str]]:
+    expected_counts: Mapping[str, int],
+) -> tuple[list[str], list[str], list[str], list[_EvidenceIdentity]]:
     packages = _mapping(value)
-    if set(packages) != {"type_domain", "constraints", "overlap"}:
+    if set(packages) != set(expected_counts):
         raise ValueError("prepared data is invalid")
 
     package_ids: dict[str, list[str]] = {}
+    evidence: list[_EvidenceIdentity] = []
     for name, raw_package in packages.items():
         package = _mapping(raw_package)
+        expected_fields = (
+            {"count", "ids_path", "ids_sha256"}
+            if name == "overlap"
+            else {"count", "source_path", "source_sha256", "ids_path", "ids_sha256"}
+        )
+        if set(package) != expected_fields:
+            raise ValueError("prepared data is invalid")
         count = _positive_integer(package.get("count"))
-        _, identifiers, ids_content = _read_ids(data_root, package.get("ids_path"))
+        if count != expected_counts[name]:
+            raise ValueError("prepared data is invalid")
+        _, identifiers, ids_content, ids_identity = _read_ids(data_root, package.get("ids_path"))
         if len(identifiers) != count or package.get("ids_sha256") != _sha256_bytes(ids_content):
             raise ValueError("prepared data is invalid")
+        evidence.append(ids_identity)
         if name != "overlap":
             _, source_path = _confined_path(data_root, package.get("source_path"))
             try:
                 source_content = source_path.read_bytes()
             except OSError:
                 raise ValueError("prepared data is invalid") from None
-            if package.get("source_sha256") != _sha256_bytes(source_content):
+            source_hash = _sha256_bytes(source_content)
+            if package.get("source_sha256") != source_hash:
                 raise ValueError("prepared data is invalid")
             if len(source_content.splitlines()) != count:
                 raise ValueError("prepared data is invalid")
+            evidence.append(_EvidenceIdentity(path=source_path.resolve(), sha256=source_hash))
         package_ids[name] = identifiers
 
     required_partitions = {"dev", "validation"}
@@ -300,7 +438,7 @@ def _validate_work_packages(
         raise ValueError("prepared data is invalid")
     if set(type_domain) != set(partition_ids["dev"]) | set(partition_ids["validation"]):
         raise ValueError("prepared data is invalid")
-    return type_domain, constraints, overlap
+    return type_domain, constraints, overlap, evidence
 
 
 def _private_records(
@@ -315,13 +453,26 @@ def _private_records(
     list[AnnotationRecord],
     list[AnnotationRecord],
     AgreementReport,
+    bytes,
+    bytes,
+    bytes,
+    list[_EvidenceIdentity],
 ]:
-    try:
-        type_domain = read_jsonl(type_domain_labels_path, TypeDomainAnnotationRecord)
-        constraints = read_jsonl(constraint_labels_path, AnnotationRecord)
-        overlap = read_jsonl(overlap_labels_path, AnnotationRecord)
-    except (OSError, ValueError):
-        raise ValueError("private annotations are invalid") from None
+    type_domain, type_domain_bytes, type_domain_identity = _read_jsonl_evidence(
+        type_domain_labels_path,
+        TypeDomainAnnotationRecord,
+        private=True,
+    )
+    constraints, constraint_bytes, constraint_identity = _read_jsonl_evidence(
+        constraint_labels_path,
+        AnnotationRecord,
+        private=True,
+    )
+    overlap, overlap_bytes, overlap_identity = _read_jsonl_evidence(
+        overlap_labels_path,
+        AnnotationRecord,
+        private=True,
+    )
     if (
         {record.query_id for record in type_domain} != set(type_domain_ids)
         or len(type_domain) != len(type_domain_ids)
@@ -333,14 +484,31 @@ def _private_records(
         raise ValueError("private annotations are invalid")
     overlap_set = set(overlap_ids)
     first_rater = [record for record in constraints if record.query_id in overlap_set]
+    first_by_id = {record.query_id: record for record in first_rater}
+    if any(first_by_id[record.query_id].annotator == record.annotator for record in overlap):
+        raise ValueError("private annotations are invalid")
     agreement = compare_annotations(
         first_rater,
         overlap,
         fields=("query_type", "domain"),
     )
-    if any(not field.accepted for field in agreement.fields.values()):
+    if any(
+        field.threshold != AGREEMENT_THRESHOLD
+        or field.kappa < AGREEMENT_THRESHOLD
+        or not field.accepted
+        for field in agreement.fields.values()
+    ):
         raise ValueError("human annotation agreement is below threshold")
-    return type_domain, constraints, overlap, agreement
+    return (
+        type_domain,
+        constraints,
+        overlap,
+        agreement,
+        type_domain_bytes,
+        constraint_bytes,
+        overlap_bytes,
+        [type_domain_identity, constraint_identity, overlap_identity],
+    )
 
 
 def audit_freeze_candidate(
@@ -361,25 +529,64 @@ def audit_freeze_candidate(
     expected_identity: dict[str, object] = {
         "repo_id": PASA_REPO_ID,
         "revision": PASA_REVISION,
+        "license": "CC-BY-NC-SA-4.0",
+        "access": "gated-hugging-face-dataset",
         "random_seed": RANDOM_SEED,
         "sampling_algorithm": SAMPLING_ALGORITHM,
         "status": PREPARED_STATUS,
+        "work_package_sampling": "answer-count-largest-remainder-v1-seeded-offsets",
     }
-    if any(manifest.get(key) != expected for key, expected in expected_identity.items()):
+    expected_fields = {
+        *expected_identity,
+        "source_files",
+        "partitions",
+        "work_packages",
+    }
+    if set(manifest) != expected_fields or any(
+        manifest.get(key) != expected for key, expected in expected_identity.items()
+    ):
         raise ValueError("prepared data is invalid")
 
-    source_file_count = _validate_source_files(data_root, manifest.get("source_files"))
-    partition_audits, frozen_partitions, partition_ids = _validate_partitions(
+    source_counts = _expectation_map(OFFICIAL_EXPECTATIONS.source_row_counts)
+    partition_counts = _expectation_map(OFFICIAL_EXPECTATIONS.partition_counts)
+    work_package_counts = _expectation_map(OFFICIAL_EXPECTATIONS.work_package_counts)
+    source_file_count, source_evidence = _validate_source_files(
+        data_root,
+        manifest.get("source_files"),
+        source_counts,
+    )
+    (
+        partition_audits,
+        frozen_partitions,
+        partition_ids,
+        partition_evidence,
+    ) = _validate_partitions(
         data_root,
         manifest.get("partitions"),
         policies,
+        partition_counts,
     )
-    type_domain_ids, constraint_ids, overlap_ids = _validate_work_packages(
+    (
+        type_domain_ids,
+        constraint_ids,
+        overlap_ids,
+        package_evidence,
+    ) = _validate_work_packages(
         data_root,
         manifest.get("work_packages"),
         partition_ids,
+        work_package_counts,
     )
-    type_domain, constraints, overlap, agreement = _private_records(
+    (
+        type_domain,
+        constraints,
+        overlap,
+        agreement,
+        type_domain_bytes,
+        constraint_bytes,
+        overlap_bytes,
+        private_evidence,
+    ) = _private_records(
         type_domain_labels_path,
         constraint_labels_path,
         overlap_labels_path,
@@ -387,12 +594,6 @@ def audit_freeze_candidate(
         constraint_ids,
         overlap_ids,
     )
-    try:
-        type_domain_bytes = type_domain_labels_path.read_bytes()
-        constraint_bytes = constraint_labels_path.read_bytes()
-        overlap_bytes = overlap_labels_path.read_bytes()
-    except OSError:
-        raise ValueError("private annotations are invalid") from None
 
     prepared_manifest_hash = _sha256_bytes(manifest_bytes)
     report = FreezeAuditReport(
@@ -409,14 +610,32 @@ def audit_freeze_candidate(
         partitions=partition_audits,
         approval_requested=False,
     )
-    frozen_manifest = manifest.copy()
-    frozen_manifest["status"] = "frozen"
-    frozen_manifest["prepared_manifest_sha256"] = prepared_manifest_hash
-    frozen_manifest["partitions"] = frozen_partitions
+    frozen_manifest: dict[str, object] = {
+        "repo_id": PASA_REPO_ID,
+        "revision": PASA_REVISION,
+        "license": "CC-BY-NC-SA-4.0",
+        "access": "gated-hugging-face-dataset",
+        "random_seed": RANDOM_SEED,
+        "sampling_algorithm": SAMPLING_ALGORITHM,
+        "status": "frozen",
+        "source_files": manifest["source_files"],
+        "partitions": frozen_partitions,
+        "work_package_sampling": ("answer-count-largest-remainder-v1-seeded-offsets"),
+        "work_packages": manifest["work_packages"],
+        "prepared_manifest_sha256": prepared_manifest_hash,
+    }
     return FreezeAuditResult(
         prepared_manifest_bytes=manifest_bytes,
         frozen_manifest_payload=frozen_manifest,
         report=report,
+        evidence=tuple(
+            [
+                *source_evidence,
+                *partition_evidence,
+                *package_evidence,
+                *private_evidence,
+            ]
+        ),
     )
 
 
@@ -441,9 +660,7 @@ def build_approval_plan(
     relative_path = _normalized_report_relative_path(report_relative_path)
     report = audit.report.model_copy(update={"approval_requested": True})
     report_bytes = _json_bytes(report.model_dump(mode="json"))
-    frozen_manifest = _mapping(
-        _load_json_bytes(_json_bytes(audit.frozen_manifest_payload))
-    )
+    frozen_manifest = _mapping(_load_json_bytes(_json_bytes(audit.frozen_manifest_payload)))
     frozen_manifest["freeze_report_path"] = relative_path
     frozen_manifest["freeze_report_sha256"] = _sha256_bytes(report_bytes)
     return FreezeApprovalPlan(
@@ -451,6 +668,7 @@ def build_approval_plan(
         frozen_manifest_bytes=_json_bytes(frozen_manifest),
         report_bytes=report_bytes,
         report=report,
+        evidence=audit.evidence,
     )
 
 
@@ -480,12 +698,193 @@ def _validated_plan_report_path(
     return report_path
 
 
+def _evidence_matches(evidence: Sequence[_EvidenceIdentity]) -> bool:
+    for identity in evidence:
+        try:
+            content = identity.path.read_bytes()
+        except OSError:
+            return False
+        if _sha256_bytes(content) != identity.sha256:
+            return False
+    return True
+
+
+def _sha256_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return f"sha256:{digest.hexdigest()}"
+
+
+def _normalized_windows_path(value: str) -> str:
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return os.path.normcase(os.path.abspath(value))
+
+
+@contextmanager
+def _stable_evidence_files(
+    evidence: Sequence[_EvidenceIdentity],
+) -> Iterator[None]:
+    descriptors: list[int] = []
+    try:
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+
+            class FileAttributeTagInfo(ctypes.Structure):
+                _fields_ = [
+                    ("file_attributes", ctypes.c_uint32),
+                    ("reparse_tag", ctypes.c_uint32),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.restype = ctypes.c_void_p
+            get_handle_info = kernel32.GetFileInformationByHandleEx
+            get_final_path = kernel32.GetFinalPathNameByHandleW
+            invalid_handle = ctypes.c_void_p(-1).value
+
+            for identity in evidence:
+                handle = create_file(
+                    str(identity.path),
+                    0x80000000,
+                    0x00000001,
+                    None,
+                    3,
+                    0x00200000,
+                    None,
+                )
+                if handle == invalid_handle:
+                    raise RuntimeError("freeze approval failed")
+                info = FileAttributeTagInfo()
+                if not get_handle_info(
+                    ctypes.c_void_p(handle),
+                    9,
+                    ctypes.byref(info),
+                    ctypes.sizeof(info),
+                ):
+                    kernel32.CloseHandle(ctypes.c_void_p(handle))
+                    raise RuntimeError("freeze approval failed")
+                if info.file_attributes & 0x00000400:
+                    kernel32.CloseHandle(ctypes.c_void_p(handle))
+                    raise RuntimeError("freeze approval failed")
+                path_buffer = ctypes.create_unicode_buffer(32768)
+                path_length = int(
+                    get_final_path(
+                        ctypes.c_void_p(handle),
+                        path_buffer,
+                        len(path_buffer),
+                        0,
+                    )
+                )
+                if (
+                    path_length == 0
+                    or path_length >= len(path_buffer)
+                    or _normalized_windows_path(path_buffer.value)
+                    != _normalized_windows_path(str(identity.path))
+                ):
+                    kernel32.CloseHandle(ctypes.c_void_p(handle))
+                    raise RuntimeError("freeze approval failed")
+                try:
+                    descriptor = msvcrt.open_osfhandle(
+                        int(handle),
+                        os.O_RDONLY | getattr(os, "O_BINARY", 0),
+                    )
+                except OSError:
+                    kernel32.CloseHandle(ctypes.c_void_p(handle))
+                    raise RuntimeError("freeze approval failed") from None
+                descriptors.append(descriptor)
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            for identity in evidence:
+                descriptor = os.open(identity.path, flags)
+                descriptors.append(descriptor)
+                proc_path = Path(f"/proc/self/fd/{descriptor}")
+                if proc_path.exists() and proc_path.resolve() != identity.path:
+                    raise RuntimeError("freeze approval failed")
+
+        if any(
+            _sha256_descriptor(descriptor) != identity.sha256
+            for descriptor, identity in zip(descriptors, evidence, strict=True)
+        ):
+            raise RuntimeError("freeze approval failed")
+        yield
+        if any(
+            _sha256_descriptor(descriptor) != identity.sha256
+            for descriptor, identity in zip(descriptors, evidence, strict=True)
+        ):
+            raise RuntimeError("freeze approval failed")
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _restore_manifest_without_overwrite(
+    backup_path: Path,
+    manifest_path: Path,
+) -> bool:
+    if manifest_path.exists():
+        return True
+    if not backup_path.exists():
+        return False
+    try:
+        os.link(backup_path, manifest_path)
+        return manifest_path.samefile(backup_path)
+    except OSError:
+        return manifest_path.exists()
+
+
+def _remove_own_published_manifest(
+    manifest_path: Path,
+    temporary_path: Path,
+) -> None:
+    try:
+        if manifest_path.samefile(temporary_path):
+            manifest_path.unlink()
+    except OSError:
+        return
+
+
+def _best_effort_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return
+
+
+def _cleanup_matching_prepared_backups(
+    data_root: Path,
+    prepared_manifest_sha256: str,
+) -> None:
+    for candidate in data_root.glob(".manifest.json.prepared.*.tmp"):
+        try:
+            if (
+                candidate.is_symlink()
+                or not candidate.is_file()
+                or candidate.stat().st_size > 1024 * 1024
+                or _sha256_bytes(candidate.read_bytes()) != prepared_manifest_sha256
+            ):
+                continue
+        except OSError:
+            continue
+        _best_effort_unlink(candidate)
+
+
 def _replace_manifest_guarded(
     manifest_path: Path,
     prepared_bytes: bytes,
     frozen_bytes: bytes,
     *,
     before_manifest_replace: Callable[[], object] | None = None,
+    evidence: Sequence[_EvidenceIdentity] = (),
 ) -> None:
     try:
         if manifest_path.read_bytes() != prepared_bytes:
@@ -499,6 +898,17 @@ def _replace_manifest_guarded(
         suffix=".tmp",
     )
     temporary_path = Path(temporary_name)
+    backup_descriptor, backup_name = tempfile.mkstemp(
+        dir=manifest_path.parent,
+        prefix=f".{manifest_path.name}.prepared.",
+        suffix=".tmp",
+    )
+    os.close(backup_descriptor)
+    backup_path = Path(backup_name)
+    manifest_taken = False
+    published = False
+    committed = False
+    preserve_backup = False
     try:
         with os.fdopen(descriptor, "wb") as temporary:
             temporary.write(frozen_bytes)
@@ -506,26 +916,170 @@ def _replace_manifest_guarded(
             os.fsync(temporary.fileno())
         if before_manifest_replace is not None:
             before_manifest_replace()
-        try:
-            if manifest_path.read_bytes() != prepared_bytes:
-                raise RuntimeError("freeze approval failed")
-        except OSError:
-            raise RuntimeError("freeze approval failed") from None
-        os.replace(temporary_path, manifest_path)
+        with _stable_evidence_files(evidence):
+            try:
+                os.replace(manifest_path, backup_path)
+                manifest_taken = True
+                if backup_path.read_bytes() != prepared_bytes:
+                    raise RuntimeError("freeze approval failed")
+                os.link(temporary_path, manifest_path)
+                published = True
+            except OSError:
+                raise RuntimeError("freeze approval failed") from None
+        if not manifest_path.samefile(temporary_path) or manifest_path.read_bytes() != frozen_bytes:
+            raise RuntimeError("freeze approval failed")
+        committed = True
+        _best_effort_unlink(temporary_path)
         temporary_path = Path()
+        _best_effort_unlink(backup_path)
+        backup_path = Path()
+    except BaseException:
+        if not committed and manifest_taken:
+            if published:
+                _remove_own_published_manifest(manifest_path, temporary_path)
+            preserve_backup = not _restore_manifest_without_overwrite(
+                backup_path,
+                manifest_path,
+            )
+        raise
     finally:
-        if temporary_path != Path():
-            temporary_path.unlink(missing_ok=True)
+        if not committed:
+            if temporary_path != Path():
+                _best_effort_unlink(temporary_path)
+            if backup_path != Path() and not preserve_backup:
+                _best_effort_unlink(backup_path)
 
 
-def approve_freeze(
+@contextmanager
+def _exclusive_freeze_lock(data_root: Path) -> Iterator[None]:
+    lock_path = data_root / ".task2-freeze.lock"
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.restype = ctypes.c_void_p
+        handle = create_file(
+            str(lock_path.resolve()),
+            0x40000000 | 0x00010000,
+            0,
+            None,
+            1,
+            0x04000000,
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise RuntimeError("freeze approval failed")
+        try:
+            yield
+        finally:
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+        return
+
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except OSError:
+        raise RuntimeError("freeze approval failed") from None
+    try:
+        yield
+    finally:
+        try:
+            descriptor_stat = os.fstat(descriptor)
+            path_stat = lock_path.stat()
+            same_file = (
+                descriptor_stat.st_dev == path_stat.st_dev
+                and descriptor_stat.st_ino == path_stat.st_ino
+            )
+        except OSError:
+            same_file = False
+        os.close(descriptor)
+        if same_file:
+            lock_path.unlink(missing_ok=True)
+
+
+@contextmanager
+def _stable_report_parent(data_root: Path, report_path: Path) -> Iterator[None]:
+    root = data_root.resolve()
+    parent = report_path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        parent_relative = parent.resolve().relative_to(root)
+    except (OSError, ValueError):
+        raise RuntimeError("freeze approval failed") from None
+
+    directories = [root]
+    current = root
+    for part in parent_relative.parts:
+        current = current / part
+        directories.append(current)
+
+    handles: list[int] = []
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            create_file = kernel32.CreateFileW
+            create_file.restype = ctypes.c_void_p
+            invalid_handle = ctypes.c_void_p(-1).value
+            get_attributes = kernel32.GetFileAttributesW
+            get_attributes.restype = ctypes.c_uint32
+
+            for directory in directories:
+                absolute = str(directory)
+                attributes = int(get_attributes(absolute))
+                if attributes == 0xFFFFFFFF or attributes & 0x00000400:
+                    raise RuntimeError("freeze approval failed")
+                handle = create_file(
+                    absolute,
+                    0x80000000 | 0x00010000,
+                    0x00000001 | 0x00000002,
+                    None,
+                    3,
+                    0x02000000 | 0x00200000,
+                    None,
+                )
+                if handle == invalid_handle:
+                    raise RuntimeError("freeze approval failed")
+                handles.append(int(handle))
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            for directory in directories:
+                handles.append(os.open(directory, flags))
+
+        if (
+            _confined_report_relative_path(data_root, report_path)
+            != report_path.resolve().relative_to(root).as_posix()
+        ):
+            raise RuntimeError("freeze approval failed")
+        yield
+    finally:
+        if os.name == "nt":
+            if handles:
+                import ctypes
+
+                close_handle = ctypes.WinDLL(
+                    "kernel32",
+                    use_last_error=True,
+                ).CloseHandle
+                for handle in reversed(handles):
+                    close_handle(ctypes.c_void_p(handle))
+        else:
+            for handle in reversed(handles):
+                os.close(handle)
+
+
+def _approve_freeze_locked(
     *,
     data_root: Path,
     plan: FreezeApprovalPlan,
-    before_manifest_replace: Callable[[], object] | None = None,
+    before_manifest_replace: Callable[[], object] | None,
 ) -> Literal["created", "matched"]:
-    """Write the complete report, then atomically transition the manifest."""
     report_path = _validated_plan_report_path(data_root, plan)
+    if not _evidence_matches(plan.evidence):
+        raise RuntimeError("freeze approval failed")
     manifest_path = data_root / "manifest.json"
     try:
         current_manifest = manifest_path.read_bytes()
@@ -534,6 +1088,10 @@ def approve_freeze(
 
     if current_manifest == plan.frozen_manifest_bytes:
         if report_path.is_file() and report_path.read_bytes() == plan.report_bytes:
+            _cleanup_matching_prepared_backups(
+                data_root,
+                plan.report.prepared_manifest_sha256,
+            )
             return "matched"
         raise RuntimeError("freeze approval failed")
     if current_manifest != plan.prepared_manifest_bytes:
@@ -541,14 +1099,58 @@ def approve_freeze(
     if report_path.exists() and report_path.read_bytes() != plan.report_bytes:
         raise FileExistsError("freeze approval failed")
 
-    write_frozen_bytes(report_path, plan.report_bytes)
+    missing_parents: list[Path] = []
+    candidate = report_path.parent
+    while not candidate.exists():
+        missing_parents.append(candidate)
+        candidate = candidate.parent
+    try:
+        with _stable_report_parent(data_root, report_path):
+            try:
+                _confined_report_relative_path(data_root, report_path)
+            except ValueError:
+                raise RuntimeError("freeze approval failed") from None
+            write_frozen_bytes(report_path, plan.report_bytes)
+            try:
+                if (
+                    _validated_plan_report_path(data_root, plan).resolve() != report_path.resolve()
+                    or not report_path.is_file()
+                    or report_path.read_bytes() != plan.report_bytes
+                ):
+                    raise RuntimeError("freeze approval failed")
+            except (OSError, ValueError):
+                raise RuntimeError("freeze approval failed") from None
+    except BaseException:
+        for created_parent in missing_parents:
+            try:
+                created_parent.rmdir()
+            except OSError:
+                break
+        raise
     _replace_manifest_guarded(
         manifest_path,
         plan.prepared_manifest_bytes,
         plan.frozen_manifest_bytes,
         before_manifest_replace=before_manifest_replace,
+        evidence=plan.evidence,
     )
     return "created"
+
+
+def approve_freeze(
+    *,
+    data_root: Path,
+    plan: FreezeApprovalPlan,
+    before_manifest_replace: Callable[[], object] | None = None,
+) -> Literal["created", "matched"]:
+    """Approve under an exclusive lock after revalidating all bound evidence."""
+    with _exclusive_freeze_lock(data_root):
+        return _approve_freeze_locked(
+            data_root=data_root,
+            plan=plan,
+            before_manifest_replace=before_manifest_replace,
+        )
+
 
 def _prepared_partition_names(data_root: Path) -> set[str]:
     try:
@@ -576,8 +1178,163 @@ def _confined_report_relative_path(data_root: Path, report_path: Path) -> str:
     return data_relative.as_posix()
 
 
+def _match_existing_approval(
+    *,
+    data_root: Path,
+    report_relative_path: str,
+    type_domain_labels_path: Path,
+    constraint_labels_path: Path,
+    overlap_labels_path: Path,
+    policies: Mapping[str, ZeroAnswerPolicy],
+) -> FreezeAuditReport | None:
+    manifest_path = data_root / "manifest.json"
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+    except OSError:
+        raise ValueError("prepared data is invalid") from None
+    manifest = _mapping(_load_json_bytes(manifest_bytes))
+    if manifest.get("status") != "frozen":
+        return None
+    expected_identity: dict[str, object] = {
+        "repo_id": PASA_REPO_ID,
+        "revision": PASA_REVISION,
+        "license": "CC-BY-NC-SA-4.0",
+        "access": "gated-hugging-face-dataset",
+        "random_seed": RANDOM_SEED,
+        "sampling_algorithm": SAMPLING_ALGORITHM,
+        "status": "frozen",
+        "work_package_sampling": "answer-count-largest-remainder-v1-seeded-offsets",
+    }
+    expected_fields = {
+        *expected_identity,
+        "source_files",
+        "partitions",
+        "work_packages",
+        "prepared_manifest_sha256",
+        "freeze_report_path",
+        "freeze_report_sha256",
+    }
+    if (
+        set(manifest) != expected_fields
+        or any(manifest.get(key) != expected for key, expected in expected_identity.items())
+        or manifest.get("freeze_report_path") != report_relative_path
+        or _json_bytes(manifest) != manifest_bytes
+    ):
+        raise ValueError("prepared data is invalid")
+
+    report_path = data_root / report_relative_path
+    try:
+        report_bytes = report_path.read_bytes()
+        report = FreezeAuditReport.model_validate(_load_json_bytes(report_bytes))
+    except (OSError, ValidationError):
+        raise ValueError("prepared data is invalid") from None
+    if (
+        _json_bytes(report.model_dump(mode="json")) != report_bytes
+        or manifest.get("freeze_report_sha256") != _sha256_bytes(report_bytes)
+        or report.approval_requested is not True
+        or manifest.get("prepared_manifest_sha256") != report.prepared_manifest_sha256
+    ):
+        raise ValueError("prepared data is invalid")
+
+    source_counts = _expectation_map(OFFICIAL_EXPECTATIONS.source_row_counts)
+    partition_counts = _expectation_map(OFFICIAL_EXPECTATIONS.partition_counts)
+    work_package_counts = _expectation_map(OFFICIAL_EXPECTATIONS.work_package_counts)
+    source_file_count, _ = _validate_source_files(
+        data_root,
+        manifest.get("source_files"),
+        source_counts,
+    )
+    frozen_partition_payload = _mapping(manifest.get("partitions"))
+    prepared_partitions: dict[str, dict[str, object]] = {}
+    expected_frozen_fields = {
+        "count",
+        "gold_path",
+        "gold_sha256",
+        "ids_path",
+        "ids_sha256",
+        "zero_answer_policy",
+        "labels_complete",
+    }
+    for name, raw_partition in frozen_partition_payload.items():
+        partition = _mapping(raw_partition)
+        if (
+            set(partition) != expected_frozen_fields
+            or partition.get("zero_answer_policy") != policies.get(name)
+            or partition.get("labels_complete") is not True
+        ):
+            raise ValueError("prepared data is invalid")
+        prepared_partitions[name] = {
+            key: partition[key]
+            for key in (
+                "count",
+                "gold_path",
+                "gold_sha256",
+                "ids_path",
+                "ids_sha256",
+            )
+        }
+    partition_audits, frozen_partitions, partition_ids, _ = _validate_partitions(
+        data_root,
+        prepared_partitions,
+        policies,
+        partition_counts,
+    )
+    if frozen_partitions != frozen_partition_payload:
+        raise ValueError("prepared data is invalid")
+    type_domain_ids, constraint_ids, overlap_ids, _ = _validate_work_packages(
+        data_root,
+        manifest.get("work_packages"),
+        partition_ids,
+        work_package_counts,
+    )
+    (
+        type_domain,
+        constraints,
+        overlap,
+        agreement,
+        type_domain_bytes,
+        constraint_bytes,
+        overlap_bytes,
+        _,
+    ) = _private_records(
+        type_domain_labels_path,
+        constraint_labels_path,
+        overlap_labels_path,
+        type_domain_ids,
+        constraint_ids,
+        overlap_ids,
+    )
+    expected_report = FreezeAuditReport(
+        prepared_manifest_sha256=_nonempty_string(manifest.get("prepared_manifest_sha256")),
+        dataset_revision=PASA_REVISION,
+        source_file_count=source_file_count,
+        type_domain_count=len(type_domain),
+        type_domain_sha256=_sha256_bytes(type_domain_bytes),
+        constraint_count=len(constraints),
+        constraint_sha256=_sha256_bytes(constraint_bytes),
+        overlap_count=len(overlap),
+        overlap_sha256=_sha256_bytes(overlap_bytes),
+        agreement=agreement,
+        partitions=partition_audits,
+        approval_requested=True,
+    )
+    if report != expected_report:
+        raise ValueError("prepared data is invalid")
+    _cleanup_matching_prepared_backups(
+        data_root,
+        report.prepared_manifest_sha256,
+    )
+    return report
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        del message
+        raise ValueError("freeze approval failed")
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Audit and approve Task 2 data freeze")
+    parser = _SafeArgumentParser(description="Audit and approve Task 2 data freeze")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--type-domain-labels", type=Path, required=True)
     parser.add_argument("--constraint-labels", type=Path, required=True)
@@ -604,13 +1361,21 @@ def _audit_error_message(error: ValueError) -> str:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the secret-safe Task 2 freeze audit CLI."""
-    args = _build_parser().parse_args(argv)
+    try:
+        args = _build_parser().parse_args(argv)
+    except ValueError:
+        print("freeze approval failed", file=sys.stderr)
+        return 2
     if args.approve != (args.report is not None):
         print("freeze approval failed", file=sys.stderr)
         return 2
+    report_relative_path: str | None = None
     if args.report is not None:
         try:
-            _confined_report_relative_path(args.data_root, args.report)
+            report_relative_path = _confined_report_relative_path(
+                args.data_root,
+                args.report,
+            )
         except ValueError:
             print("freeze approval failed", file=sys.stderr)
             return 2
@@ -620,35 +1385,46 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.zero_answer_policies,
             partition_names,
         )
-        result = audit_freeze_candidate(
-            data_root=args.data_root,
-            type_domain_labels_path=args.type_domain_labels,
-            constraint_labels_path=args.constraint_labels,
-            overlap_labels_path=args.overlap_labels,
-            policies=policies,
-        )
+        existing_report = None
+        if args.approve and report_relative_path is not None:
+            existing_report = _match_existing_approval(
+                data_root=args.data_root,
+                report_relative_path=report_relative_path,
+                type_domain_labels_path=args.type_domain_labels,
+                constraint_labels_path=args.constraint_labels,
+                overlap_labels_path=args.overlap_labels,
+                policies=policies,
+            )
+        if existing_report is None:
+            result = audit_freeze_candidate(
+                data_root=args.data_root,
+                type_domain_labels_path=args.type_domain_labels,
+                constraint_labels_path=args.constraint_labels,
+                overlap_labels_path=args.overlap_labels,
+                policies=policies,
+            )
     except ValueError as error:
         print(_audit_error_message(error), file=sys.stderr)
         return 2
-    output_report = result.report
-    if args.approve:
-        if args.report is None:
-            print("freeze approval failed", file=sys.stderr)
-            return 2
-        try:
-            report_relative_path = _confined_report_relative_path(
-                args.data_root,
-                args.report,
-            )
-            plan = build_approval_plan(
-                result,
-                report_relative_path=report_relative_path,
-            )
-            approve_freeze(data_root=args.data_root, plan=plan)
-        except (OSError, RuntimeError, ValueError):
-            print("freeze approval failed", file=sys.stderr)
-            return 2
-        output_report = plan.report
+
+    if existing_report is not None:
+        output_report = existing_report
+    else:
+        output_report = result.report
+        if args.approve:
+            if report_relative_path is None:
+                print("freeze approval failed", file=sys.stderr)
+                return 2
+            try:
+                plan = build_approval_plan(
+                    result,
+                    report_relative_path=report_relative_path,
+                )
+                approve_freeze(data_root=args.data_root, plan=plan)
+            except (OSError, RuntimeError, ValueError):
+                print("freeze approval failed", file=sys.stderr)
+                return 2
+            output_report = plan.report
     print(
         json.dumps(
             output_report.model_dump(mode="json"),

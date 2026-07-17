@@ -42,13 +42,15 @@
 ```text
 prepared manifest + gold/ID + private annotation files + explicit policies
   -> audit_freeze_candidate()
-  -> FreezeAuditReport + FrozenManifestPlan
-  -> approve_freeze(expected_prepared_sha256, approve=True)
+  -> FreezeAuditResult
+  -> build_approval_plan(audit, confined_report_path)
+  -> FreezeApprovalPlan
+  -> approve_freeze(plan, approve=True)
   -> atomic manifest transition + safe freeze report
   -> existing Week 1 runner
 ```
 
-审核逻辑不读取环境变量、不访问网络、不直接写文件。CLI 负责读取明确传入的路径、调用纯函数、显示安全错误，并在 `--approve` 时调用受控写入函数。
+审核逻辑不读取环境变量、不访问网络、不直接写文件。audit-only 结果不包含最终 report 路径或 frozen manifest 字节。CLI 负责读取明确传入的路径、调用纯函数、显示安全错误，并仅在 `--approve` 时使用受限 report 路径构造最终批准计划和调用受控写入函数。
 
 ## 5. 数据模型
 

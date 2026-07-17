@@ -61,6 +61,43 @@ Do not change the manifest status to `frozen` until human labeling and the data 
 - `zero_answer_policy` set explicitly to `reject` or `allow`.
 
 The manifest must retain a nonempty dataset `revision`. Gold JSONL must be nonempty, contain exactly `count` records, and list query IDs in exactly the same order as the unique nonempty strings in the JSON ID list. Under `reject`, every gold record needs at least one relevant paper ID. Under `allow`, zero-answer records are permitted and the policy becomes part of formal run identity.
+## 冻结审核与批准
+
+不要手工把 `status` 改为 `frozen`。团队通过私密渠道准备三份真人标注文件：协作者交付类型/领域与约束标注，主负责人交付独立 overlap 标注。文件路径、正文和标注人答案不得写入 Git、普通聊天或审核报告。主负责人先运行只读审核，并为每个 manifest 分区显式选择 `reject` 或 `allow`；工具会拒绝遗漏、重复、未知分区和非法策略，不存在全局默认值：
+
+```powershell
+uv run --no-sync --no-env-file python -m paper_search.evaluation.freeze `
+  --data-root data `
+  --type-domain-labels <private-type-domain-labels.jsonl> `
+  --constraint-labels <private-constraint-labels.jsonl> `
+  --overlap-labels <private-overlap-labels.jsonl> `
+  --zero-answer-policy dev=reject `
+  --zero-answer-policy validation=reject `
+  --zero-answer-policy simulated_test=allow
+```
+
+以上命令只向 stdout 输出安全 JSON 摘要，不写 report 或 manifest。摘要只包含数量、精确字节 SHA-256、分区身份和聚合 kappa；不包含查询、paper ID、标注正文、标注人答案或私密路径。
+
+审核通过且策略经主负责人确认后，主负责人使用完全相同的输入增加显式批准参数：
+
+```powershell
+uv run --no-sync --no-env-file python -m paper_search.evaluation.freeze `
+  --data-root data `
+  --type-domain-labels <private-type-domain-labels.jsonl> `
+  --constraint-labels <private-constraint-labels.jsonl> `
+  --overlap-labels <private-overlap-labels.jsonl> `
+  --zero-answer-policy dev=reject `
+  --zero-answer-policy validation=reject `
+  --zero-answer-policy simulated_test=allow `
+  --approve `
+  --report data/freeze_reports/data-freeze-232428b0-v1.json
+```
+
+`--report` 必须位于 `data/freeze_reports/` 下。程序先完整写入安全 report，再通过受保护的同目录原子替换把 manifest 从审核时的精确 prepared 字节转换为 frozen 字节。若 manifest 在审核后变化，批准失败。若 report 已完整写入但 manifest 替换失败，该 report 是可复用的孤立证据，不代表已经冻结；当前 `data/manifest.json` 的 `status: frozen`、report 路径及 report SHA-256 才是唯一权威状态。
+
+孤立 report 重试时使用完全相同的私密文件、逐分区策略、`--report` 路径和完整批准命令；程序只复用字节完全一致的 report，任何差异都会拒绝。三份私密文件应保存在仓库外的访问受控目录，文件名不要包含查询或人员身份；仅在本地受控终端运行，按团队保留策略清理，不复制到 CI、普通日志或共享命令记录。
+
+冻结命令不自动暂存或提交文件。真实 gold、原始数据和三份人工标签始终不得进入 Git；`data/manifest.json`、安全 report 和 ID 清单是否进入后续证据提交，必须由主负责人另行执行范围与隐私审查。
 
 ## Git 边界
 
@@ -79,7 +116,7 @@ The manifest must retain a nonempty dataset `revision`. Gold JSONL must be nonem
 
 ## 协作者开始流程
 
-1. 切换到 `codex/task2-evaluation`，执行 `uv sync --all-groups`；
+1. 切换到 `codex/week1-collaboration`，执行 `uv sync --all-groups`；
 2. 运行全量 pytest、Ruff 和 mypy，报告环境结果但不附密钥；
 3. 使用自己的账号运行数据准备命令；
 4. 核对 manifest 中的 revision、三个源文件哈希、分区数量和工作包数量；

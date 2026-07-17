@@ -202,42 +202,79 @@ annotator
 - [ ] 额外 10 条复核全部闭环；
 - [ ] 最终标注通过私密渠道交接并核对 SHA-256。
 
-## 8. 工作包 5：gold、ID 清单与 manifest 正式冻结
+## 8. 工作包 5：只读冻结审核与主负责人显式批准
 
 ### 开始条件
 
-工作包 1–4 完成；gold labels 已由真人确认完整；主负责人已决定各分区 `zero_answer_policy` 为 `reject` 或 `allow`。
+工作包 1–4 完成；gold labels 已由真人确认完整；三份私密标注文件已通过安全渠道交接；主负责人已独立决定每个分区的 `zero_answer_policy` 为 `reject` 或 `allow`。
 
-### manifest 必核字段
+三份输入必须分别满足：
 
-```text
-status
-revision
-count
-gold_path
-gold_sha256
-ids_path
-ids_sha256
-labels_complete
-zero_answer_policy
+- `--type-domain-labels`：恰好覆盖开发集与验证集共 90 条，只含 `query_id`、`query_type`、`domain`、`annotator`；
+- `--constraint-labels`：恰好覆盖冻结的 40 条约束 ID，符合工作包 3 列出的完整 `AnnotationRecord` 字段和 Schema；
+- `--overlap-labels`：由主负责人独立完成，符合相同 `AnnotationRecord` Schema，恰好覆盖 `overlap_annotation.ids.json` 的固定 20 条；工具从协作者的 40 条约束标注中抽取相同 20 条逐 ID 对齐。
+
+协作者负责交付类型/领域和约束标注、数量及精确字节 SHA-256；主负责人负责独立 overlap 标注及其 SHA-256。三份文件均保存在仓库外的访问受控目录，文件名不含查询或人员身份，且不得进入 CI、普通日志、共享命令记录或 Git。只有主负责人可以运行 `--approve`；双方都不得手工修改 manifest 状态或补写哈希。
+
+### 第一步：只读审核
+
+主负责人先运行不带 `--approve` 和 `--report` 的审核命令。以下策略只是命令结构示例，必须替换为主负责人已经确认的逐分区决策，不存在默认策略：
+
+```powershell
+uv run --no-sync --no-env-file python -m paper_search.evaluation.freeze `
+  --data-root data `
+  --type-domain-labels <private-type-domain-labels.jsonl> `
+  --constraint-labels <private-constraint-labels.jsonl> `
+  --overlap-labels <private-overlap-labels.jsonl> `
+  --zero-answer-policy dev=reject `
+  --zero-answer-policy validation=reject `
+  --zero-answer-policy simulated_test=allow
 ```
+
+审核成功必须返回退出码 0 和 `approval_requested: false`，并保持 `data/manifest.json` 精确字节不变，不创建 `data/freeze_reports/`；审核失败同样不得写 report 或 manifest。安全摘要只允许包含：
+
+- prepared manifest SHA-256 和 dataset revision；
+- 原始源文件数量；
+- 三份私密标注文件的数量和精确字节 SHA-256；
+- `query_type`、`domain` 的聚合 kappa、门槛和是否接受；
+- 各分区 count、gold/ID 相对路径与哈希、`labels_complete` 和显式策略。
+
+摘要、stdout 和 stderr 不得出现查询、paper ID、标注正文、标注人答案、凭据或私密绝对路径。主负责人必须把摘要中的三份标签文件 SHA-256 与安全渠道收到的交接哈希逐项比对。`query_type` 和 `domain` 分别用未舍入 kappa 与 `0.80` 比较，不计算覆盖全部约束字段的综合 kappa。任一字段低于门槛、ID/数量/顺序/哈希不一致、路径逃逸，或策略存在遗漏、重复、未知分区、非法值时，停止冻结并回到对应工作包修复证据。
+
+### 第二步：主负责人显式批准
+
+只读审核通过且双方核对安全摘要后，主负责人使用完全相同的输入增加批准参数：
+
+```powershell
+uv run --no-sync --no-env-file python -m paper_search.evaluation.freeze `
+  --data-root data `
+  --type-domain-labels <private-type-domain-labels.jsonl> `
+  --constraint-labels <private-constraint-labels.jsonl> `
+  --overlap-labels <private-overlap-labels.jsonl> `
+  --zero-answer-policy dev=reject `
+  --zero-answer-policy validation=reject `
+  --zero-answer-policy simulated_test=allow `
+  --approve `
+  --report data/freeze_reports/data-freeze-232428b0-v1.json
+```
+
+`--approve` 与 `--report` 必须同时出现，report 必须限制在 `data/freeze_reports/` 下。程序先完整写入内容安全的 report，再次核对当前 manifest 仍等于审核开始时的精确 prepared 字节，最后通过同目录临时文件、`fsync` 和原子替换完成状态转换。
 
 ### 冻结验收
 
-- [ ] `revision` 非空且与固定来源一致；
-- [ ] 每个 `count` 为正整数；
-- [ ] `gold_path`、`ids_path` 是限制在 `data/` 下的相对路径；
-- [ ] `gold_sha256`、`ids_sha256` 是精确字节的 `sha256:<64 hex>`；
-- [ ] gold JSONL 非空且恰有 `count` 条；
-- [ ] ID 清单恰有 `count` 个非空唯一字符串；
-- [ ] gold query ID 与 ID 清单顺序完全一致；
-- [ ] `labels_complete: true`；
-- [ ] `zero_answer_policy` 明确为 `reject` 或 `allow`；
-- [ ] `reject` 下每条 gold 至少有一个 relevant paper ID；
-- [ ] `allow` 下零答案记录已人工确认且策略进入正式运行身份；
-- [ ] 两人交叉核对后，由主负责人批准 `status: frozen`。
+- [ ] audit-only 返回 0、`approval_requested: false`，且没有写文件；
+- [ ] 三份标签数量为 90/40/20，ID 集合与冻结工作包完全一致；
+- [ ] `query_type` 和 `domain` kappa 均不低于 `0.80`；
+- [ ] 每个 `count` 为正整数，gold/ID 非空、数量一致、ID 唯一且顺序一致；
+- [ ] `gold_sha256`、`ids_sha256` 和三份标签哈希均来自精确文件字节；
+- [ ] `labels_complete: true`，每个分区策略均为显式 `reject` 或 `allow`；
+- [ ] 批准输出为 `approval_requested: true`；
+- [ ] 当前 `data/manifest.json` 为 `status: frozen`；
+- [ ] 顶层 `prepared_manifest_sha256`、`freeze_report_path`、`freeze_report_sha256` 与实际文件一致；
+- [ ] report 完整、内容安全，且没有临时文件或部分 manifest；
+- [ ] Git 状态不含 raw、gold、真实查询或三份人工标签。
 
-只有全部通过后才能冻结。任一内容变化都必须产生新哈希并重新审核，不能覆盖旧证据。旧 manifest 和审核汇总按 `data-freeze-<revision>-v<N>` 命名保存在团队批准的证据目录；受限 gold 仍只保存在私密存储。
+如果 report 已完整写入但 manifest 原子替换失败，使用完全相同的三份私密文件、逐分区策略、`--report` 路径和完整批准命令重试；程序只复用字节完全一致的 report。该孤立 report 是非权威证据，只有当前 manifest 的 `status: frozen`、report 路径和 report SHA-256 同时匹配，才表示正式冻结完成。任何不同 policy、标签哈希、report 内容或 frozen manifest 都不得覆盖已有正式证据。
 
 若主负责人批准切换到备用数据源，原工作包立即失效，必须生成新的数据身份和工作包版本，并重新发布明确的“标注工作包 v<N> 已冻结”通知。
 

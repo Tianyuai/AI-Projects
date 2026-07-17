@@ -1,143 +1,152 @@
-# 协作者快速接入与 Task 2 工作指南
+# Week 1 协作者立即执行任务清单
 
-> 适用对象：第一次加入项目、此前只看得到 GitHub 仓库的协作者。
+> 工作分支：`codex/week1-collaboration`
 >
-> 当前协作分支：`codex/task2-evaluation`
+> 当前状态：Task 1–4 工程部分已完成；正式数据冻结、真实 baseline、人工审计和 Week 1 gate 尚未完成。
 >
-> 最后更新：2026-07-16
+> 最后更新：2026-07-17
 
-## 1. 先了解三件事
+## 1. 当前目标
 
-1. 这是一个面向复杂学术查询的智能论文搜索与推荐项目；主负责人负责架构、后端、评测和算法，协作者当前重点负责 Task 2 的数据质检与人工标注。
-2. Task 2 的工程准备已按 TDD 完成到可复现生成协作者工作包的阶段，当前状态为 `waiting_for_human_label_freeze`；真实受限数据、工作包 v1 和人工标签仍未冻结。
-3. PaSa 是受限数据集。真实查询、金标准和人工标注文件不得提交到 GitHub；GitHub 只保存代码、安全文档、哈希、ID 清单和不含受限文本的汇总信息。
+协作者现在不继续开发检索算法，而是准备和审核真实、完整、可复现的数据证据。当前仓库没有正式 `data/manifest.json`，因此不得运行或宣称正式 Week 1 baseline，也不得宣布 Week 1 gate 通过。
 
-建议按以下顺序阅读：
+执行顺序：环境与访问检查 → 固定数据准备 → 90 条类型/领域标记 → 40 条约束标注 → 固定 20 条独立双标 → 正式数据冻结 → 真实 baseline → 模糊去重审计 → Recall/失败率/成本审核 → Week 1 gate。
 
-1. 本文档；
-2. [`PRD.md`](../PRD.md) 中的“Task 2：数据集适配和评测指标”；
-3. [`Task 2 设计文档`](superpowers/specs/2026-07-15-task2-evaluation-design.md)；
-4. [`Task 2 实施计划`](superpowers/plans/2026-07-16-task2-evaluation-implementation.md)。
+## 2. 安全红线
 
-## 2. API、`.env` 和软件环境
+- 不读取、打印、搜索、解析、复制或提交任何 `.env` 内容。
+- 真实查询、PaSa 原始文件、gold、人工标签、受限工作包及含受限文本的截图或日志不得进入 Git。
+- 不提交 API Key、Token、Authorization Header 或带凭据的 URL。
+- 不得仅把 manifest 的 `status` 改成 `frozen` 就宣称数据冻结。
+- 不得修改 gold、随机种子、dataset revision、split ID 或抽样算法来改善指标。
+- 不得使用 LLM 代替人工标注；双标完成前双方不得交换答案。
+- 不得自行修改评测、去重、过滤或排序算法；发现问题先提交证据。
+- 不得修改、格式化、暂存或提交 `docs/superpowers/specs/2026-07-15-task2-evaluation-design.md`。
+- 未经主负责人批准，不得创建 PR、合并、强制推送、删除 worktree 或清理分支。
 
-一句话说明：请安装 Git、Python 3.11 和 uv，使用自己的 OpenAlex、Semantic Scholar、DashScope 和 Hugging Face 只读凭据，复制 `.env.example` 为本地 `.env` 后填写，最后执行 `uv sync --all-groups`；不得复制主负责人的密钥、`.venv` 或整个本地项目目录。
+## 3. 工作包 0：环境与访问就绪
 
-### 2.1 需要自行申请的凭据
+### 输入
 
-| 本地环境变量 | 用途 | 当前 Task 2 是否必需 |
-|---|---|---|
-| `HF_TOKEN` | 访问已接受条款的 PaSa gated dataset | 是 |
-| `OPENALEX_API_KEY` | 后续 OpenAlex 检索 | 当前人工标注不必调用 |
-| `SEMANTIC_SCHOLAR_API_KEY` | 后续 Semantic Scholar 检索 | 当前人工标注不必调用 |
-| `LLM_API_KEY` | DashScope 兼容接口 | 当前人工标注不得使用 LLM 代写 |
-| `LLM_BASE_URL` | DashScope 兼容接口地址 | 环境联调需要 |
-| `LLM_MODEL_PRIMARY` | 主模型名称 | 使用项目当前配置，不自行猜测 |
-| `LLM_MODEL_FALLBACK` | 备用模型名称 | 使用项目当前配置，不自行猜测 |
+- Git、Python 3.11、uv 和仓库访问权限；
+- 你自己的 Hugging Face 只读账号及 `HF_TOKEN`；
+- 你自己的 OpenAlex key（环境变量名为 `OPENALEX_API_KEY`），正式 baseline 前必须可由运行子进程加载；
+- 已接受 `CarlanLark/pasa-dataset` gated dataset 条款。
 
-当前分支的 `.env.example` 已提供空的 `HF_TOKEN=` 占位。请复制模板后，只在你自己的本地配置中填写真实值：
+### 操作
 
-```dotenv
-HF_TOKEN=
-```
-
-真实值只写在 `.env` 中。不要将密钥粘贴到 Issue、提交记录、日志、截图或聊天消息中。
-
-### 2.2 首次拉取和验证
+首次克隆使用：
 
 ```powershell
 git clone https://github.com/Tianyuai/AI-Projects.git
 Set-Location AI-Projects
 git fetch origin
-git switch --track origin/codex/task2-evaluation
-Copy-Item .env.example .env
-uv sync --all-groups
-uv run pytest -q
-uv run ruff check .
-uv run mypy src
+git switch --track origin/codex/week1-collaboration
 ```
 
-如果本地已经有同名分支，使用：
+已经有本地仓库时，先确认工作树清洁，再使用：
 
 ```powershell
-git switch codex/task2-evaluation
+git status --short --branch
+git fetch origin
+git show-ref --verify --quiet refs/heads/codex/week1-collaboration
+if ($LASTEXITCODE -eq 0) {
+  git switch codex/week1-collaboration
+} else {
+  git switch --track origin/codex/week1-collaboration
+}
+git branch --set-upstream-to=origin/codex/week1-collaboration codex/week1-collaboration
 git pull --ff-only
 ```
 
-环境验收要求：Python 为 3.11.x，`uv sync --all-groups` 成功，pytest、Ruff 和 mypy 全部通过。若失败，请把命令、错误信息和系统版本发给主负责人，但先删除其中可能出现的本机用户名、绝对私有路径和凭据。
+两种情况随后都执行：
 
-## 3. 你现在应当做什么
+```powershell
+uv sync --all-groups
+uv run --no-env-file pytest -q
+uv run --no-env-file ruff check .
+uv run --no-env-file mypy src
+```
 
-在人工标注工作包生成前，先完成以下工作：
+这里的 `--no-env-file` 只表示“不会主动加载 `.env`”，不会清除进程中已经存在的环境变量，也不是网络隔离。`uv sync --all-groups` 可能访问包索引；需要真正离线时，必须预先准备依赖缓存，并由主负责人提供断网环境或防火墙验证方式。
 
-- [ ] 克隆仓库并切换到 `codex/task2-evaluation`；
-- [ ] 完成 Python 3.11、uv 和项目依赖安装；
-- [ ] 使用自己的账号申请四类 API/数据访问权限并配置本地 `.env`；
-- [ ] 在 Hugging Face 页面接受 `CarlanLark/pasa-dataset` 的访问条款；
-- [ ] 运行 pytest、Ruff 和 mypy，确认环境可复现；
-- [ ] 阅读本文档、Task 2 设计和实施计划；
-- [ ] 等待主负责人明确发出“Task 2 标注工作包 v1 已冻结”的开始信号。
+数据准备子进程可以通过 `--env-file` 加载凭据，但不要打开或输出 `.env`：
 
-在开始信号发出前，不要自行选择样本、修改 split ID、复制网络上的 PaSa 数据，或提前创建自己的标注格式。
+```powershell
+uv run --env-file .env python scripts/prepare_task2_data.py --output-root data
+```
 
-## 4. Task 2 的目标和你的职责边界
+### 验收
 
-Task 2 要建立可复现的离线评测体系，包括数据适配、ID 规范化、Precision/Recall/F1、Recall@5/10/20、固定抽样、数据冻结和人工一致性检查。
+- [ ] 分支为 `codex/week1-collaboration`；
+- [ ] Python 为 3.11.x，依赖安装成功；
+- [ ] 不主动加载 `.env` 的 pytest、Ruff、mypy 通过；
+- [ ] PaSa 访问已获批；
+- [ ] `OPENALEX_API_KEY` 已由本人申请并可供正式运行子进程加载；未配置时将阻塞工作包 6；
+- [ ] 汇报中没有密钥、本机用户名或私有绝对路径。
 
-主负责人负责：
+若 PaSa 不可访问，不得自行换源。由主负责人决定是否启用唯一备用 `allenai/asta-bench` 标签 `v0.3.1`，并记录原因；两种来源不得混合构造同一 F1 分区。
 
-- JSONL 契约、ID 规范化和映射；
-- PaSa 与预测格式适配器；
-- 指标内核和评测命令；
-- 固定 revision、抽样、哈希、manifest 和覆盖保护；
-- 标注 Schema、校验工具、Cohen's kappa 和最终复核。
+## 4. 工作包 1：固定数据准备与身份核对
 
-协作者负责：
+### 固定输入
 
-- 开发集与验证集的查询类型和领域标记；
-- 固定 40 条开发查询的约束标注；
-- 与主负责人对其中固定 20 条进行相互独立的双人标注；
-- 按标注指南修正分歧样本；
-- 从全新环境走查数据准备说明，记录复现问题；
-- 整理不包含受限文本的进度、缺失项和问题汇总。
+- 数据源：`CarlanLark/pasa-dataset`；
+- revision：`232428b0c867268c3b8ded90db4d98c1b30501d6`；
+- 随机种子：`20260714`；
+- 抽样算法：`answer-count-largest-remainder-v1`；
+- 源文件：`AutoScholarQuery/dev.jsonl`、`AutoScholarQuery/test.jsonl`、`RealScholarQuery/test.jsonl`。
 
-你不负责修改评测算法、金标准、抽样种子、数据 revision 或 split ID。发现问题时先记录并提交给主负责人，不要直接“修正”公开或冻结标签。
+### 操作与验收
 
-## 5. 人工标注的开始条件
+- [ ] 运行数据准备脚本，确认解析到的 revision 完全一致；
+- [ ] 核对三个源文件 SHA-256、许可、访问条件和下载日期；
+- [ ] 核对开发/验证/模拟测试数量为 60/30/50；
+- [ ] 核对 `dev.ids.json`、`validation.ids.json`、`simulated_test.ids.json`；
+- [ ] 核对 `constraint_annotation.ids.json` 为 40 条；
+- [ ] 核对 `overlap_annotation.ids.json` 为 20 条；
+- [ ] 所有 query ID 均为非空唯一字符串；
+- [ ] 相同输入重跑得到相同 ID 顺序和哈希；
+- [ ] Git 状态不包含 raw、gold、真实查询或标注文件。
 
-只有以下条件全部满足后，才开始正式标注：
+运行前先用 `git check-ignore` 验证 `data/raw/`、`data/dev/gold.jsonl`、`data/validation/gold.jsonl`、`data/simulated_test/` 和 `data/annotation_work/` 均被忽略。受限输出只保存在访问受控的本地目录或团队批准的端到端加密存储中；交接时只在 Git/普通聊天中记录 SHA-256，不发送正文或公开链接。
 
-- 主负责人明确宣布“Task 2 标注工作包 v1 已冻结”；
-- `data/manifest.json` 已记录 PaSa revision、文件哈希、随机种子和抽样算法；
-- `data/splits/dev.ids.json` 与 `data/splits/validation.ids.json` 已冻结；
-- `data/annotation_guide.md` 已明确 query type、domain 和各约束字段的口径；
-- 本地 `data/annotation_work/` 工作包已生成并通过 Schema 校验；
-- 双方确认固定的 20 条重叠标注 query ID，但没有查看对方答案。
+`data/splits/*.ids.json` 中只含 query ID 的清单属于可提交安全元数据；包含查询文本、gold 或人工答案的标注工作包仍是受限文件。
 
-推荐每位成员使用自己的 Hugging Face 账号和 Token，通过同一 revision 在本地复现工作包。确需传递工作包时，只能使用双方约定的私密渠道，不能上传到 GitHub。
+完成后等待主负责人明确发布：
 
-## 6. 具体工作包
+```text
+Task 2 标注工作包 v1 已冻结
+```
 
-### 工作包 A：90 条查询类型与领域标记
+没有这条通知，不得开始正式标注。
 
-标记范围：
+## 5. 工作包 2：90 条查询类型与领域标记
 
-- 开发集 60 条；
-- 验证集 30 条；
-- 合计 90 条。
+### 输入
 
-每条记录至少填写：
+冻结的开发集 60 条、验证集 30 条、冻结版 `data/annotation_guide.md` 和团队约定的稳定 `annotator` 代号。
 
-- `query_id`：保持工作包原值，不得修改；
-- `query_type`：只能使用 `data/annotation_guide.md` 允许的标签；
-- `domain`：只能使用指南约定的格式；
-- `annotator`：使用团队约定的稳定代号。
+### 每条必填
 
-遇到无法归类的查询时，不自行发明新标签。把 `query_id`、候选标签和疑问写入单独的问题清单，由双方统一修改指南后再继续。
+- `query_id`：保持原值；
+- `query_type`：只使用指南允许的标签；
+- `domain`：只使用指南规定的格式；
+- `annotator`：使用稳定代号。
 
-### 工作包 B：40 条开发查询约束标注
+无法归类时不要发明标签。将 query ID、候选解释和疑问写入私密问题清单，统一口径后再继续。
 
-这 40 条由冻结的 ID 清单指定，不是由协作者自行挑选。每条记录字段固定为：
+### 验收
+
+- [ ] 90 条全部完成；
+- [ ] 无缺失、无新增、无重复、无 query ID 修改；
+- [ ] 字段通过标注 Schema；
+- [ ] 疑难项均有统一结论；
+- [ ] 标注文件通过私密渠道保存，未进入 Git。
+
+## 6. 工作包 3：固定 40 条查询约束标注
+
+由 `constraint_annotation.ids.json` 指定，不得自行挑选。固定字段为：
 
 ```text
 query_id
@@ -153,148 +162,271 @@ domain
 annotator
 ```
 
-填写原则：
+### 规则
 
-- `research_goal`：概括用户真正要解决的研究问题，不改写成搜索关键词堆积；
-- `must_have`：缺失任一项就不应入选的硬约束；
-- `should_have`：提高相关性但不构成一票否决的软约束；
-- `exclusions`：明确需要排除的方法、主题、文献类型或条件；
-- `year_from`、`year_to`：只在原查询明确要求时填写，边界包含在内；
-- `venues`：只记录原查询明确给出的 venue；
-- 不确定时按指南记录，不根据个人领域常识补造用户没有表达的条件。
+- `research_goal` 描述真实研究目标，不写成关键词堆积；
+- `must_have` 只放缺失后就不应入选的硬约束；
+- `should_have` 放提高相关性但不一票否决的条件；
+- `exclusions` 只记录原查询明确排除的内容；
+- 年份和 venue 仅在原查询明确给出时填写；
+- 不根据个人常识补造查询没有表达的条件；
+- 不确定项按指南记录并进入问题清单。
 
-以下示例是项目原创的格式示例，不来自 PaSa：
+### 验收
 
-```json
-{"query_id":"example-q1","research_goal":"查找用于长文档检索的高效注意力方法","must_have":["长文档检索"],"should_have":["稀疏注意力"],"exclusions":["仅图像任务"],"year_from":2020,"year_to":null,"venues":[],"query_type":"method","domain":"information-retrieval","annotator":"member-b"}
-```
+- [ ] 恰好 40 条且与冻结 ID 清单一致；
+- [ ] 字段名、类型、年份区间和集合字段通过 Schema；
+- [ ] 集合中没有空字符串；
+- [ ] query ID 无缺失、重复、新增或修改；
+- [ ] 工作包和答案未提交到 Git。
 
-实际允许的 `query_type` 和 `domain` 值以冻结版 `data/annotation_guide.md` 为准，不能从示例推断完整标签集合。
+## 7. 工作包 4：固定 20 条独立双标与一致性
 
-### 工作包 C：固定 20 条双人独立标注
+这 20 条包含在上述 40 条中，不是额外 20 条。
 
-这 20 条包含在协作者的 40 条中，不是额外增加 20 条。流程如下：
-
-1. 双方确认相同的 20 个 query ID 和相同指南版本；
-2. 协作者与主负责人分别独立填写；
-3. 双方完成前不交换、不查看对方答案，也不使用 LLM 生成标签；
-4. 完成后由主负责人运行一致性工具；
+1. 确认双方使用相同 ID 清单、工作包版本和指南版本；
+2. 协作者与主负责人独立完成；
+3. 双方完成前不得交换答案或使用 LLM 代标；
+4. 两人都报告完成后才交换文件哈希并计算一致性；
 5. 对 `query_type`、`domain` 等关键离散字段计算 Cohen's kappa；
-6. 任一关键字段低于 `0.80` 时，先修订指南，再重新标注分歧样本；
-7. 一致性达标后，由主负责人额外复核 10 条。
+6. 任一关键字段低于 `0.80` 时，先修订指南，再独立重标分歧样本；重标后的分歧样本只用于裁决，不得冒充新的独立 kappa；
+7. 若初始 kappa 未达标，必须在查看初始分歧明细或开展裁决前冻结一组新的独立重叠 ID；一致性工具此时只披露聚合 kappa，再使用新样本重新验证；
+8. 一致性达标后，主负责人按固定 ID 清单额外复核 10 条，所有问题必须有结论和责任人。
 
-### 工作包 D：复现和数据质检
+### 验收
 
-工程脚本完成后，协作者在自己的全新环境执行数据准备与测试命令，检查：
+- [ ] 固定 20 条由双方独立完成；
+- [ ] 每个关键离散字段 kappa 不低于 0.80；
+- [ ] 未达门槛项已完成指南修订和分歧重标；
+- [ ] 初始 kappa 未达标时，已用新冻结的独立重叠样本重新验证，未用已知分歧样本抬高 kappa；
+- [ ] 额外 10 条复核全部闭环；
+- [ ] 最终标注通过私密渠道交接并核对 SHA-256。
 
-```powershell
-uv run --env-file .env python scripts/prepare_task2_data.py --output-root data
-```
+## 8. 工作包 5：gold、ID 清单与 manifest 正式冻结
 
-- 文档是否足以完成安装和数据准备；
-- 固定 revision 和样本数是否一致；
-- 同一输入重复运行是否得到相同 ID 清单和哈希；
-- 受限数据和标注文件是否被 Git 正确忽略；
-- 错误信息是否会泄露 Token、本机用户名或完整 `.env`；
-- 指南中是否存在两种合理但冲突的解释。
+### 开始条件
 
-问题汇总可以提交到 GitHub，但只能包含命令、匿名化错误、哈希、数量和改进建议，不得包含真实查询、金标准或标注内容。
+工作包 1–4 完成；gold labels 已由真人确认完整；主负责人已决定各分区 `zero_answer_policy` 为 `reject` 或 `allow`。
 
-## 7. 交付物与验收标准
-
-协作者完成 Task 2 配合工作的标准：
-
-- [ ] 90 条记录全部具有合法的 `query_type`、`domain` 和 `annotator`；
-- [ ] 固定 40 条查询约束记录全部填写，字段名和类型通过 Schema 校验；
-- [ ] 固定 20 条重叠样本在未查看对方答案的情况下独立完成；
-- [ ] query ID 无缺失、无新增、无重复、无修改；
-- [ ] 年份区间合法，集合字段没有空字符串；
-- [ ] 所有疑难项已进入问题清单并得到统一口径；
-- [ ] 关键离散字段 Cohen's kappa 不低于 `0.80`，或已按流程修订指南并重标；
-- [ ] 主负责人额外复核的 10 条已完成问题闭环；
-- [ ] 真实标注文件通过私密渠道交接，没有进入 Git 历史；
-- [ ] GitHub 中只提交不含受限文本的复现问题或汇总信息。
-
-人工标签未完成和冻结前，Task 2 状态必须保持：
+### manifest 必核字段
 
 ```text
-waiting_for_human_label_freeze
+status
+revision
+count
+gold_path
+gold_sha256
+ids_path
+ids_sha256
+labels_complete
+zero_answer_policy
 ```
 
-## 8. Git 和数据安全规则
+### 冻结验收
 
-### 可以提交到 GitHub
+- [ ] `revision` 非空且与固定来源一致；
+- [ ] 每个 `count` 为正整数；
+- [ ] `gold_path`、`ids_path` 是限制在 `data/` 下的相对路径；
+- [ ] `gold_sha256`、`ids_sha256` 是精确字节的 `sha256:<64 hex>`；
+- [ ] gold JSONL 非空且恰有 `count` 条；
+- [ ] ID 清单恰有 `count` 个非空唯一字符串；
+- [ ] gold query ID 与 ID 清单顺序完全一致；
+- [ ] `labels_complete: true`；
+- [ ] `zero_answer_policy` 明确为 `reject` 或 `allow`；
+- [ ] `reject` 下每条 gold 至少有一个 relevant paper ID；
+- [ ] `allow` 下零答案记录已人工确认且策略进入正式运行身份；
+- [ ] 两人交叉核对后，由主负责人批准 `status: frozen`。
 
-- 代码、测试和安全文档；
-- `data/README.md`、标注指南和不含受限文本的说明；
-- 数据 revision、SHA-256、样本数量、随机种子和抽样算法版本；
-- 只含 query ID 的安全 split 清单；
-- 不含真实查询文本的统计汇总和匿名化问题记录。
+只有全部通过后才能冻结。任一内容变化都必须产生新哈希并重新审核，不能覆盖旧证据。旧 manifest 和审核汇总按 `data-freeze-<revision>-v<N>` 命名保存在团队批准的证据目录；受限 gold 仍只保存在私密存储。
 
-### 禁止提交到 GitHub
+若主负责人批准切换到备用数据源，原工作包立即失效，必须生成新的数据身份和工作包版本，并重新发布明确的“标注工作包 v<N> 已冻结”通知。
 
-- `.env`、API Key、Token、Authorization Header；
-- PaSa 原始 JSONL；
-- 开发/验证/模拟测试金标准；
-- 真实查询文本工作包；
-- 任一成员的人工标注 JSONL；
-- 包含受限内容的截图、日志、压缩包或临时文件。
+## 9. 工作包 6：冻结数据上的真实 Week 1 baseline
 
-开始修改安全文档或测试前，从协作分支新建自己的分支：
+### 开始条件
+
+正式 manifest 已真实冻结；开发集 gold/ID/哈希验证通过；运行进程能以授权方式加载 OpenAlex key；输出目录不会覆盖不同身份的正式产物。
+
+由主负责人运行，协作者负责记录和审核：
 
 ```powershell
-git switch codex/task2-evaluation
-git pull --ff-only
-git switch -c collab/task2-data-qa
+uv run --env-file .env python -m paper_search.evaluation.runner `
+  --config configs/base.yaml `
+  --split dev `
+  --output experiments/baseline-week1
 ```
 
-完成后先运行测试，再向 `codex/task2-evaluation` 提交 Pull Request。只有人工标注或受限数据变化时，不需要也不允许通过 Git 提交；使用私密交接渠道并由主负责人记录哈希和冻结状态。
+### 必审产物
 
-## 9. 主负责人的主线能否继续
+`predictions.jsonl`、`metrics.json`、`usage.json`、`run.json`、`deduplication.jsonl`、`filtering.jsonl`、`snapshot_manifest.json` 和 `snapshots/`。
 
-可以继续，而且不应等待协作者学习完成后才推进核心工程。
+### 验收
 
-### 当前可以继续的工作
+- [ ] Git SHA、split、gold/ID 哈希和 manifest identity 正确；
+- [ ] scoring version、去重阈值、过滤规则和 penalty 参数已记录；
+- [ ] 缓存响应均绑定到同目录不可变快照；
+- [ ] 快照哈希与原始字节一致；
+- [ ] 每个查询都有预测或明确失败；
+- [ ] 逐查询与 aggregate 指标、调用量和延迟齐全；
+- [ ] 没有密钥、私有路径或受限原文泄露；
+- [ ] 没有部分写入或覆盖旧正式证据。
 
-- 严格 JSONL 读写、文件哈希和 ID Map；
-- PaSa/预测格式适配器；
-- Precision、Recall、F1、Recall@5/10/20 和宏/微平均；
-- 评测 CLI、确定性抽样、冻结保护和 manifest；
-- 标注 Schema、校验工具和 Cohen's kappa 代码；
-- 使用合成 fixture 的检索、去重、排序和后端开发；
-- 压力集、错误处理、安全检查和自动化测试。
+## 10. 工作包 7：模糊去重人工抽样审计
 
-### 必须等待协作者交付后才能完成的工作
+1. 从正式 `deduplication.jsonl` 中选取 `match_rule == "fuzzy_title"` 的合并；
+2. 模糊合并不超过 200 条时全部审计；超过 200 条时按种子 `20260714` 确定性抽取 200 条，并在查看判断结果前冻结抽样算法、样本 ID 清单和清单 SHA-256；
+3. 核对标题、年份、作者和稳定 ID；
+4. 标记 `correct_merge`、`false_merge` 或 `needs_adjudication`；
+5. 两人复核全部 false merge 和 needs adjudication；
+6. 汇总样本数、正确数、错误数、裁决数和准确率。
 
-- 将 Task 2 标记为全部完成；
-- 冻结最终人工标签和一致性结果；
-- 验收强约束抽取 Recall；
-- 计算按 query type/domain 分组的正式指标；
-- 用人工标签完成最终失败归因或模型方案选择；
-- 声称开发/验证数据工作已经全部验收。
+### 验收
 
-主线开发期间使用固定接口、合成 fixture 和冻结 ID 清单。不要用未冻结人工标签调参，也不要提前查看或反复运行模拟测试集标签。
+- [ ] 每条判断有最小证据和审计人；
+- [ ] 模糊去重人工准确率不低于 `98%`；
+- [ ] 低于 98% 时停止 gate，只提交失败案例，不放宽口径；
+- [ ] 可提交报告不含受限查询或原始响应正文。
 
-## 10. 推荐的协作节奏
+## 11. 工作包 8：Recall、失败率、成本与产物审核
 
-协作者只需在以下节点主动报告：
+对相同冻结查询和相同原始候选，分别统计：原始候选、去重后、硬过滤后、词法排序与 Top-K 后。`0.02` 验收线应用于“去重输入候选 → 硬过滤接受池”的累计 Recall 绝对下降；Top-K 截断损失单独报告，不混入该门槛。
 
-1. `环境就绪`：附 pytest、Ruff、mypy 的结果，不附密钥；
-2. `工作包已复现`：附 revision、manifest/hash 和行数，不附查询文本；
-3. `20 条独立标注完成`：只报告完成状态，双方此时才能交换答案；
-4. `40 条约束标注完成`：附 Schema 校验结果和疑难项数量；
-5. `90 条类型/领域标记完成`：附缺失/重复检查结果；
-6. `分歧重标完成`：附各关键字段 kappa 和指南版本；
-7. `私密交接完成`：双方核对文件哈希，主负责人更新冻结状态。
+### 质量验收
 
-## 11. 当前立即行动清单
+- [ ] 计算各阶段 relevant paper 保留数和 Recall；
+- [ ] 分别报告去重、过滤和截断造成的 Recall 绝对变化；
+- [ ] 过滤/初筛后 Recall 绝对下降不超过 `0.02`；
+- [ ] 每个 relevant paper 损失都有 query ID、paper ID、阶段和原因；
+- [ ] 不通过修改 gold 或冻结状态掩盖损失。
 
-如果你今天刚加入，请只做以下五件事：
+### 运行验收
 
-1. 拉取 `codex/task2-evaluation`；
-2. 配置自己的 API 和 `.env`；
-3. 安装依赖并跑通全部检查；
-4. 阅读本文档、Task 2 设计和实施计划；
-5. 回复主负责人：`环境就绪，等待 Task 2 标注工作包 v1 冻结通知`。
+- [ ] API 调用数、缓存命中、P50、P95 和失败率齐全；
+- [ ] 硬失败率与显式部分结果比例分开报告；
+- [ ] 未知费用保持 `null/None`，不伪造为 0；
+- [ ] 指标、用量和快照 manifest 相互引用一致；
+- [ ] 异常和失败案例已分类。
 
-在收到冻结通知后，再开始 90 条类型/领域标记和 40 条约束标注。
+任一指标不达标时，交给主负责人按严格 TDD 修复；协作者不自行改算法。
+
+Week 1 对成本没有额外数值门槛；“成本通过审核”只表示已知费用按真实值记录、未知费用保持 `null/None`、调用量和延迟齐全且没有超出配置硬预算。
+
+## 12. Week 1 阶段闸门进入条件
+
+只有以下条件全部满足，主负责人才能判定 gate：
+
+- [ ] Task 1–4 工程基线有本次 gate 审核后新运行的聚焦测试、全量 pytest、Ruff 和 mypy 证据；
+- [ ] revision、抽样算法、随机种子和分区身份已冻结；
+- [ ] gold/ID 非空、数量一致、ID 唯一且顺序一致；
+- [ ] 精确字节哈希与 manifest 一致；
+- [ ] `labels_complete: true` 且零答案策略明确；
+- [ ] 冻结开发集真实 baseline 生成完整不可变产物；
+- [ ] 可以从查询得到去重论文列表并计算 F1；Week 1 gate 只要求 baseline 可计算，不设置最低 F1，通过不代表达到最终 PRD 质量目标；
+- [ ] 模糊去重人工准确率至少 98%；
+- [ ] Recall 损失证据齐全，过滤/初筛绝对下降不超过 0.02；
+- [ ] 调用量、延迟、失败率、成本和快照证据通过审核；
+- [ ] `git diff --check` 通过；`git diff --name-only <Task4基线>...HEAD` 不包含受保护或无关文件；凭据模式扫描无命中；
+- [ ] 独立审查记录审查人、时间、审查范围和 Critical/Important/Minor 结论，所有有效问题已关闭。
+
+任何一项未完成，状态必须写“阻塞”或“未通过”。Week 1 gate 未通过前不开始关系图。
+
+## 13. Git 交付边界
+
+### 可以提交
+
+- 代码、测试和安全文档；
+- revision、SHA-256、数量、随机种子和抽样算法；
+- 只含 query ID 的安全清单；
+- 不含真实查询、gold、人工答案或响应正文的汇总指标和审计统计。
+
+### 禁止提交
+
+- `.env` 或任何凭据；
+- PaSa 原始 JSONL；
+- 开发、验证或模拟测试 gold；
+- 真实查询文本工作包；
+- 任一成员的人工标注；
+- 含受限内容的截图、日志、缓存数据库、压缩包或临时文件。
+
+## 14. 汇报模板
+
+### 环境和固定数据就绪
+
+```text
+阶段：环境与固定数据核对完成
+分支：codex/week1-collaboration
+Python：3.11.x
+pytest/Ruff/mypy：通过
+PaSa 访问：已获批/阻塞
+revision：<SHA>
+分区数量：dev=60, validation=30, simulated_test=50
+约束/重叠清单：40/20
+受限文件进入 Git：否
+阻塞：<无或匿名化说明>
+```
+
+### 标注工作包完成
+
+```text
+阶段：工作包 <2/3/4> 完成
+输入身份：<指南版本和 ID 清单哈希>
+记录数量：<数量>
+Schema：通过/失败
+缺失/重复/新增 ID：0/0/0
+疑难项：<数量>
+受限文件进入 Git：否
+下一步：<等待批准或下一工作包>
+```
+
+### 双标一致性
+
+```text
+阶段：20 条独立双标完成
+指南版本：<版本>
+完成前交换答案：否
+query_type kappa：<数值>
+domain kappa：<数值>
+需重标样本：<数量>
+额外复核 10 条：完成/待完成
+```
+
+### 数据冻结申请
+
+```text
+阶段：申请正式冻结
+revision：<SHA>
+count：dev=60, validation=30, simulated_test=50
+gold/ID 哈希：已逐项复核
+ID 唯一且顺序一致：是
+labels_complete：true
+zero_answer_policy：<reject/allow>
+双人复核：完成
+未解决问题：<无或列表>
+```
+
+### Week 1 gate 审核
+
+```text
+阶段：Week 1 gate 待判定
+run identity / Git SHA：<值>
+macro F1 / Recall：<值>
+模糊去重准确率：<值>
+过滤/初筛 Recall 绝对损失：<值>
+硬失败率 / 部分结果率：<值>/<值>
+API 调用 / P50 / P95 / 成本：<值>
+快照与哈希：通过/失败
+秘密与范围检查：通过/失败
+独立审查：通过/失败
+建议：通过/阻塞/修复后重审
+```
+
+## 15. 现在立即执行
+
+1. 拉取 `codex/week1-collaboration`；
+2. 完成工作包 0 的不主动加载 `.env` 的环境验证；
+3. 确认自己的 PaSa 只读访问；
+4. 完成工作包 1，核对 revision、哈希和 60/30/50、40、20；
+5. 回复主负责人“环境与固定数据核对完成”；
+6. 等待“Task 2 标注工作包 v1 已冻结”；
+7. 收到通知后依次完成 90 条、40 条和固定 20 条人工工作；
+8. 正式冻结批准前，不运行 baseline，不修改 manifest 状态。

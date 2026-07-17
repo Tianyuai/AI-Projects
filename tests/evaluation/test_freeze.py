@@ -13,6 +13,7 @@ import pytest
 
 from paper_search.evaluation.freeze import (
     audit_freeze_candidate,
+    main,
     parse_zero_answer_policies,
 )
 
@@ -225,6 +226,24 @@ def _label_rows(path: Path) -> list[dict[str, object]]:
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert all(isinstance(row, dict) for row in rows)
     return cast(list[dict[str, object]], rows)
+
+def _cli_args(fixture: PreparedFixture) -> list[str]:
+    return [
+        "--data-root",
+        str(fixture.data_root),
+        "--type-domain-labels",
+        str(fixture.type_domain_labels),
+        "--constraint-labels",
+        str(fixture.constraint_labels),
+        "--overlap-labels",
+        str(fixture.overlap_labels),
+        "--zero-answer-policy",
+        "dev=reject",
+        "--zero-answer-policy",
+        "validation=reject",
+        "--zero-answer-policy",
+        "simulated_test=allow",
+    ]
 
 def test_audit_candidate_builds_safe_result_without_writing(tmp_path: Path) -> None:
     fixture = _prepared_tree(tmp_path)
@@ -510,3 +529,95 @@ def test_audit_report_is_content_safe(tmp_path: Path) -> None:
     assert sentinel not in report_text
     assert "Synthetic question" not in report_text
     assert str(fixture.type_domain_labels) not in report_text
+
+def test_cli_audit_only_prints_safe_report_without_writing(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    original_manifest = (fixture.data_root / "manifest.json").read_bytes()
+
+    exit_code = main(_cli_args(fixture))
+
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
+    assert exit_code == 0
+    assert captured.err == ""
+    assert report["approval_requested"] is False
+    assert (fixture.data_root / "manifest.json").read_bytes() == original_manifest
+    assert not (fixture.data_root / "freeze_reports").exists()
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--approve"],
+        ["--report", "data/freeze_reports/report.json"],
+    ],
+)
+def test_cli_rejects_unpaired_approval_arguments(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    extra_args: list[str],
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+
+    exit_code = main([*_cli_args(fixture), *extra_args])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert captured.err.rstrip() == "freeze approval failed"
+
+
+def test_cli_requires_all_explicit_inputs() -> None:
+    with pytest.raises(SystemExit) as error:
+        main([])
+
+    assert error.value.code == 2
+
+
+def test_cli_redacts_private_validation_failures(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    sentinel = "PRIVATE-PATH-SENTINEL"
+    private_path = tmp_path / sentinel / "invalid.jsonl"
+    private_path.parent.mkdir()
+    private_path.write_text("not-json", encoding="utf-8")
+    args = _cli_args(fixture)
+    args[args.index(str(fixture.overlap_labels))] = str(private_path)
+
+    exit_code = main(args)
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert (
+        captured.err.rstrip()
+        == "freeze audit failed: private annotations are invalid"
+    )
+    assert sentinel not in captured.err
+
+def test_cli_rejects_report_path_outside_freeze_reports(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    outside_report = tmp_path / "outside-report.json"
+
+    exit_code = main(
+        [
+            *_cli_args(fixture),
+            "--approve",
+            "--report",
+            str(outside_report),
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert captured.err.rstrip() == "freeze approval failed"
+    assert not outside_report.exists()

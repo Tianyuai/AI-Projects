@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import argparse
+
 import hashlib
 import json
+import sys
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -388,3 +391,102 @@ def audit_freeze_candidate(
         frozen_manifest_payload=frozen_manifest,
         report=report,
     )
+
+
+def _prepared_partition_names(data_root: Path) -> set[str]:
+    try:
+        manifest_bytes = (data_root / "manifest.json").read_bytes()
+    except OSError:
+        raise ValueError("prepared data is invalid") from None
+    manifest = _mapping(_load_json_bytes(manifest_bytes))
+    partitions = _mapping(manifest.get("partitions"))
+    if not partitions:
+        raise ValueError("prepared data is invalid")
+    return set(partitions)
+
+
+def _confined_report_relative_path(data_root: Path, report_path: Path) -> str:
+    data_root_resolved = data_root.resolve()
+    report_root = (data_root_resolved / "freeze_reports").resolve()
+    resolved = report_path.resolve()
+    try:
+        report_relative = resolved.relative_to(report_root)
+        data_relative = resolved.relative_to(data_root_resolved)
+    except ValueError:
+        raise ValueError("freeze approval failed") from None
+    if report_relative == Path("."):
+        raise ValueError("freeze approval failed")
+    return data_relative.as_posix()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Audit and approve Task 2 data freeze")
+    parser.add_argument("--data-root", type=Path, required=True)
+    parser.add_argument("--type-domain-labels", type=Path, required=True)
+    parser.add_argument("--constraint-labels", type=Path, required=True)
+    parser.add_argument("--overlap-labels", type=Path, required=True)
+    parser.add_argument(
+        "--zero-answer-policy",
+        action="append",
+        required=True,
+        dest="zero_answer_policies",
+    )
+    parser.add_argument("--approve", action="store_true")
+    parser.add_argument("--report", type=Path)
+    return parser
+
+
+def _audit_error_message(error: ValueError) -> str:
+    reason = str(error)
+    if reason == "private annotations are invalid":
+        return "freeze audit failed: private annotations are invalid"
+    if reason == "human annotation agreement is below threshold":
+        return "freeze audit failed: human annotation agreement is below threshold"
+    return "freeze audit failed: prepared data is invalid"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the secret-safe Task 2 freeze audit CLI."""
+    args = _build_parser().parse_args(argv)
+    if args.approve != (args.report is not None):
+        print("freeze approval failed", file=sys.stderr)
+        return 2
+    if args.report is not None:
+        try:
+            _confined_report_relative_path(args.data_root, args.report)
+        except ValueError:
+            print("freeze approval failed", file=sys.stderr)
+            return 2
+    try:
+        partition_names = _prepared_partition_names(args.data_root)
+        policies = parse_zero_answer_policies(
+            args.zero_answer_policies,
+            partition_names,
+        )
+        result = audit_freeze_candidate(
+            data_root=args.data_root,
+            type_domain_labels_path=args.type_domain_labels,
+            constraint_labels_path=args.constraint_labels,
+            overlap_labels_path=args.overlap_labels,
+            policies=policies,
+        )
+    except ValueError as error:
+        print(_audit_error_message(error), file=sys.stderr)
+        return 2
+    if args.approve:
+        print("freeze approval failed", file=sys.stderr)
+        return 2
+    print(
+        json.dumps(
+            result.report.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

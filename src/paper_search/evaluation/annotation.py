@@ -31,6 +31,14 @@ DomainLabel = Annotated[
 ]
 
 
+class TypeDomainAnnotationRecord(DomainModel):
+    """One minimal human-authored query type/domain label."""
+
+    query_id: NonEmptyStr
+    query_type: QueryType
+    domain: DomainLabel
+    annotator: NonEmptyStr
+
 class AnnotationRecord(DomainModel):
     """One human-authored query constraint annotation."""
 

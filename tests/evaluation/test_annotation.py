@@ -5,6 +5,7 @@ from pydantic import ValidationError
 
 from paper_search.evaluation.annotation import (
     AnnotationRecord,
+    TypeDomainAnnotationRecord,
     cohen_kappa,
     compare_annotations,
 )
@@ -58,6 +59,48 @@ def test_annotation_schema_rejects_unapproved_labels(field: str, value: str) -> 
     with pytest.raises(ValidationError):
         AnnotationRecord.model_validate({**_annotation("q1"), field: value})
 
+
+def test_type_domain_annotation_accepts_only_the_minimal_frozen_contract() -> None:
+    record = TypeDomainAnnotationRecord.model_validate(
+        {
+            "query_id": "q1",
+            "query_type": "method",
+            "domain": "information-retrieval",
+            "annotator": "member-b",
+        }
+    )
+
+    assert record.query_id == "q1"
+    with pytest.raises(ValidationError):
+        record.domain = "changed"
+    with pytest.raises(ValidationError):
+        TypeDomainAnnotationRecord.model_validate(
+            {**record.model_dump(), "research_goal": "not allowed"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("query_id", "   "),
+        ("annotator", "   "),
+        ("query_type", "invented"),
+        ("domain", "Information Retrieval"),
+    ],
+)
+def test_type_domain_annotation_rejects_invalid_fields(
+    field: str,
+    value: str,
+) -> None:
+    payload = {
+        "query_id": "q1",
+        "query_type": "method",
+        "domain": "information-retrieval",
+        "annotator": "member-b",
+    }
+
+    with pytest.raises(ValidationError):
+        TypeDomainAnnotationRecord.model_validate({**payload, field: value})
 
 def test_cohen_kappa_is_one_for_perfect_agreement() -> None:
     assert cohen_kappa(["method", "topic"], ["method", "topic"]) == 1.0

@@ -315,9 +315,14 @@ def test_cli_loads_process_environment_and_builds_provider_without_secret_leak(
     assert provider_calls[0]["api_key"] == SENTINEL_API_KEY
     assert SENTINEL_API_KEY not in captured.out
     assert SENTINEL_API_KEY not in captured.err
-    for artifact in (tmp_path / "out").rglob("*"):
-        if artifact.is_file():
-            assert SENTINEL_API_KEY.encode() not in artifact.read_bytes()
+    scanned_files = {
+        artifact.relative_to(tmp_path).as_posix(): artifact.read_bytes()
+        for artifact in tmp_path.rglob("*")
+        if artifact.is_file()
+    }
+    assert ".cache/openalex.sqlite3" in scanned_files
+    for relative_path, content in scanned_files.items():
+        assert SENTINEL_API_KEY.encode() not in content, relative_path
 
 
 def test_cli_requires_openalex_key_from_process_environment(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,8 +24,14 @@ CONFIGS = Path(__file__).parents[2] / "configs"
 
 
 class FixedProvider:
-    def __init__(self, results: dict[str, list[Paper]]) -> None:
+    def __init__(
+        self,
+        results: dict[str, list[Paper]],
+        raw_responses: dict[str, bytes],
+    ) -> None:
         self._results = results
+        self._raw_responses = raw_responses
+        self.responses: list[ProviderResult[list[Paper]]] = []
 
     async def search(
         self,
@@ -35,21 +42,25 @@ class FixedProvider:
     ) -> ProviderResult[list[Paper]]:
         del filters, reservation
         query_index = list(self._results).index(query) + 1
-        return ProviderResult(
+        response = ProviderResult(
             data=self._results[query][:limit],
-            usage=UsageActual(search_api_calls=1, elapsed_ms=query_index),
+            usage=UsageActual(search_api_calls=0, elapsed_ms=query_index),
             provenance={
                 "provider": "openalex",
                 "endpoint": "/works",
                 "model_id": "openalex-api",
                 "requested_at": "2026-07-17T00:00:00+00:00",
-                "response_hash": f"sha256:{'0' * 64}",
+                "response_hash": (
+                    f"sha256:{hashlib.sha256(self._raw_responses[query]).hexdigest()}"
+                ),
                 "cache_keys": json.dumps([f"fixture-page-{query_index}"]),
             },
             cache_hit=True,
             latency_ms=query_index,
             errors=[],
         )
+        self.responses.append(response)
+        return response
 
 
 def _runtime_config() -> RuntimeConfig:
@@ -70,30 +81,34 @@ def test_fixed_week1_fixture_runs_full_pipeline_and_snapshot(tmp_path: Path) -> 
         query: [Paper.model_validate(record) for record in records]
         for query, records in payload.items()
     }
-    cache = SQLiteResponseCache(tmp_path / ".cache" / "openalex.sqlite3")
-    now = datetime(2026, 7, 17, tzinfo=UTC)
-    for index, query in enumerate(results, start=1):
-        raw_response = json.dumps(
+    raw_responses = {
+        query: json.dumps(
             {"query": query, "results": payload[query]},
             sort_keys=True,
         ).encode("utf-8")
+        for query in results
+    }
+    cache = SQLiteResponseCache(tmp_path / ".cache" / "openalex.sqlite3")
+    now = datetime(2026, 7, 17, tzinfo=UTC)
+    for index, query in enumerate(results, start=1):
         cache.put_response(
             key=f"fixture-page-{index}",
             provider="openalex",
             endpoint="/works",
             cache_version="v1",
             params={"search": query},
-            raw_response=raw_response,
+            raw_response=raw_responses[query],
             requested_at=now,
             ttl=timedelta(days=7),
             safe_headers={},
         )
     output = tmp_path / "run"
+    provider = FixedProvider(results, raw_responses)
 
     result = asyncio.run(
         run_evaluation(
             gold,
-            provider=FixedProvider(results),
+            provider=provider,
             cache=cache,
             config=_runtime_config(),
             output=output,
@@ -102,6 +117,13 @@ def test_fixed_week1_fixture_runs_full_pipeline_and_snapshot(tmp_path: Path) -> 
 
     assert result.evaluation.summary.query_count == 2
     assert result.evaluation.summary.macro_f1 > 0
+    assert [
+        (response.usage.search_api_calls, response.provenance["response_hash"])
+        for response in provider.responses
+    ] == [
+        (0, f"sha256:{hashlib.sha256(raw_response).hexdigest()}")
+        for raw_response in raw_responses.values()
+    ]
     assert result.query_runs[0].pipeline.deduplication.decisions
     assert result.query_runs[0].pipeline.filtering.rejected[0].reason_code == "retracted"
     assert any(

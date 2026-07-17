@@ -11,7 +11,10 @@ from typing import cast
 
 import pytest
 
-from paper_search.evaluation.freeze import audit_freeze_candidate
+from paper_search.evaluation.freeze import (
+    audit_freeze_candidate,
+    parse_zero_answer_policies,
+)
 
 
 def _load_preparation_module() -> ModuleType:
@@ -210,6 +213,19 @@ def _audit(fixture: PreparedFixture) -> object:
         policies={"dev": "reject", "validation": "reject", "simulated_test": "allow"},
     )
 
+def _label_path(fixture: PreparedFixture, name: str) -> Path:
+    return {
+        "type_domain": fixture.type_domain_labels,
+        "constraints": fixture.constraint_labels,
+        "overlap": fixture.overlap_labels,
+    }[name]
+
+
+def _label_rows(path: Path) -> list[dict[str, object]]:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert all(isinstance(row, dict) for row in rows)
+    return cast(list[dict[str, object]], rows)
+
 def test_audit_candidate_builds_safe_result_without_writing(tmp_path: Path) -> None:
     fixture = _prepared_tree(tmp_path)
     original_manifest_bytes = (fixture.data_root / "manifest.json").read_bytes()
@@ -376,3 +392,121 @@ def test_work_package_rejects_source_hash_mismatch(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="prepared data is invalid"):
         _audit(fixture)
+
+@pytest.mark.parametrize("label_name", ["type_domain", "constraints", "overlap"])
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "extra", "wrong-set"])
+def test_human_labels_require_exact_unique_annotation_alignment(
+    tmp_path: Path,
+    label_name: str,
+    mutation: str,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    path = _label_path(fixture, label_name)
+    rows = _label_rows(path)
+    if mutation == "missing":
+        changed = rows[:-1]
+    elif mutation == "duplicate":
+        changed = [*rows, rows[0]]
+    elif mutation == "extra":
+        changed = [*rows, {**rows[0], "query_id": "extra-query"}]
+    else:
+        changed = [{**rows[0], "query_id": "wrong-query"}, *rows[1:]]
+    _jsonl(path, changed)
+
+    with pytest.raises(ValueError, match="private annotations are invalid") as error:
+        _audit(fixture)
+
+    assert "query" not in str(error.value)
+    assert str(path) not in str(error.value)
+
+
+def test_annotation_alignment_rejects_low_agreement_without_details(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    rows = _label_rows(fixture.overlap_labels)
+    rows[0]["query_type"] = "topic"
+    rows[0]["domain"] = "computer-vision"
+    _jsonl(fixture.overlap_labels, rows)
+
+    with pytest.raises(
+        ValueError,
+        match="human annotation agreement is below threshold",
+    ) as error:
+        _audit(fixture)
+
+    assert rows[0]["query_id"] not in str(error.value)
+    assert "computer-vision" not in str(error.value)
+
+
+def test_zero_answer_policy_parser_requires_one_explicit_policy_per_partition() -> None:
+    assert parse_zero_answer_policies(
+        ["dev=reject", "validation=allow"],
+        {"dev", "validation"},
+    ) == {"dev": "reject", "validation": "allow"}
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        ["dev=reject"],
+        ["dev=reject", "dev=allow", "validation=reject"],
+        ["dev=reject", "validation=reject", "unknown=allow"],
+        ["dev", "validation=reject"],
+        ["dev=maybe", "validation=reject"],
+    ],
+)
+def test_zero_answer_policy_parser_rejects_unsafe_input(values: list[str]) -> None:
+    with pytest.raises(ValueError, match="zero-answer policies are invalid"):
+        parse_zero_answer_policies(values, {"dev", "validation"})
+
+
+def test_partition_policy_controls_zero_answer_acceptance(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    gold_path = fixture.data_root / "simulated_test" / "gold.jsonl"
+    rows = _label_rows(gold_path)
+    rows[0]["relevant_paper_ids"] = []
+    _jsonl(gold_path, rows)
+
+    audit_freeze_candidate(
+        data_root=fixture.data_root,
+        type_domain_labels_path=fixture.type_domain_labels,
+        constraint_labels_path=fixture.constraint_labels,
+        overlap_labels_path=fixture.overlap_labels,
+        policies={"dev": "reject", "validation": "reject", "simulated_test": "allow"},
+    )
+    with pytest.raises(ValueError, match="prepared data is invalid"):
+        audit_freeze_candidate(
+            data_root=fixture.data_root,
+            type_domain_labels_path=fixture.type_domain_labels,
+            constraint_labels_path=fixture.constraint_labels,
+            overlap_labels_path=fixture.overlap_labels,
+            policies={
+                "dev": "reject",
+                "validation": "reject",
+                "simulated_test": "reject",
+            },
+        )
+
+
+def test_audit_report_is_content_safe(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    sentinel = "PRIVATE-SENTINEL-DO-NOT-EMIT"
+    for path in (
+        fixture.type_domain_labels,
+        fixture.constraint_labels,
+        fixture.overlap_labels,
+    ):
+        rows = _label_rows(path)
+        for row in rows:
+            row["annotator"] = sentinel
+            if "research_goal" in row:
+                row["research_goal"] = sentinel
+        _jsonl(path, rows)
+
+    result = _audit(fixture)
+    report_text = json.dumps(result.report.model_dump(mode="json"), sort_keys=True)
+
+    assert sentinel not in report_text
+    assert "Synthetic question" not in report_text
+    assert str(fixture.type_domain_labels) not in report_text

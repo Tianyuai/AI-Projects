@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -26,6 +26,31 @@ SAMPLING_ALGORITHM = "answer-count-largest-remainder-v1"
 PREPARED_STATUS = "waiting_for_human_label_freeze"
 
 ZeroAnswerPolicy = Literal["reject", "allow"]
+
+def parse_zero_answer_policies(
+    values: Sequence[str],
+    partition_names: Collection[str],
+) -> dict[str, ZeroAnswerPolicy]:
+    """Parse exactly one explicit zero-answer policy for every partition."""
+    expected = set(partition_names)
+    if not expected or any(not name.strip() for name in expected):
+        raise ValueError("zero-answer policies are invalid")
+    parsed: dict[str, ZeroAnswerPolicy] = {}
+    for value in values:
+        if value.count("=") != 1:
+            raise ValueError("zero-answer policies are invalid")
+        name, policy = value.split("=", maxsplit=1)
+        if (
+            not name
+            or name not in expected
+            or name in parsed
+            or policy not in ("reject", "allow")
+        ):
+            raise ValueError("zero-answer policies are invalid")
+        parsed[name] = cast(ZeroAnswerPolicy, policy)
+    if set(parsed) != expected:
+        raise ValueError("zero-answer policies are invalid")
+    return parsed
 
 
 class PartitionFreezeAudit(DomainModel):

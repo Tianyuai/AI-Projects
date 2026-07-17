@@ -17,7 +17,7 @@ from paper_search.processing import (
     RejectedPaper,
 )
 from paper_search.ranking import LexicalScore
-from paper_search.ui.app import create_app
+from paper_search.ui.app import MAX_FORM_BODY_BYTES, MAX_FORM_FIELDS, create_app
 
 
 def _paper(identifier: str, title: str) -> Paper:
@@ -218,6 +218,31 @@ def test_repeated_query_is_rejected_without_calling_service() -> None:
     )
 
     assert response.status_code == 400
+    assert service.queries == []
+
+
+def test_oversized_form_body_returns_constant_413_without_calling_service() -> None:
+    service = FakeSearchService(_pipeline_result())
+    content = b"query=" + (b"x" * MAX_FORM_BODY_BYTES)
+
+    response = asyncio.run(_request_invalid_query(content, service))
+
+    assert response.status_code == 413
+    assert response.text == "request body is too large"
+    assert service.queries == []
+
+
+def test_excess_form_fields_returns_constant_400_without_calling_service() -> None:
+    service = FakeSearchService(_pipeline_result())
+    extra_fields = b"&".join(
+        f"field{index}=x".encode() for index in range(MAX_FORM_FIELDS)
+    )
+    content = b"query=safe&" + extra_fields
+
+    response = asyncio.run(_request_invalid_query(content, service))
+
+    assert response.status_code == 400
+    assert response.text == "query must be provided exactly once"
     assert service.queries == []
 
 

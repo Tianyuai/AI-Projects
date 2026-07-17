@@ -14,12 +14,20 @@ if TYPE_CHECKING:
     from paper_search.evaluation.runner import PipelineResult
 
 
+MAX_FORM_BODY_BYTES = 4096
+MAX_FORM_FIELDS = 8
+
 _INVALID_QUERY_MESSAGE = "query must be provided exactly once"
+_REQUEST_TOO_LARGE_MESSAGE = "request body is too large"
 _UNAVAILABLE_MESSAGE = "search is temporarily unavailable"
 
 
 class _InvalidQuery(ValueError):
     """The URL-encoded request did not contain one non-empty query."""
+
+
+class _RequestTooLarge(ValueError):
+    """The form body exceeded the collaborator UI's fixed byte limit."""
 
 
 class _SearchUnavailable(RuntimeError):
@@ -111,10 +119,23 @@ def _render_results(query: str, result: PipelineResult) -> str:
     )
 
 
+async def _read_form_body(request: Request) -> bytes:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > MAX_FORM_BODY_BYTES:
+            raise _RequestTooLarge
+        body.extend(chunk)
+    return bytes(body)
+
+
 def _parse_query(body: bytes) -> str:
     try:
-        fields = parse_qs(body.decode("utf-8"), keep_blank_values=True)
-    except UnicodeDecodeError as error:
+        fields = parse_qs(
+            body.decode("utf-8"),
+            keep_blank_values=True,
+            max_num_fields=MAX_FORM_FIELDS,
+        )
+    except (UnicodeDecodeError, ValueError) as error:
         raise _InvalidQuery from error
     values = fields.get("query", [])
     if len(values) != 1 or not values[0].strip():
@@ -133,7 +154,11 @@ def create_app(search_service: SearchService) -> FastAPI:
     @application.post("/search", response_class=HTMLResponse)
     async def search(request: Request) -> HTMLResponse:
         try:
-            query = _parse_query(await request.body())
+            body = await _read_form_body(request)
+        except _RequestTooLarge:
+            return HTMLResponse(_REQUEST_TOO_LARGE_MESSAGE, status_code=413)
+        try:
+            query = _parse_query(body)
         except _InvalidQuery:
             return HTMLResponse(_INVALID_QUERY_MESSAGE, status_code=400)
         try:

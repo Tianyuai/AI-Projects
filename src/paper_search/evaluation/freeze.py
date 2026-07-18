@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import sys
 import tempfile
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
@@ -860,22 +861,125 @@ def _best_effort_unlink(path: Path) -> None:
         return
 
 
-def _cleanup_matching_prepared_backups(
-    data_root: Path,
-    prepared_manifest_sha256: str,
+def _best_effort_close_descriptor(descriptor: int) -> None:
+    try:
+        os.close(descriptor)
+    except OSError:
+        return
+
+
+def _delete_matching_manifest_temporary_windows(
+    candidate: Path,
+    expected_sha256: str,
 ) -> None:
-    for candidate in data_root.glob(".manifest.json.prepared.*.tmp"):
+    import ctypes
+    import msvcrt
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", ctypes.c_uint32),
+            ("reparse_tag", ctypes.c_uint32),
+        ]
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.restype = ctypes.c_void_p
+    get_handle_info = kernel32.GetFileInformationByHandleEx
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    set_handle_info = kernel32.SetFileInformationByHandle
+    invalid_handle = ctypes.c_void_p(-1).value
+    handle = create_file(
+        str(candidate),
+        0x80000000 | 0x00010000,
+        0x00000001,
+        None,
+        3,
+        0x00200000,
+        None,
+    )
+    if handle == invalid_handle:
+        return
+    descriptor: int | None = None
+    try:
+        attributes = FileAttributeTagInfo()
+        if not get_handle_info(
+            ctypes.c_void_p(handle),
+            9,
+            ctypes.byref(attributes),
+            ctypes.sizeof(attributes),
+        ) or attributes.file_attributes & 0x00000400:
+            return
+        path_buffer = ctypes.create_unicode_buffer(32768)
+        path_length = int(
+            get_final_path(
+                ctypes.c_void_p(handle),
+                path_buffer,
+                len(path_buffer),
+                0,
+            )
+        )
+        if (
+            path_length == 0
+            or path_length >= len(path_buffer)
+            or _normalized_windows_path(path_buffer.value)
+            != _normalized_windows_path(str(candidate))
+        ):
+            return
         try:
-            if (
-                candidate.is_symlink()
-                or not candidate.is_file()
-                or candidate.stat().st_size > 1024 * 1024
-                or _sha256_bytes(candidate.read_bytes()) != prepared_manifest_sha256
-            ):
-                continue
+            descriptor = msvcrt.open_osfhandle(
+                int(handle),
+                os.O_RDONLY | getattr(os, "O_BINARY", 0),
+            )
         except OSError:
-            continue
-        _best_effort_unlink(candidate)
+            return
+        handle = None
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > 1024 * 1024
+            or _sha256_descriptor(descriptor) != expected_sha256
+        ):
+            return
+        disposition = FileDispositionInfo(1)
+        set_handle_info(
+            ctypes.c_void_p(msvcrt.get_osfhandle(descriptor)),
+            4,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        )
+    except OSError:
+        return
+    finally:
+        if descriptor is not None:
+            _best_effort_close_descriptor(descriptor)
+        elif handle not in (None, invalid_handle):
+            kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
+def _delete_matching_manifest_temporary(
+    candidate: Path,
+    expected_sha256: str,
+) -> None:
+    if os.name == "nt":
+        _delete_matching_manifest_temporary_windows(candidate, expected_sha256)
+
+
+def _cleanup_matching_manifest_temporaries(
+    data_root: Path,
+    *,
+    prepared_manifest_sha256: str,
+    frozen_manifest_sha256: str,
+) -> None:
+    for candidate in data_root.glob(".manifest.json.*.tmp"):
+        expected_sha256 = (
+            prepared_manifest_sha256
+            if candidate.name.startswith(".manifest.json.prepared.")
+            else frozen_manifest_sha256
+        )
+        _delete_matching_manifest_temporary(candidate, expected_sha256)
 
 
 def _replace_manifest_guarded(
@@ -1088,9 +1192,10 @@ def _approve_freeze_locked(
 
     if current_manifest == plan.frozen_manifest_bytes:
         if report_path.is_file() and report_path.read_bytes() == plan.report_bytes:
-            _cleanup_matching_prepared_backups(
+            _cleanup_matching_manifest_temporaries(
                 data_root,
-                plan.report.prepared_manifest_sha256,
+                prepared_manifest_sha256=plan.report.prepared_manifest_sha256,
+                frozen_manifest_sha256=_sha256_bytes(plan.frozen_manifest_bytes),
             )
             return "matched"
         raise RuntimeError("freeze approval failed")
@@ -1320,9 +1425,10 @@ def _match_existing_approval(
     )
     if report != expected_report:
         raise ValueError("prepared data is invalid")
-    _cleanup_matching_prepared_backups(
+    _cleanup_matching_manifest_temporaries(
         data_root,
-        report.prepared_manifest_sha256,
+        prepared_manifest_sha256=report.prepared_manifest_sha256,
+        frozen_manifest_sha256=_sha256_bytes(manifest_bytes),
     )
     return report
 

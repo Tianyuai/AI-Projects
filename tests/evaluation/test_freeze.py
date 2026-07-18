@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -1106,7 +1108,199 @@ def test_backup_cleanup_failure_does_not_misreport_committed_freeze(
     assert (fixture.data_root / "manifest.json").read_bytes() == plan.frozen_manifest_bytes
     monkeypatch.setattr(Path, "unlink", original_unlink)
     assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
-    assert not list(fixture.data_root.glob(".manifest.json.prepared.*.tmp"))
+    remaining = list(fixture.data_root.glob(".manifest.json.prepared.*.tmp"))
+    assert (not remaining) if os.name == "nt" else len(remaining) == 1
+
+
+def test_frozen_temporary_cleanup_failure_is_retried_on_matched_freeze(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    original_unlink = Path.unlink
+
+    def fail_frozen_temporary_unlink(
+        path: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        if (
+            path.name.startswith(".manifest.json.")
+            and ".manifest.json.prepared." not in path.name
+        ):
+            raise OSError("synthetic frozen temporary cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_frozen_temporary_unlink)
+
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    assert (fixture.data_root / "manifest.json").read_bytes() == plan.frozen_manifest_bytes
+    monkeypatch.setattr(Path, "unlink", original_unlink)
+    frozen_temporaries = [
+        candidate
+        for candidate in fixture.data_root.glob(".manifest.json.*.tmp")
+        if ".manifest.json.prepared." not in candidate.name
+    ]
+    assert len(frozen_temporaries) == 1
+    assert frozen_temporaries[0].samefile(fixture.data_root / "manifest.json")
+
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
+    remaining = [
+        candidate
+        for candidate in fixture.data_root.glob(".manifest.json.*.tmp")
+        if ".manifest.json.prepared." not in candidate.name
+    ]
+    assert (not remaining) if os.name == "nt" else len(remaining) == 1
+
+
+def test_matched_freeze_preserves_nonmatching_manifest_temporary(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    unrelated = fixture.data_root / ".manifest.json.unrelated.tmp"
+    unrelated.write_bytes(b"not the frozen manifest")
+
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
+    assert unrelated.read_bytes() == b"not the frozen manifest"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle sharing semantics")
+def test_matched_freeze_does_not_delete_candidate_replaced_after_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    candidate = fixture.data_root / ".manifest.json.race.tmp"
+    candidate.write_bytes(plan.frozen_manifest_bytes)
+    replacement = fixture.data_root / "replacement.tmp"
+    replacement.write_bytes(b"replacement must survive")
+    expected_sha256 = freeze_module._sha256_bytes(plan.frozen_manifest_bytes)
+    original_sha256_bytes = freeze_module._sha256_bytes
+    original_sha256_descriptor = freeze_module._sha256_descriptor
+    frozen_byte_hashes = 0
+    replacement_attempted = False
+
+    def attempt_replacement() -> None:
+        nonlocal replacement_attempted
+        replacement_attempted = True
+        try:
+            os.replace(replacement, candidate)
+        except OSError:
+            pass
+
+    def sha256_bytes_with_replacement(content: bytes) -> str:
+        nonlocal frozen_byte_hashes
+        result = original_sha256_bytes(content)
+        if content == plan.frozen_manifest_bytes:
+            frozen_byte_hashes += 1
+            if frozen_byte_hashes == 2:
+                attempt_replacement()
+        return result
+
+    def sha256_descriptor_with_replacement(descriptor: int) -> str:
+        result = original_sha256_descriptor(descriptor)
+        if result == expected_sha256 and not replacement_attempted:
+            attempt_replacement()
+        return result
+
+    monkeypatch.setattr(freeze_module, "_sha256_bytes", sha256_bytes_with_replacement)
+    monkeypatch.setattr(
+        freeze_module,
+        "_sha256_descriptor",
+        sha256_descriptor_with_replacement,
+    )
+
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
+    assert replacement_attempted
+    assert replacement.read_bytes() == b"replacement must survive"
+    assert not candidate.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle cleanup semantics")
+def test_matched_freeze_ignores_cleanup_descriptor_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    candidate = fixture.data_root / ".manifest.json.close-failure.tmp"
+    candidate.write_bytes(plan.frozen_manifest_bytes)
+    original_close = freeze_module.os.close
+
+    def close_then_fail(descriptor: int) -> None:
+        original_close(descriptor)
+        raise OSError("synthetic descriptor close failure")
+
+    monkeypatch.setattr(freeze_module.os, "close", close_then_fail)
+
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
+    assert not candidate.exists()
+
+
+def test_matched_freeze_preserves_cross_category_manifest_hashes(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    prepared_name_with_frozen_bytes = (
+        fixture.data_root / ".manifest.json.prepared.cross.tmp"
+    )
+    frozen_name_with_prepared_bytes = fixture.data_root / ".manifest.json.cross.tmp"
+    prepared_name_with_frozen_bytes.write_bytes(plan.frozen_manifest_bytes)
+    frozen_name_with_prepared_bytes.write_bytes(plan.prepared_manifest_bytes)
+
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
+    assert prepared_name_with_frozen_bytes.read_bytes() == plan.frozen_manifest_bytes
+    assert frozen_name_with_prepared_bytes.read_bytes() == plan.prepared_manifest_bytes
+
+
+def test_matched_freeze_rejects_oversized_temporary_before_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    oversized = fixture.data_root / ".manifest.json.oversized.tmp"
+    oversized.write_bytes(b"x" * (1024 * 1024 + 1))
+
+    def fail_hash(_: int) -> str:
+        raise AssertionError("oversized temporary must not be hashed")
+
+    monkeypatch.setattr(freeze_module, "_sha256_descriptor", fail_hash)
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
+    assert oversized.stat().st_size == 1024 * 1024 + 1
+
+
+if os.name == "nt":
+
+    def test_matched_freeze_preserves_reparse_candidate(tmp_path: Path) -> None:
+        fixture = _prepared_tree(tmp_path)
+        plan = _approval_plan(fixture)
+        assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+        target = tmp_path / "outside-directory"
+        target.mkdir()
+        marker = target / "manifest.json"
+        marker.write_bytes(plan.frozen_manifest_bytes)
+        candidate = fixture.data_root / ".manifest.json.reparse.tmp"
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(candidate), str(target)],
+            capture_output=True,
+            check=False,
+        )
+        assert created.returncode == 0
+        try:
+            assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
+            assert candidate.is_dir()
+            assert marker.read_bytes() == plan.frozen_manifest_bytes
+        finally:
+            candidate.rmdir()
 
 
 def test_failed_publish_and_restore_preserve_prepared_recovery_backup(

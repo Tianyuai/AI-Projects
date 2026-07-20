@@ -53,6 +53,25 @@ def test_pasa_uses_title_only_when_corresponding_arxiv_id_is_missing() -> None:
     assert result.relevant_paper_ids == ["arxiv:2501.10120", "title:paper b"]
 
 
+def test_pasa_deduplicates_canonical_answer_ids_in_source_order() -> None:
+    source = PaSaRecord(
+        qid="q1",
+        question="Find papers",
+        answer=["Paper A v1", "Paper A v2", "Paper B"],
+        answer_arxiv_id=["2501.10120v1", "2501.10120v2", "1706.03762"],
+        source_meta={},
+    )
+
+    result = adapt_pasa_record(
+        source,
+        source="AutoScholarQuery",
+        split="dev",
+        revision="abc",
+    )
+
+    assert result.relevant_paper_ids == ["arxiv:2501.10120", "arxiv:1706.03762"]
+
+
 def test_pasa_coerces_single_answer_fields_to_lists() -> None:
     source = PaSaRecord.model_validate(
         {

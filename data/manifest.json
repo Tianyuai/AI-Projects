@@ -1,0 +1,74 @@
+{
+  "access": "gated-hugging-face-dataset",
+  "license": "CC-BY-NC-SA-4.0",
+  "partitions": {
+    "dev": {
+      "count": 60,
+      "gold_path": "dev/gold.jsonl",
+      "ids_path": "splits/dev.ids.json",
+      "ids_sha256": "sha256:c0dd21c5c37b3bcae06d82c4ca007366f953e78dd6852a3343e9ea7e1250d210"
+    },
+    "simulated_test": {
+      "count": 50,
+      "gold_path": "simulated_test/gold.jsonl",
+      "ids_path": "splits/simulated_test.ids.json",
+      "ids_sha256": "sha256:f99a99e327638f22b1a4ad5956a5c507e0a81d0b3dc2de2d91f7654c83be997e"
+    },
+    "validation": {
+      "count": 30,
+      "gold_path": "validation/gold.jsonl",
+      "ids_path": "splits/validation.ids.json",
+      "ids_sha256": "sha256:a2d547f3adf0e83612ca63ff6c2870357f896cfe694c426c2041d8bf0ea5c4bc"
+    }
+  },
+  "random_seed": 20260714,
+  "repo_id": "CarlanLark/pasa-dataset",
+  "revision": "232428b0c867268c3b8ded90db4d98c1b30501d6",
+  "sampling_algorithm": "answer-count-largest-remainder-v1",
+  "source_files": [
+    {
+      "byte_count": 450875,
+      "path": "AutoScholarQuery/dev.jsonl",
+      "raw_path": "raw/AutoScholarQuery/dev.jsonl",
+      "row_count": 1000,
+      "sha256": "sha256:d211a33f8171bd847331a34b0b4ea98e3ce06f2b1d64ff3f35b633407cb1d082"
+    },
+    {
+      "byte_count": 438997,
+      "path": "AutoScholarQuery/test.jsonl",
+      "raw_path": "raw/AutoScholarQuery/test.jsonl",
+      "row_count": 1000,
+      "sha256": "sha256:7d8c7f59b289a54912c38cf204d16dbfec14ca35de850b9978b4051ad43a8b36"
+    },
+    {
+      "byte_count": 84709,
+      "path": "RealScholarQuery/test.jsonl",
+      "raw_path": "raw/RealScholarQuery/test.jsonl",
+      "row_count": 50,
+      "sha256": "sha256:b3b570411ce2399ce4ea145ba9b2d3d0048b248030edeeb44ba95a7e9dc575c2"
+    }
+  ],
+  "status": "waiting_for_human_label_freeze",
+  "work_package_sampling": "answer-count-largest-remainder-v1-seeded-offsets",
+  "work_packages": {
+    "constraints": {
+      "count": 40,
+      "ids_path": "splits/constraint_annotation.ids.json",
+      "ids_sha256": "sha256:436d5a5e6de806006b223446800aed7bacd6a1199062e8d46440818f0fa78038",
+      "source_path": "annotation_work/constraints_source.jsonl",
+      "source_sha256": "sha256:3a518c1f282b1be696e83b2e5a768cd3b108bdb38c02bcbca0d2ef1b5a10f4e6"
+    },
+    "overlap": {
+      "count": 20,
+      "ids_path": "splits/overlap_annotation.ids.json",
+      "ids_sha256": "sha256:13ecb8126b9bd87594dd6c4b9e76d6ee4634dbfae835588e58043fcd2b5126c5"
+    },
+    "type_domain": {
+      "count": 90,
+      "ids_path": "splits/type_domain_annotation.ids.json",
+      "ids_sha256": "sha256:624262176ccec01846c2b364f37c330ce567f488460ccf96ec062fcfd7f691b8",
+      "source_path": "annotation_work/type_domain_source.jsonl",
+      "source_sha256": "sha256:7ff56d629a73a6bb9b2b513b095ec7f16e833e68b98ceb081f64a221aec268c4"
+    }
+  }
+}

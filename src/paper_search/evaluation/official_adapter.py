@@ -55,6 +55,7 @@ def adapt_pasa_record(
 ) -> EvaluationQuery:
     """Convert one PaSa source record to the canonical evaluation contract."""
     relevant_paper_ids: list[str] = []
+    seen_paper_ids: set[str] = set()
     pair_count = max(len(record.answer), len(record.answer_arxiv_id))
 
     for index in range(pair_count):
@@ -64,10 +65,15 @@ def adapt_pasa_record(
             if index < len(record.answer_arxiv_id)
             else ""
         )
+        paper_id: str | None = None
         if arxiv_id.strip():
-            relevant_paper_ids.append(normalize_paper_id(arxiv_id, kind="arxiv"))
+            paper_id = normalize_paper_id(arxiv_id, kind="arxiv")
         elif title.strip():
-            relevant_paper_ids.append(normalize_paper_id(title, kind="title"))
+            paper_id = normalize_paper_id(title, kind="title")
+
+        if paper_id is not None and paper_id not in seen_paper_ids:
+            seen_paper_ids.add(paper_id)
+            relevant_paper_ids.append(paper_id)
 
     return EvaluationQuery(
         query_id=record.qid,

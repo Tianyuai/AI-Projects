@@ -1,14 +1,84 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
+from paper_search.evaluation import annotation as annotation_module
 from paper_search.evaluation.annotation import (
     AnnotationRecord,
     TypeDomainAnnotationRecord,
     cohen_kappa,
     compare_annotations,
 )
+
+
+EXPECTED_DOMAIN_LABELS = (
+    "artificial-intelligence",
+    "machine-learning",
+    "natural-language-processing",
+    "information-retrieval",
+    "computer-vision",
+    "speech-audio",
+    "robotics",
+    "data-mining",
+    "knowledge-graphs",
+    "recommender-systems",
+    "human-computer-interaction",
+    "software-engineering",
+    "computer-systems",
+    "networks-security",
+    "databases",
+    "theory-algorithms",
+    "computational-biology",
+    "computational-social-science",
+    "scientific-computing",
+    "multidisciplinary",
+    "other",
+)
+
+
+def test_domain_vocabulary_artifact_is_frozen_and_bound_to_code() -> None:
+    payload = json.loads(Path("data/domain_labels.v1.json").read_text(encoding="utf-8"))
+
+    assert payload["version"] == "domain-labels-v1"
+    assert tuple(payload["labels"]) == EXPECTED_DOMAIN_LABELS
+    assert len(payload["labels"]) == len(set(payload["labels"]))
+    assert set(payload["definitions"]) == set(payload["labels"])
+    assert all(payload["definitions"][label].strip() for label in payload["labels"])
+    assert annotation_module.DOMAIN_LABELS == EXPECTED_DOMAIN_LABELS
+
+
+@pytest.mark.parametrize("domain", ["information-retrieval", "other"])
+def test_domain_vocabulary_accepts_frozen_values(domain: str) -> None:
+    record = TypeDomainAnnotationRecord.model_validate(
+        {
+            "query_id": "q1",
+            "query_type": "method",
+            "domain": domain,
+            "annotator": "member-b",
+        }
+    )
+
+    assert record.domain == domain
+
+
+@pytest.mark.parametrize(
+    "domain",
+    ["search-systems", "Information-Retrieval", "search systems"],
+)
+def test_domain_vocabulary_rejects_values_outside_frozen_list(domain: str) -> None:
+    with pytest.raises(ValidationError):
+        TypeDomainAnnotationRecord.model_validate(
+            {
+                "query_id": "q1",
+                "query_type": "method",
+                "domain": domain,
+                "annotator": "member-b",
+            }
+        )
 
 
 def _annotation(

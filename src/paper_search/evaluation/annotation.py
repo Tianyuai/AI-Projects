@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from datetime import date
 from typing import Annotated, Literal
 
-from pydantic import Field, StringConstraints, model_validator
+from pydantic import AfterValidator, Field, StringConstraints, model_validator
 
 from paper_search.domain.models import DomainModel, NonEmptyStr, NonNegativeInt, UnitFloat
 
@@ -21,6 +21,37 @@ QueryType = Literal[
     "exclusion",
     "ambiguous",
 ]
+DOMAIN_LABELS = (
+    "artificial-intelligence",
+    "machine-learning",
+    "natural-language-processing",
+    "information-retrieval",
+    "computer-vision",
+    "speech-audio",
+    "robotics",
+    "data-mining",
+    "knowledge-graphs",
+    "recommender-systems",
+    "human-computer-interaction",
+    "software-engineering",
+    "computer-systems",
+    "networks-security",
+    "databases",
+    "theory-algorithms",
+    "computational-biology",
+    "computational-social-science",
+    "scientific-computing",
+    "multidisciplinary",
+    "other",
+)
+
+
+def _validate_domain_label(value: str) -> str:
+    if value not in DOMAIN_LABELS:
+        raise ValueError("domain must use the frozen domain-labels-v1 vocabulary")
+    return value
+
+
 DomainLabel = Annotated[
     str,
     StringConstraints(
@@ -28,6 +59,7 @@ DomainLabel = Annotated[
         min_length=1,
         pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$",
     ),
+    AfterValidator(_validate_domain_label),
 ]
 
 

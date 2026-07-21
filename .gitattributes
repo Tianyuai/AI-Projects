@@ -1,0 +1,3 @@
+data/manifest.json text eol=lf
+data/splits/*.json text eol=lf
+data/freeze_reports/*.json text eol=lf

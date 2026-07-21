@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -186,3 +187,26 @@ def test_prepare_rejects_inconsistent_frozen_rerun(tmp_path: Path) -> None:
             constraint_annotation_size=1,
             overlap_annotation_size=1,
         )
+
+
+def test_repository_pins_hashed_data_checkout_bytes_to_lf() -> None:
+    paths = (
+        "data/manifest.json",
+        "data/splits/dev.ids.json",
+        "data/freeze_reports/example.json",
+    )
+    result = subprocess.run(
+        ["git", "check-attr", "text", "eol", "--", *paths],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.splitlines() == [
+        "data/manifest.json: text: set",
+        "data/manifest.json: eol: lf",
+        "data/splits/dev.ids.json: text: set",
+        "data/splits/dev.ids.json: eol: lf",
+        "data/freeze_reports/example.json: text: set",
+        "data/freeze_reports/example.json: eol: lf",
+    ]

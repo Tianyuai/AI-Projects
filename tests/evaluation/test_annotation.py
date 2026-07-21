@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -232,3 +235,187 @@ def test_compare_annotations_rejects_missing_and_duplicate_query_ids() -> None:
         compare_annotations([q1], [q2], fields=("query_type",))
     with pytest.raises(ValueError, match="duplicate left query_id: q1"):
         compare_annotations([q1, q1], [q1], fields=("query_type",))
+
+def _write_jsonl(path: Path, records: list[dict[str, object]]) -> bytes:
+    payload = "".join(
+        json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n" for record in records
+    ).encode("utf-8")
+    path.write_bytes(payload)
+    return payload
+
+
+def _write_ids(path: Path, query_ids: list[str]) -> None:
+    path.write_text(json.dumps(query_ids), encoding="utf-8")
+
+
+def _type_domain(
+    query_id: str,
+    *,
+    domain: str = "information-retrieval",
+) -> dict[str, object]:
+    return {
+        "query_id": query_id,
+        "query_type": "method",
+        "domain": domain,
+        "annotator": "member-b",
+    }
+
+
+def test_validate_type_domain_file_returns_only_safe_summary(tmp_path: Path) -> None:
+    labels = tmp_path / "private.jsonl"
+    ids = tmp_path / "safe.ids.json"
+    payload = _write_jsonl(labels, [_type_domain("q1"), _type_domain("q2")])
+    _write_ids(ids, ["q1", "q2"])
+
+    summary = annotation_module.validate_annotation_file(
+        labels,
+        ids,
+        kind="type-domain",
+    )
+
+    assert summary.model_dump() == {
+        "status": "valid",
+        "kind": "type-domain",
+        "count": 2,
+        "sha256": f"sha256:{sha256(payload).hexdigest()}",
+        "ids_match": True,
+    }
+    assert "private.jsonl" not in summary.model_dump_json()
+    assert "q1" not in summary.model_dump_json()
+
+
+def test_validate_constraint_file_uses_full_annotation_schema(tmp_path: Path) -> None:
+    labels = tmp_path / "constraints.jsonl"
+    ids = tmp_path / "safe.ids.json"
+    _write_jsonl(labels, [_annotation("q1")])
+    _write_ids(ids, ["q1"])
+
+    summary = annotation_module.validate_annotation_file(labels, ids, kind="constraints")
+
+    assert summary.status == "valid"
+    assert summary.count == 1
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "invalid-utf8",
+        "blank-line",
+        "unknown-field",
+        "duplicate-id",
+        "missing-id",
+        "extra-id",
+        "wrong-kind",
+        "invalid-domain",
+    ],
+)
+def test_validate_annotation_file_collapses_private_failures(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    labels = tmp_path / "private.jsonl"
+    ids = tmp_path / "safe.ids.json"
+    records = [_type_domain("q1")]
+    expected_ids = ["q1"]
+    if case == "invalid-utf8":
+        labels.write_bytes(b"\xff")
+    elif case == "blank-line":
+        labels.write_bytes(
+            (json.dumps(_type_domain("q1")) + "\n\n").encode("utf-8")
+        )
+    else:
+        if case == "unknown-field":
+            records[0]["private-answer"] = "must-not-leak"
+        elif case == "duplicate-id":
+            records.append(_type_domain("q1"))
+        elif case == "missing-id":
+            expected_ids.append("q2")
+        elif case == "extra-id":
+            records.append(_type_domain("q2"))
+        elif case == "wrong-kind":
+            pass
+        elif case == "invalid-domain":
+            records[0]["domain"] = "search-systems"
+        _write_jsonl(labels, records)
+    _write_ids(ids, expected_ids)
+    kind = "constraints" if case == "wrong-kind" else "type-domain"
+
+    with pytest.raises(ValueError) as exc_info:
+        annotation_module.validate_annotation_file(labels, ids, kind=kind)
+
+    assert str(exc_info.value) == "private annotations are invalid"
+    assert exc_info.value.__cause__ is None
+
+
+def test_annotation_cli_success_outputs_safe_json(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    labels = tmp_path / "private.jsonl"
+    ids = tmp_path / "safe.ids.json"
+    _write_jsonl(labels, [_type_domain("q1")])
+    _write_ids(ids, ["q1"])
+
+    exit_code = annotation_module.main(
+        ["--kind", "type-domain", "--labels", str(labels), "--ids", str(ids)]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert json.loads(captured.out)["status"] == "valid"
+    assert captured.err == ""
+    assert "q1" not in captured.out
+    assert str(labels) not in captured.out
+
+
+def test_annotation_cli_failure_leaks_no_private_values(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    private_dir = tmp_path / "private-filename-sentinel"
+    private_dir.mkdir()
+    labels = private_dir / "labels.jsonl"
+    ids = tmp_path / "safe.ids.json"
+    _write_jsonl(
+        labels,
+        [
+            {
+                "query_id": "query-id-sentinel",
+                "query_type": "method",
+                "domain": "information-retrieval",
+                "annotator": "annotator-sentinel",
+                "private-answer": "answer-sentinel",
+            }
+        ],
+    )
+    _write_ids(ids, ["query-id-sentinel"])
+
+    exit_code = annotation_module.main(
+        ["--kind", "type-domain", "--labels", str(labels), "--ids", str(ids)]
+    )
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == "annotation validation failed\n"
+    for sentinel in (
+        "private-filename-sentinel",
+        "query-id-sentinel",
+        "annotator-sentinel",
+        "answer-sentinel",
+    ):
+        assert sentinel not in combined
+
+def test_annotation_module_cli_executes_without_preimport_warning() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "paper_search.evaluation.annotation", "--help"],
+        check=False,
+        capture_output=True,
+        cwd=Path("src"),
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "usage:" in result.stdout
+    assert result.stderr == ""

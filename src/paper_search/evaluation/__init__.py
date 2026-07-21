@@ -2,13 +2,6 @@
 
 from typing import TYPE_CHECKING
 
-from paper_search.evaluation.annotation import (
-    AgreementReport,
-    AnnotationRecord,
-    FieldAgreement,
-    cohen_kappa,
-    compare_annotations,
-)
 from paper_search.evaluation.dataset import (
     EvaluationQuery,
     IdentifierMap,
@@ -31,6 +24,16 @@ from paper_search.evaluation.official_adapter import (
 
 
 if TYPE_CHECKING:
+    from paper_search.evaluation.annotation import (
+        AgreementReport,
+        AnnotationRecord,
+        AnnotationValidationSummary,
+        FieldAgreement,
+        TypeDomainAnnotationRecord,
+        cohen_kappa,
+        compare_annotations,
+        validate_annotation_file,
+    )
     from paper_search.evaluation.metrics import (
         EvaluationResult,
         MetricSummary,
@@ -41,6 +44,18 @@ if TYPE_CHECKING:
     )
 
 
+_ANNOTATION_EXPORTS = frozenset(
+    {
+        "AgreementReport",
+        "AnnotationRecord",
+        "AnnotationValidationSummary",
+        "FieldAgreement",
+        "TypeDomainAnnotationRecord",
+        "cohen_kappa",
+        "compare_annotations",
+        "validate_annotation_file",
+    }
+)
 _METRIC_EXPORTS = frozenset(
     {
         "EvaluationResult",
@@ -54,27 +69,50 @@ _METRIC_EXPORTS = frozenset(
 
 
 def __getattr__(name: str) -> object:
-    """Load metric exports lazily so ``python -m ...metrics`` stays warning-free."""
-    if name not in _METRIC_EXPORTS:
+    """Load executable-submodule exports lazily so ``python -m`` stays warning-free."""
+    if name in _ANNOTATION_EXPORTS:
+        from paper_search.evaluation.annotation import (
+            AgreementReport,
+            AnnotationRecord,
+            AnnotationValidationSummary,
+            FieldAgreement,
+            TypeDomainAnnotationRecord,
+            cohen_kappa,
+            compare_annotations,
+            validate_annotation_file,
+        )
+
+        exports: dict[str, object] = {
+            "AgreementReport": AgreementReport,
+            "AnnotationRecord": AnnotationRecord,
+            "AnnotationValidationSummary": AnnotationValidationSummary,
+            "FieldAgreement": FieldAgreement,
+            "TypeDomainAnnotationRecord": TypeDomainAnnotationRecord,
+            "cohen_kappa": cohen_kappa,
+            "compare_annotations": compare_annotations,
+            "validate_annotation_file": validate_annotation_file,
+        }
+    elif name in _METRIC_EXPORTS:
+        from paper_search.evaluation.metrics import (
+            EvaluationResult,
+            MetricSummary,
+            QueryMetrics,
+            deduplicate_ranked,
+            evaluate,
+            score_query,
+        )
+
+        exports = {
+            "EvaluationResult": EvaluationResult,
+            "MetricSummary": MetricSummary,
+            "QueryMetrics": QueryMetrics,
+            "deduplicate_ranked": deduplicate_ranked,
+            "evaluate": evaluate,
+            "score_query": score_query,
+        }
+    else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-    from paper_search.evaluation.metrics import (
-        EvaluationResult,
-        MetricSummary,
-        QueryMetrics,
-        deduplicate_ranked,
-        evaluate,
-        score_query,
-    )
-
-    exports: dict[str, object] = {
-        "EvaluationResult": EvaluationResult,
-        "MetricSummary": MetricSummary,
-        "QueryMetrics": QueryMetrics,
-        "deduplicate_ranked": deduplicate_ranked,
-        "evaluate": evaluate,
-        "score_query": score_query,
-    }
     value = exports[name]
     globals()[name] = value
     return value
@@ -83,6 +121,7 @@ def __getattr__(name: str) -> object:
 __all__ = [
     "AgreementReport",
     "AnnotationRecord",
+    "AnnotationValidationSummary",
     "EvaluationQuery",
     "EvaluationResult",
     "FieldAgreement",
@@ -92,6 +131,7 @@ __all__ = [
     "PaSaRecord",
     "PredictionRecord",
     "QueryMetrics",
+    "TypeDomainAnnotationRecord",
     "adapt_pasa_record",
     "adapt_prediction_record",
     "answer_count_bucket",
@@ -105,6 +145,7 @@ __all__ = [
     "score_query",
     "sha256_file",
     "stratified_sample",
+    "validate_annotation_file",
     "write_frozen_bytes",
     "write_jsonl_atomic",
 ]

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import argparse
+import json
 import math
+import sys
 from collections import Counter
 from collections.abc import Sequence
 from datetime import date
+from hashlib import sha256
+from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, Field, StringConstraints, model_validator
+from pydantic import AfterValidator, Field, StringConstraints, ValidationError, model_validator
 
 from paper_search.domain.models import DomainModel, NonEmptyStr, NonNegativeInt, UnitFloat
 
@@ -21,6 +26,7 @@ QueryType = Literal[
     "exclusion",
     "ambiguous",
 ]
+AnnotationKind = Literal["type-domain", "constraints"]
 DOMAIN_LABELS = (
     "artificial-intelligence",
     "machine-learning",
@@ -101,6 +107,16 @@ class AnnotationRecord(DomainModel):
         return self
 
 
+class AnnotationValidationSummary(DomainModel):
+    """Secret-safe result of validating one private annotation file."""
+
+    status: Literal["valid"] = "valid"
+    kind: AnnotationKind
+    count: NonNegativeInt
+    sha256: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    ids_match: bool
+
+
 class FieldAgreement(DomainModel):
     """Agreement result for one categorical annotation field."""
 
@@ -114,6 +130,68 @@ class AgreementReport(DomainModel):
 
     compared_query_count: NonNegativeInt
     fields: dict[str, FieldAgreement]
+
+
+def validate_annotation_file(
+    labels_path: Path,
+    ids_path: Path,
+    *,
+    kind: AnnotationKind,
+) -> AnnotationValidationSummary:
+    """Validate private JSONL without returning paths, IDs, or record values."""
+    try:
+        if kind not in ("type-domain", "constraints"):
+            raise ValueError
+        raw_labels = labels_path.read_bytes()
+        lines = raw_labels.decode("utf-8").splitlines()
+        if not lines or any(not line.strip() for line in lines):
+            raise ValueError
+
+        model = TypeDomainAnnotationRecord if kind == "type-domain" else AnnotationRecord
+        query_ids: list[str] = []
+        for line in lines:
+            payload = json.loads(line)
+            if not isinstance(payload, dict):
+                raise ValueError
+            query_ids.append(model.model_validate(payload).query_id)
+        if len(query_ids) != len(set(query_ids)):
+            raise ValueError
+
+        expected_payload = json.loads(ids_path.read_bytes().decode("utf-8"))
+        if not isinstance(expected_payload, list) or not all(
+            isinstance(query_id, str) and query_id.strip() for query_id in expected_payload
+        ):
+            raise ValueError
+        expected_ids = list(expected_payload)
+        if len(expected_ids) != len(set(expected_ids)):
+            raise ValueError
+        if len(query_ids) != len(expected_ids) or set(query_ids) != set(expected_ids):
+            raise ValueError
+    except (OSError, UnicodeError, json.JSONDecodeError, ValidationError, TypeError, ValueError):
+        raise ValueError("private annotations are invalid") from None
+
+    return AnnotationValidationSummary(
+        kind=kind,
+        count=len(query_ids),
+        sha256=f"sha256:{sha256(raw_labels).hexdigest()}",
+        ids_match=True,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Validate one private annotation file and print only a safe summary."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--kind", choices=("type-domain", "constraints"), required=True)
+    parser.add_argument("--labels", type=Path, required=True)
+    parser.add_argument("--ids", type=Path, required=True)
+    args = parser.parse_args(argv)
+    try:
+        summary = validate_annotation_file(args.labels, args.ids, kind=args.kind)
+    except ValueError:
+        print("annotation validation failed", file=sys.stderr)
+        return 1
+    print(summary.model_dump_json())
+    return 0
 
 
 def cohen_kappa(first: Sequence[str], second: Sequence[str]) -> float:
@@ -191,3 +269,6 @@ def compare_annotations(
         compared_query_count=len(query_ids),
         fields=report_fields,
     )
+
+if __name__ == "__main__":
+    raise SystemExit(main())

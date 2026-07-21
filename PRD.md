@@ -777,14 +777,14 @@ Streamlit 前端包含：
 **协作者文件：** `data/README.md`、开发集样例  
 **测试文件：** `tests/evaluation/test_metrics.py`、`tests/evaluation/test_dataset.py`
 
-**当前状态：** `waiting_for_human_label_freeze`。评测内核、数据准备脚本、工作包生成、标注校验与安全压力集已完成；真实受限数据冻结和人工标注仍待协作者按固定 revision 完成。
+**当前状态：** `waiting_for_human_label_freeze`。固定 revision、prepared manifest、60/30/50 分区 ID 清单及 90/40/20 标注工作包 ID 已准备并完成独立核对；真人标签、gold 与正式冻结仍待完成。
 
 - [x] 定义包含 `query_id`、`query`、`relevant_paper_ids` 和元数据的 JSONL 格式。
 - [x] 实现 DOI、OpenAlex ID、Semantic Scholar ID 和标题的答案归一化。
 - [x] 实现 `OfficialEvaluationAdapter`；官方评分器未发布时使用第 14.0 节契约，并通过固定 fixture 验证预测文件字段、ID、去重和空答案行为。
 - [x] 实现 Precision、Recall、F1、Recall@5、Recall@10、Recall@20。
 - [x] 为零预测、零标准答案、重复预测和 ID 映射编写边界测试。
-- [ ] 按第 14.1 节准备 60 条开发、30 条验证和 50 条模拟测试样本，记录 dataset revision、文件哈希、访问条件、抽样脚本和随机种子。
+- [x] 按第 14.1 节准备 60 条开发、30 条验证和 50 条模拟测试样本，记录 dataset revision、文件哈希、访问条件、抽样脚本和随机种子。（证据：`d6adb6e`。）
 - [ ] 协作者在第 7 天前完成开发/验证样本的查询类型与领域标记；模拟测试集只保存 ID 清单，第 14 天冻结后不再查看标签。
 - [x] 建立 24 条覆盖七类查询及中英文改写的压力集；该压力集只用于鲁棒性，不参与 F1 调参。
 - [ ] 协作者在第 7 天前交付 40 条查询约束标注 JSONL，字段固定为 `query_id, research_goal, must_have, should_have, exclusions, year_from, year_to, venues, query_type, domain, annotator`；主负责人复核 10 条。
@@ -823,11 +823,11 @@ Streamlit 前端包含：
 - [x] 实现 `uv run python -m paper_search.evaluation.runner --config configs/base.yaml --split dev --output experiments/baseline-week1`。
 - [x] 输出逐查询指标、宏平均指标、调用数和延迟。
 - [x] 协作者实现查询框和论文列表，不实现算法逻辑。
-- [ ] 运行全部测试并对开发集完成第一次基线评测。（工程测试已通过；真实开发集基线阻塞于协作者数据集尚未冻结。）
-- [ ] 第 7 天冻结开发集、验证集和抽样脚本；后续新增样本单独进入压力集，不回写已冻结分区。（阻塞：协作者数据集尚未冻结。）
-- [ ] 完成模糊标题合并的人工准确率审计，并记录真实开发集上的去重 Recall 损失。（阻塞：协作者数据集尚未冻结。）
+- [ ] 运行全部测试并对开发集完成第一次基线评测。（工程测试已通过；准备 manifest/ID 已固定，真人标签、gold 与正式冻结证据仍缺失。）
+- [ ] 第 7 天冻结开发集、验证集和抽样脚本；后续新增样本单独进入压力集，不回写已冻结分区。（阻塞：准备 manifest/ID 已固定，真人标签、gold 与正式冻结证据仍缺失。）
+- [ ] 完成模糊标题合并的人工准确率审计，并记录真实开发集上的去重 Recall 损失。（阻塞：准备 manifest/ID 已固定，真人标签、gold 与正式冻结证据仍缺失。）
 
-- [ ] **第 1 周阶段闸门：** 可以从查询得到去重论文列表并计算 F1；未达到则第 2 周前两天继续修复，不开发关系图。（阻塞：真实开发集基线与人工去重审计尚无冻结数据证据。）
+- [ ] **第 1 周阶段闸门：** 可以从查询得到去重论文列表并计算 F1；未达到则第 2 周前两天继续修复，不开发关系图。（阻塞：准备 manifest/ID 已固定，真人标签、gold、正式冻结、真实开发集 baseline 与人工去重审计证据仍缺失。）
 
 ### 第 2 周：完整端到端 baseline
 

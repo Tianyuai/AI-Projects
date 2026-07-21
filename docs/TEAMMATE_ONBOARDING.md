@@ -2,13 +2,13 @@
 
 > 工作分支：`codex/week1-collaboration`
 >
-> 当前状态：Task 1–4 工程部分已完成；正式数据冻结、真实 baseline、人工审计和 Week 1 gate 尚未完成。
+> 当前状态：Task 1–4 工程部分及安全准备元数据已完成，Task 2 标注工作包输入已固定；正式数据冻结、真实 baseline、人工审计和 Week 1 gate 尚未完成。
 >
-> 最后更新：2026-07-17
+> 最后更新：2026-07-21
 
 ## 1. 当前目标
 
-协作者现在不继续开发检索算法，而是准备和审核真实、完整、可复现的数据证据。当前仓库没有正式 `data/manifest.json`，因此不得运行或宣称正式 Week 1 baseline，也不得宣布 Week 1 gate 通过。
+协作者现在不继续开发检索算法，而是完成真人独立标注并审核真实、完整、可复现的数据证据。仓库已有 prepared `data/manifest.json` 和安全 ID 清单，但 manifest 仍为 `waiting_for_human_label_freeze`，不能驱动或代表正式 Week 1 baseline，也不能据此宣布 Week 1 gate 通过。
 
 执行顺序：环境与访问检查 → 固定数据准备 → 90 条类型/领域标记 → 40 条约束标注 → 固定 20 条独立双标 → 正式数据冻结 → 真实 baseline → 模糊去重审计 → Recall/失败率/成本审核 → Week 1 gate。
 
@@ -113,13 +113,17 @@ uv run --env-file .env python scripts/prepare_task2_data.py --output-root data
 
 `data/splits/*.ids.json` 中只含 query ID 的清单属于可提交安全元数据；包含查询文本、gold 或人工答案的标注工作包仍是受限文件。
 
-完成后等待主负责人明确发布：
+### 主负责人通知（2026-07-21）
 
 ```text
-Task 2 标注工作包 v1 已冻结
+Task 2 标注工作包 v1 已冻结（仅标注输入）
+source commit: d6adb6e1f1ab12c40cf87315951de1cfe9742121
+dataset revision: 232428b0c867268c3b8ded90db4d98c1b30501d6
+prepared manifest sha256: sha256:b5eaa1bc83d3a22b655c9f7e3e1ffa506176e49781cc3c2c618307d7c541ae21
+counts: dev=60, validation=30, simulated_test=50, type_domain=90, constraints=40, overlap=20
 ```
 
-没有这条通知，不得开始正式标注。
+这条通知只固定标注输入并授权开始真人独立标注，不代表数据集已正式冻结。当前 manifest 必须继续保持 `waiting_for_human_label_freeze`；正式 `frozen` 仍需完整 gold、90/40/20 私密标签、kappa、逐分区 `zero_answer_policy` 和主负责人显式批准。
 
 ## 5. 工作包 2：90 条查询类型与领域标记
 
@@ -462,8 +466,8 @@ API 调用 / P50 / P95 / 成本：<值>
 1. 拉取 `codex/week1-collaboration`；
 2. 完成工作包 0 的不主动加载 `.env` 的环境验证；
 3. 确认自己的 PaSa 只读访问；
-4. 完成工作包 1，核对 revision、哈希和 60/30/50、40、20；
-5. 回复主负责人“环境与固定数据核对完成”；
-6. 等待“Task 2 标注工作包 v1 已冻结”；
-7. 收到通知后依次完成 90 条、40 条和固定 20 条人工工作；
+4. 核对 source commit `d6adb6e1f1ab12c40cf87315951de1cfe9742121`、dataset revision、prepared manifest SHA-256、60/30/50 与 90/40/20 ID 清单，以及本地私密源文件哈希；
+5. 回复主负责人“环境、固定数据身份与本地私密源哈希核对完成”；
+6. 按本通知立即开始 90 条类型/领域、40 条约束和固定 20 条独立真人工作，双标完成前不得交换答案；
+7. 仅通过访问受控渠道交付三份私密标签的数量与精确字节 SHA-256，不在 Git 或普通聊天中发送正文；
 8. 正式冻结批准前，不运行 baseline，不修改 manifest 状态。

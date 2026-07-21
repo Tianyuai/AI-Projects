@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
+from collections.abc import Sequence
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
@@ -38,63 +40,83 @@ def _dependency_report() -> dict[str, dict[str, Any]]:
     return report
 
 
-def collect_local_health(matrix_size: int = 64) -> dict[str, Any]:
-    """Collect a secret-free local Python, CUDA, and retrieval-stack report."""
+def _cpu_smoke(torch_module: Any, matrix_size: int) -> dict[str, object]:
+    with torch_module.inference_mode():
+        left = torch_module.ones((matrix_size, matrix_size), device="cpu")
+        right = torch_module.ones((matrix_size, matrix_size), device="cpu")
+        product = left @ right
+        finite = bool(torch_module.isfinite(product).all().item())
+        checksum = float(product.sum().item())
+    return {
+        "shape": [matrix_size, matrix_size],
+        "finite": finite,
+        "checksum": checksum,
+    }
+
+
+def _cuda_smoke(torch_module: Any, matrix_size: int) -> dict[str, object]:
+    device_index = torch_module.cuda.current_device()
+    with torch_module.inference_mode():
+        left = torch_module.ones((matrix_size, matrix_size), device="cuda")
+        right = torch_module.ones((matrix_size, matrix_size), device="cuda")
+        product = left @ right
+        finite = bool(torch_module.isfinite(product).all().item())
+        checksum = float(product.sum().item())
+    torch_module.cuda.synchronize(device_index)
+    smoke = {
+        "shape": [matrix_size, matrix_size],
+        "finite": finite,
+        "checksum": checksum,
+    }
+    del left, right, product
+    torch_module.cuda.empty_cache()
+    return {
+        "device": str(torch_module.cuda.get_device_name(device_index)),
+        "matrix_smoke": smoke,
+    }
+
+
+def collect_local_health(
+    matrix_size: int = 64,
+    require_accelerator: str | None = None,
+) -> dict[str, Any]:
+    """Collect secret-free core and optional accelerator health evidence."""
     if matrix_size < 1:
         raise ValueError("matrix_size must be positive")
+    if require_accelerator not in (None, "cuda"):
+        raise ValueError("unsupported accelerator requirement")
 
     import torch
 
     dependencies = _dependency_report()
-    cuda_available = torch.cuda.is_available()
-    torch_report: dict[str, Any] = {
-        "version": torch.__version__,
-        "cuda_build": torch.version.cuda,
-        "cuda_available": cuda_available,
+    errors = [
+        f"dependency_missing:{name}"
+        for name, item in dependencies.items()
+        if not item["available"]
+    ]
+
+    cpu_smoke: dict[str, object] | None = None
+    try:
+        cpu_smoke = _cpu_smoke(torch, matrix_size)
+    except RuntimeError as exc:
+        errors.append(f"cpu_smoke:{type(exc).__name__}")
+
+    accelerator: dict[str, object] = {
+        "backend": "cuda",
+        "status": "unavailable",
+        "build": torch.version.cuda,
         "device": None,
-        "compute_capability": None,
-        "total_memory_mb": None,
         "matrix_smoke": None,
     }
-
-    errors: list[str] = []
-    if cuda_available:
+    if torch.cuda.is_available():
         try:
-            device_index = torch.cuda.current_device()
-            properties = torch.cuda.get_device_properties(device_index)
-            torch.cuda.reset_peak_memory_stats(device_index)
-            with torch.inference_mode():
-                left = torch.ones((matrix_size, matrix_size), device="cuda")
-                right = torch.ones((matrix_size, matrix_size), device="cuda")
-                product = left @ right
-                finite = bool(torch.isfinite(product).all().item())
-                checksum = float(product.sum().item())
-            torch.cuda.synchronize(device_index)
-            peak_memory_mb = torch.cuda.max_memory_allocated(device_index) / (1024**2)
-            torch_report.update(
-                {
-                    "device": properties.name,
-                    "compute_capability": list(torch.cuda.get_device_capability(device_index)),
-                    "total_memory_mb": round(properties.total_memory / (1024**2), 1),
-                    "matrix_smoke": {
-                        "shape": [matrix_size, matrix_size],
-                        "finite": finite,
-                        "checksum": checksum,
-                        "peak_memory_mb": round(peak_memory_mb, 2),
-                    },
-                }
-            )
-            del left, right, product
-            torch.cuda.empty_cache()
-        except RuntimeError as exc:
-            errors.append(f"gpu_smoke:{type(exc).__name__}")
-    else:
-        errors.append("cuda_unavailable")
+            accelerator.update(_cuda_smoke(torch, matrix_size))
+            accelerator["status"] = "available"
+        except RuntimeError:
+            accelerator["status"] = "error"
 
-    missing_dependencies = [
-        name for name, item in dependencies.items() if not item["available"]
-    ]
-    errors.extend(f"dependency_missing:{name}" for name in missing_dependencies)
+    if require_accelerator == "cuda" and accelerator["status"] != "available":
+        errors.append("accelerator_required:cuda")
 
     return {
         "status": "ready" if not errors else "degraded",
@@ -103,16 +125,23 @@ def collect_local_health(matrix_size: int = 64) -> dict[str, Any]:
             "major_minor": f"{sys.version_info.major}.{sys.version_info.minor}",
             "executable": sys.executable,
         },
-        "torch": torch_report,
-        "dependencies": dependencies,
+        "core": {
+            "torch_version": str(torch.__version__),
+            "matrix_smoke": cpu_smoke,
+            "dependencies": dependencies,
+        },
+        "accelerator": accelerator,
         "errors": errors,
     }
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Print the local health report as JSON without reading application secrets."""
-    report = collect_local_health()
-    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--require-accelerator", choices=("cuda",))
+    args = parser.parse_args(argv)
+    report = collect_local_health(require_accelerator=args.require_accelerator)
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
     return 0 if report["status"] == "ready" else 1
 
 

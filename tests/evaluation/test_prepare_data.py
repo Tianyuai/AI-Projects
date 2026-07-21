@@ -254,7 +254,11 @@ def test_fresh_windows_checkout_preserves_manifest_id_hashes(
     )
 
     data_root = checkout / "data"
-    manifest = json.loads((data_root / "manifest.json").read_bytes())
+    manifest_bytes = (data_root / "manifest.json").read_bytes()
+    assert "sha256:" + hashlib.sha256(manifest_bytes).hexdigest() == (
+        "sha256:b5eaa1bc83d3a22b655c9f7e3e1ffa506176e49781cc3c2c618307d7c541ae21"
+    )
+    manifest = json.loads(manifest_bytes)
     for section in ("partitions", "work_packages"):
         for entry in manifest[section].values():
             payload = (data_root / entry["ids_path"]).read_bytes()

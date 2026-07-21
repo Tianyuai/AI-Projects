@@ -524,7 +524,7 @@ def test_audit_report_is_content_safe(tmp_path: Path) -> None:
     fixture = _prepared_tree(tmp_path)
     sentinel = "PRIVATE-SENTINEL-DO-NOT-EMIT"
     for path, annotator in (
-        (fixture.type_domain_labels, f"{sentinel}-type-domain"),
+        (fixture.type_domain_labels, f"{sentinel}-first"),
         (fixture.constraint_labels, f"{sentinel}-first"),
         (fixture.overlap_labels, f"{sentinel}-second"),
     ):
@@ -848,6 +848,48 @@ def test_audit_rejects_same_annotator_for_overlap(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="private annotations are invalid"):
         _audit(fixture)
 
+
+def test_audit_rejects_constraint_labels_that_disagree_with_type_domain(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    overlap_ids = {row["query_id"] for row in _label_rows(fixture.overlap_labels)}
+    rows = _label_rows(fixture.constraint_labels)
+    target = next(row for row in rows if row["query_id"] not in overlap_ids)
+    target["query_type"] = "topic"
+    target["domain"] = "computer-vision"
+    _jsonl(fixture.constraint_labels, rows)
+
+    with pytest.raises(ValueError, match="private annotations are invalid"):
+        _audit(fixture)
+
+
+@pytest.mark.parametrize("label_name", ["type_domain", "constraints", "overlap"])
+def test_audit_rejects_unstable_annotator_within_each_private_file(
+    tmp_path: Path,
+    label_name: str,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    path = _label_path(fixture, label_name)
+    rows = _label_rows(path)
+    rows[0]["annotator"] = "member-c"
+    _jsonl(path, rows)
+
+    with pytest.raises(ValueError, match="private annotations are invalid"):
+        _audit(fixture)
+
+
+def test_audit_rejects_different_annotators_for_type_domain_and_constraints(
+    tmp_path: Path,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    rows = _label_rows(fixture.constraint_labels)
+    for row in rows:
+        row["annotator"] = "member-c"
+    _jsonl(fixture.constraint_labels, rows)
+
+    with pytest.raises(ValueError, match="private annotations are invalid"):
+        _audit(fixture)
 
 @pytest.mark.parametrize("location", ["top", "source", "work_package"])
 def test_audit_rejects_unknown_manifest_fields(

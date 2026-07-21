@@ -407,6 +407,31 @@ def test_annotation_cli_failure_leaks_no_private_values(
     ):
         assert sentinel not in combined
 
+def test_annotation_cli_syntax_error_does_not_echo_private_argv(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sentinel = "PRIVATE-PATH-SENTINEL"
+
+    with pytest.raises(SystemExit) as exc_info:
+        annotation_module.main(
+            [
+                "--kind",
+                "type-domain",
+                "--labels",
+                sentinel,
+                "--ids",
+                "safe.ids.json",
+                "--unexpected",
+                sentinel,
+            ]
+        )
+
+    captured = capsys.readouterr()
+    assert exc_info.value.code == 2
+    assert captured.out == ""
+    assert captured.err == "annotation validation failed\n"
+    assert sentinel not in captured.err
+
 def test_annotation_module_cli_executes_without_preimport_warning() -> None:
     result = subprocess.run(
         [sys.executable, "-m", "paper_search.evaluation.annotation", "--help"],

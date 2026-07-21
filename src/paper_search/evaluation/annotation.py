@@ -9,7 +9,7 @@ from collections.abc import Sequence
 from datetime import date
 from hashlib import sha256
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, NoReturn
 
 from pydantic import AfterValidator, Field, StringConstraints, ValidationError, model_validator
 
@@ -178,9 +178,14 @@ def validate_annotation_file(
     )
 
 
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        self.exit(2, "annotation validation failed\n")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Validate one private annotation file and print only a safe summary."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = _SafeArgumentParser(description=__doc__)
     parser.add_argument("--kind", choices=("type-domain", "constraints"), required=True)
     parser.add_argument("--labels", type=Path, required=True)
     parser.add_argument("--ids", type=Path, required=True)

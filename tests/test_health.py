@@ -107,6 +107,52 @@ def test_cpu_smoke_failure_is_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "private cpu detail" not in json.dumps(report)
 
 
+@pytest.mark.parametrize(
+    "smoke",
+    [
+        {"shape": [4, 4], "finite": False, "checksum": 64.0},
+        {"shape": [4, 4], "finite": True, "checksum": 63.0},
+    ],
+)
+def test_incorrect_cpu_smoke_result_is_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+    smoke: dict[str, object],
+) -> None:
+    monkeypatch.setattr(health, "_dependency_report", _available_dependencies)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(health, "_cpu_smoke", lambda _torch, _size: smoke)
+
+    report = health.collect_local_health(matrix_size=4)
+
+    assert report["status"] == "degraded"
+    assert report["errors"] == ["cpu_smoke:invalid_result"]
+
+
+@pytest.mark.parametrize(
+    "smoke",
+    [
+        {"shape": [4, 4], "finite": False, "checksum": 64.0},
+        {"shape": [4, 4], "finite": True, "checksum": 63.0},
+    ],
+)
+def test_incorrect_required_cuda_smoke_result_is_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+    smoke: dict[str, object],
+) -> None:
+    monkeypatch.setattr(health, "_dependency_report", _available_dependencies)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        health,
+        "_cuda_smoke",
+        lambda _torch, _size: {"device": "test-cuda", "matrix_smoke": smoke},
+    )
+
+    report = health.collect_local_health(matrix_size=4, require_accelerator="cuda")
+
+    assert report["status"] == "degraded"
+    assert report["accelerator"]["status"] == "error"
+    assert report["errors"] == ["accelerator_required:cuda"]
+
 def test_missing_dependency_is_blocking(monkeypatch: pytest.MonkeyPatch) -> None:
     dependencies = _available_dependencies()
     dependencies["faiss"] = {

@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
@@ -76,6 +76,16 @@ def _cuda_smoke(torch_module: Any, matrix_size: int) -> dict[str, object]:
     }
 
 
+def _smoke_result_is_valid(smoke: object, matrix_size: int) -> bool:
+    if not isinstance(smoke, Mapping):
+        return False
+    return (
+        smoke.get("shape") == [matrix_size, matrix_size]
+        and smoke.get("finite") is True
+        and smoke.get("checksum") == float(matrix_size**3)
+    )
+
+
 def collect_local_health(
     matrix_size: int = 64,
     require_accelerator: str | None = None,
@@ -98,6 +108,8 @@ def collect_local_health(
     cpu_smoke: dict[str, object] | None = None
     try:
         cpu_smoke = _cpu_smoke(torch, matrix_size)
+        if not _smoke_result_is_valid(cpu_smoke, matrix_size):
+            errors.append("cpu_smoke:invalid_result")
     except RuntimeError as exc:
         errors.append(f"cpu_smoke:{type(exc).__name__}")
 
@@ -110,8 +122,13 @@ def collect_local_health(
     }
     if torch.cuda.is_available():
         try:
-            accelerator.update(_cuda_smoke(torch, matrix_size))
-            accelerator["status"] = "available"
+            cuda_result = _cuda_smoke(torch, matrix_size)
+            accelerator.update(cuda_result)
+            accelerator["status"] = (
+                "available"
+                if _smoke_result_is_valid(cuda_result.get("matrix_smoke"), matrix_size)
+                else "error"
+            )
         except RuntimeError:
             accelerator["status"] = "error"
 

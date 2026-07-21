@@ -483,6 +483,28 @@ def _private_records(
         or len(overlap) != len(overlap_ids)
     ):
         raise ValueError("private annotations are invalid")
+    type_domain_by_id = {record.query_id: record for record in type_domain}
+    if any(
+        record.query_type != type_domain_by_id[record.query_id].query_type
+        or record.domain != type_domain_by_id[record.query_id].domain
+        for record in constraints
+    ):
+        raise ValueError("private annotations are invalid")
+    annotator_sets = (
+        {record.annotator for record in type_domain},
+        {record.annotator for record in constraints},
+        {record.annotator for record in overlap},
+    )
+    if any(len(annotators) != 1 for annotators in annotator_sets):
+        raise ValueError("private annotations are invalid")
+    type_domain_annotator = next(iter(annotator_sets[0]))
+    constraint_annotator = next(iter(annotator_sets[1]))
+    overlap_annotator = next(iter(annotator_sets[2]))
+    if (
+        type_domain_annotator != constraint_annotator
+        or overlap_annotator == constraint_annotator
+    ):
+        raise ValueError("private annotations are invalid")
     overlap_set = set(overlap_ids)
     first_rater = [record for record in constraints if record.query_id in overlap_set]
     first_by_id = {record.query_id: record for record in first_rater}

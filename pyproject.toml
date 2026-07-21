@@ -13,9 +13,17 @@ dependencies = [
     "python-dotenv>=1.0,<2",
     "pyyaml>=6,<7",
     "rank-bm25>=0.2.2,<0.3",
+    "transformers>=4.48,<5",
+]
+
+[project.optional-dependencies]
+cpu = [
     "sentence-transformers>=3.3,<6",
     "torch==2.5.1",
-    "transformers>=4.48,<5",
+]
+cuda = [
+    "sentence-transformers>=3.3,<6",
+    "torch==2.5.1",
 ]
 
 [dependency-groups]
@@ -39,6 +47,7 @@ addopts = "-ra -p no:cacheprovider --import-mode=importlib"
 pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
+    "hardware: requires an explicitly selected accelerator environment",
     "online: requires explicit external provider credentials and network",
 ]
 
@@ -52,8 +61,24 @@ strict = true
 plugins = ["pydantic.mypy"]
 warn_unused_configs = true
 
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cuda" },
+    ],
+]
+
 [tool.uv.sources]
-torch = { index = "pytorch-cu121" }
+torch = [
+    { index = "pytorch-cu121", extra = "cuda" },
+    { index = "pytorch-cpu", extra = "cpu" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu121"

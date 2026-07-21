@@ -47,13 +47,13 @@ git switch --track origin/codex/week1-collaboration
 完成全新 checkout 后执行：
 
 ```powershell
-uv sync --all-groups
+uv sync --locked --extra cpu
 uv run --no-env-file pytest -q
 uv run --no-env-file ruff check .
 uv run --no-env-file mypy src
 ```
 
-这里的 `--no-env-file` 只表示“不会主动加载 `.env`”，不会清除进程中已经存在的环境变量，也不是网络隔离。`uv sync --all-groups` 可能访问包索引；需要真正离线时，必须预先准备依赖缓存，并由主负责人提供断网环境或防火墙验证方式。
+这里的 `--no-env-file` 只表示“不会主动加载 `.env`”，不会清除进程中已经存在的环境变量，也不是网络隔离。`uv sync --locked --extra cpu` 可能访问包索引；需要真正离线时，必须预先准备依赖缓存，并由主负责人提供断网环境或防火墙验证方式。 裸 `uv sync` 是 core-only，不足以运行完整检索与健康检查。
 
 数据准备子进程可以通过 `--env-file` 加载凭据，但不要打开或输出 `.env`：
 
@@ -111,6 +111,33 @@ counts: dev=60, validation=30, simulated_test=50, type_domain=90, constraints=40
 ```
 
 这条通知只固定标注输入并授权开始真人独立标注，不代表数据集已正式冻结。当前 manifest 必须继续保持 `waiting_for_human_label_freeze`；正式 `frozen` 仍需完整 gold、90/40/20 私密标签、kappa、逐分区 `zero_answer_policy` 和主负责人显式批准。
+### 私密标注文件、角色与本地校验
+
+- 协作者使用稳定代号 `member-b`，独立完成 90 条 `type_domain_labels.jsonl` 和固定 40 条 `constraint_labels.jsonl`。
+- 主负责人使用不同稳定代号 `member-a`，独立完成固定 20 条 `overlap_labels.jsonl`；这 20 条是协作者 40 条约束标注中的固定子集。
+- domain 只能使用 `data/domain_labels.v1.json` 中的 `domain-labels-v1`；不要自行创造近义标签，无法归类时使用 `other` 并保留私密问题记录。
+- 双方完成前不得交换答案。各自先本地校验，再只交换记录数量和精确字节 SHA-256（hash-first handoff）。
+
+三份文件只能位于被忽略的 `data/annotation_work/` 或其他访问受控目录。以下命令只输出数量、文件 SHA-256 和通用状态，不输出 query ID、字段值、标注答案或私密路径：
+
+```powershell
+uv run --no-sync --no-env-file python -m paper_search.evaluation.annotation `
+  --kind type-domain `
+  --labels data/annotation_work/type_domain_labels.jsonl `
+  --ids data/splits/type_domain_annotation.ids.json
+
+uv run --no-sync --no-env-file python -m paper_search.evaluation.annotation `
+  --kind constraints `
+  --labels data/annotation_work/constraint_labels.jsonl `
+  --ids data/splits/constraint_annotation.ids.json
+
+uv run --no-sync --no-env-file python -m paper_search.evaluation.annotation `
+  --kind constraints `
+  --labels data/annotation_work/overlap_labels.jsonl `
+  --ids data/splits/overlap_annotation.ids.json
+```
+
+只有两位真人独立完成且 `query_type`、`domain` 的 Cohen's kappa 分别达到 `0.80`，才能进入正式冻结审核。
 
 ## 5. 工作包 2：90 条查询类型与领域标记
 

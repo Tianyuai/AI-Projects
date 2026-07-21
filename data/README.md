@@ -24,7 +24,7 @@
 先在自己的 Hugging Face 账号接受数据条款，将 Token 仅写入本地环境配置，然后执行：
 
 ```powershell
-uv sync --all-groups
+uv sync --locked --extra cpu
 uv run --env-file .env python scripts/prepare_task2_data.py --output-root data
 ```
 
@@ -50,6 +50,19 @@ uv run python -m paper_search.evaluation.metrics `
 
 对本地开发集评测时，将 `--gold` 指向 `data/dev/gold.jsonl`，将 `--pred` 指向符合固定预测 Schema 的本地文件。不要提交受限输入或由其生成的逐查询内容。
 
+## 已发布的标注输入与预冻结校验
+
+“Task 2 标注工作包 v1 已冻结（仅标注输入）”通知已经发布。它只固定标注输入，当前 manifest 仍必须保持 `waiting_for_human_label_freeze`，不代表 gold、人工标签或正式数据冻结已经完成。
+
+协作者可在不运行正式 freeze audit 的情况下分别校验 90 条类型/领域和 40 条约束文件；主负责人用相同入口校验独立 20 条 overlap 文件：
+
+```powershell
+uv run --no-sync --no-env-file python -m paper_search.evaluation.annotation --kind type-domain --labels data/annotation_work/type_domain_labels.jsonl --ids data/splits/type_domain_annotation.ids.json
+uv run --no-sync --no-env-file python -m paper_search.evaluation.annotation --kind constraints --labels data/annotation_work/constraint_labels.jsonl --ids data/splits/constraint_annotation.ids.json
+uv run --no-sync --no-env-file python -m paper_search.evaluation.annotation --kind constraints --labels data/annotation_work/overlap_labels.jsonl --ids data/splits/overlap_annotation.ids.json
+```
+
+成功后只通过受控渠道交换记录数量与精确字节 SHA-256，不交换逐条答案。该校验不计算 kappa、不修改 manifest，也不能替代正式冻结审核。
 ## Frozen partition contract
 
 Do not change the manifest status to `frozen` until human labeling and the data freeze are complete. Each frozen partition must contain:
@@ -116,12 +129,12 @@ uv run --no-sync --no-env-file python -m paper_search.evaluation.freeze `
 
 ## 协作者开始流程
 
-1. 切换到 `codex/week1-collaboration`，执行 `uv sync --all-groups`；
+1. 切换到 `codex/week1-collaboration`，执行 `uv sync --locked --extra cpu`；
 2. 运行全量 pytest、Ruff 和 mypy，报告环境结果但不附密钥；
 3. 使用自己的账号运行数据准备命令；
 4. 核对 manifest 中的 revision、三个源文件哈希、分区数量和工作包数量；
 5. 核对 `data/splits/constraint_annotation.ids.json` 为 40 条、`overlap_annotation.ids.json` 为 20 条；
-6. 等待主负责人发出“Task 2 标注工作包 v1 已冻结”通知；
-7. 两位成员按 `data/annotation_guide.md` 独立完成固定重叠样本，完成前不交换答案。
+6. 核对已经发布的“Task 2 标注工作包 v1 已冻结（仅标注输入）”通知；该通知只固定标注输入；
+7. 使用 `domain-labels-v1` 和上述安全校验命令完成 90/40/20 工作流，两位成员完成前不交换答案。
 
 工程脚本和合成测试通过不代表人工标签已经完成。90 条类型/领域标记、40 条约束标注、固定 20 条独立双标及最终 kappa 必须由真人完成后，状态才能从 `waiting_for_human_label_freeze` 更新。

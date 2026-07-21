@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import subprocess
@@ -210,3 +211,52 @@ def test_repository_pins_hashed_data_checkout_bytes_to_lf() -> None:
         "data/freeze_reports/example.json: text: set",
         "data/freeze_reports/example.json: eol: lf",
     ]
+
+
+def test_onboarding_requires_fresh_checkout_for_hashed_metadata() -> None:
+    onboarding = Path("docs/TEAMMATE_ONBOARDING.md").read_text(encoding="utf-8")
+
+    assert "不要在旧 checkout 中只执行 `git pull --ff-only`" in onboarding
+    assert "创建全新 clone 或全新 worktree" in onboarding
+
+
+def test_fresh_windows_checkout_preserves_manifest_id_hashes(
+    tmp_path: Path,
+) -> None:
+    repository = Path(
+        subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    checkout = tmp_path / "checkout"
+    subprocess.run(
+        [
+            "git",
+            "clone",
+            "--no-hardlinks",
+            "--quiet",
+            "--no-checkout",
+            str(repository),
+            str(checkout),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "config", "core.autocrlf", "true"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(checkout), "checkout", "--quiet", "HEAD"],
+        check=True,
+    )
+
+    data_root = checkout / "data"
+    manifest = json.loads((data_root / "manifest.json").read_bytes())
+    for section in ("partitions", "work_packages"):
+        for entry in manifest[section].values():
+            payload = (data_root / entry["ids_path"]).read_bytes()
+            actual = "sha256:" + hashlib.sha256(payload).hexdigest()
+            assert actual == entry["ids_sha256"]

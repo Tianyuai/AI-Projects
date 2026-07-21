@@ -35,31 +35,16 @@
 
 ### 操作
 
-首次克隆使用：
+本次标注输入包含精确字节哈希契约。不要在旧 checkout 中只执行 `git pull --ff-only`：后加入的 `.gitattributes` 不会自动重写已存在的 CRLF 数据文件。必须创建全新 clone 或全新 worktree；推荐使用以下全新 clone 流程：
 
 ```powershell
-git clone https://github.com/Tianyuai/AI-Projects.git
-Set-Location AI-Projects
+git clone https://github.com/Tianyuai/AI-Projects.git AI-Projects-week1-collaboration
+Set-Location AI-Projects-week1-collaboration
 git fetch origin
 git switch --track origin/codex/week1-collaboration
 ```
 
-已经有本地仓库时，先确认工作树清洁，再使用：
-
-```powershell
-git status --short --branch
-git fetch origin
-git show-ref --verify --quiet refs/heads/codex/week1-collaboration
-if ($LASTEXITCODE -eq 0) {
-  git switch codex/week1-collaboration
-} else {
-  git switch --track origin/codex/week1-collaboration
-}
-git branch --set-upstream-to=origin/codex/week1-collaboration codex/week1-collaboration
-git pull --ff-only
-```
-
-两种情况随后都执行：
+完成全新 checkout 后执行：
 
 ```powershell
 uv sync --all-groups
@@ -101,6 +86,8 @@ uv run --env-file .env python scripts/prepare_task2_data.py --output-root data
 
 - [ ] 运行数据准备脚本，确认解析到的 revision 完全一致；
 - [ ] 核对三个源文件 SHA-256、许可、访问条件和下载日期；
+- [ ] 在全新 checkout 中确认 `data/manifest.json` 的精确字节 SHA-256 为 `sha256:b5eaa1bc83d3a22b655c9f7e3e1ffa506176e49781cc3c2c618307d7c541ae21`；
+- [ ] 在全新 checkout 中确认 manifest 引用的六个 ID 文件精确字节 SHA-256 全部匹配；
 - [ ] 核对开发/验证/模拟测试数量为 60/30/50；
 - [ ] 核对 `dev.ids.json`、`validation.ids.json`、`simulated_test.ids.json`；
 - [ ] 核对 `constraint_annotation.ids.json` 为 40 条；
@@ -463,7 +450,7 @@ API 调用 / P50 / P95 / 成本：<值>
 
 ## 15. 现在立即执行
 
-1. 拉取 `codex/week1-collaboration`；
+1. 按工作包 0 创建全新 clone 或全新 worktree，并检出 `codex/week1-collaboration`；
 2. 完成工作包 0 的不主动加载 `.env` 的环境验证；
 3. 确认自己的 PaSa 只读访问；
 4. 核对 source commit `d6adb6e1f1ab12c40cf87315951de1cfe9742121`、dataset revision、prepared manifest SHA-256、60/30/50 与 90/40/20 ID 清单，以及本地私密源文件哈希；

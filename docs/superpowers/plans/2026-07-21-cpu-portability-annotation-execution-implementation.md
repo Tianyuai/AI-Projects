@@ -4,7 +4,7 @@
 
 **Goal:** Make the repository reproducible on Windows/Linux CPU machines while retaining an explicit CUDA extra, and give both human annotators a secret-safe pre-freeze validation workflow.
 
-**Architecture:** Keep one uv lock with CPU torch as the no-extra default and a conditional `cuda` extra. Split health into blocking CPU/core evidence and non-blocking accelerator evidence. Keep private JSONL outside Git; validate it with a standalone CLI that emits only counts, exact hashes, and generic status, while formal cross-rater agreement remains in the freeze audit.
+**Architecture:** Keep one uv lock with mutually exclusive `cpu` and `cuda` extras; the required third-party profile explicitly selects `cpu`, while a bare install is core-only. Split health into blocking CPU/core evidence and non-blocking accelerator evidence. Keep private JSONL outside Git; validate it with a standalone CLI that emits only counts, exact hashes, and generic status, while formal cross-rater agreement remains in the freeze audit.
 
 **Tech Stack:** Python 3.11, uv 0.11, PyTorch 2.5.1, Pydantic 2, pytest, Ruff, mypy, UTF-8 JSON/JSONL.
 
@@ -26,8 +26,8 @@
 
 ## File Map
 
-- Modify `pyproject.toml`: CPU default torch source, conditional CUDA extra, hardware marker.
-- Modify `uv.lock`: one reproducible CPU-default/CUDA-extra resolution.
+- Modify `pyproject.toml`: mutually exclusive CPU/CUDA torch sources and hardware marker.
+- Modify `uv.lock`: one reproducible CPU-extra/CUDA-extra resolution.
 - Create `tests/test_packaging.py`: assert dependency/source contract without installing packages.
 - Modify `src/paper_search/health.py`: CPU/core and optional accelerator health semantics.
 - Rewrite `tests/test_health.py`: deterministic hardware-independent tests.
@@ -41,7 +41,7 @@
 
 ---
 
-### Task 1: CPU Default and Explicit CUDA Extra
+### Task 1: Required CPU Profile and Explicit CUDA Profile
 
 **Files:**
 - Create: `tests/test_packaging.py`
@@ -50,7 +50,7 @@
 
 **Interfaces:**
 - Consumes: uv 0.11 conditional source resolution.
-- Produces: no-extra CPU torch resolution; `--extra cuda` CUDA torch resolution; `hardware` pytest marker.
+- Produces: `--extra cpu` CPU torch resolution; `--extra cuda` CUDA torch resolution; mutual exclusion; `hardware` pytest marker.
 
 - [ ] **Step 1: Add the dependency-contract test**
 
@@ -63,16 +63,23 @@ import tomllib
 from pathlib import Path
 
 
-def test_torch_defaults_to_cpu_and_cuda_is_explicit() -> None:
+def test_torch_profiles_are_explicit_and_mutually_exclusive() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    dependencies = project["project"]["dependencies"]
     optional = project["project"]["optional-dependencies"]
+    conflicts = project["tool"]["uv"]["conflicts"]
     sources = project["tool"]["uv"]["sources"]["torch"]
     indexes = {item["name"]: item["url"] for item in project["tool"]["uv"]["index"]}
 
-    assert optional["cuda"] == ["torch==2.5.1"]
+    assert not any(item.startswith("torch") for item in dependencies)
+    assert not any(item.startswith("sentence-transformers") for item in dependencies)
+    embedding_profile = ["sentence-transformers>=3.3,<6", "torch==2.5.1"]
+    assert optional["cpu"] == embedding_profile
+    assert optional["cuda"] == embedding_profile
+    assert conflicts == [[{"extra": "cpu"}, {"extra": "cuda"}]]
     assert sources == [
         {"index": "pytorch-cu121", "extra": "cuda"},
-        {"index": "pytorch-cpu"},
+        {"index": "pytorch-cpu", "extra": "cpu"},
     ]
     assert indexes == {
         "pytorch-cpu": "https://download.pytorch.org/whl/cpu",
@@ -96,7 +103,7 @@ $env:UV_PROJECT_ENVIRONMENT='D:\AI Projects\Projects\.venv'
 & 'D:\Dev\uv\uv.exe' run --no-sync --no-env-file pytest tests/test_packaging.py -q
 ```
 
-Expected: FAIL because there is no `cuda` optional dependency, torch has one unconditional CUDA source, and the hardware marker is absent.
+Expected: FAIL because there are no mutually exclusive `cpu`/`cuda` profiles, torch has one unconditional CUDA source, and the hardware marker is absent.
 
 - [ ] **Step 3: Apply the minimal pyproject configuration**
 
@@ -104,8 +111,21 @@ Add:
 
 ```toml
 [project.optional-dependencies]
-cuda = [
+cpu = [
+    "sentence-transformers>=3.3,<6",
     "torch==2.5.1",
+]
+cuda = [
+    "sentence-transformers>=3.3,<6",
+    "torch==2.5.1",
+]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cuda" },
+    ],
 ]
 ```
 
@@ -115,7 +135,7 @@ Replace the torch source/index section with:
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cu121", extra = "cuda" },
-    { index = "pytorch-cpu" },
+    { index = "pytorch-cpu", extra = "cpu" },
 ]
 
 [[tool.uv.index]]
@@ -142,11 +162,11 @@ Run:
 ```powershell
 & 'D:\Dev\uv\uv.exe' lock
 & 'D:\Dev\uv\uv.exe' lock --check
-& 'D:\Dev\uv\uv.exe' sync --locked --dry-run
+& 'D:\Dev\uv\uv.exe' sync --locked --extra cpu --dry-run
 & 'D:\Dev\uv\uv.exe' sync --locked --extra cuda --dry-run
 ```
 
-Expected: all commands exit `0`; default dry-run selects CPU torch; CUDA dry-run selects `2.5.1+cu121`; neither command proposes both torch variants in one environment. If the conditional source syntax is rejected or one resolution contains both variants, stop Task 1 and do not commit a fallback configuration.
+Expected: all commands exit `0`; CPU dry-run selects CPU torch; CUDA dry-run selects `2.5.1+cu121`; selecting both extras is rejected; neither supported command proposes both torch variants in one environment. If the conditional source syntax is rejected or one resolution contains both variants, stop Task 1 and do not commit a fallback configuration.
 
 - [ ] **Step 6: Verify the CPU wheel identities safely**
 
@@ -157,7 +177,7 @@ Run a script that parses `uv.lock` and prints only torch source/version plus whe
 Run the packaging tests and `ruff check tests/test_packaging.py`. Check staged files before/after; stage exactly `pyproject.toml`, `uv.lock`, and `tests/test_packaging.py`; run `git diff --cached --check`; commit:
 
 ```text
-fix: make CPU the default torch profile
+fix: add portable torch profiles
 ```
 
 ---
@@ -374,7 +394,7 @@ feat: validate private annotations safely
 
 Assert README/onboarding contain:
 
-- CPU default install command without `--all-groups`;
+- required CPU install command using `--extra cpu` and without `--all-groups`;
 - optional `--extra cuda` command;
 - default and required-CUDA health commands;
 - `--no-env-file` offline validation;
@@ -389,11 +409,11 @@ Run the documentation-contract tests. Expected: FAIL because README is absent an
 
 - [ ] **Step 3: Write README CPU quickstart**
 
-Document fresh clone, Python 3.11, `uv sync --locked`, default health, offline test commands, expected OpenAlex skip, and prepared hash verification. Put CUDA under an explicitly optional section using `uv sync --locked --extra cuda` and `--require-accelerator cuda`.
+Document fresh clone, Python 3.11, `uv sync --locked --extra cpu`, default health, offline test commands, expected OpenAlex skip, and prepared hash verification. Explain that bare sync is core-only. Put CUDA under an explicitly optional section using `uv sync --locked --extra cuda` and `--require-accelerator cuda`.
 
 - [ ] **Step 4: Update collaborator docs**
 
-Replace `uv sync --all-groups` with the CPU default. Add these exact commands; all three label files remain under the ignored local directory:
+Replace `uv sync --all-groups` with `uv sync --locked --extra cpu`. Add these exact commands; all three label files remain under the ignored local directory:
 
 ```powershell
 uv run --no-sync --no-env-file python -m paper_search.evaluation.annotation `
@@ -431,7 +451,7 @@ docs: document portable annotation workflow
 
 - [ ] **Step 1: Verify dependency resolutions**
 
-Run `uv lock --check`, CPU dry-run, CUDA-extra dry-run, and safe torch resolution summaries. Default must resolve CPU; CUDA extra must resolve CUDA; neither may contain both variants.
+Run `uv lock --check`, CPU-extra dry-run, CUDA-extra dry-run, a both-extras rejection check, and safe torch resolution summaries. CPU extra must resolve CPU; CUDA extra must resolve CUDA; neither may contain both variants.
 
 - [ ] **Step 2: Verify a fresh CPU environment**
 

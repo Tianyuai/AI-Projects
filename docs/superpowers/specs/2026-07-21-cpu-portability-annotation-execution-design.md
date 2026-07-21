@@ -44,18 +44,19 @@
 
 ## 4. 依赖配置设计
 
-### 4.1 CPU 默认配置
+### 4.1 CPU 必选验收配置
 
-- 默认安装必须从 PyTorch CPU 索引解析固定版本 torch，不再从 `pytorch-cu121` 解析。
-- 默认开发命令只安装 CPU 基线和 `dev` 依赖，不再使用会无差别安装所有硬件组的 `uv sync --all-groups`。
+- 第三方默认验收命令必须显式选择 `--extra cpu`，从 PyTorch CPU 索引解析固定版本 torch，不再从 `pytorch-cu121` 解析。
+- 裸 `uv sync` 只安装不含 embedding/torch 的核心依赖；需要运行完整检索、健康检查或测试时必须选择 `cpu` 或 `cuda` profile。
+- 默认开发命令安装 `cpu` profile 和 `dev` 依赖，不再使用会无差别安装所有硬件组的 `uv sync --all-groups`。
 - `uv.lock` 必须同时记录 Windows/Linux 可用的 CPU wheel；锁文件变更通过 fresh environment dry-run、导入 smoke 和全量离线测试验证。
 
 ### 4.2 CUDA 可选配置
 
-- 仓库只维护一个 `uv.lock`：无 extra 的默认解析固定 CPU torch；`--extra cuda` 显式切换到固定 CUDA 索引和版本。
-- uv source 条件必须保证同一次解析中只有一个 torch 来源生效，不能依赖安装顺序、已有虚拟环境或额外的手工 pip 命令。
-- 第三方验收说明只要求 CPU profile。CUDA 命令放在单独章节，明确为可选。
-- `uv lock`、默认 CPU dry-run 和 CUDA extra dry-run 任一不能证明单锁互斥解析时，依赖改动视为阻塞，不提交折中配置，也不恢复全局 CUDA 默认值。
+- 仓库只维护一个 `uv.lock`：`--extra cpu` 显式选择固定 CPU 索引和版本；`--extra cuda` 显式选择固定 CUDA 索引和版本。
+- `cpu` 与 `cuda` extras 必须通过 uv `conflicts` 声明互斥；同一次解析中只能有一个 torch 来源生效，不能依赖安装顺序、已有虚拟环境或额外的手工 pip 命令。
+- 第三方验收说明固定使用 CPU profile。CUDA 命令放在单独章节，明确为可选。
+- `uv lock`、CPU-extra dry-run 和 CUDA-extra dry-run 任一不能证明单锁互斥解析时，依赖改动视为阻塞，不提交折中配置，也不恢复全局 CUDA 默认值。
 
 实施前先用当前固定的 uv 版本验证配置语法和 dry-run；不得凭猜测修改锁文件。
 

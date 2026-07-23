@@ -112,10 +112,24 @@ class MockSearchOrchestrator:
             )
         try:
             analysis_result = await self._analyzer(query, analysis_reservation)
+        except Exception:
+            self._controller.fail_closed(analysis_reservation)
+            return self._result(
+                self._fallback(query),
+                [],
+                provider_results,
+                trace,
+                "hard_stop",
+                True,
+                ["analysis: dependency failure"],
+            )
+        try:
             self._controller.settle(analysis_reservation, analysis_result.usage)
         except ReservationError:
             self._controller.fail_closed(analysis_reservation)
             raise
+        if analysis_result.errors:
+            warnings.append("analysis: analyzer returned errors")
         analysis = await self._parser.parse(query, analysis_result)
         trace.append({"step": "analyze", "prompt_version": self._prompt_version})
 

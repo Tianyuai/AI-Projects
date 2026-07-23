@@ -7,12 +7,20 @@ from paper_search.api.contracts import (
     ReadyHealthResponse,
     SearchRequest,
 )
+from paper_search.api.service import (
+    MockApiSearchService,
+    OrchestratorFactory,
+    SearchOrchestrator,
+)
 
 
 __all__ = [
     "BudgetProfile",
     "LiveHealthResponse",
+    "MockApiSearchService",
+    "OrchestratorFactory",
     "ProviderHealthStatus",
     "ReadyHealthResponse",
+    "SearchOrchestrator",
     "SearchRequest",
 ]

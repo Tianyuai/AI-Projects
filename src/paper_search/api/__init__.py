@@ -12,6 +12,7 @@ from paper_search.api.contracts import (
     ProviderHealthStatus,
     ReadyHealthResponse,
     SearchRequest,
+    UnavailableResponse,
 )
 from paper_search.api.service import (
     MockApiSearchService,
@@ -31,6 +32,7 @@ __all__ = [
     "SearchOrchestrator",
     "SearchRequest",
     "SearchService",
+    "UnavailableResponse",
     "app",
     "create_app",
 ]

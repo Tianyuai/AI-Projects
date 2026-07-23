@@ -23,3 +23,9 @@ class LiveHealthResponse(DomainModel):
 class ReadyHealthResponse(DomainModel):
     status: Literal["ready", "degraded"]
     providers: dict[NonEmptyStr, ProviderHealthStatus]
+
+
+class UnavailableResponse(DomainModel):
+    detail: Literal["search temporarily unavailable"] = (
+        "search temporarily unavailable"
+    )

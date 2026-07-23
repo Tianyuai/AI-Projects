@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-from typing import Any
+from typing import Any, cast
 
 import httpx
+import pytest
 
 from paper_search.api.app import create_app
 from paper_search.api.contracts import SearchRequest
@@ -165,6 +166,37 @@ def test_ready_reports_false_provider_and_probe_failure_as_degraded() -> None:
     assert "private readiness detail" not in failed.text
 
 
+@pytest.mark.parametrize(
+    "providers",
+    [
+        {"": True},
+        {1: True},
+        {"openalex": "false"},
+        {"openalex": 1},
+        {"openalex": True, 1: False},
+    ],
+)
+def test_ready_fails_closed_for_malformed_probe_mapping(
+    providers: object,
+) -> None:
+    response = asyncio.run(
+        _request(
+            create_app(
+                RecordingService(),
+                readiness_probe=cast(
+                    Any,
+                    lambda: providers,
+                ),
+            ),
+            "GET",
+            "/health/ready",
+        )
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {"status": "degraded", "providers": {}}
+
+
 def test_default_module_app_is_explicitly_degraded() -> None:
     api_module = importlib.import_module("paper_search.api.app")
 
@@ -250,3 +282,13 @@ def test_search_unavailable_and_service_failure_return_constant_safe_503() -> No
     assert failed.status_code == 503
     assert failed.json() == expected
     assert "private failure detail" not in failed.text
+
+
+def test_search_openapi_declares_fixed_503_json_schema() -> None:
+    schema = create_app().openapi()
+
+    unavailable = schema["paths"]["/v1/search"]["post"]["responses"]["503"]
+
+    assert unavailable["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/UnavailableResponse"
+    }

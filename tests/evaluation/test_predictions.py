@@ -99,6 +99,7 @@ def test_write_response_predictions_rejects_duplicate_query_before_write(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "predictions.jsonl"
+    output.write_bytes(b"sentinel\n")
 
     with pytest.raises(ValueError, match=r"^duplicate query_id: q1$"):
         write_response_predictions(
@@ -106,4 +107,4 @@ def test_write_response_predictions_rejects_duplicate_query_before_write(
             [_response("q1", ["openalex:W1"]), _response("q1", [])],
         )
 
-    assert not output.exists()
+    assert output.read_bytes() == b"sentinel\n"

@@ -272,6 +272,33 @@ def test_orchestrator_soft_stop_prevents_provider_calls() -> None:
     assert result.warnings == ["openalex: budget unavailable"]
 
 
+def test_orchestrator_retains_valid_sibling_result_when_one_provider_fails() -> None:
+    events: list[str] = []
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "openalex": FakeProvider("openalex", events, failed=True),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "3" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    result = asyncio.run(
+        orchestrator.run("graph retrieval", max_provider_results=5)
+    )
+
+    assert "openalex" in events
+    assert "semantic_scholar" in events
+    assert [paper.canonical_id for paper in result.papers] == ["s2:S1"]
+    assert result.stop_reason == "completed"
+    assert result.is_partial is True
+    assert "openalex: provider returned errors" in result.warnings
+
+
 def test_orchestrator_returns_sibling_result_on_provider_failure_and_skips_calls_on_budget_stop() -> None:
     events: list[str] = []
     controller = HardBudgetController(_budget(max_search_api_calls=1, target_search_api_calls=1))

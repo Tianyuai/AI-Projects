@@ -151,12 +151,12 @@ def test_unknown_actual_llm_cost_does_not_release_reservation() -> None:
         UsageEstimate(llm_calls=1, cost_cny=0.5),
     )
 
-    with pytest.raises(reservation_error):
-        controller.settle(reservation, UsageActual(llm_calls=1, cost_cny=None))
+    controller.settle(reservation, UsageActual(llm_calls=1, cost_cny=None))
 
-    assert controller.reserved_usage.llm_calls == 1
-    assert controller.reserved_usage.cost_cny == pytest.approx(0.5)
-    assert controller.committed_usage.llm_calls == 0
+    assert controller.reserved_usage.llm_calls == 0
+    assert controller.committed_usage.llm_calls == 1
+    assert controller.committed_usage.cost_cny is None
+    assert controller.unknown_cost_actions == ["llm.generate"]
 
 
 def test_release_expiry_stop_status_and_recovery_are_deterministic() -> None:
@@ -222,3 +222,28 @@ def test_concurrent_reservations_are_atomic() -> None:
 
     assert sorted(outcomes) == ["blocked", "reserved"]
     assert controller.reserved_usage.search_api_calls == 1
+
+
+def test_failed_settlement_can_force_a_fail_closed_hard_stop() -> None:
+    controller_type, exceeded_error, reservation_error = budget_api()
+    controller = controller_type(make_budget())
+    reservation = controller.reserve("provider.search", UsageEstimate(search_api_calls=1))
+
+    with pytest.raises(reservation_error):
+        controller.settle(reservation, UsageActual(search_api_calls=2))
+    controller.fail_closed(reservation)
+
+    assert controller.stop_status() == "hard_stop"
+    with pytest.raises(exceeded_error):
+        controller.reserve("provider.retry", UsageEstimate(search_api_calls=1))
+
+
+def test_recovery_rejects_duplicate_reservation_ids() -> None:
+    controller_type, _, _ = budget_api()
+    controller = controller_type(make_budget())
+    reservation = controller.reserve("provider.search", UsageEstimate(search_api_calls=1))
+    state = controller.export_state()
+    state["reservations"] = [reservation.model_dump(mode="json"), reservation.model_dump(mode="json")]
+
+    with pytest.raises(ValueError, match="invalid budget controller state"):
+        controller_type.from_state(make_budget(), state)

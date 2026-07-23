@@ -68,6 +68,31 @@ class MockSearchOrchestrator:
         spec = rule_fallback(query)
         return QueryAnalysisResult(query_spec=spec, search_plan=QueryPlanner().finalize(spec, None))
 
+    @staticmethod
+    def _combine_provider_results(
+        results: list[ProviderResult[list[Paper]]],
+    ) -> ProviderResult[list[Paper]]:
+        last = results[-1]
+        costs = [item.usage.cost_cny for item in results]
+        return last.model_copy(
+            update={
+                "data": [paper for item in results for paper in item.data],
+                "usage": UsageActual(
+                    search_api_calls=sum(item.usage.search_api_calls for item in results),
+                    llm_calls=sum(item.usage.llm_calls for item in results),
+                    input_tokens=sum(item.usage.input_tokens for item in results),
+                    output_tokens=sum(item.usage.output_tokens for item in results),
+                    cost_cny=sum(cost for cost in costs if cost is not None)
+                    if all(cost is not None for cost in costs)
+                    else None,
+                    elapsed_ms=sum(item.usage.elapsed_ms for item in results),
+                ),
+                "cache_hit": all(item.cache_hit for item in results),
+                "latency_ms": sum(item.latency_ms for item in results),
+                "errors": [error for item in results for error in item.errors],
+            }
+        )
+
     async def run(self, query: str, *, max_provider_results: int) -> MinimalSearchResult:
         warnings: list[str] = []
         trace: list[dict[str, Any]] = []
@@ -89,35 +114,55 @@ class MockSearchOrchestrator:
             analysis_result = await self._analyzer(query, analysis_reservation)
             self._controller.settle(analysis_reservation, analysis_result.usage)
         except ReservationError:
-            self._controller.release(analysis_reservation)
+            self._controller.fail_closed(analysis_reservation)
             raise
         analysis = await self._parser.parse(query, analysis_result)
         trace.append({"step": "analyze", "prompt_version": self._prompt_version})
 
-        for name in sorted(self._providers):
-            status = self._controller.stop_status()
-            if status != "continue":
-                warnings.append(f"{name}: budget unavailable")
-                break
-            try:
-                reservation = self._controller.reserve(f"{name}.search", self._provider_estimate)
-            except BudgetExceededError:
-                warnings.append(f"{name}: budget unavailable")
-                break
-            try:
-                result = await self._providers[name].search(
-                    analysis.search_plan.subqueries[0].text,
-                    analysis.search_plan.inherited_hard_filters,
-                    max_provider_results,
-                    reservation,
+        collected: dict[str, list[ProviderResult[list[Paper]]]] = {}
+        stopped = False
+        for subquery in analysis.search_plan.subqueries:
+            names = [
+                name
+                for name in sorted(self._providers)
+                if subquery.provider_hint == "either" or subquery.provider_hint == name
+            ]
+            for name in names:
+                status = self._controller.stop_status()
+                if status != "continue":
+                    warnings.append(f"{name}: budget unavailable")
+                    stopped = True
+                    break
+                try:
+                    reservation = self._controller.reserve(
+                        f"{name}.search:{subquery.query_id}", self._provider_estimate
+                    )
+                except BudgetExceededError:
+                    warnings.append(f"{name}: budget unavailable")
+                    stopped = True
+                    break
+                try:
+                    result = await self._providers[name].search(
+                        subquery.text,
+                        analysis.search_plan.inherited_hard_filters,
+                        max_provider_results,
+                        reservation,
+                    )
+                    self._controller.settle(reservation, result.usage)
+                except ReservationError:
+                    self._controller.fail_closed(reservation)
+                    raise
+                collected.setdefault(name, []).append(result)
+                trace.append(
+                    {"step": "retrieve", "provider": name, "subquery_id": subquery.query_id}
                 )
-                self._controller.settle(reservation, result.usage)
-            except ReservationError:
-                self._controller.release(reservation)
-                raise
-            provider_results[name] = result
-            if result.errors:
-                warnings.append(f"{name}: provider returned errors")
+                if result.errors:
+                    warnings.append(f"{name}: provider returned errors")
+            if stopped:
+                break
+        provider_results = {
+            name: self._combine_provider_results(results) for name, results in collected.items()
+        }
 
         merged = deduplicate_papers([paper for result in provider_results.values() for paper in result.data])
         trace.append({"step": "deduplicate", "count": len(merged.papers)})

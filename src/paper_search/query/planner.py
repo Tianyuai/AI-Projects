@@ -99,9 +99,10 @@ class QueryPlanner:
         if (
             isinstance(max_subqueries, bool)
             or not isinstance(max_subqueries, int)
-            or not 3 <= max_subqueries <= 5
+            or max_subqueries < 3
         ):
-            raise ValueError("max_subqueries must be an integer between 3 and 5")
+            raise ValueError("max_subqueries must be an integer of at least 3")
+        limit = min(max_subqueries, 5)
 
         candidates: list[SubQuery] = []
         if plan is not None:
@@ -130,7 +131,7 @@ class QueryPlanner:
                     }
                 )
             )
-            if len(selected) == max_subqueries:
+            if len(selected) == limit:
                 break
 
         if len(selected) < 3:

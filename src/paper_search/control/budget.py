@@ -69,6 +69,7 @@ class HardBudgetController:
         self._reservations: dict[str, BudgetReservation] = {}
         self._committed: list[UsageActual] = []
         self._committed_actions: list[str] = []
+        self._fail_closed = False
 
     @property
     def budget(self) -> SearchBudget:
@@ -130,8 +131,6 @@ class HardBudgetController:
                 raise ReservationError("reservation is unknown or already settled")
             if active != reservation:
                 raise ReservationError("reservation does not match the active reservation")
-            if actual.llm_calls > 0 and actual.cost_cny is None:
-                raise ReservationError("actual LLM usage requires a known cost")
             self._ensure_within_reservation(active.reserved, actual)
 
             other_reserved = [
@@ -158,10 +157,20 @@ class HardBudgetController:
         with self._lock:
             return self._expire_locked()
 
+    def fail_closed(self, reservation: BudgetReservation) -> None:
+        """Block all future calls after a provider reports unaccountable usage."""
+        with self._lock:
+            active = self._reservations.get(reservation.reservation_id)
+            if active != reservation:
+                raise ReservationError("reservation is unknown or does not match the active reservation")
+            self._fail_closed = True
+
     def stop_status(self) -> str:
         """Return deterministic continue, soft-stop, or hard-stop state."""
         with self._lock:
             self._expire_locked()
+            if self._fail_closed:
+                return "hard_stop"
             total = _aggregate([*self._committed, *(r.reserved for r in self._reservations.values())])
             hard = (
                 total.search_api_calls >= self._budget.max_search_api_calls
@@ -184,6 +193,7 @@ class HardBudgetController:
             return {
                 "version": 1,
                 "reservation_ttl_seconds": self.reservation_ttl_seconds,
+                "fail_closed": self._fail_closed,
                 "reservations": [item.model_dump(mode="json") for item in self._reservations.values()],
                 "committed": [
                     {"action": action, "usage": usage.model_dump(mode="json")}
@@ -201,7 +211,12 @@ class HardBudgetController:
     ) -> HardBudgetController:
         """Restore validated state without bypassing budget accounting invariants."""
         reservation_ttl_seconds = state.get("reservation_ttl_seconds")
-        if state.get("version") != 1 or not isinstance(reservation_ttl_seconds, int):
+        fail_closed = state.get("fail_closed")
+        if (
+            state.get("version") != 1
+            or not isinstance(reservation_ttl_seconds, int)
+            or not isinstance(fail_closed, bool)
+        ):
             raise ValueError("invalid budget controller state")
         controller = cls(
             budget,
@@ -213,10 +228,13 @@ class HardBudgetController:
         if not isinstance(reservations, list) or not isinstance(committed, list):
             raise ValueError("invalid budget controller state")
         try:
+            restored_reservations = [BudgetReservation.model_validate(raw) for raw in reservations]
+            if len({item.reservation_id for item in restored_reservations}) != len(
+                restored_reservations
+            ):
+                raise ValueError("duplicate reservation IDs")
             controller._reservations = {
-                item.reservation_id: item
-                for raw in reservations
-                for item in [BudgetReservation.model_validate(raw)]
+                item.reservation_id: item for item in restored_reservations
             }
             controller._committed = []
             controller._committed_actions = []
@@ -228,6 +246,7 @@ class HardBudgetController:
             controller._check_hard_limits(
                 [*controller._committed, *(item.reserved for item in controller._reservations.values())]
             )
+            controller._fail_closed = fail_closed
         except (TypeError, ValueError) as error:
             raise ValueError("invalid budget controller state") from error
         controller._expire_locked()

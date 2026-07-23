@@ -11,7 +11,7 @@ from paper_search.pipeline.orchestrator import MockSearchOrchestrator
 
 def _budget(**updates: object) -> SearchBudget:
     values = {
-        "max_search_api_calls": 3,
+        "max_search_api_calls": 6,
         "target_search_api_calls": 1,
         "max_llm_calls": 2,
         "target_llm_calls": 1,
@@ -56,16 +56,32 @@ class FakeAnalyzer:
             {
                 "query_spec": {"original_query": query, "research_goal": "find papers"},
                 "search_plan": {
-                    "subqueries": [
-                        {
-                            "query_id": "model-1",
-                            "text": query,
-                            "query_type": "exact",
-                            "target_constraints": ["papers"],
-                            "priority": 1,
-                            "provider_hint": "either",
-                        }
-                    ],
+                "subqueries": [
+                    {
+                        "query_id": "model-1",
+                        "text": f"{query} openalex",
+                        "query_type": "exact",
+                        "target_constraints": ["papers"],
+                        "priority": 1,
+                        "provider_hint": "openalex",
+                    },
+                    {
+                        "query_id": "model-2",
+                        "text": f"{query} semantic",
+                        "query_type": "decomposed",
+                        "target_constraints": ["papers"],
+                        "priority": 2,
+                        "provider_hint": "semantic_scholar",
+                    },
+                    {
+                        "query_id": "model-3",
+                        "text": query,
+                        "query_type": "expanded",
+                        "target_constraints": ["papers"],
+                        "priority": 3,
+                        "provider_hint": "either",
+                    },
+                ],
                     "inherited_hard_filters": {},
                     "rationale": "fixture",
                 },
@@ -110,9 +126,18 @@ def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
 
     result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
-    assert events == ["analyze", "openalex", "semantic_scholar"]
+    assert events == ["analyze", "openalex", "semantic_scholar", "openalex", "semantic_scholar"]
     assert [paper.canonical_id for paper in result.papers] == ["openalex:W1", "s2:S1"]
-    assert [item["step"] for item in result.trace] == ["analyze", "deduplicate", "filter", "fuse"]
+    assert [item["step"] for item in result.trace] == [
+        "analyze",
+        "retrieve",
+        "retrieve",
+        "retrieve",
+        "retrieve",
+        "deduplicate",
+        "filter",
+        "fuse",
+    ]
     assert set(result.provider_results) == {"openalex", "semantic_scholar"}
     assert result.config_hash == "sha256:" + "b" * 64
     assert result.prompt_version == "query-analyze-v1"
@@ -142,3 +167,32 @@ def test_orchestrator_returns_sibling_result_on_provider_failure_and_skips_calls
         "openalex: provider returned errors",
         "semantic_scholar: budget unavailable",
     ]
+
+
+class OverrunProvider(FakeProvider):
+    async def search(self, query: str, filters: dict[str, object], limit: int, reservation: object) -> ProviderResult[list[Paper]]:
+        result = await super().search(query, filters, limit, reservation)
+        return result.model_copy(update={"usage": UsageActual(search_api_calls=2)})
+
+
+def test_orchestrator_fails_closed_when_a_provider_exceeds_its_reservation() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget())
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": OverrunProvider("openalex", events)},
+        config_hash="sha256:" + "d" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    try:
+        asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("over-reservation usage must fail the orchestration")
+
+    assert controller.stop_status() == "hard_stop"

@@ -100,6 +100,12 @@ def test_finalize_rejects_invalid_max_subqueries() -> None:
     try:
         planner.finalize(_spec(), None, max_subqueries=2)
     except ValueError as error:
-        assert "between 3 and 5" in str(error)
+        assert "at least 3" in str(error)
     else:
         raise AssertionError("max_subqueries below three must be rejected")
+
+
+def test_finalize_clamps_caps_above_five() -> None:
+    plan = QueryPlanner().finalize(_spec(), None, max_subqueries=99)
+
+    assert len(plan.subqueries) == 3

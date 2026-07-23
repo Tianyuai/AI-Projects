@@ -1,0 +1,9 @@
+name: query_analyze
+version: query-analyze-v1
+temperature: 0
+response_model: QueryAnalysisResult
+instructions:
+  - Preserve the original query and every explicit hard constraint.
+  - Return one QuerySpec and one SearchPlan as a JSON object.
+  - Generate three to five targeted subqueries.
+  - Do not infer facts that are not stated by the user.

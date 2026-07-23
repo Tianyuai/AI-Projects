@@ -1,4 +1,6 @@
 import importlib
+import threading
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -155,3 +157,68 @@ def test_unknown_actual_llm_cost_does_not_release_reservation() -> None:
     assert controller.reserved_usage.llm_calls == 1
     assert controller.reserved_usage.cost_cny == pytest.approx(0.5)
     assert controller.committed_usage.llm_calls == 0
+
+
+def test_release_expiry_stop_status_and_recovery_are_deterministic() -> None:
+    controller_type, exceeded_error, _ = budget_api()
+    current = datetime(2026, 7, 23, tzinfo=UTC)
+    controller = controller_type(make_budget(), clock=lambda: current, reservation_ttl_seconds=1)
+    reservation = controller.reserve("provider.search", UsageEstimate(search_api_calls=1))
+
+    controller.release(reservation)
+    assert controller.reserved_usage.search_api_calls == 0
+    expiring = controller.reserve("provider.search", UsageEstimate(search_api_calls=1))
+    current += timedelta(seconds=2)
+    assert controller.expire_reservations() == [expiring.reservation_id]
+    assert controller.reserved_usage.search_api_calls == 0
+
+    soft = controller.reserve("slow", UsageEstimate(elapsed_ms=1_000))
+    controller.settle(soft, UsageActual(elapsed_ms=1_000))
+    assert controller.stop_status() == "soft_stop"
+    hard = controller.reserve("slower", UsageEstimate(elapsed_ms=1_000))
+    controller.settle(hard, UsageActual(elapsed_ms=1_000))
+    assert controller.stop_status() == "hard_stop"
+    with pytest.raises(exceeded_error):
+        controller.reserve("blocked", UsageEstimate(search_api_calls=1))
+
+    restored = controller_type.from_state(make_budget(), controller.export_state(), clock=lambda: current)
+    assert restored.committed_usage == controller.committed_usage
+    assert restored.stop_status() == "hard_stop"
+
+
+def test_unknown_cost_is_separate_from_known_cost_after_settlement() -> None:
+    controller_type, _, _ = budget_api()
+    controller = controller_type(make_budget())
+    known = controller.reserve("known", UsageEstimate(search_api_calls=1, cost_cny=0.25))
+    controller.settle(known, UsageActual(search_api_calls=1, cost_cny=0.2))
+    unknown = controller.reserve("unknown", UsageEstimate(search_api_calls=1))
+    controller.settle(unknown, UsageActual(search_api_calls=1, cost_cny=None))
+
+    assert controller.committed_usage.cost_cny is None
+    assert controller.known_committed_cost_cny == pytest.approx(0.2)
+    assert controller.unknown_cost_actions == ["unknown"]
+
+
+def test_concurrent_reservations_are_atomic() -> None:
+    controller_type, exceeded_error, _ = budget_api()
+    controller = controller_type(make_budget(max_search_api_calls=1, target_search_api_calls=1))
+    barrier = threading.Barrier(2)
+    outcomes: list[str] = []
+
+    def reserve() -> None:
+        barrier.wait()
+        try:
+            controller.reserve("parallel", UsageEstimate(search_api_calls=1))
+        except exceeded_error:
+            outcomes.append("blocked")
+        else:
+            outcomes.append("reserved")
+
+    threads = [threading.Thread(target=reserve), threading.Thread(target=reserve)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["blocked", "reserved"]
+    assert controller.reserved_usage.search_api_calls == 1

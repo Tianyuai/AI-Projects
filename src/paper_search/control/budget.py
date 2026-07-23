@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
+import threading
 from uuid import uuid4
 
 from paper_search.domain.models import (
@@ -20,6 +21,9 @@ class BudgetExceededError(RuntimeError):
 
 class ReservationError(RuntimeError):
     """Raised when a reservation is invalid or cannot be settled safely."""
+
+
+Clock = Callable[[], datetime]
 
 
 def _aggregate(usages: Iterable[UsageEstimate]) -> UsageEstimate:
@@ -49,13 +53,22 @@ class HardBudgetController:
     process and prevents a caller from settling more usage than it reserved.
     """
 
-    def __init__(self, budget: SearchBudget, *, reservation_ttl_seconds: int = 120) -> None:
+    def __init__(
+        self,
+        budget: SearchBudget,
+        *,
+        reservation_ttl_seconds: int = 120,
+        clock: Clock | None = None,
+    ) -> None:
         if reservation_ttl_seconds <= 0:
             raise ValueError("reservation_ttl_seconds must be positive")
         self._budget = SearchBudget.model_validate(budget.model_dump())
         self.reservation_ttl_seconds = reservation_ttl_seconds
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._lock = threading.RLock()
         self._reservations: dict[str, BudgetReservation] = {}
         self._committed: list[UsageActual] = []
+        self._committed_actions: list[str] = []
 
     @property
     def budget(self) -> SearchBudget:
@@ -63,45 +76,173 @@ class HardBudgetController:
 
     @property
     def reserved_usage(self) -> UsageEstimate:
-        return _aggregate(item.reserved for item in self._reservations.values())
+        with self._lock:
+            self._expire_locked()
+            return _aggregate(item.reserved for item in self._reservations.values())
 
     @property
     def committed_usage(self) -> UsageActual:
-        summary = _aggregate(self._committed)
-        return UsageActual.model_validate(summary.model_dump())
+        with self._lock:
+            summary = _aggregate(self._committed)
+            return UsageActual.model_validate(summary.model_dump())
+
+    @property
+    def known_committed_cost_cny(self) -> float:
+        with self._lock:
+            return _known_cost(self._committed)
+
+    @property
+    def unknown_cost_actions(self) -> list[str]:
+        with self._lock:
+            return [
+                action
+                for action, usage in zip(self._committed_actions, self._committed, strict=True)
+                if usage.cost_cny is None
+            ]
 
     def reserve(self, action: str, estimate: UsageEstimate) -> BudgetReservation:
-        if estimate.llm_calls > 0 and estimate.cost_cny is None:
-            raise ReservationError("LLM reservations require a known cost estimate")
-        candidate = [*self._committed, *(r.reserved for r in self._reservations.values()), estimate]
-        self._check_hard_limits(candidate)
-        reservation = BudgetReservation(
-            reservation_id=str(uuid4()),
-            action=action,
-            reserved=estimate,
-            expires_at=datetime.now(UTC) + timedelta(seconds=self.reservation_ttl_seconds),
-        )
-        self._reservations[reservation.reservation_id] = reservation
-        return reservation
+        with self._lock:
+            self._expire_locked()
+            if self.stop_status() == "hard_stop":
+                raise BudgetExceededError("budget controller is in hard-stop state")
+            if estimate.llm_calls > 0 and estimate.cost_cny is None:
+                raise ReservationError("LLM reservations require a known cost estimate")
+            candidate = [
+                *self._committed,
+                *(r.reserved for r in self._reservations.values()),
+                estimate,
+            ]
+            self._check_hard_limits(candidate)
+            reservation = BudgetReservation(
+                reservation_id=str(uuid4()),
+                action=action,
+                reserved=estimate,
+                expires_at=self._clock() + timedelta(seconds=self.reservation_ttl_seconds),
+            )
+            self._reservations[reservation.reservation_id] = reservation
+            return reservation
 
     def settle(self, reservation: BudgetReservation, actual: UsageActual) -> None:
-        active = self._reservations.get(reservation.reservation_id)
-        if active is None:
-            raise ReservationError("reservation is unknown or already settled")
-        if active != reservation:
-            raise ReservationError("reservation does not match the active reservation")
-        if actual.llm_calls > 0 and actual.cost_cny is None:
-            raise ReservationError("actual LLM usage requires a known cost")
-        self._ensure_within_reservation(active.reserved, actual)
+        with self._lock:
+            self._expire_locked()
+            active = self._reservations.get(reservation.reservation_id)
+            if active is None:
+                raise ReservationError("reservation is unknown or already settled")
+            if active != reservation:
+                raise ReservationError("reservation does not match the active reservation")
+            if actual.llm_calls > 0 and actual.cost_cny is None:
+                raise ReservationError("actual LLM usage requires a known cost")
+            self._ensure_within_reservation(active.reserved, actual)
 
-        other_reserved = [
-            item.reserved
-            for reservation_id, item in self._reservations.items()
-            if reservation_id != reservation.reservation_id
+            other_reserved = [
+                item.reserved
+                for reservation_id, item in self._reservations.items()
+                if reservation_id != reservation.reservation_id
+            ]
+            self._check_hard_limits([*self._committed, *other_reserved, actual])
+            del self._reservations[reservation.reservation_id]
+            self._committed.append(actual)
+            self._committed_actions.append(active.action)
+
+    def release(self, reservation: BudgetReservation) -> None:
+        """Release an unused active reservation."""
+        with self._lock:
+            self._expire_locked()
+            active = self._reservations.get(reservation.reservation_id)
+            if active != reservation:
+                raise ReservationError("reservation is unknown or does not match the active reservation")
+            del self._reservations[reservation.reservation_id]
+
+    def expire_reservations(self) -> list[str]:
+        """Release expired reservations and return their stable IDs."""
+        with self._lock:
+            return self._expire_locked()
+
+    def stop_status(self) -> str:
+        """Return deterministic continue, soft-stop, or hard-stop state."""
+        with self._lock:
+            self._expire_locked()
+            total = _aggregate([*self._committed, *(r.reserved for r in self._reservations.values())])
+            hard = (
+                total.search_api_calls >= self._budget.max_search_api_calls
+                or total.llm_calls >= self._budget.max_llm_calls
+                or total.input_tokens + total.output_tokens >= self._budget.max_total_tokens
+                or total.elapsed_ms >= self._budget.max_elapsed_seconds * 1000
+                or _known_cost([*self._committed, *(r.reserved for r in self._reservations.values())])
+                >= self._budget.max_cost_cny
+            )
+            if hard:
+                return "hard_stop"
+            if total.elapsed_ms >= self._budget.soft_deadline_seconds * 1000:
+                return "soft_stop"
+            return "continue"
+
+    def export_state(self) -> dict[str, object]:
+        """Return JSON-round-trippable reservation and committed usage state."""
+        with self._lock:
+            self._expire_locked()
+            return {
+                "version": 1,
+                "reservation_ttl_seconds": self.reservation_ttl_seconds,
+                "reservations": [item.model_dump(mode="json") for item in self._reservations.values()],
+                "committed": [
+                    {"action": action, "usage": usage.model_dump(mode="json")}
+                    for action, usage in zip(self._committed_actions, self._committed, strict=True)
+                ],
+            }
+
+    @classmethod
+    def from_state(
+        cls,
+        budget: SearchBudget,
+        state: Mapping[str, object],
+        *,
+        clock: Clock | None = None,
+    ) -> HardBudgetController:
+        """Restore validated state without bypassing budget accounting invariants."""
+        reservation_ttl_seconds = state.get("reservation_ttl_seconds")
+        if state.get("version") != 1 or not isinstance(reservation_ttl_seconds, int):
+            raise ValueError("invalid budget controller state")
+        controller = cls(
+            budget,
+            reservation_ttl_seconds=reservation_ttl_seconds,
+            clock=clock,
+        )
+        reservations = state.get("reservations")
+        committed = state.get("committed")
+        if not isinstance(reservations, list) or not isinstance(committed, list):
+            raise ValueError("invalid budget controller state")
+        try:
+            controller._reservations = {
+                item.reservation_id: item
+                for raw in reservations
+                for item in [BudgetReservation.model_validate(raw)]
+            }
+            controller._committed = []
+            controller._committed_actions = []
+            for raw in committed:
+                if not isinstance(raw, Mapping) or not isinstance(raw.get("action"), str):
+                    raise ValueError("invalid committed usage state")
+                controller._committed_actions.append(raw["action"])
+                controller._committed.append(UsageActual.model_validate(raw.get("usage")))
+            controller._check_hard_limits(
+                [*controller._committed, *(item.reserved for item in controller._reservations.values())]
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("invalid budget controller state") from error
+        controller._expire_locked()
+        return controller
+
+    def _expire_locked(self) -> list[str]:
+        now = self._clock()
+        expired = [
+            reservation_id
+            for reservation_id, reservation in self._reservations.items()
+            if reservation.expires_at <= now
         ]
-        self._check_hard_limits([*self._committed, *other_reserved, actual])
-        del self._reservations[reservation.reservation_id]
-        self._committed.append(actual)
+        for reservation_id in expired:
+            del self._reservations[reservation_id]
+        return sorted(expired)
 
     def _check_hard_limits(self, usages: list[UsageEstimate]) -> None:
         total = _aggregate(usages)

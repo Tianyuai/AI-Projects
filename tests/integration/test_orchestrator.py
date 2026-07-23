@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+import asyncio
+from datetime import UTC, datetime
+from typing import Any
+
+from paper_search.control.budget import HardBudgetController
+from paper_search.domain.models import ErrorDetail, Paper, ProviderResult, SearchBudget, UsageActual, UsageEstimate
+from paper_search.pipeline.orchestrator import MockSearchOrchestrator
+
+
+def _budget(**updates: object) -> SearchBudget:
+    values = {
+        "max_search_api_calls": 3,
+        "target_search_api_calls": 1,
+        "max_llm_calls": 2,
+        "target_llm_calls": 1,
+        "max_total_tokens": 100,
+        "max_cost_cny": 1.0,
+        "max_elapsed_seconds": 2,
+        "soft_deadline_seconds": 1,
+    }
+    values.update(updates)
+    return SearchBudget.model_validate(values)
+
+
+def _result(provider: str, data: Any, usage: UsageActual, *, failed: bool = False) -> ProviderResult[Any]:
+    return ProviderResult[Any](
+        data=data,
+        usage=usage,
+        provenance={
+            "provider": provider,
+            "endpoint": "/synthetic",
+            "model_id": "fixture",
+            "requested_at": datetime(2026, 7, 23, tzinfo=UTC).isoformat(),
+            "response_hash": f"sha256:{provider}",
+        },
+        cache_hit=False,
+        latency_ms=0,
+        errors=(
+            [ErrorDetail(code="timeout", message="synthetic", retryable=True, provider=provider)]
+            if failed
+            else []
+        ),
+    )
+
+
+class FakeAnalyzer:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def __call__(self, query: str, _: object) -> ProviderResult[dict[str, object]]:
+        self.events.append("analyze")
+        return _result(
+            "llm",
+            {
+                "query_spec": {"original_query": query, "research_goal": "find papers"},
+                "search_plan": {
+                    "subqueries": [
+                        {
+                            "query_id": "model-1",
+                            "text": query,
+                            "query_type": "exact",
+                            "target_constraints": ["papers"],
+                            "priority": 1,
+                            "provider_hint": "either",
+                        }
+                    ],
+                    "inherited_hard_filters": {},
+                    "rationale": "fixture",
+                },
+            },
+            UsageActual(llm_calls=1, cost_cny=0.1),
+        )
+
+
+class FakeProvider:
+    def __init__(self, name: str, events: list[str], *, failed: bool = False) -> None:
+        self.name = name
+        self.events = events
+        self.failed = failed
+
+    async def search(self, query: str, filters: dict[str, object], limit: int, reservation: object) -> ProviderResult[list[Paper]]:
+        assert query
+        assert filters == {}
+        assert limit == 5
+        assert reservation is not None
+        self.events.append(self.name)
+        paper = Paper(
+            canonical_id="openalex:W1" if self.name == "openalex" else "s2:S1",
+            title=f"{self.name} paper",
+            openalex_id="W1" if self.name == "openalex" else None,
+            semantic_scholar_id="S1" if self.name != "openalex" else None,
+            sources=[self.name],
+        )
+        return _result(self.name, [] if self.failed else [paper], UsageActual(search_api_calls=1), failed=self.failed)
+
+
+def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
+    events: list[str] = []
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": FakeProvider("openalex", events), "semantic_scholar": FakeProvider("semantic_scholar", events)},
+        config_hash="sha256:" + "b" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert events == ["analyze", "openalex", "semantic_scholar"]
+    assert [paper.canonical_id for paper in result.papers] == ["openalex:W1", "s2:S1"]
+    assert [item["step"] for item in result.trace] == ["analyze", "deduplicate", "filter", "fuse"]
+    assert set(result.provider_results) == {"openalex", "semantic_scholar"}
+    assert result.config_hash == "sha256:" + "b" * 64
+    assert result.prompt_version == "query-analyze-v1"
+    assert result.stop_reason == "completed"
+
+
+def test_orchestrator_returns_sibling_result_on_provider_failure_and_skips_calls_on_budget_stop() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget(max_search_api_calls=1, target_search_api_calls=1))
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": FakeProvider("openalex", events, failed=True), "semantic_scholar": FakeProvider("semantic_scholar", events)},
+        config_hash="sha256:" + "c" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert events == ["analyze", "openalex"]
+    assert result.papers == []
+    assert result.is_partial is True
+    assert result.stop_reason == "hard_stop"
+    assert result.warnings == [
+        "openalex: provider returned errors",
+        "semantic_scholar: budget unavailable",
+    ]

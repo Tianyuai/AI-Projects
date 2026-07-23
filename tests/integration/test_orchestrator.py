@@ -299,7 +299,7 @@ def test_orchestrator_retains_valid_sibling_result_when_one_provider_fails() -> 
     assert "openalex: provider returned errors" in result.warnings
 
 
-def test_orchestrator_returns_sibling_result_on_provider_failure_and_skips_calls_on_budget_stop() -> None:
+def test_orchestrator_records_provider_failure_and_skips_calls_on_budget_stop() -> None:
     events: list[str] = []
     controller = HardBudgetController(_budget(max_search_api_calls=1, target_search_api_calls=1))
     orchestrator = MockSearchOrchestrator(

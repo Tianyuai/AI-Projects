@@ -21,6 +21,10 @@ from paper_search.evaluation.official_adapter import (
     adapt_pasa_record,
     adapt_prediction_record,
 )
+from paper_search.evaluation.predictions import (
+    prediction_from_response,
+    write_response_predictions,
+)
 
 
 if TYPE_CHECKING:
@@ -141,6 +145,7 @@ __all__ = [
     "evaluate",
     "normalize_paper_id",
     "normalize_title",
+    "prediction_from_response",
     "read_jsonl",
     "score_query",
     "sha256_file",
@@ -148,4 +153,5 @@ __all__ = [
     "validate_annotation_file",
     "write_frozen_bytes",
     "write_jsonl_atomic",
+    "write_response_predictions",
 ]

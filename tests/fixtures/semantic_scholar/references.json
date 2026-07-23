@@ -1,0 +1,23 @@
+{
+  "offset": 0,
+  "next": null,
+  "data": [
+    {
+      "contexts": ["Synthetic context."],
+      "intents": ["background"],
+      "isInfluential": false,
+      "citedPaper": {
+        "paperId": "S2-010",
+        "title": "Synthetic Reference",
+        "abstract": null,
+        "authors": [],
+        "year": 2020,
+        "venue": "Fixture Journal",
+        "externalIds": {},
+        "url": "https://example.test/papers/s2-010",
+        "citationCount": 1,
+        "isRetracted": false
+      }
+    }
+  ]
+}

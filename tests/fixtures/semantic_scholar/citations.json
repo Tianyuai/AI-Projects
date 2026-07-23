@@ -1,0 +1,23 @@
+{
+  "offset": 0,
+  "next": null,
+  "data": [
+    {
+      "contexts": [],
+      "intents": [],
+      "isInfluential": false,
+      "citingPaper": {
+        "paperId": "S2-020",
+        "title": "Synthetic Citation",
+        "abstract": "Synthetic citing paper.",
+        "authors": [{"authorId": "A-3", "name": "Lin Fixture"}],
+        "year": 2025,
+        "venue": "FixtureConf",
+        "externalIds": {},
+        "url": "https://example.test/papers/s2-020",
+        "citationCount": 0,
+        "isRetracted": false
+      }
+    }
+  ]
+}

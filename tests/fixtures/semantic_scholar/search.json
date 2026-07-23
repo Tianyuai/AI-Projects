@@ -1,0 +1,31 @@
+{
+  "total": 2,
+  "offset": 0,
+  "next": 2,
+  "data": [
+    {
+      "paperId": "S2-001",
+      "title": "Synthetic Graph Retrieval",
+      "abstract": "A fully synthetic fixture about graph retrieval.",
+      "authors": [{"authorId": "A-1", "name": "Ada Fixture"}],
+      "year": 2024,
+      "venue": "FixtureConf",
+      "externalIds": {"DOI": "10.9999/synthetic.001", "ArXiv": "2401.00001"},
+      "url": "https://example.test/papers/s2-001",
+      "citationCount": 7,
+      "isRetracted": false
+    },
+    {
+      "paperId": "S2-002",
+      "title": "Synthetic Constraint Search",
+      "abstract": null,
+      "authors": [{"authorId": "A-2", "name": "Grace Fixture"}],
+      "year": 2023,
+      "venue": null,
+      "externalIds": {},
+      "url": "https://example.test/papers/s2-002",
+      "citationCount": 0,
+      "isRetracted": null
+    }
+  ]
+}

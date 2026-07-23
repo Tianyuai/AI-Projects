@@ -1,0 +1,17 @@
+[
+  {
+    "paperId": "S2-001",
+    "title": "Synthetic Graph Retrieval",
+    "abstract": "Synthetic batch detail.",
+    "authors": [{"authorId": "A-1", "name": "Ada Fixture"}],
+    "year": 2024,
+    "venue": "FixtureConf",
+    "externalIds": {"DOI": "10.9999/synthetic.001"},
+    "url": "https://example.test/papers/s2-001",
+    "citationCount": 7,
+    "isRetracted": false,
+    "references": [{"paperId": "S2-010"}],
+    "citations": [{"paperId": "S2-020"}]
+  },
+  null
+]

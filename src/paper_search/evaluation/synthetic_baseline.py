@@ -71,6 +71,8 @@ async def run_synthetic_baseline(
     for request in ordered:
         try:
             response = await search_service(request)
+            if response.query_id != request.query_id:
+                raise ValueError("response query_id does not match request query_id")
             record = prediction_from_response(response)
         except Exception:
             record = InternalPredictionRecord(

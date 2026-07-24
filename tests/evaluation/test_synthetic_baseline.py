@@ -75,6 +75,21 @@ class RecordingService:
         return _response(request, [f"openalex:W{len(self.calls)}"])
 
 
+class MismatchedResponseService:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def __call__(
+        self,
+        request: SearchRequest,
+    ) -> StructuredSearchResponse:
+        self.calls.append(request.query_id)
+        response = _response(request, [f"openalex:W{len(self.calls)}"])
+        if request.query_id == "synthetic-q2":
+            return response.model_copy(update={"query_id": "synthetic-unexpected"})
+        return response
+
+
 def _requests() -> tuple[SearchRequest, ...]:
     return (
         SearchRequest(query_id="synthetic-q1", query="synthetic one"),
@@ -106,6 +121,42 @@ def test_batch_keeps_order_and_continues_after_query_exception(
     tmp_path: Path,
 ) -> None:
     service = RecordingService(failing_query_id="synthetic-q2")
+    output = tmp_path / "predictions.jsonl"
+
+    records = asyncio.run(
+        run_synthetic_baseline(
+            _requests(),
+            search_service=service,
+            output=output,
+        )
+    )
+
+    assert service.calls == ["synthetic-q1", "synthetic-q2", "synthetic-q3"]
+    assert records == [
+        InternalPredictionRecord(
+            query_id="synthetic-q1",
+            selected_paper_ids=["openalex:W1"],
+        ),
+        InternalPredictionRecord(
+            query_id="synthetic-q2",
+            selected_paper_ids=[],
+        ),
+        InternalPredictionRecord(
+            query_id="synthetic-q3",
+            selected_paper_ids=["openalex:W3"],
+        ),
+    ]
+    assert output.read_bytes() == (
+        b'{"query_id":"synthetic-q1","selected_paper_ids":["openalex:W1"]}\n'
+        b'{"query_id":"synthetic-q2","selected_paper_ids":[]}\n'
+        b'{"query_id":"synthetic-q3","selected_paper_ids":["openalex:W3"]}\n'
+    )
+
+
+def test_batch_isolates_mismatched_response_query_id_and_keeps_request_order(
+    tmp_path: Path,
+) -> None:
+    service = MismatchedResponseService()
     output = tmp_path / "predictions.jsonl"
 
     records = asyncio.run(

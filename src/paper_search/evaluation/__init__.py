@@ -47,6 +47,12 @@ if TYPE_CHECKING:
         evaluate,
         score_query,
     )
+    from paper_search.evaluation.synthetic_baseline import (
+        SYNTHETIC_QUERIES,
+        SyntheticSearchService,
+        run_synthetic_baseline,
+        validate_synthetic_requests,
+    )
 
 
 _ANNOTATION_EXPORTS = frozenset(
@@ -69,6 +75,14 @@ _METRIC_EXPORTS = frozenset(
         "deduplicate_ranked",
         "evaluate",
         "score_query",
+    }
+)
+_SYNTHETIC_BASELINE_EXPORTS = frozenset(
+    {
+        "SYNTHETIC_QUERIES",
+        "SyntheticSearchService",
+        "run_synthetic_baseline",
+        "validate_synthetic_requests",
     }
 )
 
@@ -115,6 +129,20 @@ def __getattr__(name: str) -> object:
             "evaluate": evaluate,
             "score_query": score_query,
         }
+    elif name in _SYNTHETIC_BASELINE_EXPORTS:
+        from paper_search.evaluation.synthetic_baseline import (
+            SYNTHETIC_QUERIES,
+            SyntheticSearchService,
+            run_synthetic_baseline,
+            validate_synthetic_requests,
+        )
+
+        exports = {
+            "SYNTHETIC_QUERIES": SYNTHETIC_QUERIES,
+            "SyntheticSearchService": SyntheticSearchService,
+            "run_synthetic_baseline": run_synthetic_baseline,
+            "validate_synthetic_requests": validate_synthetic_requests,
+        }
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
@@ -151,7 +179,11 @@ __all__ = [
     "score_query",
     "sha256_file",
     "stratified_sample",
+    "SYNTHETIC_QUERIES",
+    "SyntheticSearchService",
+    "run_synthetic_baseline",
     "validate_annotation_file",
+    "validate_synthetic_requests",
     "write_frozen_bytes",
     "write_jsonl_atomic",
     "write_prediction_records",

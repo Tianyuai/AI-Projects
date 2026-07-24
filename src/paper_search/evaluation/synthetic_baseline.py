@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Protocol
@@ -13,6 +15,7 @@ from paper_search.evaluation.predictions import (
     prediction_from_response,
     write_prediction_records,
 )
+from paper_search.evaluation.synthetic_mocks import build_synthetic_search_service
 
 
 SYNTHETIC_QUERIES = (
@@ -81,3 +84,30 @@ async def run_synthetic_baseline(
             )
         records.append(record)
     return write_prediction_records(output, records)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Write deterministic Task 8C synthetic predictions"
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    try:
+        asyncio.run(
+            run_synthetic_baseline(
+                SYNTHETIC_QUERIES,
+                search_service=build_synthetic_search_service(),
+                output=args.output,
+            )
+        )
+    except (OSError, ValueError):
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

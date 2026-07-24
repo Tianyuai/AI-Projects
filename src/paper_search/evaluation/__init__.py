@@ -23,6 +23,7 @@ from paper_search.evaluation.official_adapter import (
 )
 from paper_search.evaluation.predictions import (
     prediction_from_response,
+    write_prediction_records,
     write_response_predictions,
 )
 
@@ -153,5 +154,6 @@ __all__ = [
     "validate_annotation_file",
     "write_frozen_bytes",
     "write_jsonl_atomic",
+    "write_prediction_records",
     "write_response_predictions",
 ]

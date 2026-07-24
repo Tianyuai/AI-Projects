@@ -17,7 +17,10 @@ from paper_search.evaluation.official_adapter import (
     InternalPredictionRecord,
     adapt_prediction_record,
 )
-from paper_search.evaluation.predictions import write_response_predictions
+from paper_search.evaluation.predictions import (
+    write_prediction_records,
+    write_response_predictions,
+)
 
 
 def _response(
@@ -59,6 +62,56 @@ def _response(
         config_hash="sha256:" + "a" * 64,
         git_sha="abc1234",
     )
+
+
+def test_write_prediction_records_preserves_order_and_bytes(tmp_path: Path) -> None:
+    output = tmp_path / "predictions.jsonl"
+    records = [
+        InternalPredictionRecord(
+            query_id="synthetic-q2",
+            selected_paper_ids=["s2:S2"],
+        ),
+        InternalPredictionRecord(
+            query_id="synthetic-q1",
+            selected_paper_ids=[],
+        ),
+    ]
+
+    written = write_prediction_records(output, records)
+
+    assert written == records
+    assert written is not records
+    assert output.read_bytes() == (
+        b'{"query_id":"synthetic-q2","selected_paper_ids":["s2:S2"]}\n'
+        b'{"query_id":"synthetic-q1","selected_paper_ids":[]}\n'
+    )
+
+
+def test_write_prediction_records_rejects_duplicate_before_write(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "predictions.jsonl"
+    output.write_bytes(b"preserve-me\n")
+
+    with pytest.raises(
+        ValueError,
+        match=r"^duplicate query_id: synthetic-q1$",
+    ):
+        write_prediction_records(
+            output,
+            [
+                InternalPredictionRecord(
+                    query_id="synthetic-q1",
+                    selected_paper_ids=[],
+                ),
+                InternalPredictionRecord(
+                    query_id="synthetic-q1",
+                    selected_paper_ids=["openalex:W1"],
+                ),
+            ],
+        )
+
+    assert output.read_bytes() == b"preserve-me\n"
 
 
 def test_write_response_predictions_is_deterministic_and_adapter_compatible(

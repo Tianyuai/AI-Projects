@@ -18,16 +18,27 @@ def prediction_from_response(
     )
 
 
+def write_prediction_records(
+    path: Path,
+    records: Sequence[InternalPredictionRecord],
+) -> list[InternalPredictionRecord]:
+    """Validate and atomically write ordered deterministic prediction records."""
+    ordered = list(records)
+    seen: set[str] = set()
+    for record in ordered:
+        if record.query_id in seen:
+            raise ValueError(f"duplicate query_id: {record.query_id}")
+        seen.add(record.query_id)
+    write_jsonl_atomic(path, ordered)
+    return ordered
+
+
 def write_response_predictions(
     path: Path,
     responses: Sequence[StructuredSearchResponse],
 ) -> list[InternalPredictionRecord]:
-    """Validate a batch before atomically writing deterministic JSONL."""
-    records = [prediction_from_response(response) for response in responses]
-    seen: set[str] = set()
-    for record in records:
-        if record.query_id in seen:
-            raise ValueError(f"duplicate query_id: {record.query_id}")
-        seen.add(record.query_id)
-    write_jsonl_atomic(path, records)
-    return records
+    """Convert structured responses and write deterministic predictions."""
+    return write_prediction_records(
+        path,
+        [prediction_from_response(response) for response in responses],
+    )

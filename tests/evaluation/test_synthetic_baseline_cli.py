@@ -83,3 +83,4 @@ for name in (
         text=True,
     )
     assert result.returncode == 0, result.stderr
+    assert result.stderr == ""

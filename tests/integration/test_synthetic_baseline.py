@@ -77,16 +77,27 @@ def test_factory_creates_fresh_budget_controller_per_request(
 def test_public_runner_is_offline_when_network_is_blocked(
     tmp_path: Path,
 ) -> None:
+    attempts: list[str] = []
+
     def reject_network(*args: object, **kwargs: object) -> None:
+        attempts.append("network")
         raise AssertionError("synthetic baseline attempted network access")
 
     async def run_with_network_blocked() -> list[InternalPredictionRecord]:
         with pytest.MonkeyPatch.context() as monkeypatch:
             monkeypatch.setattr(socket.socket, "connect", reject_network)
+            monkeypatch.setattr(socket.socket, "connect_ex", reject_network)
+            monkeypatch.setattr(socket, "create_connection", reject_network)
+            monkeypatch.setattr(socket, "getaddrinfo", reject_network)
             return await run_synthetic_baseline(
                 output=tmp_path / "predictions.jsonl"
             )
 
     records = asyncio.run(run_with_network_blocked())
 
-    assert len(records) == len(SYNTHETIC_QUERIES)
+    assert attempts == []
+    assert [record.selected_paper_ids for record in records] == [
+        ["openalex:W100"],
+        [],
+        ["openalex:W100"],
+    ]

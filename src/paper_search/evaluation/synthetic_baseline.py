@@ -40,7 +40,7 @@ SYNTHETIC_QUERIES = (
 )
 
 
-class SyntheticSearchService(Protocol):
+class _SyntheticSearchService(Protocol):
     async def __call__(
         self,
         request: SearchRequest,
@@ -60,25 +60,25 @@ def _validate_synthetic_requests(
         if not isinstance(candidate, SearchRequest):
             raise ValueError("synthetic query catalog contains invalid request")
         try:
-            SearchRequest.model_validate(candidate.model_dump(mode="python"))
-        except ValueError as error:
+            original = candidate.model_dump(mode="python", warnings="error")
+            request = SearchRequest.model_validate(original, strict=True)
+            if request.model_dump(mode="python") != original:
+                raise ValueError("request is not in canonical form")
+        except Exception as error:
             raise ValueError(
                 "synthetic query catalog contains invalid request"
             ) from error
-        request = candidate
         if request.query_id in seen:
             raise ValueError(f"duplicate query_id: {request.query_id}")
         seen.add(request.query_id)
         validated.append(request)
-    if isinstance(requests, tuple):
-        return requests
     return tuple(validated)
 
 
 async def _run_synthetic_batch(
     requests: Sequence[object],
     *,
-    search_service: SyntheticSearchService,
+    search_service: _SyntheticSearchService,
     output: Path,
 ) -> list[InternalPredictionRecord]:
     """Run an ordered synthetic batch and isolate query-level failures."""
@@ -89,9 +89,13 @@ async def _run_synthetic_batch(
             response = await search_service(request)
             if not isinstance(response, StructuredSearchResponse):
                 raise ValueError("search service returned an invalid response")
+            original = response.model_dump(mode="python", warnings="error")
             validated_response = StructuredSearchResponse.model_validate(
-                response.model_dump(mode="python")
+                original,
+                strict=True,
             )
+            if validated_response.model_dump(mode="python") != original:
+                raise ValueError("search service response is not in canonical form")
             if validated_response.query_id != request.query_id:
                 raise ValueError("response query_id does not match request query_id")
             record = prediction_from_response(validated_response)

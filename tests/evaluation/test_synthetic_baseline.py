@@ -122,7 +122,7 @@ def test_catalog_is_fixed_strict_and_unique() -> None:
             include_trace=False,
         ),
     )
-    assert _validate_synthetic_requests(SYNTHETIC_QUERIES) is SYNTHETIC_QUERIES
+    assert _validate_synthetic_requests(SYNTHETIC_QUERIES) == SYNTHETIC_QUERIES
 
 
 def test_public_runner_only_accepts_an_output_path() -> None:
@@ -130,6 +130,8 @@ def test_public_runner_only_accepts_an_output_path() -> None:
 
     assert tuple(signature.parameters) == ("output",)
     assert signature.parameters["output"].kind is inspect.Parameter.KEYWORD_ONLY
+    with pytest.raises(TypeError):
+        asyncio.run(run_synthetic_baseline(Path("predictions.jsonl")))  # type: ignore[call-arg]
 
 
 def test_validate_synthetic_requests_rejects_empty_duplicate_and_invalid() -> None:
@@ -159,6 +161,18 @@ def test_validate_synthetic_requests_rejects_empty_duplicate_and_invalid() -> No
         _validate_synthetic_requests(
             cast(tuple[SearchRequest, ...], (_requests()[0], object()))
         )
+
+    coercible = SearchRequest.model_construct(
+        query_id="synthetic-q2",
+        query="synthetic coercible",
+        budget_profile="low",
+        include_trace="false",
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"^synthetic query catalog contains invalid request$",
+    ):
+        _validate_synthetic_requests((_requests()[0], coercible))
 
 
 def test_batch_keeps_order_and_continues_after_query_exception(
@@ -295,6 +309,39 @@ def test_batch_isolates_invalid_response_and_continues(
         ["openalex:W1"],
         [],
         ["openalex:W3"],
+    ]
+
+
+def test_batch_isolates_coercible_constructed_response(
+    tmp_path: Path,
+) -> None:
+    class CoercibleResponseService:
+        async def __call__(
+            self,
+            request: SearchRequest,
+        ) -> StructuredSearchResponse:
+            valid = _response(request, ["openalex:W1"])
+            return StructuredSearchResponse.model_construct(
+                **{
+                    **valid.model_dump(mode="python"),
+                    "selected_paper_ids": ("openalex:FORGED",),
+                    "is_partial": "false",
+                }
+            )
+
+    records = asyncio.run(
+        _run_synthetic_batch(
+            (_requests()[0],),
+            search_service=CoercibleResponseService(),
+            output=tmp_path / "predictions.jsonl",
+        )
+    )
+
+    assert records == [
+        InternalPredictionRecord(
+            query_id="synthetic-q1",
+            selected_paper_ids=[],
+        )
     ]
 
 

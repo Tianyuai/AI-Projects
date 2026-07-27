@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -17,8 +19,9 @@ from paper_search.domain.models import (
 from paper_search.evaluation.official_adapter import InternalPredictionRecord
 from paper_search.evaluation.synthetic_baseline import (
     SYNTHETIC_QUERIES,
+    _run_synthetic_batch,
+    _validate_synthetic_requests,
     run_synthetic_baseline,
-    validate_synthetic_requests,
 )
 
 
@@ -99,22 +102,63 @@ def _requests() -> tuple[SearchRequest, ...]:
 
 
 def test_catalog_is_fixed_strict_and_unique() -> None:
-    assert SYNTHETIC_QUERIES
-    assert all(request.include_trace is False for request in SYNTHETIC_QUERIES)
-    assert all("synthetic" in request.query.casefold() for request in SYNTHETIC_QUERIES)
-    assert len({request.query_id for request in SYNTHETIC_QUERIES}) == len(
-        SYNTHETIC_QUERIES
+    assert SYNTHETIC_QUERIES == (
+        SearchRequest(
+            query_id="synthetic-graph-retrieval",
+            query="Synthetic graph retrieval research",
+            budget_profile="low",
+            include_trace=False,
+        ),
+        SearchRequest(
+            query_id="synthetic-empty-result",
+            query="Synthetic zero-result literature search",
+            budget_profile="balanced",
+            include_trace=False,
+        ),
+        SearchRequest(
+            query_id="synthetic-budget-path",
+            query="Synthetic budget-aware scholarly search",
+            budget_profile="low",
+            include_trace=False,
+        ),
     )
-    assert validate_synthetic_requests(SYNTHETIC_QUERIES) is SYNTHETIC_QUERIES
+    assert _validate_synthetic_requests(SYNTHETIC_QUERIES) is SYNTHETIC_QUERIES
 
 
-def test_validate_synthetic_requests_rejects_empty_and_duplicate() -> None:
+def test_public_runner_only_accepts_an_output_path() -> None:
+    signature = inspect.signature(run_synthetic_baseline)
+
+    assert tuple(signature.parameters) == ("output",)
+    assert signature.parameters["output"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_validate_synthetic_requests_rejects_empty_duplicate_and_invalid() -> None:
     with pytest.raises(ValueError, match=r"^synthetic query catalog must not be empty$"):
-        validate_synthetic_requests(())
+        _validate_synthetic_requests(())
 
     duplicate = SearchRequest(query_id="synthetic-q1", query="synthetic duplicate")
     with pytest.raises(ValueError, match=r"^duplicate query_id: synthetic-q1$"):
-        validate_synthetic_requests((_requests()[0], duplicate))
+        _validate_synthetic_requests((_requests()[0], duplicate))
+
+    invalid = SearchRequest.model_construct(
+        query_id="synthetic-q2",
+        query="synthetic invalid",
+        budget_profile="not-a-profile",
+        include_trace=False,
+    )
+    with pytest.raises(
+        ValueError,
+        match=r"^synthetic query catalog contains invalid request$",
+    ):
+        _validate_synthetic_requests((_requests()[0], invalid))
+
+    with pytest.raises(
+        ValueError,
+        match=r"^synthetic query catalog contains invalid request$",
+    ):
+        _validate_synthetic_requests(
+            cast(tuple[SearchRequest, ...], (_requests()[0], object()))
+        )
 
 
 def test_batch_keeps_order_and_continues_after_query_exception(
@@ -124,7 +168,7 @@ def test_batch_keeps_order_and_continues_after_query_exception(
     output = tmp_path / "predictions.jsonl"
 
     records = asyncio.run(
-        run_synthetic_baseline(
+        _run_synthetic_batch(
             _requests(),
             search_service=service,
             output=output,
@@ -160,7 +204,7 @@ def test_batch_isolates_mismatched_response_query_id_and_keeps_request_order(
     output = tmp_path / "predictions.jsonl"
 
     records = asyncio.run(
-        run_synthetic_baseline(
+        _run_synthetic_batch(
             _requests(),
             search_service=service,
             output=output,
@@ -199,7 +243,7 @@ def test_preflight_failure_does_not_call_service_or_replace_output(
 
     with pytest.raises(ValueError, match=r"^duplicate query_id: synthetic-q1$"):
         asyncio.run(
-            run_synthetic_baseline(
+            _run_synthetic_batch(
                 (_requests()[0], duplicate),
                 search_service=service,
                 output=output,
@@ -208,3 +252,85 @@ def test_preflight_failure_does_not_call_service_or_replace_output(
 
     assert service.calls == []
     assert output.read_bytes() == b"preserve-me\n"
+
+
+@pytest.mark.parametrize(
+    "invalid_response",
+    [
+        {
+            "query_id": "synthetic-q2",
+            "selected_paper_ids": ["openalex:FORGED"],
+        },
+        StructuredSearchResponse.model_construct(
+            query_id="synthetic-q2",
+            selected_paper_ids=["openalex:FORGED"],
+        ),
+    ],
+)
+def test_batch_isolates_invalid_response_and_continues(
+    tmp_path: Path,
+    invalid_response: object,
+) -> None:
+    class InvalidResponseService:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def __call__(self, request: SearchRequest) -> StructuredSearchResponse:
+            self.calls.append(request.query_id)
+            if request.query_id == "synthetic-q2":
+                return cast(StructuredSearchResponse, invalid_response)
+            return _response(request, [f"openalex:W{len(self.calls)}"])
+
+    service = InvalidResponseService()
+    records = asyncio.run(
+        _run_synthetic_batch(
+            _requests(),
+            search_service=service,
+            output=tmp_path / "predictions.jsonl",
+        )
+    )
+
+    assert service.calls == ["synthetic-q1", "synthetic-q2", "synthetic-q3"]
+    assert [record.selected_paper_ids for record in records] == [
+        ["openalex:W1"],
+        [],
+        ["openalex:W3"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("is_partial", "stop_reason", "warnings"),
+    [
+        (False, "completed", []),
+        (True, "budget_exhausted", ["synthetic soft limit"]),
+        (True, "provider_failure", ["synthetic hard failure"]),
+    ],
+)
+def test_batch_preserves_selected_ids_from_valid_response_states(
+    tmp_path: Path,
+    is_partial: bool,
+    stop_reason: str,
+    warnings: list[str],
+) -> None:
+    class ResponseStateService:
+        async def __call__(
+            self,
+            request: SearchRequest,
+        ) -> StructuredSearchResponse:
+            return _response(request, ["openalex:W1"]).model_copy(
+                update={
+                    "is_partial": is_partial,
+                    "stop_reason": stop_reason,
+                    "warnings": warnings,
+                }
+            )
+
+    records = asyncio.run(
+        _run_synthetic_batch(
+            (_requests()[0],),
+            search_service=ResponseStateService(),
+            output=tmp_path / "predictions.jsonl",
+        )
+    )
+
+    assert records[0].selected_paper_ids == ["openalex:W1"]

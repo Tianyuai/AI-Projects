@@ -80,16 +80,20 @@ A preflight failure occurs before service execution and before any output write.
 
 ## Batch Data Flow
 
-The batch accepts:
+The public runner accepts only an output path:
 
 ```python
 async def run_synthetic_baseline(
-    requests: Sequence[SearchRequest],
     *,
-    search_service: SearchService,
     output: Path,
 ) -> list[InternalPredictionRecord]
 ```
+
+It always binds the fixed `SYNTHETIC_QUERIES` catalog to the fixed offline mock
+service. Arbitrary request catalogs and service implementations are available
+only through a module-private batch seam used by focused tests. This prevents a
+normal caller from substituting real queries or a network-backed service while
+preserving deterministic failure-injection coverage.
 
 It processes requests sequentially in their declared order. Concurrency is
 deliberately excluded because it adds scheduling variability without serving
@@ -97,8 +101,8 @@ the integration goal.
 
 For each request:
 
-1. call `await search_service.search(request)`;
-2. require a valid `StructuredSearchResponse`;
+1. call the fixed mock service;
+2. require and revalidate a real `StructuredSearchResponse`;
 3. convert it with the existing `prediction_from_response` boundary;
 4. append the resulting `InternalPredictionRecord`.
 

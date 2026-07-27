@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 from pathlib import Path
+
+import pytest
 
 from paper_search.evaluation.official_adapter import InternalPredictionRecord
 from paper_search.evaluation.synthetic_baseline import (
@@ -12,21 +15,14 @@ from paper_search.evaluation.synthetic_mocks import (
     SyntheticOrchestratorFactory,
     build_synthetic_search_service,
 )
+from paper_search.evaluation.synthetic_baseline import _run_synthetic_batch
 
 
 def test_real_mock_stack_writes_only_ordered_synthetic_predictions(
     tmp_path: Path,
 ) -> None:
     output = tmp_path / "artifacts" / "predictions.jsonl"
-    service = build_synthetic_search_service()
-
-    records = asyncio.run(
-        run_synthetic_baseline(
-            SYNTHETIC_QUERIES,
-            search_service=service,
-            output=output,
-        )
-    )
+    records = asyncio.run(run_synthetic_baseline(output=output))
 
     assert [record.query_id for record in records] == [
         request.query_id for request in SYNTHETIC_QUERIES
@@ -46,19 +42,11 @@ def test_real_mock_stack_repeated_runs_are_byte_identical(
     output = tmp_path / "predictions.jsonl"
 
     asyncio.run(
-        run_synthetic_baseline(
-            SYNTHETIC_QUERIES,
-            search_service=build_synthetic_search_service(),
-            output=output,
-        )
+        run_synthetic_baseline(output=output)
     )
     first = output.read_bytes()
     asyncio.run(
-        run_synthetic_baseline(
-            SYNTHETIC_QUERIES,
-            search_service=build_synthetic_search_service(),
-            output=output,
-        )
+        run_synthetic_baseline(output=output)
     )
 
     assert output.read_bytes() == first
@@ -73,7 +61,7 @@ def test_factory_creates_fresh_budget_controller_per_request(
     service = build_synthetic_search_service(factory=factory)
 
     asyncio.run(
-        run_synthetic_baseline(
+        _run_synthetic_batch(
             SYNTHETIC_QUERIES,
             search_service=service,
             output=tmp_path / "predictions.jsonl",
@@ -84,3 +72,21 @@ def test_factory_creates_fresh_budget_controller_per_request(
     assert len({id(controller) for controller in factory.controllers}) == len(
         SYNTHETIC_QUERIES
     )
+
+
+def test_public_runner_is_offline_when_network_is_blocked(
+    tmp_path: Path,
+) -> None:
+    def reject_network(*args: object, **kwargs: object) -> None:
+        raise AssertionError("synthetic baseline attempted network access")
+
+    async def run_with_network_blocked() -> list[InternalPredictionRecord]:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(socket.socket, "connect", reject_network)
+            return await run_synthetic_baseline(
+                output=tmp_path / "predictions.jsonl"
+            )
+
+    records = asyncio.run(run_with_network_blocked())
+
+    assert len(records) == len(SYNTHETIC_QUERIES)

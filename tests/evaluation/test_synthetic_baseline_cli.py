@@ -53,6 +53,7 @@ def test_cli_rejects_formal_evaluation_arguments(tmp_path: Path) -> None:
         "--manifest",
         "--api-key",
         "--endpoint",
+        "--out",
     ):
         output = tmp_path / f"{argument[2:]}.jsonl"
         result = _run_cli(output, argument, "forbidden")
@@ -71,9 +72,11 @@ from paper_search.evaluation import synthetic_baseline
 for name in (
     "SYNTHETIC_QUERIES",
     "run_synthetic_baseline",
-    "validate_synthetic_requests",
 ):
     assert getattr(evaluation, name) is getattr(synthetic_baseline, name)
+
+for name in ("SyntheticSearchService", "validate_synthetic_requests"):
+    assert not hasattr(evaluation, name)
 """
     result = subprocess.run(
         [sys.executable, "-c", script],

@@ -256,6 +256,23 @@ def test_main_rejects_non_mock_server_arguments(argv: list[str]) -> None:
         mock_server.main(argv)
 ```
 
+Add this CLI-presence test before any implementation of `mock_server.main`:
+
+```python
+def test_mock_server_module_exposes_help_cli() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "paper_search.api.mock_server", "--help"],
+        check=False,
+        capture_output=True,
+        env=_child_environment(),
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "--host" in result.stdout
+    assert "--port" in result.stdout
+```
+
 Add a fresh-interpreter guard test so the permanent audit hook never leaks
 into pytest's own process:
 
@@ -313,7 +330,8 @@ $env:UV_PROJECT_ENVIRONMENT='D:\AI Projects\Projects\.venv'
 & 'D:\Dev\uv\uv.exe' run --no-sync --no-env-file pytest tests/api/test_mock_server.py -q
 ```
 
-Expected: failures because `main`, `_build_parser`, and
+Expected: the new CLI-presence test fails because the module is absent; the
+other new tests also fail because `main`, `_build_parser`, and
 `_install_loopback_only_guard` are absent.
 
 - [ ] **Step 3: Implement strict parser, audit guard, and entry point**
@@ -432,7 +450,7 @@ Expected staged paths: exactly the two paths listed above.
 - Produces: test-only `MockServerProcess` helper that starts, polls, terminates, and reaps a child process.
 - Produces: test-only `reserve_loopback_port() -> int` and `wait_until_live(base_url: str, process: subprocess.Popen[str]) -> None` helpers with bounded timeouts.
 
-- [ ] **Step 1: Write the failing real-process success-path test**
+- [ ] **Step 1: Add the real-process success-path test after Task 2 GREEN**
 
 Create `tests/integration/test_mock_server_process.py` with a minimal process fixture and this test:
 
@@ -542,7 +560,7 @@ def test_mock_server_process_serves_ready_and_synthetic_search() -> None:
     )
 ```
 
-- [ ] **Step 2: Run the process test to verify RED**
+- [ ] **Step 2: Run the process test to establish the GREEN integration baseline**
 
 Run:
 
@@ -551,11 +569,13 @@ $env:UV_PROJECT_ENVIRONMENT='D:\AI Projects\Projects\.venv'
 & 'D:\Dev\uv\uv.exe' run --no-sync --no-env-file pytest tests/integration/test_mock_server_process.py::test_mock_server_process_serves_ready_and_synthetic_search -q
 ```
 
-Expected: FAIL because the Task 2 CLI does not yet exist, or because it cannot import Uvicorn before Task 1's lock update.
+Expected: 1 passed. Task 2 already proves the new production entry point with
+the CLI-presence RED→GREEN cycle; this task adds real socket and process
+coverage without changing production code.
 
-- [ ] **Step 3: Run the test to verify the real process smoke path is GREEN**
+- [ ] **Step 3: Re-run the test after any harness-only cleanup adjustments**
 
-After Tasks 1 and 2 are complete, rerun the command from Step 2.
+After the process fixture is complete, rerun the command from Step 2.
 
 Expected: 1 passed; the child binds only its loopback port and is reaped by the fixture.
 

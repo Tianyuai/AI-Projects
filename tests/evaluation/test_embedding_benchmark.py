@@ -53,6 +53,26 @@ class UnsafeMetadataRanker:
         )
 
 
+class PathMetadataRanker:
+    def __init__(self, model_id: str) -> None:
+        self._model_id = model_id
+
+    def rank(
+        self,
+        query: str,
+        papers: Sequence[Paper],
+    ) -> EmbeddingRankingResult:
+        del query, papers
+        return EmbeddingRankingResult(
+            ranked=[],
+            status="applied",
+            model_id=self._model_id,
+            device="cpu",
+            fallback_used=False,
+            warnings=[],
+        )
+
+
 class CountingRanker:
     def __init__(self, events: list[str]) -> None:
         self._events = events
@@ -121,7 +141,7 @@ def test_benchmark_sanitizes_unsafe_model_metadata_and_warning_text() -> None:
     )
 
     assert result.model_dump() == {
-        "model_id": "all-MiniLM-L6-v2",
+        "model_id": "local_model",
         "device": "cpu",
         "candidate_count": 0,
         "batch_size": 1,
@@ -136,6 +156,35 @@ def test_benchmark_sanitizes_unsafe_model_metadata_and_warning_text() -> None:
     assert "private-cache" not in serialized
     assert "synthetic benchmark query" not in serialized
     assert "RuntimeError" not in serialized
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        r"D:\private-cache\models\all-MiniLM-L6-v2",
+        r"\\private-host\share\all-MiniLM-L6-v2",
+        "/private-cache/models/all-MiniLM-L6-v2",
+        "~/private-cache/all-MiniLM-L6-v2",
+        "./private-cache/all-MiniLM-L6-v2",
+        "../private-cache/all-MiniLM-L6-v2",
+    ],
+)
+def test_benchmark_maps_any_detected_local_path_model_id_to_fixed_constant(
+    model_id: str,
+) -> None:
+    result = benchmark_embedding(
+        ranker=PathMetadataRanker(model_id),
+        query="synthetic benchmark query",
+        papers=[],
+        batch_size=1,
+        clock=lambda: 10.0,
+        peak_rss=lambda: 123_456,
+        cuda_peak=lambda: None,
+        cuda_reset=lambda: None,
+    )
+
+    assert result.model_id == "local_model"
+    assert "all-MiniLM-L6-v2" not in result.model_dump_json()
 
 
 @pytest.mark.parametrize("batch_size", [0, -1])

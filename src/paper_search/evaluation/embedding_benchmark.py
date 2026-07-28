@@ -22,6 +22,7 @@ _SAFE_MODEL_ID_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?$"
 )
 _SAFE_WARNING_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
+_LOCAL_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{1,2}|~[\\/]|\.{1,2}[\\/])")
 
 
 class EmbeddingBenchmarkResult(DomainModel):
@@ -60,8 +61,8 @@ def _validate_batch_size(batch_size: object) -> int:
 
 def _sanitize_model_id(model_id: str) -> str:
     candidate = model_id.strip()
-    if re.match(r"^(?:[A-Za-z]:[\\/]|[\\/]{1,2}|~[\\/]|\.{1,2}[\\/])", candidate):
-        candidate = candidate.replace("\\", "/").rstrip("/").rsplit("/", maxsplit=1)[-1]
+    if _LOCAL_PATH_RE.match(candidate):
+        return "local_model"
     if not _SAFE_MODEL_ID_RE.fullmatch(candidate):
         raise ValueError("model_id must be a safe identifier")
     return candidate

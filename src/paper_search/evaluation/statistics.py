@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 _DEFAULT_RESAMPLES = 1000
 _DEFAULT_CONFIDENCE_LEVEL = 0.95
+_WEEK3_DEFAULT_SEED = 20260728
 
 
 class BootstrapInterval(BaseModel):
@@ -28,7 +29,7 @@ class BootstrapInterval(BaseModel):
         allow_inf_nan=False,
     )
     resamples: int = Field(default=_DEFAULT_RESAMPLES, strict=True, ge=_DEFAULT_RESAMPLES)
-    seed: int | None = Field(default=None, strict=True)
+    seed: int | None = Field(default=_WEEK3_DEFAULT_SEED, strict=True)
 
     @model_validator(mode="after")
     def _validate_bounds(self) -> "BootstrapInterval":
@@ -50,9 +51,12 @@ class MacroF1Comparison(BaseModel):
     delta_interval: BootstrapInterval
 
 
-def _validate_resamples(resamples: int) -> None:
-    if isinstance(resamples, bool) or resamples < _DEFAULT_RESAMPLES:
+def _validate_resamples(resamples: object) -> int:
+    if not isinstance(resamples, int) or isinstance(resamples, bool):
         raise ValueError("resamples must be an integer greater than or equal to 1000")
+    if resamples < _DEFAULT_RESAMPLES:
+        raise ValueError("resamples must be an integer greater than or equal to 1000")
+    return resamples
 
 
 def _normalize_values(values: Sequence[float], *, field_name: str) -> list[float]:
@@ -77,11 +81,11 @@ def bootstrap_mean_interval(
     values: Sequence[float],
     *,
     resamples: int = _DEFAULT_RESAMPLES,
-    seed: int | None = None,
+    seed: int | None = _WEEK3_DEFAULT_SEED,
 ) -> BootstrapInterval:
     """Bootstrap the mean of aggregate scalar values with deterministic sampling."""
 
-    _validate_resamples(resamples)
+    resamples = _validate_resamples(resamples)
     normalized_values = _normalize_values(values, field_name="values")
 
     rng = random.Random(seed)
@@ -112,7 +116,7 @@ def compare_macro_f1(
     candidate_values: Sequence[float],
     *,
     resamples: int = _DEFAULT_RESAMPLES,
-    seed: int | None = None,
+    seed: int | None = _WEEK3_DEFAULT_SEED,
 ) -> MacroF1Comparison:
     """Compare candidate and baseline macro-F1 using paired bootstrap deltas."""
 
@@ -121,7 +125,10 @@ def compare_macro_f1(
     if len(baseline) != len(candidate):
         raise ValueError("baseline_values and candidate_values must have equal lengths")
 
-    delta_values = [candidate_value - baseline_value for baseline_value, candidate_value in zip(baseline, candidate)]
+    delta_values = [
+        candidate_value - baseline_value
+        for baseline_value, candidate_value in zip(baseline, candidate)
+    ]
     delta_interval = bootstrap_mean_interval(delta_values, resamples=resamples, seed=seed)
 
     baseline_mean = _mean(baseline)

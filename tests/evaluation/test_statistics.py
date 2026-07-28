@@ -11,6 +11,22 @@ from paper_search.evaluation.statistics import (
 )
 
 
+def test_bootstrap_interval_defaults_are_deterministic_without_explicit_seed() -> None:
+    first = bootstrap_mean_interval([0.0, 0.5, 1.0])
+    second = bootstrap_mean_interval([0.0, 0.5, 1.0])
+
+    assert first == second
+    assert first.seed == 20260728
+
+
+def test_macro_f1_comparison_defaults_are_deterministic_without_explicit_seed() -> None:
+    first = compare_macro_f1([0.0, 1.0], [0.5, 1.0])
+    second = compare_macro_f1([0.0, 1.0], [0.5, 1.0])
+
+    assert first == second
+    assert first.delta_interval.seed == 20260728
+
+
 def test_bootstrap_interval_is_seeded_and_contains_observed_mean() -> None:
     first = bootstrap_mean_interval([0.0, 0.5, 1.0], resamples=1000, seed=20260728)
     second = bootstrap_mean_interval([0.0, 0.5, 1.0], resamples=1000, seed=20260728)
@@ -59,6 +75,14 @@ def test_bootstrap_mean_interval_rejects_fewer_than_1000_resamples() -> None:
         bootstrap_mean_interval([0.0, 1.0], resamples=999, seed=1)
 
 
+@pytest.mark.parametrize("invalid_resamples", ["1000", 1000.5, True, False])
+def test_bootstrap_mean_interval_rejects_non_integer_or_boolean_resamples(
+    invalid_resamples: object,
+) -> None:
+    with pytest.raises(ValueError, match="resamples"):
+        bootstrap_mean_interval([0.0, 1.0], resamples=invalid_resamples)
+
+
 @pytest.mark.parametrize(
     ("baseline_values", "candidate_values"),
     [
@@ -78,4 +102,16 @@ def test_compare_macro_f1_rejects_invalid_paired_inputs(
             candidate_values,
             resamples=1000,
             seed=11,
+        )
+
+
+@pytest.mark.parametrize("invalid_resamples", ["1000", 1000.5, True, False])
+def test_compare_macro_f1_rejects_non_integer_or_boolean_resamples(
+    invalid_resamples: object,
+) -> None:
+    with pytest.raises(ValueError, match="resamples"):
+        compare_macro_f1(
+            [0.0, 1.0],
+            [0.5, 1.0],
+            resamples=invalid_resamples,
         )

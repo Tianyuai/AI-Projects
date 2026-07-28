@@ -68,6 +68,20 @@ suite. Use an already-downloaded local model path plus synthetic text, and
 record only aggregate latency, process peak RSS, CUDA peak allocation, status,
 and fallback state.
 
+## Week 3 offline ablation framework
+
+The ablation framework is offline and injected by default. Its public case
+matrix lives in `configs/ablations.yaml`, and `run_ablations(...)` evaluates
+only caller-supplied `AblationCase` values through an injected evaluator.
+
+By default, the framework does not call APIs or load `.env`. The YAML matrix
+stores only public module booleans, keeps citation expansion and LLM rerank
+disabled, and leaves embedding off except for the explicit `embedding` case.
+
+Selection notes from these offline runs remain `owner_only_provisional`.
+Validation may record only the `selection_only` phase, while tuning remains a
+dev-only activity.
+
 ## 数据与人工标注
 
 协作者的立即执行清单见 `docs/TEAMMATE_ONBOARDING.md`，安全数据契约见 `data/README.md`。真实查询、gold、原始数据和人工标签不得进入 Git。不得读取、打印、搜索或复制 `.env`；只有明确授权的在线或数据准备子进程可以通过 `--env-file` 加载它。

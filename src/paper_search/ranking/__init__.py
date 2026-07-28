@@ -22,6 +22,10 @@ from paper_search.ranking.lexical import (
     rank_lexically,
     tokenize_text,
 )
+from paper_search.ranking.sentence_transformer import (
+    SentenceTransformerEncoder,
+    sentence_transformer_factory,
+)
 
 
 __all__ = [
@@ -40,9 +44,11 @@ __all__ = [
     "FusedPaper",
     "FusionMethod",
     "LexicalScore",
+    "SentenceTransformerEncoder",
     "TextEncoder",
     "TextEncoderFactory",
     "fuse_provider_results",
     "rank_lexically",
+    "sentence_transformer_factory",
     "tokenize_text",
 ]

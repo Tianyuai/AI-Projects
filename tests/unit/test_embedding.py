@@ -5,7 +5,11 @@ from collections.abc import Sequence
 import pytest
 
 from paper_search.domain.models import Paper
-from paper_search.ranking.embedding import EmbeddingRanker
+from paper_search.ranking.embedding import (
+    EmbeddingOutOfMemoryError,
+    EmbeddingRanker,
+    EmbeddingUnavailableError,
+)
 
 
 class FakeEncoder:
@@ -54,6 +58,21 @@ class RaisingEncoder:
 
     def close(self) -> None:
         self._closed.append(self.device)
+
+
+class FailingEncoder(FakeEncoder):
+    def __init__(self, *, error: Exception, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._error = error
+
+    def encode(
+        self,
+        texts: Sequence[str],
+        *,
+        batch_size: int,
+    ) -> list[list[float]]:
+        del texts, batch_size
+        raise self._error
 
 
 def _paper(identifier: str, title: str, abstract: str | None) -> Paper:
@@ -223,7 +242,7 @@ def test_embedding_ranker_falls_back_to_cpu_after_cuda_unavailable() -> None:
 
     def encoder_factory(device: str) -> object:
         if device == "cuda":
-            raise RuntimeError("cuda device not available")
+            raise EmbeddingUnavailableError("sanitized")
         return FakeEncoder(
             device=device,
             vectors=vectors,
@@ -254,7 +273,7 @@ def test_embedding_ranker_falls_back_to_cpu_after_cuda_unavailable() -> None:
     assert result.status == "applied"
     assert result.device == "cpu"
     assert result.fallback_used is True
-    assert result.warnings == ["cuda_unavailable"]
+    assert result.warnings == ["cuda_unavailable_cpu_fallback"]
     assert calls == [
         ("cpu", ["query"], 1),
         (
@@ -278,7 +297,7 @@ def test_embedding_ranker_falls_back_to_cpu_after_cuda_out_of_memory() -> None:
         if device == "cuda":
             return RaisingEncoder(
                 device=device,
-                exc=MemoryError("cuda out of memory"),
+                exc=EmbeddingOutOfMemoryError("sanitized"),
                 closed=closed,
             )
         return FakeEncoder(
@@ -311,8 +330,44 @@ def test_embedding_ranker_falls_back_to_cpu_after_cuda_out_of_memory() -> None:
     assert result.status == "applied"
     assert result.device == "cpu"
     assert result.fallback_used is True
-    assert result.warnings == ["cuda_out_of_memory"]
+    assert result.warnings == ["cuda_oom_cpu_fallback"]
     assert closed == ["cuda", "cpu"]
+
+
+def test_cuda_oom_closes_encoder_then_retries_once_on_cpu() -> None:
+    created: list[str] = []
+    closed: list[str] = []
+    vectors = {"query": [1.0, 0.0], "Paper": [1.0, 0.0]}
+
+    def factory(device: str) -> FakeEncoder:
+        created.append(device)
+        common = {
+            "device": device,
+            "vectors": vectors,
+            "calls": [],
+            "closed": closed,
+        }
+        if device == "cuda":
+            return FailingEncoder(
+                error=EmbeddingOutOfMemoryError("sanitized"),
+                **common,
+            )
+        return FakeEncoder(**common)
+
+    result = EmbeddingRanker(
+        encoder_factory=factory,  # type: ignore[arg-type]
+        model_id="fixture-embedding-v1",
+        preferred_device="cuda",
+        batch_size=2,
+        fallback_to_cpu=True,
+    ).rank("query", [_paper("paper:1", "Paper", None)])
+
+    assert created == ["cuda", "cpu"]
+    assert closed == ["cuda", "cpu"]
+    assert result.status == "applied"
+    assert result.device == "cpu"
+    assert result.fallback_used is True
+    assert result.warnings == ["cuda_oom_cpu_fallback"]
 
 
 def test_embedding_ranker_degrades_when_cpu_fallback_also_fails() -> None:
@@ -320,10 +375,10 @@ def test_embedding_ranker_degrades_when_cpu_fallback_also_fails() -> None:
 
     def encoder_factory(device: str) -> object:
         if device == "cuda":
-            raise RuntimeError("cuda unavailable")
+            raise EmbeddingUnavailableError("sanitized")
         return RaisingEncoder(
             device=device,
-            exc=RuntimeError("private cpu failure detail"),
+            exc=EmbeddingUnavailableError("private cpu failure detail"),
             closed=closed,
         )
 
@@ -344,10 +399,44 @@ def test_embedding_ranker_degrades_when_cpu_fallback_also_fails() -> None:
     assert result.status == "degraded"
     assert result.device == "cpu"
     assert result.fallback_used is True
-    assert result.warnings == ["cuda_unavailable", "cpu_unavailable"]
+    assert result.warnings == ["cuda_unavailable_cpu_fallback", "cpu_encoder_unavailable"]
     assert [item.paper.canonical_id for item in result.ranked] == [
         "paper:z",
         "paper:a",
     ]
     assert [item.similarity for item in result.ranked] == [0.0, 0.0]
     assert "private" not in " ".join(result.warnings)
+
+
+def test_cpu_failure_returns_prior_order_without_exception_detail() -> None:
+    private_detail = "private device path"
+
+    def factory(device: str) -> FakeEncoder:
+        return FailingEncoder(
+            error=EmbeddingUnavailableError(private_detail),
+            device=device,
+            vectors={},
+            calls=[],
+            closed=[],
+        )
+
+    papers = [
+        _paper("paper:2", "Second", None),
+        _paper("paper:1", "First", None),
+    ]
+    result = EmbeddingRanker(
+        encoder_factory=factory,  # type: ignore[arg-type]
+        model_id="fixture-embedding-v1",
+        preferred_device="cpu",
+        batch_size=2,
+        fallback_to_cpu=True,
+    ).rank("query", papers)
+
+    assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:2",
+        "paper:1",
+    ]
+    assert all(item.similarity == 0.0 for item in result.ranked)
+    assert result.status == "degraded"
+    assert result.warnings == ["encoder_unavailable"]
+    assert private_detail not in result.model_dump_json()

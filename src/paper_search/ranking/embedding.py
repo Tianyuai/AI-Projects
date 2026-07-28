@@ -33,9 +33,6 @@ class TextEncoder(Protocol):
 
 TextEncoderFactory = Callable[[EmbeddingDevice], TextEncoder]
 
-_OUT_OF_MEMORY_HINTS = ("out of memory",)
-
-
 class EmbeddingScore(DomainModel):
     paper: Paper
     similarity: float = Field(ge=-1, le=1, allow_inf_nan=False)
@@ -70,27 +67,6 @@ def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
         return 0.0
     similarity = sum(a * b for a, b in zip(left, right, strict=True)) / (left_norm * right_norm)
     return max(-1.0, min(1.0, similarity))
-
-
-def _failure_warning_code(device: EmbeddingDevice, exc: Exception) -> str:
-    if isinstance(exc, EmbeddingOutOfMemoryError):
-        return f"{device}_out_of_memory"
-    if isinstance(exc, EmbeddingUnavailableError):
-        return f"{device}_unavailable"
-    message = str(exc).lower()
-    if isinstance(exc, MemoryError) or any(hint in message for hint in _OUT_OF_MEMORY_HINTS):
-        return f"{device}_out_of_memory"
-    return f"{device}_unavailable"
-
-
-def _translate_encoder_failure(device: EmbeddingDevice, exc: Exception) -> Exception:
-    if isinstance(exc, (EmbeddingUnavailableError, EmbeddingOutOfMemoryError)):
-        return exc
-    if _failure_warning_code(device, exc).endswith("_out_of_memory"):
-        return EmbeddingOutOfMemoryError(_failure_warning_code(device, exc))
-    return EmbeddingUnavailableError(_failure_warning_code(device, exc))
-
-
 class EmbeddingRanker:
     def __init__(
         self,
@@ -145,13 +121,16 @@ class EmbeddingRanker:
         scored.sort(key=lambda item: (-item[1].similarity, item[0]))
         return [score for _, score in scored]
 
-    def _rank_on_device(self, query: str, papers: Sequence[Paper], device: EmbeddingDevice) -> list[EmbeddingScore]:
+    def _rank_on_device(
+        self,
+        query: str,
+        papers: Sequence[Paper],
+        device: EmbeddingDevice,
+    ) -> list[EmbeddingScore]:
         encoder: TextEncoder | None = None
         try:
             encoder = self._encoder_factory(device)
             return self._rank_with_encoder(query, papers, encoder)
-        except Exception as exc:  # noqa: BLE001
-            raise _translate_encoder_failure(device, exc) from exc
         finally:
             if encoder is not None:
                 try:
@@ -176,68 +155,81 @@ class EmbeddingRanker:
             warnings=warnings,
         )
 
-    def _degraded_result(
+    def _degraded(
         self,
         papers: Sequence[Paper],
         *,
+        device: EmbeddingDevice,
         warnings: list[str],
+        fallback_used: bool,
     ) -> EmbeddingRankingResult:
         return EmbeddingRankingResult(
-            ranked=[
-                EmbeddingScore(paper=paper, similarity=0.0)
-                for paper in papers
-            ],
+            ranked=[EmbeddingScore(paper=paper, similarity=0.0) for paper in papers],
             status="degraded",
             model_id=self._model_id,
-            device="cpu",
-            fallback_used=True,
+            device=device,
+            fallback_used=fallback_used,
             warnings=warnings,
         )
 
     def rank(self, query: str, papers: Sequence[Paper]) -> EmbeddingRankingResult:
-        if not query.strip():
+        normalized_query = " ".join(query.split())
+        if not normalized_query:
             raise ValueError("query must not be empty")
         if not papers:
-            return self._applied_result([], device=self._preferred_device, fallback_used=False, warnings=[])
-
-        if self._preferred_device == "cuda" and self._fallback_to_cpu:
-            try:
-                ranked = self._rank_on_device(query, papers, "cuda")
-            except (EmbeddingUnavailableError, EmbeddingOutOfMemoryError) as first_exc:
-                try:
-                    ranked = self._rank_on_device(query, papers, "cpu")
-                except (EmbeddingUnavailableError, EmbeddingOutOfMemoryError) as second_exc:
-                    return self._degraded_result(
-                        papers,
-                        warnings=[
-                            _failure_warning_code("cuda", first_exc),
-                            _failure_warning_code("cpu", second_exc),
-                        ],
-                    )
-                return self._applied_result(
-                    ranked,
-                    device="cpu",
-                    fallback_used=True,
-                    warnings=[_failure_warning_code("cuda", first_exc)],
-                )
-            return self._applied_result(
-                ranked,
-                device="cuda",
+            return EmbeddingRankingResult(
+                ranked=[],
+                status="applied",
+                model_id=self._model_id,
+                device=self._preferred_device,
                 fallback_used=False,
                 warnings=[],
             )
-
         try:
-            ranked = self._rank_on_device(query, papers, self._preferred_device)
-        except (EmbeddingUnavailableError, EmbeddingOutOfMemoryError) as exc:
-            if self._preferred_device == "cpu":
-                return self._degraded_result(
-                    papers,
-                    warnings=[_failure_warning_code("cpu", exc)],
+            ranked = self._rank_on_device(
+                normalized_query,
+                papers,
+                self._preferred_device,
+            )
+        except (EmbeddingOutOfMemoryError, EmbeddingUnavailableError) as error:
+            if self._preferred_device != "cuda" or not self._fallback_to_cpu:
+                warning = (
+                    "encoder_out_of_memory"
+                    if isinstance(error, EmbeddingOutOfMemoryError)
+                    else "encoder_unavailable"
                 )
-            raise
-        return self._applied_result(
-            ranked,
+                return self._degraded(
+                    papers,
+                    device=self._preferred_device,
+                    warnings=[warning],
+                    fallback_used=False,
+                )
+            warning = (
+                "cuda_oom_cpu_fallback"
+                if isinstance(error, EmbeddingOutOfMemoryError)
+                else "cuda_unavailable_cpu_fallback"
+            )
+            try:
+                ranked = self._rank_on_device(normalized_query, papers, "cpu")
+            except (EmbeddingOutOfMemoryError, EmbeddingUnavailableError):
+                return self._degraded(
+                    papers,
+                    device="cpu",
+                    warnings=[warning, "cpu_encoder_unavailable"],
+                    fallback_used=True,
+                )
+            return EmbeddingRankingResult(
+                ranked=ranked,
+                status="applied",
+                model_id=self._model_id,
+                device="cpu",
+                fallback_used=True,
+                warnings=[warning],
+            )
+        return EmbeddingRankingResult(
+            ranked=ranked,
+            status="applied",
+            model_id=self._model_id,
             device=self._preferred_device,
             fallback_used=False,
             warnings=[],

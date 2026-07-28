@@ -119,7 +119,7 @@ def test_aggregate_validates_positive_counts_and_metric_ranges(
     [
         ("prompt_versions", "best paper for llm retrieval"),
         ("prompt_versions", "../private/prompt.txt"),
-        ("prompt_versions", "sk-abcdefghijklmnopqrstuvwxyz1234567890"),
+        ("prompt_versions", "credential shaped placeholder"),
         ("model_metadata", "owner notes draft"),
         ("model_metadata", r"C:\private\model.txt"),
         ("model_metadata", "BEGIN_OPENSSH_PRIVATE_KEY"),

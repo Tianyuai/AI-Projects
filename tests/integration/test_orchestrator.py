@@ -6,9 +6,21 @@ from datetime import UTC, datetime
 from typing import Any
 
 from paper_search.control.budget import HardBudgetController
-from paper_search.domain.models import ErrorDetail, Paper, ProviderResult, SearchBudget, UsageActual, UsageEstimate
+from paper_search.domain.models import (
+    ErrorDetail,
+    Paper,
+    ProviderResult,
+    SearchBudget,
+    UsageActual,
+    UsageEstimate,
+)
+from paper_search.graph.citation_expand import CitationExpansionResult
 from paper_search.pipeline.orchestrator import MockSearchOrchestrator
 from paper_search.ranking.embedding import EmbeddingRankingResult, EmbeddingScore
+from paper_search.ranking.rerank import (
+    ConstraintRerankResult,
+    ConstraintScoredPaper,
+)
 
 
 def _budget(**updates: object) -> SearchBudget:
@@ -200,6 +212,109 @@ class MaliciousEmbeddingRanker:
             fallback_used=True,
             warnings=["cuda_oom_cpu_fallback", private_warning, private_code],
         )
+
+
+class FakeCitationExpander:
+    def __init__(self, extra: Paper) -> None:
+        self.extra = extra
+        self.calls: list[list[str]] = []
+
+    def expand(self, seeds: Sequence[Paper]) -> CitationExpansionResult:
+        self.calls.append([paper.canonical_id for paper in seeds])
+        return CitationExpansionResult(
+            papers=[*seeds, self.extra],
+            edges=[],
+            skipped_edge_count=0,
+            truncated=False,
+            warnings=[],
+        )
+
+
+class FakeConstraintReranker:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], list[str]]] = []
+
+    def rerank(
+        self,
+        papers: Sequence[Paper],
+        constraints: Sequence[str],
+    ) -> ConstraintRerankResult:
+        self.calls.append(
+            ([paper.canonical_id for paper in papers], list(constraints))
+        )
+        ranked = [
+            ConstraintScoredPaper(
+                paper=paper,
+                score=0.5,
+                assessment={
+                    "matched_constraint_count": 0,
+                    "unmatched_constraint_count": 0,
+                    "relevance_score": 0.5,
+                    "constraint_coverage": 0.0,
+                },
+            )
+            for paper in reversed(papers)
+        ]
+        return ConstraintRerankResult(
+            ranked=ranked,
+            status="applied",
+            processed_count=len(ranked),
+            truncated=False,
+            batch_count=1 if ranked else 0,
+            warnings=[],
+        )
+
+
+def test_orchestrator_runs_optional_citation_then_rerank_stages() -> None:
+    events: list[str] = []
+    extra = Paper(canonical_id="fixture:extra", title="Expanded fixture")
+    citation = FakeCitationExpander(extra)
+    reranker = FakeConstraintReranker()
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": FakeProvider("openalex", events)},
+        config_hash="sha256:" + "9" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        citation_expander=citation,
+        constraint_reranker=reranker,
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert citation.calls == [["openalex:W1"]]
+    assert reranker.calls == [(["openalex:W1", "fixture:extra"], [])]
+    assert [paper.canonical_id for paper in result.papers] == [
+        "fixture:extra",
+        "openalex:W1",
+    ]
+    assert [item["step"] for item in result.trace[-2:]] == ["citation", "rerank"]
+
+
+def test_orchestrator_keeps_order_when_optional_stage_degrades() -> None:
+    events: list[str] = []
+
+    class BrokenCitation:
+        def expand(self, seeds: Sequence[Paper]) -> CitationExpansionResult:
+            raise RuntimeError("private fixture failure")
+
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": FakeProvider("openalex", events)},
+        config_hash="sha256:" + "a" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        citation_expander=BrokenCitation(),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert [paper.canonical_id for paper in result.papers] == ["openalex:W1"]
+    assert result.warnings[-1] == "citation: expansion_unavailable"
 
 
 def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:

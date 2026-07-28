@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import Field
 
@@ -26,11 +26,25 @@ from paper_search.ranking.embedding import (
     sanitize_embedding_model_id,
     sanitize_embedding_warnings,
 )
+from paper_search.graph.citation_expand import CitationExpansionResult
 from paper_search.ranking.fusion import fuse_provider_results
+from paper_search.ranking.rerank import ConstraintRerankResult
 from paper_search.retrieval.base import SearchProvider
 
 
 Analyzer = Callable[[str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]]
+
+
+class CitationExpansionStage(Protocol):
+    def expand(self, seeds: list[Paper]) -> CitationExpansionResult: ...
+
+
+class ConstraintRerankingStage(Protocol):
+    def rerank(self, papers: list[Paper], constraints: list[str]) -> ConstraintRerankResult: ...
+
+
+_SAFE_CITATION_WARNINGS = frozenset({"unresolved_citation_edge"})
+_SAFE_RERANK_WARNINGS = frozenset({"rerank_unavailable"})
 
 
 class MinimalSearchResult(DomainModel):
@@ -60,6 +74,8 @@ class MockSearchOrchestrator:
         analysis_estimate: UsageEstimate,
         provider_estimate: UsageEstimate,
         embedding_ranker: EmbeddingRankingStage | None = None,
+        citation_expander: CitationExpansionStage | None = None,
+        constraint_reranker: ConstraintRerankingStage | None = None,
     ) -> None:
         self._controller = controller
         self._analyzer = analyzer
@@ -69,6 +85,8 @@ class MockSearchOrchestrator:
         self._analysis_estimate = analysis_estimate
         self._provider_estimate = provider_estimate
         self._embedding_ranker = embedding_ranker
+        self._citation_expander = citation_expander
+        self._constraint_reranker = constraint_reranker
         self._parser = QueryParser(QueryPlanner())
 
     def _fallback(self, query: str) -> QueryAnalysisResult:
@@ -213,6 +231,67 @@ class MockSearchOrchestrator:
                 }
             )
             warnings.extend(f"embedding: {warning}" for warning in safe_warnings)
+        if self._citation_expander is not None and papers:
+            prior_ids = {paper.canonical_id for paper in papers}
+            try:
+                citation = self._citation_expander.expand([papers[0]])
+            except Exception:  # noqa: BLE001
+                warnings.append("citation: expansion_unavailable")
+                trace.append(
+                    {"step": "citation", "status": "degraded", "count": len(papers)}
+                )
+            else:
+                additions = [
+                    paper for paper in citation.papers if paper.canonical_id not in prior_ids
+                ]
+                papers = [*papers, *additions]
+                safe_citation_warnings = [
+                    warning
+                    for warning in citation.warnings
+                    if warning in _SAFE_CITATION_WARNINGS
+                ]
+                warnings.extend(f"citation: {warning}" for warning in safe_citation_warnings)
+                trace.append(
+                    {
+                        "step": "citation",
+                        "status": "applied",
+                        "count": len(papers),
+                        "expanded_count": len(additions),
+                        "edge_count": len(citation.edges),
+                        "skipped_edge_count": citation.skipped_edge_count,
+                        "truncated": citation.truncated,
+                    }
+                )
+        if self._constraint_reranker is not None and papers:
+            constraints = [
+                *analysis.query_spec.must_have,
+                *analysis.query_spec.should_have,
+                *analysis.query_spec.exclusions,
+            ]
+            try:
+                rerank = self._constraint_reranker.rerank(papers, constraints)
+            except Exception:  # noqa: BLE001
+                warnings.append("rerank: rerank_unavailable")
+                trace.append(
+                    {"step": "rerank", "status": "degraded", "count": len(papers)}
+                )
+            else:
+                if rerank.status == "applied":
+                    papers = [item.paper for item in rerank.ranked]
+                safe_rerank_warnings = [
+                    warning for warning in rerank.warnings if warning in _SAFE_RERANK_WARNINGS
+                ]
+                warnings.extend(f"rerank: {warning}" for warning in safe_rerank_warnings)
+                trace.append(
+                    {
+                        "step": "rerank",
+                        "status": rerank.status,
+                        "count": len(papers),
+                        "processed_count": rerank.processed_count,
+                        "batch_count": rerank.batch_count,
+                        "truncated": rerank.truncated,
+                    }
+                )
         status = self._controller.stop_status()
         stop_reason = status if status != "continue" else "completed"
         partial = bool(warnings) or stop_reason != "completed"

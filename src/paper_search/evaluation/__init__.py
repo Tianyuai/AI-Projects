@@ -47,6 +47,12 @@ if TYPE_CHECKING:
         evaluate,
         score_query,
     )
+    from paper_search.evaluation.experiments import (
+        ExperimentAggregate,
+        ExperimentRecord,
+        build_experiment_record,
+        write_experiment_record,
+    )
     from paper_search.evaluation.synthetic_baseline import (
         SYNTHETIC_QUERIES,
         run_synthetic_baseline,
@@ -73,6 +79,14 @@ _METRIC_EXPORTS = frozenset(
         "deduplicate_ranked",
         "evaluate",
         "score_query",
+    }
+)
+_EXPERIMENT_EXPORTS = frozenset(
+    {
+        "ExperimentAggregate",
+        "ExperimentRecord",
+        "build_experiment_record",
+        "write_experiment_record",
     }
 )
 _SYNTHETIC_BASELINE_EXPORTS = frozenset(
@@ -125,6 +139,20 @@ def __getattr__(name: str) -> object:
             "evaluate": evaluate,
             "score_query": score_query,
         }
+    elif name in _EXPERIMENT_EXPORTS:
+        from paper_search.evaluation.experiments import (
+            ExperimentAggregate,
+            ExperimentRecord,
+            build_experiment_record,
+            write_experiment_record,
+        )
+
+        exports = {
+            "ExperimentAggregate": ExperimentAggregate,
+            "ExperimentRecord": ExperimentRecord,
+            "build_experiment_record": build_experiment_record,
+            "write_experiment_record": write_experiment_record,
+        }
     elif name in _SYNTHETIC_BASELINE_EXPORTS:
         from paper_search.evaluation.synthetic_baseline import (
             SYNTHETIC_QUERIES,
@@ -149,6 +177,8 @@ __all__ = [
     "AnnotationValidationSummary",
     "EvaluationQuery",
     "EvaluationResult",
+    "ExperimentAggregate",
+    "ExperimentRecord",
     "FieldAgreement",
     "IdentifierMap",
     "InternalPredictionRecord",
@@ -164,6 +194,7 @@ __all__ = [
     "compare_annotations",
     "deduplicate_ranked",
     "evaluate",
+    "build_experiment_record",
     "normalize_paper_id",
     "normalize_title",
     "prediction_from_response",
@@ -175,6 +206,7 @@ __all__ = [
     "run_synthetic_baseline",
     "validate_annotation_file",
     "write_frozen_bytes",
+    "write_experiment_record",
     "write_jsonl_atomic",
     "write_prediction_records",
     "write_response_predictions",

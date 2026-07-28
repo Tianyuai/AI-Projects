@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Callable, Sequence
 from typing import Literal, Protocol
 
@@ -12,6 +13,36 @@ from paper_search.domain.models import DomainModel, NonEmptyStr, Paper
 
 EmbeddingDevice = Literal["cpu", "cuda"]
 EmbeddingStatus = Literal["applied", "degraded"]
+_SAFE_MODEL_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?$"
+)
+_PUBLIC_WARNING_CODES = frozenset(
+    {
+        "cpu_encoder_unavailable",
+        "cuda_oom_cpu_fallback",
+        "cuda_unavailable_cpu_fallback",
+        "encoder_out_of_memory",
+        "encoder_unavailable",
+        "unsanitized_warning",
+    }
+)
+
+
+def sanitize_embedding_model_id(model_id: str) -> str:
+    """Return a public-safe embedding model identifier."""
+    candidate = model_id.strip()
+    if "/" in candidate or "\\" in candidate:
+        return "local_model"
+    return candidate if _SAFE_MODEL_ID_RE.fullmatch(candidate) else "local_model"
+
+
+def sanitize_embedding_warnings(warnings: Sequence[str]) -> list[str]:
+    """Return bounded public warning codes."""
+    sanitized: list[str] = []
+    for warning in warnings:
+        candidate = warning.strip()
+        sanitized.append(candidate if candidate in _PUBLIC_WARNING_CODES else "unsanitized_warning")
+    return sanitized
 
 
 class EmbeddingUnavailableError(RuntimeError):

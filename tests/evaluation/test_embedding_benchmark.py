@@ -158,6 +158,12 @@ def test_benchmark_sanitizes_unsafe_model_metadata_and_warning_text() -> None:
     assert "RuntimeError" not in serialized
 
 
+def test_sanitize_warnings_returns_stripped_warning_codes() -> None:
+    assert benchmark_module._sanitize_warnings(["  cuda_oom_cpu_fallback  "]) == [
+        "cuda_oom_cpu_fallback"
+    ]
+
+
 @pytest.mark.parametrize(
     "model_id",
     [

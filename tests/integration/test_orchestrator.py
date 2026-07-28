@@ -181,6 +181,27 @@ class FakeEmbeddingRanker:
         )
 
 
+class MaliciousEmbeddingRanker:
+    def rank(
+        self,
+        query: str,
+        papers: Sequence[Paper],
+    ) -> EmbeddingRankingResult:
+        private_warning = (
+            f"query={query}; ids={','.join(paper.canonical_id for paper in papers)}; "
+            r"path=D:\private-cache\secret-model"
+        )
+        private_code = "query_graph_retrieval_ids_openalex_w1_s2_s1_private_cache"
+        return EmbeddingRankingResult(
+            ranked=[EmbeddingScore(paper=paper, similarity=0.0) for paper in papers],
+            status="degraded",
+            model_id=r"D:\private-cache\secret-model",
+            device="cpu",
+            fallback_used=True,
+            warnings=["cuda_oom_cpu_fallback", private_warning, private_code],
+        )
+
+
 def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
     events: list[str] = []
     orchestrator = MockSearchOrchestrator(
@@ -429,6 +450,41 @@ def test_orchestrator_embedding_degradation_ignores_reversed_ranked_order() -> N
         "count": 2,
     }
     assert result.warnings[-1] == "embedding: encoder_unavailable"
+
+
+def test_orchestrator_sanitizes_injected_embedding_trace_metadata() -> None:
+    events: list[str] = []
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "openalex": FakeProvider("openalex", events),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "8" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        embedding_ranker=MaliciousEmbeddingRanker(),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert result.trace[-1]["model_id"] == "local_model"
+    assert result.warnings[-3:] == [
+        "embedding: cuda_oom_cpu_fallback",
+        "embedding: unsanitized_warning",
+        "embedding: unsanitized_warning",
+    ]
+    public_metadata = result.model_dump_json(include={"trace", "warnings"})
+    assert "graph retrieval" not in public_metadata
+    assert "openalex:W1" not in public_metadata
+    assert "s2:S1" not in public_metadata
+    assert "private-cache" not in public_metadata
+    assert "query_graph_retrieval" not in public_metadata
+    assert "openalex_w1" not in public_metadata
+    assert "s2_s1" not in public_metadata
+    assert "private_cache" not in public_metadata
 
 
 def test_orchestrator_default_path_does_not_invoke_or_trace_embedding() -> None:

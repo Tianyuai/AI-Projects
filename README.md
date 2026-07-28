@@ -60,8 +60,7 @@ never by basename. Raw exception text and query-like free text are not emitted.
 Offline focused verification command:
 
 ```powershell
-$env:UV_PROJECT_ENVIRONMENT='D:\AI Projects\Projects\.venv'
-& 'D:\Dev\uv\uv.exe' run --no-sync --no-env-file pytest tests/unit/test_embedding.py tests/unit/test_sentence_transformer.py tests/evaluation/test_embedding_benchmark.py tests/integration/test_orchestrator.py -q
+uv run --no-sync --no-env-file pytest tests/unit/test_embedding.py tests/unit/test_sentence_transformer.py tests/evaluation/test_embedding_benchmark.py tests/integration/test_orchestrator.py -q
 ```
 
 Opt-in real local-model benchmarking is separate from the default offline test

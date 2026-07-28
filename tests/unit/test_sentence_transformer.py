@@ -13,7 +13,7 @@ from paper_search.ranking.embedding import (
 
 
 class FakeModel:
-    def __init__(self, *, raises: RuntimeError | None = None) -> None:
+    def __init__(self, *, raises: RuntimeError | AssertionError | None = None) -> None:
         self.raises = raises
         self.calls: list[dict[str, object]] = []
 
@@ -81,3 +81,80 @@ def test_adapter_maps_oom_and_other_runtime_errors_to_sanitized_types(
     )
     with pytest.raises(EmbeddingUnavailableError, match="not installed"):
         adapter.SentenceTransformerEncoder(model_id="fixture/model", device="cpu")
+
+
+def test_adapter_maps_constructor_cuda_oom_and_cleans_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = r"CUDA out of memory while loading D:\private-cache\secret-model"
+    events: list[str] = []
+
+    def import_fake(name: str) -> object:
+        if name == "sentence_transformers":
+            def fail_constructor(_model_id: str, *, device: str) -> None:
+                events.append(f"construct:{device}")
+                raise RuntimeError(private)
+
+            return SimpleNamespace(SentenceTransformer=fail_constructor)
+        if name == "torch":
+            return SimpleNamespace(
+                cuda=SimpleNamespace(empty_cache=lambda: events.append("empty_cache"))
+            )
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(adapter, "import_module", import_fake)
+
+    with pytest.raises(EmbeddingOutOfMemoryError) as captured:
+        adapter.SentenceTransformerEncoder(model_id="fixture/model", device="cuda")
+
+    assert str(captured.value) == "embedding encoder exhausted device memory"
+    assert private not in str(captured.value)
+    assert events == ["construct:cuda", "empty_cache"]
+
+
+def test_adapter_maps_unsupported_cuda_constructor_to_unavailable_and_cleans_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = r"Torch not compiled with CUDA enabled at D:\private-cache"
+    events: list[str] = []
+
+    def import_fake(name: str) -> object:
+        if name == "sentence_transformers":
+            def fail_constructor(_model_id: str, *, device: str) -> None:
+                events.append(f"construct:{device}")
+                raise AssertionError(private)
+
+            return SimpleNamespace(SentenceTransformer=fail_constructor)
+        if name == "torch":
+            return SimpleNamespace(
+                cuda=SimpleNamespace(empty_cache=lambda: events.append("empty_cache"))
+            )
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(adapter, "import_module", import_fake)
+
+    with pytest.raises(EmbeddingUnavailableError) as captured:
+        adapter.SentenceTransformerEncoder(model_id="fixture/model", device="cuda")
+
+    assert str(captured.value) == "embedding encoder failed"
+    assert private not in str(captured.value)
+    assert events == ["construct:cuda", "empty_cache"]
+
+
+def test_adapter_maps_unsupported_cuda_encode_to_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = r"Torch not compiled with CUDA enabled at D:\private-cache"
+    model = FakeModel(raises=AssertionError(private))
+    monkeypatch.setattr(
+        adapter,
+        "import_module",
+        lambda _name: SimpleNamespace(SentenceTransformer=lambda _model_id, device: model),
+    )
+    encoder = adapter.SentenceTransformerEncoder(model_id="fixture/model", device="cuda")
+
+    with pytest.raises(EmbeddingUnavailableError) as captured:
+        encoder.encode(["one"], batch_size=1)
+
+    assert str(captured.value) == "embedding encoder failed"
+    assert private not in str(captured.value)

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import re
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -16,13 +15,9 @@ from paper_search.ranking.embedding import (
     EmbeddingDevice,
     EmbeddingRankingStage,
     EmbeddingStatus,
+    sanitize_embedding_model_id,
+    sanitize_embedding_warnings,
 )
-
-_SAFE_MODEL_ID_RE = re.compile(
-    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?$"
-)
-_SAFE_WARNING_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
-_LOCAL_PATH_RE = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/]{1,2}|~[\\/]|\.{1,2}[\\/])")
 
 
 class EmbeddingBenchmarkResult(DomainModel):
@@ -60,19 +55,11 @@ def _validate_batch_size(batch_size: object) -> int:
 
 
 def _sanitize_model_id(model_id: str) -> str:
-    candidate = model_id.strip()
-    if _LOCAL_PATH_RE.match(candidate) or "/" in candidate or "\\" in candidate:
-        return "local_model"
-    if not _SAFE_MODEL_ID_RE.fullmatch(candidate):
-        raise ValueError("model_id must be a safe identifier")
-    return candidate
+    return sanitize_embedding_model_id(model_id)
 
 
 def _sanitize_warnings(warnings: Sequence[str]) -> list[str]:
-    return [
-        warning if _SAFE_WARNING_RE.fullmatch(warning.strip()) else "unsanitized_warning"
-        for warning in warnings
-    ]
+    return sanitize_embedding_warnings(warnings)
 
 
 def process_peak_rss_bytes() -> int:

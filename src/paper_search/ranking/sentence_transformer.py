@@ -28,11 +28,12 @@ class SentenceTransformerEncoder:
             raise EmbeddingUnavailableError(
                 "sentence-transformers is not installed"
             ) from None
-        except RuntimeError as error:
+        except (RuntimeError, AssertionError) as error:
+            self.close()
             self._raise_sanitized(error)
 
     @staticmethod
-    def _raise_sanitized(error: RuntimeError) -> None:
+    def _raise_sanitized(error: RuntimeError | AssertionError) -> None:
         if "out of memory" in str(error).casefold():
             raise EmbeddingOutOfMemoryError(
                 "embedding encoder exhausted device memory"
@@ -55,7 +56,7 @@ class SentenceTransformerEncoder:
                 normalize_embeddings=True,
                 show_progress_bar=False,
             )
-        except RuntimeError as error:
+        except (RuntimeError, AssertionError) as error:
             self._raise_sanitized(error)
         matrix = np.asarray(values, dtype=np.float32)
         return [[float(value) for value in row] for row in matrix]
@@ -67,7 +68,7 @@ class SentenceTransformerEncoder:
         try:
             torch = import_module("torch")
             torch.cuda.empty_cache()
-        except (ImportError, RuntimeError):
+        except (ImportError, RuntimeError, AssertionError):
             return
 
 

@@ -21,7 +21,11 @@ from paper_search.processing.deduplicate import deduplicate_papers
 from paper_search.processing.filter import apply_hard_filters
 from paper_search.query.parser import QueryParser, rule_fallback
 from paper_search.query.planner import QueryPlanner
-from paper_search.ranking.embedding import EmbeddingRankingStage
+from paper_search.ranking.embedding import (
+    EmbeddingRankingStage,
+    sanitize_embedding_model_id,
+    sanitize_embedding_warnings,
+)
 from paper_search.ranking.fusion import fuse_provider_results
 from paper_search.retrieval.base import SearchProvider
 
@@ -196,17 +200,19 @@ class MockSearchOrchestrator:
             )
             if embedding.status == "applied":
                 papers = [item.paper for item in embedding.ranked]
+            safe_model_id = sanitize_embedding_model_id(embedding.model_id)
+            safe_warnings = sanitize_embedding_warnings(embedding.warnings)
             trace.append(
                 {
                     "step": "embedding",
                     "status": embedding.status,
-                    "model_id": embedding.model_id,
+                    "model_id": safe_model_id,
                     "device": embedding.device,
                     "fallback_used": embedding.fallback_used,
                     "count": len(papers),
                 }
             )
-            warnings.extend(f"embedding: {warning}" for warning in embedding.warnings)
+            warnings.extend(f"embedding: {warning}" for warning in safe_warnings)
         status = self._controller.stop_status()
         stop_reason = status if status != "continue" else "completed"
         partial = bool(warnings) or stop_reason != "completed"

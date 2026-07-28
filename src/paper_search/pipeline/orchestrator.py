@@ -194,7 +194,8 @@ class MockSearchOrchestrator:
                 analysis.query_spec.original_query,
                 papers,
             )
-            papers = [item.paper for item in embedding.ranked]
+            if embedding.status == "applied":
+                papers = [item.paper for item in embedding.ranked]
             trace.append(
                 {
                     "step": "embedding",

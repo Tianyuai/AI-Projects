@@ -148,8 +148,14 @@ class FakeProvider:
 
 
 class FakeEmbeddingRanker:
-    def __init__(self, *, degraded: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        degraded: bool = False,
+        reverse_on_degraded: bool = False,
+    ) -> None:
         self.degraded = degraded
+        self.reverse_on_degraded = reverse_on_degraded
         self.calls: list[tuple[str, list[str]]] = []
 
     def rank(
@@ -158,7 +164,10 @@ class FakeEmbeddingRanker:
         papers: Sequence[Paper],
     ) -> EmbeddingRankingResult:
         self.calls.append((query, [paper.canonical_id for paper in papers]))
-        ordered = list(papers) if self.degraded else list(reversed(papers))
+        if self.degraded and not self.reverse_on_degraded:
+            ordered = list(papers)
+        else:
+            ordered = list(reversed(papers))
         return EmbeddingRankingResult(
             ranked=[
                 EmbeddingScore(paper=paper, similarity=0.0 if self.degraded else 0.8)
@@ -384,6 +393,41 @@ def test_orchestrator_embedding_degradation_keeps_fused_order() -> None:
         "s2:S1",
     ]
     assert result.is_partial is True
+    assert result.warnings[-1] == "embedding: encoder_unavailable"
+
+
+def test_orchestrator_embedding_degradation_ignores_reversed_ranked_order() -> None:
+    events: list[str] = []
+    embedding = FakeEmbeddingRanker(degraded=True, reverse_on_degraded=True)
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "openalex": FakeProvider("openalex", events),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "7" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        embedding_ranker=embedding,
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert embedding.calls == [("graph retrieval", ["openalex:W1", "s2:S1"])]
+    assert [paper.canonical_id for paper in result.papers] == [
+        "openalex:W1",
+        "s2:S1",
+    ]
+    assert result.trace[-1] == {
+        "step": "embedding",
+        "status": "degraded",
+        "model_id": "fixture-embedding-v1",
+        "device": "cpu",
+        "fallback_used": False,
+        "count": 2,
+    }
     assert result.warnings[-1] == "embedding: encoder_unavailable"
 
 

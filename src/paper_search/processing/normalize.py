@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import date
 
 from paper_search.domain.models import Paper
 from paper_search.evaluation.dataset import normalize_paper_id
@@ -34,6 +35,15 @@ def _optional_int(value: object, field: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError(f"{field} must be an integer or null")
     return value
+
+
+def _optional_publication_year(value: object) -> int | None:
+    """Keep malformed provider years from invalidating an otherwise usable work."""
+    year = _optional_int(value, "publication_year")
+    if year is None:
+        return None
+    maximum_year = date.today().year + 1
+    return year if 1900 <= year <= maximum_year else None
 
 
 def _optional_bool(value: object, field: str) -> bool | None:
@@ -111,7 +121,7 @@ def normalize_openalex_work(raw_work: Mapping[str, object]) -> Paper:
         title=title_value,
         abstract=reconstruct_abstract(raw_work.get("abstract_inverted_index")),
         authors=_extract_authors(raw_work.get("authorships")),
-        publication_year=_optional_int(raw_work.get("publication_year"), "publication_year"),
+        publication_year=_optional_publication_year(raw_work.get("publication_year")),
         venue=venue,
         doi=doi,
         openalex_id=openalex_id,

@@ -17,6 +17,23 @@ from paper_search.evaluation.synthetic_mocks import build_synthetic_search_servi
 
 _LOOPBACK_HOST = "127.0.0.1"
 _NETWORK_ERROR = "mock server blocks non-loopback network access"
+_SOCKET_TARGET_EVENTS = frozenset(
+    {
+        "socket.bind",
+        "socket.connect",
+        "socket.connect_ex",
+        "socket.sendmsg",
+        "socket.sendto",
+    }
+)
+_NAME_TARGET_EVENTS = frozenset(
+    {
+        "socket.getaddrinfo",
+        "socket.gethostbyname",
+        "socket.gethostbyname_ex",
+        "socket.getnameinfo",
+    }
+)
 
 
 def mock_readiness() -> dict[str, bool]:
@@ -48,19 +65,41 @@ def _loopback_host(value: str) -> str:
     return value
 
 
-def _is_loopback_target(value: object) -> bool:
-    if not isinstance(value, tuple) or not value or not isinstance(value[0], str):
+def _is_loopback_name(value: object) -> bool:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode("ascii")
+        except UnicodeDecodeError:
+            return False
+    if not isinstance(value, str):
         return False
     try:
-        return ipaddress.ip_address(value[0]).is_loopback
+        return ipaddress.ip_address(value).is_loopback
     except ValueError:
         return False
 
 
+def _is_loopback_target(value: object) -> bool:
+    if not isinstance(value, tuple) or not value or not isinstance(value[0], str):
+        return False
+    return _is_loopback_name(value[0])
+
+
+def _socket_target(args: tuple[Any, ...]) -> object:
+    for candidate in reversed(args[1:]):
+        if isinstance(candidate, tuple):
+            return candidate
+    return None
+
+
 def _audit_network(event: str, args: tuple[Any, ...]) -> None:
-    if event == "socket.connect" and len(args) == 2 and not _is_loopback_target(args[1]):
+    if event in _SOCKET_TARGET_EVENTS and not _is_loopback_target(_socket_target(args)):
         raise RuntimeError(_NETWORK_ERROR)
-    if event == "socket.getaddrinfo" and args and args[0] not in {None, _LOOPBACK_HOST}:
+    if event == "socket.getnameinfo":
+        if not args or not _is_loopback_target(args[0]):
+            raise RuntimeError(_NETWORK_ERROR)
+        return
+    if event in _NAME_TARGET_EVENTS and args and not _is_loopback_name(args[0]):
         raise RuntimeError(_NETWORK_ERROR)
 
 
@@ -81,13 +120,21 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     _install_loopback_only_guard()
-    uvicorn.run(
-        create_mock_app(),
-        host=args.host,
-        port=args.port,
-        access_log=False,
-        log_level="warning",
-    )
+    try:
+        uvicorn.run(
+            create_mock_app(),
+            host=args.host,
+            port=args.port,
+            access_log=False,
+            log_level="warning",
+        )
+    except OSError:
+        print("mock server startup failed", file=sys.stderr)
+        return 2
+    except SystemExit as error:
+        if error.code not in (None, 0):
+            print("mock server startup failed", file=sys.stderr)
+            return 2
     return 0
 
 

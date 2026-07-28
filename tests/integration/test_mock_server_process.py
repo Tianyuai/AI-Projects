@@ -156,9 +156,11 @@ def test_mock_server_process_reports_occupied_port() -> None:
             while server.process.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.05)
             category = server.exit_category()
+        startup_stderr = server.stderr
 
     assert category == "process-exited"
     assert server.process.returncode not in {None, 0}
+    assert "mock server startup failed" in startup_stderr
 
 
 def test_mock_server_process_reaps_delayed_request_child() -> None:
@@ -190,6 +192,10 @@ http.server.HTTPServer(("127.0.0.1", __PORT__), Handler).serve_forever()
     finally:
         if child.poll() is None:
             child.terminate()
-        child.wait(timeout=3)
+            try:
+                child.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait(timeout=3)
 
     assert child.poll() is not None

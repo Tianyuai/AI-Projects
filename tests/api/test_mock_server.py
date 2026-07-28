@@ -74,6 +74,26 @@ assert seen["access_log"] is False
     assert result.returncode == 0, result.stderr
 
 
+def test_main_reports_fixed_startup_failure_category_in_fresh_process() -> None:
+    script = """
+from paper_search.api import mock_server
+def run(application, **kwargs):
+    raise OSError("private bind detail")
+mock_server.uvicorn.run = run
+assert mock_server.main(["--host", "127.0.0.1", "--port", "43123"]) == 2
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=_child_environment(),
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr.strip() == "mock server startup failed"
+
+
 @pytest.mark.parametrize(
     "argv",
     [
@@ -121,3 +141,57 @@ socket.create_connection(("203.0.113.1", 443), timeout=0.01)
 
     assert result.returncode != 0
     assert "mock server blocks non-loopback network access" in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("event", "arguments"),
+    [
+        ("socket.bind", "(sock, ('0.0.0.0', 0))"),
+        ("socket.sendto", "(sock, b'x', ('0.0.0.0', 9))"),
+        ("socket.gethostbyname", "('0.0.0.0',)"),
+        ("socket.gethostbyname_ex", "('0.0.0.0',)"),
+        ("socket.getaddrinfo", "('localhost', 80)"),
+        ("socket.getaddrinfo", "(None, 80)"),
+    ],
+)
+def test_loopback_guard_rejects_non_loopback_audit_events(
+    event: str,
+    arguments: str,
+) -> None:
+    script = f"""
+import socket
+import sys
+from paper_search.api.mock_server import _install_loopback_only_guard
+_install_loopback_only_guard()
+sock = socket.socket()
+sys.audit({event!r}, *{arguments})
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=_child_environment(),
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "mock server blocks non-loopback network access" in result.stderr
+
+
+def test_loopback_guard_allows_literal_loopback_getnameinfo() -> None:
+    script = """
+import socket
+import sys
+from paper_search.api.mock_server import _install_loopback_only_guard
+_install_loopback_only_guard()
+sys.audit("socket.getnameinfo", ("127.0.0.1", 80), 0)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=_child_environment(),
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr

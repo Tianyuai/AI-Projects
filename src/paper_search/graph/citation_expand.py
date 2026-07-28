@@ -105,7 +105,9 @@ def expand_one_hop(
     if len(set(seed_canonical_ids)) != len(seed_canonical_ids):
         raise ValueError("seed canonical IDs must be unique")
 
-    active_seeds = list(seeds[:max_seeds])
+    active_seeds = [
+        _resolved_paper(seed, canonical_by_provider_id) for seed in seeds[:max_seeds]
+    ]
     active_seed_ids = {paper.canonical_id for paper in active_seeds}
 
     preliminary_edges: list[ResolvedCitationEdge] = []

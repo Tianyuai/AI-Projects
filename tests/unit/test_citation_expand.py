@@ -83,6 +83,31 @@ def test_expand_one_hop_maps_forward_and_backward_edges() -> None:
     assert result.warnings == []
 
 
+def test_expand_one_hop_remaps_seed_canonical_id_before_edge_matching() -> None:
+    from paper_search.graph.citation_expand import expand_one_hop
+
+    seed = make_seed(canonical_id="s2:seed", semantic_scholar_id="S-SEED")
+    cited = make_expanded(canonical_id="s2:ref", semantic_scholar_id="S-REF")
+
+    result = expand_one_hop(
+        [seed],
+        CitationExpansion(
+            papers=[cited],
+            raw_edges=[edge(citing="S-SEED", cited="S-REF")],
+        ),
+        {
+            s2("S-SEED"): "doi:seed",
+            s2("S-REF"): "doi:ref",
+        },
+    )
+
+    assert [paper.canonical_id for paper in result.papers] == ["doi:seed", "doi:ref"]
+    assert result.papers[0].title == seed.title
+    assert [(resolved.citing_canonical_id, resolved.cited_canonical_id) for resolved in result.edges] == [
+        ("doi:seed", "doi:ref")
+    ]
+
+
 def test_expand_one_hop_counts_unresolved_and_malformed_edges_aggregately() -> None:
     from paper_search.graph.citation_expand import expand_one_hop
 

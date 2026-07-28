@@ -24,11 +24,30 @@ from paper_search.domain.models import SearchBudget
 BudgetConfig = SearchBudget
 
 
+class EmbeddingConfig(BaseModel):
+    """Public, reproducible settings for the optional local embedding stage."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    enabled: bool = False
+    model_id: str = Field(
+        default=(
+            "sentence-transformers/"
+            "paraphrase-multilingual-MiniLM-L12-v2"
+        ),
+        min_length=1,
+    )
+    device: Literal["cpu", "cuda"] = "cpu"
+    batch_size: int = Field(default=16, strict=True, ge=1, le=128)
+    fallback_to_cpu: bool = True
+
+
 class RuntimeConfig(BaseModel):
     """Validated non-secret project config plus secrets loaded from the environment."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     budget_profile: Literal["low", "balanced"]
     budget: SearchBudget
     llm_base_url: str = Field(min_length=1)

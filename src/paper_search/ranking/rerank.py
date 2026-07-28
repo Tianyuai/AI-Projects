@@ -12,6 +12,7 @@ from paper_search.domain.models import DomainModel, Paper, UnitFloat
 
 
 ConstraintRerankStatus = Literal["applied", "degraded"]
+ConstraintRerankWarning = Literal["rerank_unavailable"]
 ConstraintEvaluator = Callable[[Paper, tuple[str, ...]], object]
 _SAFE_WARNING_CODES = frozenset({"rerank_unavailable"})
 _RELEVANCE_WEIGHT = 0.7
@@ -37,7 +38,7 @@ class ConstraintRerankResult(DomainModel):
     processed_count: int = Field(ge=0)
     truncated: bool
     batch_count: int = Field(ge=0)
-    warnings: list[str]
+    warnings: list[ConstraintRerankWarning]
 
 
 def _normalize_constraint(text: str) -> str:
@@ -137,12 +138,12 @@ def _score_assessment(assessment: ConstraintAssessment) -> float:
     )
 
 
-def _sanitize_warnings(warnings: Sequence[str]) -> list[str]:
-    sanitized: list[str] = []
+def _sanitize_warnings(warnings: Sequence[str]) -> list[ConstraintRerankWarning]:
+    sanitized: list[ConstraintRerankWarning] = []
     for warning in warnings:
         code = warning.strip()
         if code in _SAFE_WARNING_CODES:
-            sanitized.append(code)
+            sanitized.append(code)  # type: ignore[arg-type]
     return sanitized
 
 
@@ -186,18 +187,17 @@ class ConstraintReranker:
             )
 
         normalized_constraints = _normalize_constraints(constraints)
-        if not normalized_constraints:
-            return ConstraintRerankResult(
-                ranked=_zero_ranked(papers),
-                status="applied",
-                processed_count=0,
-                truncated=False,
-                batch_count=0,
-                warnings=[],
-            )
-
         process_limit = min(self._max_candidates, self._batch_size * self._max_batches)
         processed_papers = list(papers[:process_limit])
+        if not normalized_constraints:
+            return ConstraintRerankResult(
+                ranked=_zero_ranked(processed_papers),
+                status="applied",
+                processed_count=len(processed_papers),
+                truncated=len(processed_papers) < len(papers),
+                batch_count=math.ceil(len(processed_papers) / self._batch_size),
+                warnings=[],
+            )
 
         try:
             ranked_items: list[tuple[int, ConstraintScoredPaper]] = []

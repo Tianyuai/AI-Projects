@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from paper_search.domain.models import Paper
-from paper_search.ranking.rerank import ConstraintReranker
+from paper_search.ranking.rerank import ConstraintRerankResult, ConstraintReranker
 
 
 class RecordingEvaluator:
@@ -165,23 +165,39 @@ def test_reranker_returns_applied_without_evaluator_for_empty_papers() -> None:
 
 
 def test_reranker_returns_zero_coverage_without_calling_evaluator_for_empty_constraints() -> None:
-    papers = [_paper("paper:1", "Alpha"), _paper("paper:2", "Beta")]
+    papers = [_paper(f"paper:{index}", f"Paper {index}") for index in range(6)]
     evaluator = RecordingEvaluator({})
 
-    result = ConstraintReranker(evaluator).rerank(papers, ["   ", "\n\t"])
+    result = ConstraintReranker(evaluator, max_candidates=4).rerank(
+        papers, ["   ", "\n\t"]
+    )
 
     assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:0",
         "paper:1",
         "paper:2",
+        "paper:3",
     ]
-    assert [item.score for item in result.ranked] == [0.0, 0.0]
+    assert [item.score for item in result.ranked] == [0.0] * 4
     assert all(item.assessment.constraint_coverage == 0.0 for item in result.ranked)
     assert all(item.assessment.relevance_score == 0.0 for item in result.ranked)
     assert result.status == "applied"
-    assert result.processed_count == 0
-    assert result.batch_count == 0
-    assert result.truncated is False
+    assert result.processed_count == 4
+    assert result.batch_count == 1
+    assert result.truncated is True
     assert evaluator.calls == []
+
+
+def test_rerank_result_rejects_unbounded_warning_codes() -> None:
+    with pytest.raises(ValueError):
+        ConstraintRerankResult(
+            ranked=[],
+            status="applied",
+            processed_count=0,
+            truncated=False,
+            batch_count=0,
+            warnings=["arbitrary warning"],
+        )
 
 
 @pytest.mark.parametrize(

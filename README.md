@@ -42,6 +42,29 @@ uv run --no-sync --no-env-file python -m paper_search.health --require-accelerat
 
 `cpu` 与 `cuda` extras 互斥，不能同时选择。Windows AMD GPU 按 CPU 路径验收；仓库不宣称原生 ROCm 支持。
 
+## Week 3 optional embedding ranking
+
+Embedding ranking is disabled by default. The offline unit and integration
+tests use deterministic injected components and do not download a model, call
+an API, or load `.env`.
+
+CPU is the default path for local embedding ranking. CUDA is opt-in, retries
+once on CPU after CUDA OOM or CUDA unavailability, and the local encoder must
+be released before another local model is loaded. Do not keep Embedding and a
+local Reranker resident on the same 4 GB GPU at the same time.
+
+Offline focused verification command:
+
+```powershell
+$env:UV_PROJECT_ENVIRONMENT='D:\AI Projects\Projects\.venv'
+& 'D:\Dev\uv\uv.exe' run --no-sync --no-env-file pytest tests/unit/test_embedding.py tests/unit/test_sentence_transformer.py tests/evaluation/test_embedding_benchmark.py tests/integration/test_orchestrator.py -q
+```
+
+Opt-in real local-model benchmarking is separate from the default offline test
+suite. Use an already-downloaded local model path plus synthetic text, and
+record only aggregate latency, process peak RSS, CUDA peak allocation, status,
+and fallback state.
+
 ## 数据与人工标注
 
 协作者的立即执行清单见 `docs/TEAMMATE_ONBOARDING.md`，安全数据契约见 `data/README.md`。真实查询、gold、原始数据和人工标签不得进入 Git。不得读取、打印、搜索或复制 `.env`；只有明确授权的在线或数据准备子进程可以通过 `--env-file` 加载它。

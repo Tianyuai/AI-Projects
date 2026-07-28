@@ -4,6 +4,8 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
+import pytest
+
 from paper_search.domain.models import ProviderResult, UsageActual
 from paper_search.query.parser import QueryParser
 from paper_search.query.planner import QueryPlanner
@@ -147,6 +149,38 @@ def test_repair_callable_is_never_invoked_for_valid_payload() -> None:
     )
 
     assert result.query_spec.original_query == query
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "面向医学影像的图神经网络检索",
+        "retrieval for an unseen materials-science domain",
+    ],
+)
+def test_rule_fallback_routes_bilingual_and_unseen_domains_without_fabrication(
+    query: str,
+) -> None:
+    result = asyncio.run(QueryParser(QueryPlanner()).parse(query, _provider_result({})))
+
+    assert result.query_spec.original_query == query
+    assert result.query_spec.topics == [query]
+    assert result.query_spec.venues == []
+    assert result.query_spec.year_from is None
+    assert len(result.search_plan.subqueries) == 3
+    assert result.search_plan.subqueries[0].query_type == "exact"
+    assert result.search_plan.subqueries[0].text == query
+
+
+def test_rule_fallback_routes_simple_query_to_distinct_rewrites() -> None:
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse("transformers", _provider_result({}))
+    )
+
+    texts = [subquery.text for subquery in result.search_plan.subqueries]
+    assert texts[0] == "transformers"
+    assert texts[1] == "transformers scholarly papers"
+    assert texts[2] == "transformers methods"
 
 
 Repair = Callable[[str], Awaitable[ProviderResult[dict]]]

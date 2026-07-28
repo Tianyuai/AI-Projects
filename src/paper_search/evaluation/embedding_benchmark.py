@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import re
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -16,6 +17,11 @@ from paper_search.ranking.embedding import (
     EmbeddingRankingStage,
     EmbeddingStatus,
 )
+
+_SAFE_MODEL_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?$"
+)
+_SAFE_WARNING_RE = re.compile(r"^[a-z0-9]+(?:_[a-z0-9]+)*$")
 
 
 class EmbeddingBenchmarkResult(DomainModel):
@@ -43,6 +49,28 @@ class _WindowsProcessMemoryCounters(ctypes.Structure):
         ("quota_non_paged_pool_usage", ctypes.c_size_t),
         ("pagefile_usage", ctypes.c_size_t),
         ("peak_pagefile_usage", ctypes.c_size_t),
+    ]
+
+
+def _validate_batch_size(batch_size: object) -> int:
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ValueError("batch_size must be a positive integer")
+    return batch_size
+
+
+def _sanitize_model_id(model_id: str) -> str:
+    candidate = model_id.strip()
+    if re.match(r"^(?:[A-Za-z]:[\\/]|[\\/]{1,2}|~[\\/]|\.{1,2}[\\/])", candidate):
+        candidate = candidate.replace("\\", "/").rstrip("/").rsplit("/", maxsplit=1)[-1]
+    if not _SAFE_MODEL_ID_RE.fullmatch(candidate):
+        raise ValueError("model_id must be a safe identifier")
+    return candidate
+
+
+def _sanitize_warnings(warnings: Sequence[str]) -> list[str]:
+    return [
+        warning if _SAFE_WARNING_RE.fullmatch(warning.strip()) else "unsanitized_warning"
+        for warning in warnings
     ]
 
 
@@ -107,19 +135,20 @@ def benchmark_embedding(
     cuda_peak: Callable[[], int | None] = cuda_peak_allocated_bytes,
     cuda_reset: Callable[[], None] = reset_cuda_peak_memory,
 ) -> EmbeddingBenchmarkResult:
+    validated_batch_size = _validate_batch_size(batch_size)
     cuda_reset()
     started = clock()
     ranking = ranker.rank(query, papers)
     latency_ms = max(0, round((clock() - started) * 1000))
     return EmbeddingBenchmarkResult(
-        model_id=ranking.model_id,
+        model_id=_sanitize_model_id(ranking.model_id),
         device=ranking.device,
         candidate_count=len(papers),
-        batch_size=batch_size,
+        batch_size=validated_batch_size,
         latency_ms=latency_ms,
         process_peak_rss_bytes=peak_rss(),
         cuda_peak_allocated_bytes=cuda_peak(),
         status=ranking.status,
         fallback_used=ranking.fallback_used,
-        warnings=ranking.warnings,
+        warnings=_sanitize_warnings(ranking.warnings),
     )

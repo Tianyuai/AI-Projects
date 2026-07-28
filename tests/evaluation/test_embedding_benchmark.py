@@ -33,6 +33,47 @@ class FakeRanker:
         )
 
 
+class UnsafeMetadataRanker:
+    def rank(
+        self,
+        query: str,
+        papers: Sequence[Paper],
+    ) -> EmbeddingRankingResult:
+        del papers
+        return EmbeddingRankingResult(
+            ranked=[],
+            status="degraded",
+            model_id=r"D:\private-cache\models\all-MiniLM-L6-v2",
+            device="cpu",
+            fallback_used=True,
+            warnings=[
+                "cuda_oom_cpu_fallback",
+                f"RuntimeError while ranking query {query!r} from D:\\private-cache",
+            ],
+        )
+
+
+class CountingRanker:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def rank(
+        self,
+        query: str,
+        papers: Sequence[Paper],
+    ) -> EmbeddingRankingResult:
+        del query, papers
+        self._events.append("rank")
+        return EmbeddingRankingResult(
+            ranked=[],
+            status="applied",
+            model_id="fixture-embedding-v1",
+            device="cpu",
+            fallback_used=False,
+            warnings=[],
+        )
+
+
 def test_benchmark_reports_only_safe_aggregate_fields() -> None:
     times = iter([10.0, 10.125])
     result = benchmark_embedding(
@@ -65,6 +106,57 @@ def test_benchmark_reports_only_safe_aggregate_fields() -> None:
     assert "synthetic:1" not in serialized
     assert "Synthetic paper" not in serialized
     assert "synthetic benchmark query" not in serialized
+
+
+def test_benchmark_sanitizes_unsafe_model_metadata_and_warning_text() -> None:
+    result = benchmark_embedding(
+        ranker=UnsafeMetadataRanker(),
+        query="synthetic benchmark query",
+        papers=[],
+        batch_size=1,
+        clock=lambda: 10.0,
+        peak_rss=lambda: 123_456,
+        cuda_peak=lambda: None,
+        cuda_reset=lambda: None,
+    )
+
+    assert result.model_dump() == {
+        "model_id": "all-MiniLM-L6-v2",
+        "device": "cpu",
+        "candidate_count": 0,
+        "batch_size": 1,
+        "latency_ms": 0,
+        "process_peak_rss_bytes": 123456,
+        "cuda_peak_allocated_bytes": None,
+        "status": "degraded",
+        "fallback_used": True,
+        "warnings": ["cuda_oom_cpu_fallback", "unsanitized_warning"],
+    }
+    serialized = result.model_dump_json()
+    assert "private-cache" not in serialized
+    assert "synthetic benchmark query" not in serialized
+    assert "RuntimeError" not in serialized
+
+
+@pytest.mark.parametrize("batch_size", [0, -1])
+def test_benchmark_rejects_invalid_batch_size_before_side_effects(
+    batch_size: int,
+) -> None:
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="batch_size"):
+        benchmark_embedding(
+            ranker=CountingRanker(events),
+            query="synthetic benchmark query",
+            papers=[],
+            batch_size=batch_size,
+            clock=lambda: 10.0,
+            peak_rss=lambda: 123_456,
+            cuda_peak=lambda: None,
+            cuda_reset=lambda: events.append("reset"),
+        )
+
+    assert events == []
 
 
 def test_process_peak_rss_is_a_positive_os_measurement() -> None:

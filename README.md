@@ -53,6 +53,9 @@ once on CPU after CUDA OOM or CUDA unavailability, and the local encoder must
 be released before another local model is loaded. Do not keep Embedding and a
 local Reranker resident on the same 4 GB GPU at the same time.
 
+Benchmark output keeps only a safe model identifier and warning codes. It does
+not emit local model paths, raw exception text, or query-like free text.
+
 Offline focused verification command:
 
 ```powershell

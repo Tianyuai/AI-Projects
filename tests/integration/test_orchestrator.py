@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 from paper_search.control.budget import HardBudgetController
 from paper_search.domain.models import ErrorDetail, Paper, ProviderResult, SearchBudget, UsageActual, UsageEstimate
 from paper_search.pipeline.orchestrator import MockSearchOrchestrator
+from paper_search.ranking.embedding import EmbeddingRankingResult, EmbeddingScore
 
 
 def _budget(**updates: object) -> SearchBudget:
@@ -142,6 +144,31 @@ class FakeProvider:
             [] if self.failed or self.empty else [paper],
             UsageActual(search_api_calls=1),
             failed=self.failed,
+        )
+
+
+class FakeEmbeddingRanker:
+    def __init__(self, *, degraded: bool = False) -> None:
+        self.degraded = degraded
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def rank(
+        self,
+        query: str,
+        papers: Sequence[Paper],
+    ) -> EmbeddingRankingResult:
+        self.calls.append((query, [paper.canonical_id for paper in papers]))
+        ordered = list(papers) if self.degraded else list(reversed(papers))
+        return EmbeddingRankingResult(
+            ranked=[
+                EmbeddingScore(paper=paper, similarity=0.0 if self.degraded else 0.8)
+                for paper in ordered
+            ],
+            status="degraded" if self.degraded else "applied",
+            model_id="fixture-embedding-v1",
+            device="cpu",
+            fallback_used=False,
+            warnings=["encoder_unavailable"] if self.degraded else [],
         )
 
 
@@ -297,6 +324,84 @@ def test_orchestrator_retains_valid_sibling_result_when_one_provider_fails() -> 
     assert result.stop_reason == "completed"
     assert result.is_partial is True
     assert "openalex: provider returned errors" in result.warnings
+
+
+def test_orchestrator_applies_injected_embedding_after_fusion() -> None:
+    events: list[str] = []
+    embedding = FakeEmbeddingRanker()
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "openalex": FakeProvider("openalex", events),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "4" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        embedding_ranker=embedding,
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert embedding.calls == [("graph retrieval", ["openalex:W1", "s2:S1"])]
+    assert [paper.canonical_id for paper in result.papers] == [
+        "s2:S1",
+        "openalex:W1",
+    ]
+    assert result.trace[-1] == {
+        "step": "embedding",
+        "status": "applied",
+        "model_id": "fixture-embedding-v1",
+        "device": "cpu",
+        "fallback_used": False,
+        "count": 2,
+    }
+
+
+def test_orchestrator_embedding_degradation_keeps_fused_order() -> None:
+    events: list[str] = []
+    embedding = FakeEmbeddingRanker(degraded=True)
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "openalex": FakeProvider("openalex", events),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "5" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        embedding_ranker=embedding,
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert [paper.canonical_id for paper in result.papers] == [
+        "openalex:W1",
+        "s2:S1",
+    ]
+    assert result.is_partial is True
+    assert result.warnings[-1] == "embedding: encoder_unavailable"
+
+
+def test_orchestrator_default_path_does_not_invoke_or_trace_embedding() -> None:
+    events: list[str] = []
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": FakeProvider("openalex", events)},
+        config_hash="sha256:" + "6" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert "embedding" not in [item["step"] for item in result.trace]
 
 
 def test_orchestrator_records_provider_failure_and_skips_calls_on_budget_stop() -> None:

@@ -21,6 +21,7 @@ from paper_search.processing.deduplicate import deduplicate_papers
 from paper_search.processing.filter import apply_hard_filters
 from paper_search.query.parser import QueryParser, rule_fallback
 from paper_search.query.planner import QueryPlanner
+from paper_search.ranking.embedding import EmbeddingRankingStage
 from paper_search.ranking.fusion import fuse_provider_results
 from paper_search.retrieval.base import SearchProvider
 
@@ -54,6 +55,7 @@ class MockSearchOrchestrator:
         prompt_version: str,
         analysis_estimate: UsageEstimate,
         provider_estimate: UsageEstimate,
+        embedding_ranker: EmbeddingRankingStage | None = None,
     ) -> None:
         self._controller = controller
         self._analyzer = analyzer
@@ -62,6 +64,7 @@ class MockSearchOrchestrator:
         self._prompt_version = prompt_version
         self._analysis_estimate = analysis_estimate
         self._provider_estimate = provider_estimate
+        self._embedding_ranker = embedding_ranker
         self._parser = QueryParser(QueryPlanner())
 
     def _fallback(self, query: str) -> QueryAnalysisResult:
@@ -186,6 +189,23 @@ class MockSearchOrchestrator:
         fused = fuse_provider_results(provider_results, method="rrf")
         papers = [item.paper for item in fused if item.paper.canonical_id in accepted_ids]
         trace.append({"step": "fuse", "count": len(papers)})
+        if self._embedding_ranker is not None and papers:
+            embedding = self._embedding_ranker.rank(
+                analysis.query_spec.original_query,
+                papers,
+            )
+            papers = [item.paper for item in embedding.ranked]
+            trace.append(
+                {
+                    "step": "embedding",
+                    "status": embedding.status,
+                    "model_id": embedding.model_id,
+                    "device": embedding.device,
+                    "fallback_used": embedding.fallback_used,
+                    "count": len(papers),
+                }
+            )
+            warnings.extend(f"embedding: {warning}" for warning in embedding.warnings)
         status = self._controller.stop_status()
         stop_reason = status if status != "continue" else "completed"
         partial = bool(warnings) or stop_reason != "completed"

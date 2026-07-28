@@ -61,7 +61,7 @@ def _validate_batch_size(batch_size: object) -> int:
 
 def _sanitize_model_id(model_id: str) -> str:
     candidate = model_id.strip()
-    if _LOCAL_PATH_RE.match(candidate):
+    if _LOCAL_PATH_RE.match(candidate) or "/" in candidate or "\\" in candidate:
         return "local_model"
     if not _SAFE_MODEL_ID_RE.fullmatch(candidate):
         raise ValueError("model_id must be a safe identifier")

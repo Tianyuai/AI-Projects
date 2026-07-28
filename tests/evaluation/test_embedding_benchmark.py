@@ -164,6 +164,7 @@ def test_benchmark_sanitizes_unsafe_model_metadata_and_warning_text() -> None:
         r"D:\private-cache\models\all-MiniLM-L6-v2",
         r"\\private-host\share\all-MiniLM-L6-v2",
         "/private-cache/models/all-MiniLM-L6-v2",
+        "models/all-MiniLM-L6-v2",
         "~/private-cache/all-MiniLM-L6-v2",
         "./private-cache/all-MiniLM-L6-v2",
         "../private-cache/all-MiniLM-L6-v2",

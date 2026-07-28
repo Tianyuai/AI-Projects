@@ -71,7 +71,7 @@ class SentenceTransformerEncoder:
         try:
             torch = import_module("torch")
             torch.cuda.empty_cache()
-        except (ImportError, RuntimeError, AssertionError):
+        except (ImportError, RuntimeError, AssertionError, OSError, ValueError):
             return
 
 

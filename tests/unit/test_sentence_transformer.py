@@ -172,6 +172,50 @@ def test_adapter_sanitizes_invalid_local_model_constructor_errors_and_cleans_cac
     assert events == ["construct:cuda", "empty_cache"]
 
 
+@pytest.mark.parametrize("cleanup_stage", ["import", "empty_cache"])
+@pytest.mark.parametrize("error_type", [OSError, ValueError])
+def test_cleanup_errors_do_not_replace_sanitized_constructor_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_stage: str,
+    error_type: type[OSError] | type[ValueError],
+) -> None:
+    constructor_private = r"invalid local model path D:\private-cache\secret-model"
+    cleanup_private = r"cleanup failed at D:\private-cache\torch"
+    events: list[str] = []
+
+    def import_fake(name: str) -> object:
+        if name == "sentence_transformers":
+            def fail_constructor(_model_id: str, *, device: str) -> None:
+                events.append(f"construct:{device}")
+                raise ValueError(constructor_private)
+
+            return SimpleNamespace(SentenceTransformer=fail_constructor)
+        if name == "torch":
+            events.append("import:torch")
+            if cleanup_stage == "import":
+                raise error_type(cleanup_private)
+
+            def fail_empty_cache() -> None:
+                events.append("empty_cache")
+                raise error_type(cleanup_private)
+
+            return SimpleNamespace(cuda=SimpleNamespace(empty_cache=fail_empty_cache))
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(adapter, "import_module", import_fake)
+
+    with pytest.raises(EmbeddingUnavailableError) as captured:
+        adapter.SentenceTransformerEncoder(model_id="fixture/model", device="cuda")
+
+    assert str(captured.value) == "embedding encoder failed"
+    assert constructor_private not in str(captured.value)
+    assert cleanup_private not in str(captured.value)
+    expected = ["construct:cuda", "import:torch"]
+    if cleanup_stage == "empty_cache":
+        expected.append("empty_cache")
+    assert events == expected
+
+
 def test_adapter_maps_unsupported_cuda_encode_to_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

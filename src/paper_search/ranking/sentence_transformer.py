@@ -28,6 +28,9 @@ class SentenceTransformerEncoder:
             raise EmbeddingUnavailableError(
                 "sentence-transformers is not installed"
             ) from None
+        except (OSError, ValueError):
+            self.close()
+            raise EmbeddingUnavailableError("embedding encoder failed") from None
         except (RuntimeError, AssertionError) as error:
             self.close()
             self._raise_sanitized(error)

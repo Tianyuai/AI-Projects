@@ -159,6 +159,27 @@ class FakeProvider:
         )
 
 
+class RaisingProvider:
+    def __init__(self, name: str, events: list[str], error: Exception) -> None:
+        self.name = name
+        self.events = events
+        self.error = error
+
+    async def search(
+        self,
+        query: str,
+        filters: dict[str, object],
+        limit: int,
+        reservation: object,
+    ) -> ProviderResult[list[Paper]]:
+        assert query
+        assert filters == {}
+        assert limit == 5
+        assert reservation is not None
+        self.events.append(self.name)
+        raise self.error
+
+
 class FakeEmbeddingRanker:
     def __init__(
         self,
@@ -642,6 +663,31 @@ def test_orchestrator_records_provider_failure_and_skips_calls_on_budget_stop() 
         "openalex: provider returned errors",
         "semantic_scholar: budget unavailable",
     ]
+
+
+def test_orchestrator_switches_provider_after_direct_timeout() -> None:
+    events: list[str] = []
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "openalex": RaisingProvider(
+                "openalex", events, TimeoutError("fixture timeout")
+            ),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "d" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert events[:3] == ["analyze", "openalex", "semantic_scholar"]
+    assert [paper.canonical_id for paper in result.papers] == ["s2:S1"]
+    assert result.is_partial is True
+    assert "openalex: provider exception" in result.warnings
 
 
 class OverrunProvider(FakeProvider):

@@ -191,6 +191,17 @@ class MockSearchOrchestrator:
                 except ReservationError:
                     self._controller.fail_closed(reservation)
                     raise
+                except Exception:  # noqa: BLE001
+                    try:
+                        self._controller.settle(
+                            reservation,
+                            UsageActual(search_api_calls=1),
+                        )
+                    except ReservationError:
+                        self._controller.fail_closed(reservation)
+                        raise
+                    warnings.append(f"{name}: provider exception")
+                    continue
                 collected.setdefault(name, []).append(result)
                 trace.append(
                     {"step": "retrieve", "provider": name, "subquery_id": subquery.query_id}

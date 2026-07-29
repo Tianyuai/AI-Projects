@@ -19,6 +19,12 @@ def budget_api() -> tuple[type, type[Exception], type[Exception]]:
     return module.HardBudgetController, module.BudgetExceededError, module.ReservationError
 
 
+def budget_preflight_api() -> tuple[type, type[Exception], type[Exception]]:
+    controller_type, exceeded_error, reservation_error = budget_api()
+    assert hasattr(controller_type, "can_reserve"), "HardBudgetController.can_reserve must be implemented"
+    return controller_type, exceeded_error, reservation_error
+
+
 def make_budget(**updates: object) -> SearchBudget:
     values = {
         "max_search_api_calls": 2,
@@ -141,6 +147,104 @@ def test_llm_reservation_requires_known_cost() -> None:
         controller.reserve("llm.generate", UsageEstimate(llm_calls=1, cost_cny=None))
 
     assert controller.reserved_usage.llm_calls == 0
+
+
+def test_can_reserve_matches_reserve_without_mutating_state() -> None:
+    controller_type, _, _ = budget_preflight_api()
+    controller = controller_type(make_budget(max_search_api_calls=1, target_search_api_calls=1))
+    estimate = UsageEstimate(search_api_calls=1)
+
+    assert controller.can_reserve(estimate) is True
+    assert controller.reserved_usage == UsageEstimate()
+    reservation = controller.reserve("test", estimate)
+    assert reservation.reserved == estimate
+    assert controller.can_reserve(UsageEstimate(search_api_calls=1)) is False
+
+
+@pytest.mark.parametrize(
+    ("estimate", "budget_updates"),
+    [
+        (UsageEstimate(search_api_calls=1), {"max_search_api_calls": 1, "target_search_api_calls": 1}),
+        (UsageEstimate(llm_calls=1, cost_cny=0.1), {"max_llm_calls": 1, "target_llm_calls": 1}),
+        (UsageEstimate(input_tokens=60, output_tokens=40), {"max_total_tokens": 100}),
+        (UsageEstimate(elapsed_ms=2_000), {"max_elapsed_seconds": 2}),
+        (UsageEstimate(cost_cny=1.0), {"max_cost_cny": 1.0}),
+    ],
+)
+def test_can_reserve_allows_exact_hard_limits(
+    estimate: UsageEstimate, budget_updates: dict[str, object]
+) -> None:
+    controller_type, _, _ = budget_preflight_api()
+    controller = controller_type(make_budget(**budget_updates))
+
+    assert controller.can_reserve(estimate) is True
+    assert controller.reserved_usage == UsageEstimate()
+
+
+@pytest.mark.parametrize(
+    ("reserved", "estimate", "budget_updates"),
+    [
+        (
+            UsageEstimate(search_api_calls=1),
+            UsageEstimate(search_api_calls=1),
+            {"max_search_api_calls": 1, "target_search_api_calls": 1},
+        ),
+        (
+            UsageEstimate(llm_calls=1, cost_cny=0.1),
+            UsageEstimate(llm_calls=1, cost_cny=0.1),
+            {"max_llm_calls": 1, "target_llm_calls": 1},
+        ),
+        (
+            UsageEstimate(input_tokens=50, output_tokens=50),
+            UsageEstimate(input_tokens=1),
+            {"max_total_tokens": 100},
+        ),
+        (
+            UsageEstimate(elapsed_ms=2_000),
+            UsageEstimate(elapsed_ms=1),
+            {"max_elapsed_seconds": 2},
+        ),
+        (
+            UsageEstimate(cost_cny=1.0),
+            UsageEstimate(cost_cny=0.1),
+            {"max_cost_cny": 1.0},
+        ),
+    ],
+)
+def test_can_reserve_accounts_for_active_reservations_in_all_hard_limits(
+    reserved: UsageEstimate, estimate: UsageEstimate, budget_updates: dict[str, object]
+) -> None:
+    controller_type, _, _ = budget_preflight_api()
+    controller = controller_type(make_budget(**budget_updates))
+    controller.reserve("active", reserved)
+
+    assert controller.can_reserve(estimate) is False
+
+
+def test_can_reserve_accounts_for_committed_usage() -> None:
+    controller_type, _, _ = budget_preflight_api()
+    controller = controller_type(make_budget(max_search_api_calls=1, target_search_api_calls=1))
+    reservation = controller.reserve("committed", UsageEstimate(search_api_calls=1))
+    controller.settle(reservation, UsageActual(search_api_calls=1))
+
+    assert controller.can_reserve(UsageEstimate(search_api_calls=1)) is False
+
+
+def test_can_reserve_returns_false_after_fail_closed() -> None:
+    controller_type, _, _ = budget_preflight_api()
+    controller = controller_type(make_budget())
+    reservation = controller.reserve("provider.search", UsageEstimate(search_api_calls=1))
+    controller.fail_closed(reservation)
+
+    assert controller.can_reserve(UsageEstimate()) is False
+
+
+def test_can_reserve_propagates_unknown_llm_cost_error() -> None:
+    controller_type, _, reservation_error = budget_preflight_api()
+    controller = controller_type(make_budget())
+
+    with pytest.raises(reservation_error, match="LLM reservations require a known cost estimate"):
+        controller.can_reserve(UsageEstimate(llm_calls=1))
 
 
 def test_unknown_actual_llm_cost_does_not_release_reservation() -> None:

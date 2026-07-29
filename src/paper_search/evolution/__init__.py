@@ -1,4 +1,5 @@
 from .coverage import CoverageAnalyzer, extract_strong_constraints
+from .costing import DeterministicRoundCostEstimator, RoundCostEstimator
 from .generation import (
     NextRoundGenerator,
     NoTargetedQueriesError,
@@ -18,9 +19,11 @@ __all__ = [
     "ConstraintRef",
     "CoverageAnalyzer",
     "CoverageReport",
+    "DeterministicRoundCostEstimator",
     "NextRoundGenerator",
     "NoTargetedQueriesError",
     "RoundPlan",
+    "RoundCostEstimator",
     "RuleBasedNextRoundGenerator",
     "extract_strong_constraints",
 ]

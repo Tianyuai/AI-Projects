@@ -259,32 +259,43 @@ class IdentifierMap:
     @classmethod
     def from_path(cls, path: Path) -> IdentifierMap:
         """Load, validate, and fully resolve an identifier mapping JSON object."""
+        return cls.from_bytes(path.read_bytes(), source=str(path))
+
+    @classmethod
+    def from_bytes(
+        cls,
+        content: bytes,
+        *,
+        source: str = "identifier map",
+    ) -> IdentifierMap:
+        """Load, validate, and fully resolve an identifier map byte snapshot."""
         try:
-            payload: object = json.loads(
-                path.read_text(encoding="utf-8"),
-                object_pairs_hook=_JsonObjectPairs,
-            )
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(f"{source}: invalid UTF-8") from None
+        try:
+            payload: object = json.loads(text, object_pairs_hook=_JsonObjectPairs)
         except json.JSONDecodeError as error:
-            raise ValueError(f"{path}: invalid JSON: {error.msg}") from None
+            raise ValueError(f"{source}: invalid JSON: {error.msg}") from None
 
         if not isinstance(payload, _JsonObjectPairs):
-            raise ValueError(f"{path}: expected a JSON object")
+            raise ValueError(f"{source}: expected a JSON object")
 
         direct: dict[str, str] = {}
         for raw_alias, raw_target in payload:
             if not isinstance(raw_target, str):
                 raise ValueError(
-                    f"{path}: identifier map keys and values must be strings"
+                    f"{source}: identifier map keys and values must be strings"
                 )
             try:
                 alias = normalize_paper_id(raw_alias)
                 target = normalize_paper_id(raw_target)
             except ValueError as error:
-                raise ValueError(f"{path}: {error}") from None
+                raise ValueError(f"{source}: {error}") from None
 
             existing = direct.get(alias)
             if existing is not None and existing != target:
-                raise ValueError(f"{path}: identifier map conflict for {alias}")
+                raise ValueError(f"{source}: identifier map conflict for {alias}")
             direct[alias] = target
 
         resolved: dict[str, str] = {}
@@ -297,7 +308,7 @@ class IdentifierMap:
             while current not in resolved:
                 if current in positions:
                     raise ValueError(
-                        f"{path}: identifier map cycle involving {current}"
+                        f"{source}: identifier map cycle involving {current}"
                     )
                 positions[current] = len(chain)
                 chain.append(current)

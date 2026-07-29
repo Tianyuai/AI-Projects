@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import inspect
 import importlib
@@ -634,7 +635,10 @@ def test_cli_binds_confined_identifier_map_into_metrics_and_identity(
     map_path = tmp_path / "data" / "annotation_work" / "dev-map.json"
     map_path.parent.mkdir(parents=True)
     map_path.write_text(
-        '{"arxiv:2501.10120":"openalex:W1"}',
+        (
+            '{"arxiv:2501.10120":"openalex:W1",'
+            '"openalex:W2":"openalex:W1"}'
+        ),
         encoding="utf-8",
     )
     map_hash = _sha256(map_path.read_bytes())
@@ -646,7 +650,10 @@ def test_cli_binds_confined_identifier_map_into_metrics_and_identity(
         return FakeProvider(
             {
                 "graph retrieval": _provider_result(
-                    [_paper("openalex:W1", title="graph retrieval")],
+                    [
+                        _paper("openalex:W1", title="graph retrieval"),
+                        _paper("openalex:W2", title="unrelated title"),
+                    ],
                     calls=1,
                     latency_ms=1,
                 )
@@ -674,6 +681,77 @@ def test_cli_binds_confined_identifier_map_into_metrics_and_identity(
     assert metrics["input_hashes"]["id_map"] == map_hash
     assert metrics["summary"]["macro_recall"] == 1.0
     assert metrics["summary"]["micro_recall"] == 1.0
+    deduplication = json.loads(
+        (tmp_path / "out" / "deduplication.jsonl").read_text(encoding="utf-8")
+    )
+    assert len(deduplication["paper_ids"]) == 1
+    assert deduplication["merge_decisions"][0]["match_rule"] == "external_id"
+    assert set(deduplication["merge_decisions"][0]["member_ids"]) == {
+        "openalex:W1",
+        "openalex:W2",
+    }
+
+
+def test_cli_uses_original_identifier_map_bytes_after_file_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_cli_manifest(
+        tmp_path,
+        gold_content=(
+            '{"query_id":"query-1","query":"graph retrieval",'
+            '"relevant_paper_ids":["arxiv:2501.10120"]}\n'
+        ),
+    )
+    map_path = tmp_path / "data" / "annotation_work" / "replacement-map.json"
+    map_path.parent.mkdir(parents=True)
+    original_bytes = b'{"arxiv:2501.10120":"openalex:W1"}'
+    replacement_bytes = b'{"arxiv:2501.10120":"openalex:W2"}'
+    map_path.write_bytes(original_bytes)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+
+    def fake_provider_factory(**kwargs: object) -> FakeProvider:
+        del kwargs
+        return FakeProvider(
+            {
+                "graph retrieval": _provider_result(
+                    [_paper("openalex:W1", title="graph retrieval")],
+                    calls=1,
+                    latency_ms=1,
+                )
+            }
+        )
+
+    original_read_bytes = Path.read_bytes
+
+    def replace_map_after_read(path: Path) -> bytes:
+        content = original_read_bytes(path)
+        if path == map_path:
+            path.write_bytes(replacement_bytes)
+        return content
+
+    monkeypatch.setattr(Path, "read_bytes", replace_map_after_read)
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        fake_provider_factory,
+        raising=False,
+    )
+
+    assert _run_cli_from(
+        tmp_path,
+        id_map="data/annotation_work/replacement-map.json",
+    ) == 0
+
+    run = json.loads((tmp_path / "out" / "run.json").read_text(encoding="utf-8"))
+    metrics = json.loads(
+        (tmp_path / "out" / "metrics.json").read_text(encoding="utf-8")
+    )
+    assert map_path.read_bytes() == replacement_bytes
+    assert run["identity"]["id_map_sha256"] == _sha256(original_bytes)
+    assert metrics["summary"]["macro_recall"] == 1.0
+    assert metrics["summary"]["micro_recall"] == 1.0
 
 
 @pytest.mark.parametrize(
@@ -698,6 +776,38 @@ def test_cli_rejects_identifier_map_outside_data_before_provider(
     )
 
     assert _run_cli_from(tmp_path, id_map=raw_path) == 2
+    assert "identifier map path must stay under data" in capsys.readouterr().err
+
+
+def test_cli_rejects_identifier_map_symlink_to_outside_data_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path)
+    outside_map = tmp_path / "outside-map.json"
+    outside_map.write_text("{}", encoding="utf-8")
+    map_link = tmp_path / "data" / "annotation_work" / "outside-link.json"
+    map_link.parent.mkdir(parents=True)
+    try:
+        map_link.symlink_to(outside_map)
+    except OSError as error:
+        if error.winerror == 1314 or error.errno in {errno.EACCES, errno.EPERM}:
+            pytest.skip(f"platform denied symlink creation: {error}")
+        raise
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        lambda **kwargs: pytest.fail(f"provider constructed: {sorted(kwargs)}"),
+        raising=False,
+    )
+
+    assert _run_cli_from(
+        tmp_path,
+        id_map="data/annotation_work/outside-link.json",
+    ) == 2
     assert "identifier map path must stay under data" in capsys.readouterr().err
 
 

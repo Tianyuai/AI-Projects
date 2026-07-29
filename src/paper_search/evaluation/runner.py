@@ -756,7 +756,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.id_map is not None:
             id_map_path = _resolve_cli_id_map(Path("data"), args.id_map)
             id_map_bytes = id_map_path.read_bytes()
-            id_map = IdentifierMap.from_path(id_map_path)
+            id_map = IdentifierMap.from_bytes(id_map_bytes)
             _require_id_map_coverage(frozen_split.gold, id_map)
             identity = identity.model_copy(
                 update={"id_map_sha256": _sha256_bytes(id_map_bytes)}

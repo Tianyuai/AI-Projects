@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from paper_search.domain.models import QuerySpec
@@ -98,8 +100,10 @@ def test_covered_min_hits_cannot_be_reassigned_after_construction() -> None:
     ]
     analyzer = CoverageAnalyzer(covered_min_hits=2)
 
-    with pytest.raises((AttributeError, TypeError)):
+    with pytest.raises(FrozenInstanceError):
         analyzer.covered_min_hits = 0  # type: ignore[misc]
+    with pytest.raises((FrozenInstanceError, TypeError)):
+        analyzer._covered_min_hits = 0  # type: ignore[attr-defined]
 
     report = analyzer.analyze(spec, ["p1", "p2"], observations)
     assert report.constraints[0].status == "low_coverage"

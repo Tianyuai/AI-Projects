@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from paper_search.domain.models import QuerySpec
 
@@ -38,17 +39,17 @@ def _constraint_key(constraint: ConstraintRef) -> tuple[str, str, str]:
     return constraint.kind, constraint.value, constraint.normalized_value
 
 
+@dataclass(frozen=True, slots=True)
 class CoverageAnalyzer:
-    def __init__(self, covered_min_hits: int) -> None:
-        if isinstance(covered_min_hits, bool) or not isinstance(covered_min_hits, int):
-            raise ValueError("covered_min_hits must be a positive integer")
-        if covered_min_hits < 1:
-            raise ValueError("covered_min_hits must be a positive integer")
-        self._covered_min_hits = covered_min_hits
+    covered_min_hits: int
 
-    @property
-    def covered_min_hits(self) -> int:
-        return self._covered_min_hits
+    def __post_init__(self) -> None:
+        if isinstance(self.covered_min_hits, bool) or not isinstance(
+            self.covered_min_hits, int
+        ):
+            raise ValueError("covered_min_hits must be a positive integer")
+        if self.covered_min_hits < 1:
+            raise ValueError("covered_min_hits must be a positive integer")
 
     def analyze(
         self,

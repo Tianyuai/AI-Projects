@@ -1,0 +1,106 @@
+# Identifier-Map-Bound R3 Baseline Design
+
+## Context
+
+The R2 real fresh-cache run proved that outbound OpenAlex retrieval works after
+wildcard normalization: all 60 queries produced snapshots, 58 produced
+predictions, and no request failed with `invalid_request`. R2 is not a valid
+relevance measurement because frozen gold identifiers and provider predictions
+use different identifier namespaces.
+
+The private Week1 map at
+`data/annotation_work/dev_identifier_map.v1.json` contains 141 unique aliases.
+Those aliases cover all 141 unique identifiers across 143 development-gold
+references. Every gold identifier resolves to a DOI or OpenAlex identifier;
+none remains in the arXiv namespace. The map body remains private.
+
+## Runner Interface and Confinement
+
+The evaluation CLI accepts an optional `--id-map PATH`. The path is relative to
+the run's `data/` root, must resolve beneath that root, and must name an existing
+file. Absolute paths and traversal outside `data/` are rejected before any
+network call.
+
+The CLI reads and hashes the exact map bytes, validates them with
+`IdentifierMap.from_path`, and checks explicit alias coverage for every unique
+gold identifier. Missing coverage fails with a fixed, value-free error before
+provider construction. The runner never prints map entries or missing
+identifiers.
+
+`IdentifierMap` exposes a boolean coverage method that normalizes the supplied
+identifier and reports whether it is an explicit alias. It does not expose or
+serialize the internal mapping.
+
+## Evaluation and Identity
+
+The same validated map instance is passed to:
+
+- candidate deduplication through `process_candidates`;
+- final metric evaluation through `evaluate`.
+
+`RunIdentity` gains optional `id_map_sha256`. When a map is supplied:
+
+- `run.json.identity.id_map_sha256` records the exact map hash;
+- `run.json.input_hashes.id_map` records the same hash;
+- `metrics.json.input_hashes.id_map` records the same hash.
+
+When no map is supplied, `id_map_sha256` and the `id_map` input hash are omitted
+from formal artifacts. Existing no-map artifact shapes and behavior remain
+compatible.
+
+Frozen gold bytes, predictions, query text, scoring, filtering, deduplication
+rules, and provider request parameters are otherwise unchanged.
+
+## Tests and Error Handling
+
+Test-first coverage proves:
+
+- a confined map resolves prediction and gold namespaces and produces nonzero
+  mapped metrics;
+- the map hash appears in run identity and both formal input-hash objects;
+- an absent `--id-map` preserves existing artifact shapes;
+- absolute, traversing, missing, invalid, partial, conflicting, and cyclic maps
+  fail before any HTTP request;
+- errors contain no map entries, gold identifiers, query text, or credentials.
+
+Focused runner and dataset tests run before the complete offline Ruff, mypy, and
+pytest suites. All test and static-analysis commands use `--no-env-file`.
+
+## R3 Execution
+
+R3 uses the committed implementation SHA, an eight-character short SHA in its
+new Git-external directory name, a new output directory, and a new empty SQLite
+cache. R1 and R2 remain immutable.
+
+The real command runs in the foreground from `D:\AI Projects\Projects` with
+relative `--env-file .env`. A secret-safe execution receipt outside the formal
+artifact directory records:
+
+- full source SHA;
+- wrapper SHA-256;
+- UTC start and end timestamps;
+- direct process exit code;
+- run-relative output and cache paths.
+
+The receipt never records environment values or the map body.
+
+## R3 Acceptance
+
+Before R3 is reported as the formal development baseline:
+
+- direct exit code is zero;
+- the snapshot manifest validates;
+- all formal artifact hashes recompute;
+- run identity binds the committed source, frozen manifest, gold, and map;
+- the recomputed private-map hash matches every recorded map hash;
+- map coverage remains complete;
+- `invalid_request` is zero;
+- search calls, snapshots, cache-key coverage, and prediction coverage are
+  positive;
+- mapped aggregate metrics are internally consistent and no longer interpreted
+  through disjoint identifier namespaces;
+- a secret scan finds no credentials or map body in the receipt, formal
+  artifacts, snapshots, or cache metadata.
+
+The seven R2 `invalid_work` records remain a separately reported quality concern
+unless R3 evidence changes their aggregate count.

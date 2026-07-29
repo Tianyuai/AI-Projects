@@ -130,3 +130,16 @@ def test_max_subqueries_requires_a_positive_integer(value: object) -> None:
             )
         )
 
+
+@pytest.mark.parametrize("value", [True, False, 1.0, 0, -1])
+def test_round_number_requires_a_positive_integer(value: object) -> None:
+    with pytest.raises(ValueError):
+        asyncio.run(
+            RuleBasedNextRoundGenerator().generate(
+                spec=query_spec(),
+                coverage=coverage_report(["uncovered"]),
+                prior_plans=[],
+                round_number=value,  # type: ignore[arg-type]
+                max_subqueries=1,
+            )
+        )

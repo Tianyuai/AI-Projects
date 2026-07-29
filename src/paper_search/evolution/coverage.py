@@ -44,7 +44,11 @@ class CoverageAnalyzer:
             raise ValueError("covered_min_hits must be a positive integer")
         if covered_min_hits < 1:
             raise ValueError("covered_min_hits must be a positive integer")
-        self.covered_min_hits = covered_min_hits
+        self._covered_min_hits = covered_min_hits
+
+    @property
+    def covered_min_hits(self) -> int:
+        return self._covered_min_hits
 
     def analyze(
         self,

@@ -89,6 +89,22 @@ def test_covered_min_hits_requires_a_positive_integer(threshold: object) -> None
         CoverageAnalyzer(threshold)  # type: ignore[arg-type]
 
 
+def test_covered_min_hits_cannot_be_reassigned_after_construction() -> None:
+    spec = QuerySpec(original_query="q", research_goal="g", topics=["topic"])
+    constraint = extract_strong_constraints(spec)[0]
+    observations = [
+        CandidateConstraintObservation(paper_id="p1", constraint=constraint, matched=True),
+        CandidateConstraintObservation(paper_id="p2", constraint=constraint, matched=False),
+    ]
+    analyzer = CoverageAnalyzer(covered_min_hits=2)
+
+    with pytest.raises((AttributeError, TypeError)):
+        analyzer.covered_min_hits = 0  # type: ignore[misc]
+
+    report = analyzer.analyze(spec, ["p1", "p2"], observations)
+    assert report.constraints[0].status == "low_coverage"
+
+
 def _matrix_fixture() -> tuple[QuerySpec, list[str], list[CandidateConstraintObservation]]:
     spec = QuerySpec(original_query="q", research_goal="g", topics=["topic"])
     constraint = extract_strong_constraints(spec)[0]

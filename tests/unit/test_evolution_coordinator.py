@@ -241,6 +241,26 @@ class MutatingExecutor(FakeExecutor):
         raise RuntimeError("secret execution mutation")
 
 
+class RetainingMutatingExecutor(FakeExecutor):
+    def __init__(self, first_execution: RoundExecution) -> None:
+        super().__init__([first_execution])
+        self.retained = first_execution
+        self.pre_second_call_snapshot: dict[str, Any] | None = None
+
+    async def execute(self, spec: QuerySpec, plan: RoundPlan) -> RoundExecution:
+        self.calls.append((spec, plan))
+        if len(self.calls) == 1:
+            return self.retained
+        self.pre_second_call_snapshot = self.retained.model_dump(mode="json")
+        self.retained.candidates[0].authors.append("Corrupt Author")
+        self.retained.candidates.append(
+            Paper(canonical_id="corrupted", title="Corrupted Paper")
+        )
+        self.retained.observations.clear()
+        self.retained.trace[0]["round"] = "corrupted"
+        raise RuntimeError("secret retained execution mutation")
+
+
 class MutatingCoverageAnalyzer(FakeCoverageAnalyzer):
     def analyze(
         self,
@@ -412,6 +432,7 @@ def test_later_executor_failure_preserves_committed_first_seen_state() -> None:
         candidates=[first_paper],
         observations=[observation("p1", matched=False)],
     )
+    execution_before = first_execution.model_dump(mode="json")
     result = run(
         coordinator(
             executor=FakeExecutor(
@@ -422,9 +443,43 @@ def test_later_executor_failure_preserves_committed_first_seen_state() -> None:
         strategy="fixed_two_round",
     )
 
-    assert result.rounds == [first_execution]
-    assert result.candidates == [first_paper]
-    assert result.candidates[0] is first_paper
+    assert result.rounds[0].model_dump(mode="json") == execution_before
+    assert result.candidates[0].model_dump(mode="json") == execution_before["candidates"][0]
+    assert result.candidates[0] is result.rounds[0].candidates[0]
+    assert result.candidates[0] is not first_paper
+    assert result.stop_reason == "round_failed"
+    assert result.failed_round == 2
+    assert result.warnings == ["execution: dependency failure"]
+    assert result.decisions[-1].failed_stage == "execution"
+
+
+def test_executor_cannot_mutate_retained_committed_output_on_later_failure() -> None:
+    first_paper = Paper(
+        canonical_id="p1",
+        title="First title",
+        authors=["Original Author"],
+    )
+    first_execution = execution(
+        1,
+        candidates=[first_paper],
+        observations=[observation("p1", matched=False)],
+    )
+    executor = RetainingMutatingExecutor(first_execution)
+
+    result = run(
+        coordinator(executor=executor),
+        strategy="fixed_two_round",
+    )
+
+    expected_round = executor.pre_second_call_snapshot
+    assert expected_round is not None
+    assert result.rounds[0].model_dump(mode="json") == expected_round
+    assert [item.model_dump(mode="json") for item in result.candidates] == expected_round[
+        "candidates"
+    ]
+    assert result.candidates[0] is result.rounds[0].candidates[0]
+    assert result.rounds[0] is not first_execution
+    assert result.candidates[0] is not first_paper
     assert result.stop_reason == "round_failed"
     assert result.failed_round == 2
     assert result.warnings == ["execution: dependency failure"]
@@ -451,14 +506,16 @@ def test_postcommit_dependency_failure_preserves_first_seen_state(
         candidates=[first_paper],
         observations=[observation("p1", matched=False)],
     )
+    execution_before = first_execution.model_dump(mode="json")
     fake_executor = FakeExecutor([first_execution, execution(2)])
     instance = coordinator(executor=fake_executor, **updates)  # type: ignore[arg-type]
 
     result = run(instance, strategy="fixed_two_round")
 
-    assert result.rounds == [first_execution]
-    assert result.candidates == [first_paper]
-    assert result.candidates[0] is first_paper
+    assert result.rounds[0].model_dump(mode="json") == execution_before
+    assert result.candidates[0].model_dump(mode="json") == execution_before["candidates"][0]
+    assert result.candidates[0] is result.rounds[0].candidates[0]
+    assert result.candidates[0] is not first_paper
     assert result.stop_reason == "round_failed"
     assert result.failed_round == (2 if stage in {"generation", "estimate", "preflight"} else 1)
     assert result.warnings == [f"{stage}: dependency failure"]
@@ -682,7 +739,8 @@ def test_duplicate_candidates_and_observations_keep_first_seen_objects() -> None
 
     assert result.stop_reason == "max_rounds_reached"
     assert result.candidates == [first_paper]
-    assert result.candidates[0] is first_paper
+    assert result.candidates[0] is result.rounds[0].candidates[0]
+    assert result.candidates[0] is not first_paper
     assert analyzer.calls[-1][1] == ["duplicate"]
     assert analyzer.calls[-1][2] == [first_observation]
     assert analyzer.calls[-1][2][0].model_dump(mode="json") == observation_before

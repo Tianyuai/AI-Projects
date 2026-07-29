@@ -232,6 +232,7 @@ class EvolutionCoordinator:
                 )
                 if execution.round_number != plan.round_number:
                     raise ValueError("execution round number does not match its plan")
+                execution = _snapshot(execution)
             except Exception:
                 return _failure(
                     stage="execution",

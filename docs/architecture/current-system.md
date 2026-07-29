@@ -24,13 +24,13 @@ For every mock API request, `MockApiSearchService` creates a fresh `MockSearchOr
 
 ## Deduplication, Filtering, Fusion, and Ranking
 
-After retrieval, `MockSearchOrchestrator` combines results by provider, deduplicates papers, applies hard filters, and fuses provider results with reciprocal-rank fusion. Only fused papers whose canonical IDs were accepted by filtering are returned. The trace records the analysis, retrieval, deduplication, filtering, and fusion stages.
+After retrieval, `MockSearchOrchestrator` combines results by provider, deduplicates papers, applies hard filters, and fuses provider results with reciprocal-rank fusion. Only fused papers whose canonical IDs were accepted by filtering are returned. On a completed, trace-enabled retrieval path, the public trace records the analysis, retrieval, deduplication, filtering, and fusion stages. An unavailable analysis budget or an analyzer exception returns before the analysis trace entry, and `include_trace=false` clears the public trace.
 
 Embedding ranking, citation expansion, and constraint reranking are optional injected stages. When provided, they run after fusion in that order and add trace or safe warning information. The synthetic mock factory does not inject any of those optional stages, so the demo path ends with the fused, filtered result set.
 
 ## Evaluation, Snapshots, and Reproducibility
 
-Evaluation utilities and snapshot support are present as offline tooling. Provider snapshots preserve exact cached bytes plus a manifest; structured responses carry a configuration hash, prompt version in the trace, and a git SHA supplied by the service composition. These mechanisms make inputs and outputs inspectable, but this document does not report a formal evaluation.
+Evaluation utilities and snapshot support are present as offline tooling. Provider snapshots preserve exact cached bytes plus a manifest. `StructuredSearchResponse` carries `config_hash` and `git_sha` as top-level fields. `prompt_version` is not a top-level response field: it appears in the successful `analyze` trace entry and is visible publicly only when tracing is enabled. These mechanisms make inputs and outputs inspectable, but this document does not report a formal evaluation.
 
 R2 is retrieval diagnostic evidence only. It is not a relevance-performance conclusion, and no relevance metrics are included here. R3 is the later point at which formal evaluation artifacts may be considered; they are outside this document's scope.
 
@@ -38,8 +38,8 @@ R2 is retrieval diagnostic evidence only. It is not a relevance-performance conc
 
 1. The mock API accepts `POST /v1/search` with a query ID, query text, budget profile, and optional trace flag.
 2. `MockApiSearchService` selects a fresh synthetic orchestrator for the profile.
-3. The orchestrator reserves analysis budget, invokes the injected analyzer, parses and finalizes the plan, then reserves and invokes each eligible injected provider.
-4. It deduplicates, filters, fuses, and optionally applies the injected post-retrieval stages before returning a minimal result with trace, usage, stop reason, partial flag, and warnings.
+3. On the normal completed path, the orchestrator reserves analysis budget, invokes the injected analyzer, parses and finalizes the plan, then reserves and invokes each eligible injected provider.
+4. It then deduplicates, filters, fuses, and optionally applies the injected post-retrieval stages before returning a minimal result with trace, usage, stop reason, partial flag, and warnings. Analysis-budget and analyzer-failure paths instead return early with an empty trace.
 5. The response converter produces the public structured response. If `include_trace` is false, the API clears only the public trace; the other response fields remain available.
 
 The API also exposes `GET /health/live` and `GET /health/ready`. Liveness is independent of dependencies. Readiness requires both an injected search service and a nonempty all-ready provider map.

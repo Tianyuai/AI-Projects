@@ -4,6 +4,7 @@ import math
 
 import pytest
 
+from paper_search.domain.models import DomainModel
 from paper_search.evolution import (
     ConstraintCoverage,
     ConstraintRef,
@@ -230,5 +231,6 @@ def test_marginal_gain_threshold_must_be_finite_and_nonnegative(threshold: float
         )
 
 
-def test_stop_decision_is_a_domain_model() -> None:
-    assert issubclass(StopDecision, object)
+def test_stop_decision_uses_the_frozen_domain_model_contract() -> None:
+    assert issubclass(StopDecision, DomainModel)
+    assert StopDecision.model_config["frozen"] is True

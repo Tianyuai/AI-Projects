@@ -16,7 +16,7 @@ _FIELDS: tuple[ConstraintKind, ...] = (
 )
 
 
-def _normalize(value: str) -> str:
+def normalize_constraint_value(value: str) -> str:
     return " ".join(value.split()).casefold()
 
 
@@ -25,7 +25,7 @@ def extract_strong_constraints(spec: QuerySpec) -> tuple[ConstraintRef, ...]:
     for kind in _FIELDS:
         seen: set[str] = set()
         for raw in getattr(spec, kind):
-            normalized = _normalize(raw)
+            normalized = normalize_constraint_value(raw)
             if normalized in seen:
                 continue
             seen.add(normalized)
@@ -67,7 +67,7 @@ class CoverageAnalyzer:
         observed: dict[tuple[str, tuple[str, str]], bool] = {}
         for observation in observations:
             if (
-                _normalize(observation.constraint.value)
+                normalize_constraint_value(observation.constraint.value)
                 != observation.constraint.normalized_value
             ):
                 raise ValueError("constraint raw value does not match normalized value")

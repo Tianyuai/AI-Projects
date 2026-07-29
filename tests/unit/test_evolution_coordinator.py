@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+from paper_search.control.budget import BudgetExceededError, ReservationError
 from paper_search.domain.models import Paper, QuerySpec, UsageActual, UsageEstimate
 from paper_search.evolution import (
     CandidateConstraintObservation,
@@ -99,6 +100,15 @@ def incomplete_coverage() -> CoverageReport:
     )
 
 
+def complete_coverage() -> CoverageReport:
+    return CoverageReport(
+        constraints=[],
+        covered_count=0,
+        low_coverage_count=0,
+        uncovered_count=0,
+    )
+
+
 class FakeExecutor:
     def __init__(
         self,
@@ -114,6 +124,25 @@ class FakeExecutor:
         self.calls.append((spec, plan))
         if len(self.calls) == self._fail_on_call:
             raise RuntimeError("secret executor payload")
+        return self._executions[len(self.calls) - 1]
+
+
+class RejectingExecutor(FakeExecutor):
+    def __init__(
+        self,
+        executions: Sequence[RoundExecution],
+        *,
+        rejection: Exception,
+        reject_on_call: int,
+    ) -> None:
+        super().__init__(executions)
+        self._rejection = rejection
+        self._reject_on_call = reject_on_call
+
+    async def execute(self, spec: QuerySpec, plan: RoundPlan) -> RoundExecution:
+        self.calls.append((spec, plan))
+        if len(self.calls) == self._reject_on_call:
+            raise self._rejection
         return self._executions[len(self.calls) - 1]
 
 
@@ -134,6 +163,21 @@ class FakeCoverageAnalyzer:
         if len(self.calls) == self._fail_on_call:
             raise RuntimeError("secret coverage matrix")
         return incomplete_coverage()
+
+
+class RetainingCoverageAnalyzer(FakeCoverageAnalyzer):
+    def __init__(self, reports: Sequence[CoverageReport]) -> None:
+        super().__init__()
+        self._reports = list(reports)
+
+    def analyze(
+        self,
+        spec: QuerySpec,
+        candidate_ids: Sequence[str],
+        observations: Sequence[CandidateConstraintObservation],
+    ) -> CoverageReport:
+        self.calls.append((spec, list(candidate_ids), list(observations)))
+        return self._reports[len(self.calls) - 1]
 
 
 class FakeGenerator:
@@ -205,6 +249,21 @@ class FakeGainEvaluator:
             new_high_relevance_count=new_count,
             score=self._score,
         )
+
+
+class RetainingGainEvaluator(FakeGainEvaluator):
+    def __init__(self, retained: MarginalGain) -> None:
+        super().__init__()
+        self._retained = retained
+
+    def evaluate(
+        self,
+        previous_ids: frozenset[str],
+        current_ids: frozenset[str],
+        execution: RoundExecution,
+    ) -> MarginalGain:
+        self.calls.append((previous_ids, current_ids, execution))
+        return self._retained
 
 
 class FakeBudget:
@@ -306,6 +365,56 @@ class MutatingGenerator(FakeGenerator):
         prior_plans[0].subqueries[0].target_constraints.append("corrupted")
         prior_plans.clear()
         raise RuntimeError("secret generation mutation")
+
+
+class MutatingRetainedCoverageGenerator(FakeGenerator):
+    def __init__(self, retained_coverage: CoverageReport) -> None:
+        super().__init__()
+        self._retained_coverage = retained_coverage
+
+    async def generate(
+        self,
+        *,
+        spec: QuerySpec,
+        coverage: CoverageReport,
+        prior_plans: Sequence[RoundPlan],
+        round_number: int,
+        max_subqueries: int,
+    ) -> RoundPlan:
+        generated = await super().generate(
+            spec=spec,
+            coverage=coverage,
+            prior_plans=prior_plans,
+            round_number=round_number,
+            max_subqueries=max_subqueries,
+        )
+        self._retained_coverage.__dict__["uncovered_count"] = 0
+        return generated
+
+
+class MutatingRetainedGainGenerator(FakeGenerator):
+    def __init__(self, retained_gain: MarginalGain) -> None:
+        super().__init__()
+        self._retained_gain = retained_gain
+
+    async def generate(
+        self,
+        *,
+        spec: QuerySpec,
+        coverage: CoverageReport,
+        prior_plans: Sequence[RoundPlan],
+        round_number: int,
+        max_subqueries: int,
+    ) -> RoundPlan:
+        generated = await super().generate(
+            spec=spec,
+            coverage=coverage,
+            prior_plans=prior_plans,
+            round_number=round_number,
+            max_subqueries=max_subqueries,
+        )
+        self._retained_gain.__dict__["score"] = 0.0
+        return generated
 
 
 class SharedEstimateEstimator(FakeEstimator):
@@ -493,6 +602,52 @@ def test_later_executor_failure_preserves_committed_first_seen_state() -> None:
     assert result.decisions[-1].failed_stage == "execution"
 
 
+@pytest.mark.parametrize(
+    ("rejection", "reason", "failed_round", "warnings", "failed_stage"),
+    [
+        (BudgetExceededError("reservation lost"), "budget_insufficient", None, [], None),
+        (
+            ReservationError("reservation invalid"),
+            "round_failed",
+            2,
+            ["execution: dependency failure"],
+            "execution",
+        ),
+    ],
+)
+def test_execution_rejection_preserves_prior_state_with_its_typed_outcome(
+    rejection: Exception,
+    reason: str,
+    failed_round: int | None,
+    warnings: list[str],
+    failed_stage: str | None,
+) -> None:
+    first_execution = execution(1)
+    first_before = first_execution.model_dump(mode="json")
+    executor = RejectingExecutor(
+        [first_execution, execution(2)],
+        rejection=rejection,
+        reject_on_call=2,
+    )
+
+    result = run(
+        coordinator(executor=executor),
+        strategy="fixed_two_round",
+    )
+
+    assert [item.model_dump(mode="json") for item in result.rounds] == [first_before]
+    assert [item.model_dump(mode="json") for item in result.candidates] == first_before[
+        "candidates"
+    ]
+    assert result.stop_reason == reason
+    assert result.failed_round == failed_round
+    assert result.warnings == warnings
+    assert result.decisions[-1].failed_stage == failed_stage
+    assert result.decisions[-1].checks["budget_insufficient"] is (
+        reason == "budget_insufficient"
+    )
+
+
 def test_executor_cannot_mutate_retained_committed_output_on_later_failure() -> None:
     first_paper = Paper(
         canonical_id="p1",
@@ -584,6 +739,53 @@ def test_next_round_budget_rejection_preserves_committed_round() -> None:
     assert [decision.reason_code for decision in result.decisions] == [
         "budget_insufficient"
     ]
+
+
+def test_retained_coverage_return_cannot_change_decision_after_async_generation() -> None:
+    retained_coverage = incomplete_coverage()
+    result = run(
+        coordinator(
+            executor=FakeExecutor([execution(1), execution(2)]),
+            coverage_analyzer=RetainingCoverageAnalyzer(
+                [retained_coverage, complete_coverage()]
+            ),
+            generator=MutatingRetainedCoverageGenerator(retained_coverage),
+        ),
+        strategy="adaptive",
+    )
+
+    assert [item.round_number for item in result.rounds] == [1, 2]
+    assert [item.reason_code for item in result.decisions] == [
+        "continue_evolution",
+        "coverage_complete",
+    ]
+    assert retained_coverage.is_complete is True
+
+
+def test_retained_gain_return_cannot_change_decision_after_async_generation() -> None:
+    retained_gain = MarginalGain(
+        new_candidate_count=1,
+        new_high_relevance_count=1,
+        score=1.0,
+    )
+    result = run(
+        coordinator(
+            executor=FakeExecutor([execution(1), execution(2)]),
+            coverage_analyzer=RetainingCoverageAnalyzer(
+                [incomplete_coverage(), complete_coverage()]
+            ),
+            generator=MutatingRetainedGainGenerator(retained_gain),
+            gain_evaluator=RetainingGainEvaluator(retained_gain),
+        ),
+        strategy="adaptive",
+    )
+
+    assert [item.round_number for item in result.rounds] == [1, 2]
+    assert [item.reason_code for item in result.decisions] == [
+        "continue_evolution",
+        "coverage_complete",
+    ]
+    assert retained_gain.score == 0.0
 
 
 @pytest.mark.parametrize("round_number_offset", [-1, 1])
@@ -786,3 +988,71 @@ def test_duplicate_candidates_and_observations_keep_first_seen_objects() -> None
     assert analyzer.calls[-1][2][0].model_dump(mode="json") == observation_before
     assert gain.calls[-1][0] == frozenset({"duplicate"})
     assert gain.calls[-1][1] == frozenset({"duplicate"})
+
+
+def test_duplicate_cells_in_an_incoming_execution_fail_before_commit() -> None:
+    first_execution = execution(
+        1,
+        candidates=[paper("p1", "First paper")],
+        observations=[observation("p1", matched=False)],
+    )
+    first_before = first_execution.model_dump(mode="json")
+    second_execution = execution(
+        2,
+        candidates=[paper("p2", "Second paper")],
+        observations=[
+            observation("p2", matched=False),
+            observation("p2", matched=True),
+        ],
+    )
+
+    result = run(
+        coordinator(executor=FakeExecutor([first_execution, second_execution])),
+        strategy="fixed_two_round",
+    )
+
+    assert [item.model_dump(mode="json") for item in result.rounds] == [first_before]
+    assert [item.model_dump(mode="json") for item in result.candidates] == first_before[
+        "candidates"
+    ]
+    assert result.stop_reason == "round_failed"
+    assert result.failed_round == 2
+    assert result.warnings == ["execution: dependency failure"]
+    assert result.decisions[-1].failed_stage == "execution"
+
+
+def test_inconsistent_incoming_constraint_cannot_hide_behind_prior_normalized_cell() -> None:
+    first_execution = execution(
+        1,
+        candidates=[paper("p1", "First paper")],
+        observations=[observation("p1", matched=False)],
+    )
+    first_before = first_execution.model_dump(mode="json")
+    forged_observation = CandidateConstraintObservation(
+        paper_id="p1",
+        constraint=ConstraintRef(
+            kind="topics",
+            value="unrelated",
+            normalized_value="topic",
+        ),
+        matched=True,
+    )
+    second_execution = execution(
+        2,
+        candidates=[paper("p1", "Later paper")],
+        observations=[forged_observation],
+    )
+
+    result = run(
+        coordinator(executor=FakeExecutor([first_execution, second_execution])),
+        strategy="fixed_two_round",
+    )
+
+    assert [item.model_dump(mode="json") for item in result.rounds] == [first_before]
+    assert [item.model_dump(mode="json") for item in result.candidates] == first_before[
+        "candidates"
+    ]
+    assert result.stop_reason == "round_failed"
+    assert result.failed_round == 2
+    assert result.warnings == ["execution: dependency failure"]
+    assert result.decisions[-1].failed_stage == "execution"

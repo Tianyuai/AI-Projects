@@ -3,9 +3,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol, TypeVar
 
+from paper_search.control.budget import BudgetExceededError
 from paper_search.domain.models import DomainModel, Paper, QuerySpec, UsageEstimate
 
-from .coverage import CoverageAnalyzer
+from .coverage import CoverageAnalyzer, normalize_constraint_value
 from .costing import RoundCostEstimator
 from .generation import NextRoundGenerator, NoTargetedQueriesError
 from .models import (
@@ -80,6 +81,26 @@ def _merge_observations(
             seen.add(key)
             result.append(item)
     return result
+
+
+def _validate_incoming_observations(
+    observations: Sequence[CandidateConstraintObservation],
+) -> None:
+    observed_cells: set[tuple[str, str, str]] = set()
+    for observation in observations:
+        if (
+            normalize_constraint_value(observation.constraint.value)
+            != observation.constraint.normalized_value
+        ):
+            raise ValueError("constraint raw value does not match normalized value")
+        cell = (
+            observation.paper_id,
+            observation.constraint.kind,
+            observation.constraint.normalized_value,
+        )
+        if cell in observed_cells:
+            raise ValueError("duplicate incoming coverage matrix cell")
+        observed_cells.add(cell)
 
 
 def _finish(
@@ -253,6 +274,24 @@ class EvolutionCoordinator:
                 if execution.round_number != plan.round_number:
                     raise ValueError("execution round number does not match its plan")
                 execution = _snapshot(execution)
+                _validate_incoming_observations(execution.observations)
+            except BudgetExceededError:
+                decision = decide_stop(
+                    strategy=strategy,
+                    completed_rounds=len(rounds),
+                    coverage=coverage,
+                    gain=gain,
+                    budget_available=False,
+                    max_rounds=max_rounds,
+                    marginal_gain_threshold=marginal_gain_threshold,
+                )
+                return _finish(
+                    strategy=strategy,
+                    rounds=rounds,
+                    candidates=candidates,
+                    decisions=[*decisions, decision],
+                    warnings=[],
+                )
             except Exception:
                 return _failure(
                     stage="execution",
@@ -273,10 +312,12 @@ class EvolutionCoordinator:
             current_ids = frozenset(paper.canonical_id for paper in candidates)
 
             try:
-                coverage = self._coverage_analyzer.analyze(
-                    _snapshot(private_spec),
-                    [paper.canonical_id for paper in candidates],
-                    _snapshot_sequence(observations),
+                coverage = _snapshot(
+                    self._coverage_analyzer.analyze(
+                        _snapshot(private_spec),
+                        [paper.canonical_id for paper in candidates],
+                        _snapshot_sequence(observations),
+                    )
                 )
             except Exception:
                 return _failure(
@@ -293,10 +334,12 @@ class EvolutionCoordinator:
                 )
 
             try:
-                gain = self._gain_evaluator.evaluate(
-                    previous_ids,
-                    current_ids,
-                    _snapshot(execution),
+                gain = _snapshot(
+                    self._gain_evaluator.evaluate(
+                        previous_ids,
+                        current_ids,
+                        _snapshot(execution),
+                    )
                 )
             except Exception:
                 return _failure(

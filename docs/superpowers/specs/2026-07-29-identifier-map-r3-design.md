@@ -17,9 +17,12 @@ none remains in the arXiv namespace. The map body remains private.
 ## Runner Interface and Confinement
 
 The evaluation CLI accepts an optional `--id-map PATH`. The path is relative to
-the run's `data/` root, must resolve beneath that root, and must name an existing
-file. Absolute paths and traversal outside `data/` are rejected before any
-network call.
+the process working directory and is supplied in repository form, for example
+`data/annotation_work/dev_identifier_map.v1.json`. Its resolved target must be
+beneath the resolved `data/` root and must name an existing file. Absolute paths
+and traversal outside `data/` are rejected before any network call. This
+interface matches the existing Week1 identifier-map plan and also works when
+`data/` is a junction to the frozen Week1 directory.
 
 The CLI reads and hashes the exact map bytes, validates them with
 `IdentifierMap.from_path`, and checks explicit alias coverage for every unique
@@ -43,6 +46,10 @@ The same validated map instance is passed to:
 - `run.json.identity.id_map_sha256` records the exact map hash;
 - `run.json.input_hashes.id_map` records the same hash;
 - `metrics.json.input_hashes.id_map` records the same hash.
+
+Every recorded map hash uses the canonical `sha256:` prefix followed by 64
+lowercase hexadecimal characters. Formal artifacts record neither the map path
+nor any map entry.
 
 When no map is supplied, `id_map_sha256` and the `id_map` input hash are omitted
 from formal artifacts. Existing no-map artifact shapes and behavior remain
@@ -74,7 +81,8 @@ cache. R1 and R2 remain immutable.
 
 The real command runs in the foreground from `D:\AI Projects\Projects` with
 relative `--env-file .env`. A secret-safe execution receipt outside the formal
-artifact directory records:
+artifact directory is written atomically after the runner's `main` function
+returns, and the launcher exits with the same code. The receipt records:
 
 - full source SHA;
 - wrapper SHA-256;
@@ -82,7 +90,8 @@ artifact directory records:
 - direct process exit code;
 - run-relative output and cache paths.
 
-The receipt never records environment values or the map body.
+The receipt never records environment values, the private map path, or the map
+body.
 
 ## R3 Acceptance
 
@@ -97,10 +106,15 @@ Before R3 is reported as the formal development baseline:
 - `invalid_request` is zero;
 - search calls, snapshots, cache-key coverage, and prediction coverage are
   positive;
-- mapped aggregate metrics are internally consistent and no longer interpreted
-  through disjoint identifier namespaces;
-- a secret scan finds no credentials or map body in the receipt, formal
-  artifacts, snapshots, or cache metadata.
+- mapped aggregate metrics are internally consistent, contain at least one true
+  positive, and have macro and micro Recall greater than zero;
+- aggregate R3 retrieval coverage, provider-error counts, and mapped metrics are
+  compared with R2 without treating R2's no-map zero metrics as a performance
+  result;
+- a secret scan finds no credentials, private map path, complete serialized map,
+  or map-entry structure in the receipt, formal metadata, or cache metadata.
+  Individual DOI/OpenAlex identifiers may legitimately occur in provider
+  snapshots and predictions and are not, by themselves, evidence of a map leak.
 
 The seven R2 `invalid_work` records remain a separately reported quality concern
 unless R3 evidence changes their aggregate count.

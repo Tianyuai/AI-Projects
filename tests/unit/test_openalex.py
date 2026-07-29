@@ -89,6 +89,48 @@ def test_search_builds_safe_bounded_request_and_maps_results(tmp_path: Path) -> 
     assert API_KEY not in json.dumps(result.provenance)
 
 
+def test_search_removes_openalex_wildcards_and_collapses_whitespace(
+    tmp_path: Path,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=fixture_bytes("works_page_1.json"))
+
+    asyncio.run(
+        run_search(
+            SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            handler,
+            query="  graph?   retrieval* methods  ",
+        )
+    )
+
+    assert seen[0].url.params["search"] == "graph retrieval methods"
+
+
+def test_search_rejects_query_that_is_empty_after_wildcard_normalization(
+    tmp_path: Path,
+) -> None:
+    requested = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requested
+        requested = True
+        return httpx.Response(200, content=fixture_bytes("works_page_1.json"))
+
+    with pytest.raises(ValueError, match="query must not be empty"):
+        asyncio.run(
+            run_search(
+                SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+                handler,
+                query=" ? * ",
+            )
+        )
+
+    assert requested is False
+
+
 def test_api_key_request_is_pinned_to_openalex_without_redirects(tmp_path: Path) -> None:
     seen: list[httpx.Request] = []
 

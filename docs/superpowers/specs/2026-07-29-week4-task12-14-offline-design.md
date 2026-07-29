@@ -239,6 +239,12 @@ Define injected asynchronous protocols:
    and apply the budget preflight;
 8. emit a `StopDecision` and repeat only when it says to continue.
 
+For `fixed_two_round` only, if the targeted generator has no low-coverage or
+uncovered target, the coordinator replays a deep snapshot of the initial plan.
+The replay preserves query IDs because they identify the same query semantics;
+the new `RoundPlan.round_number` distinguishes the separate execution instance.
+This fallback is not used for other strategies or generator failures.
+
 If generation, estimation, execution, coverage analysis, or gain evaluation
 fails, the coordinator records a bounded safe warning and `round_failed`.
 Previously committed rounds and candidates remain unchanged. Provider usage

@@ -108,6 +108,28 @@ def test_matrix_uses_normalized_constraint_identity() -> None:
     assert report.constraints[0].matched_candidate_ids == ["p1"]
 
 
+def test_analyze_rejects_inconsistent_raw_and_normalized_constraint() -> None:
+    spec = QuerySpec(original_query="q", research_goal="g", topics=["Graph RAG"])
+    forged_constraint = ConstraintRef(
+        kind="topics",
+        value="unrelated",
+        normalized_value="graph rag",
+    )
+
+    with pytest.raises(ValueError, match="raw value does not match normalized value"):
+        CoverageAnalyzer(covered_min_hits=1).analyze(
+            spec,
+            ["p1"],
+            [
+                CandidateConstraintObservation(
+                    paper_id="p1",
+                    constraint=forged_constraint,
+                    matched=True,
+                )
+            ],
+        )
+
+
 @pytest.mark.parametrize("threshold", [True, False, 1.0, 0, -1])
 def test_covered_min_hits_requires_a_positive_integer(threshold: object) -> None:
     with pytest.raises(ValueError):

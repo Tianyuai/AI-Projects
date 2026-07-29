@@ -66,6 +66,11 @@ class CoverageAnalyzer:
         }
         observed: dict[tuple[str, tuple[str, str]], bool] = {}
         for observation in observations:
+            if (
+                _normalize(observation.constraint.value)
+                != observation.constraint.normalized_value
+            ):
+                raise ValueError("constraint raw value does not match normalized value")
             cell_key = (observation.paper_id, _constraint_key(observation.constraint))
             if cell_key not in expected_keys:
                 raise ValueError("observation is outside the expected coverage matrix")

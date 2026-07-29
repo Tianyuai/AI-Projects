@@ -10,8 +10,13 @@ from .models import (
     ConstraintCoverage,
     ConstraintRef,
     CoverageReport,
+    EvolutionStrategy,
+    MarginalGain,
     RoundPlan,
+    StopDecision,
+    StopReason,
 )
+from .stopping import decide_stop
 
 __all__ = [
     "CandidateConstraintObservation",
@@ -20,10 +25,15 @@ __all__ = [
     "CoverageAnalyzer",
     "CoverageReport",
     "DeterministicRoundCostEstimator",
+    "EvolutionStrategy",
+    "MarginalGain",
     "NextRoundGenerator",
     "NoTargetedQueriesError",
     "RoundPlan",
     "RoundCostEstimator",
     "RuleBasedNextRoundGenerator",
+    "StopDecision",
+    "StopReason",
+    "decide_stop",
     "extract_strong_constraints",
 ]

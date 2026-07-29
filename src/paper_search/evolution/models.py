@@ -8,6 +8,15 @@ ConstraintKind = Literal[
     "must_have", "topics", "methods", "tasks", "datasets", "domains", "venues"
 ]
 CoverageStatus = Literal["covered", "low_coverage", "uncovered"]
+EvolutionStrategy = Literal["fixed_one_round", "fixed_two_round", "adaptive"]
+StopReason = Literal[
+    "round_failed",
+    "coverage_complete",
+    "max_rounds_reached",
+    "marginal_gain_below_threshold",
+    "budget_insufficient",
+    "continue_evolution",
+]
 
 
 class ConstraintRef(DomainModel):
@@ -43,3 +52,22 @@ class CoverageReport(DomainModel):
 class RoundPlan(DomainModel):
     round_number: int = Field(strict=True, gt=0)
     subqueries: list[SubQuery] = Field(min_length=1)
+
+
+class MarginalGain(DomainModel):
+    new_candidate_count: int = Field(strict=True, ge=0)
+    new_high_relevance_count: int = Field(strict=True, ge=0)
+    score: float = Field(ge=0, allow_inf_nan=False)
+    f1_delta: float | None = Field(default=None, allow_inf_nan=False)
+    recall_delta: float | None = Field(default=None, allow_inf_nan=False)
+
+
+class StopDecision(DomainModel):
+    should_continue: bool
+    reason_code: StopReason
+    strategy: EvolutionStrategy
+    completed_rounds: int = Field(strict=True, ge=0)
+    max_rounds: int = Field(strict=True, gt=0)
+    marginal_gain_threshold: float = Field(ge=0, allow_inf_nan=False)
+    checks: dict[str, bool]
+    failed_stage: str | None = None

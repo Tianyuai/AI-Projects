@@ -4,7 +4,13 @@ import pytest
 import yaml
 
 from paper_search.evaluation import ExperimentAggregate
-from paper_search.evaluation.ablations import AblationCase, AblationReport, run_ablations
+from paper_search.evaluation.ablations import (
+    AblationCase,
+    AblationReport,
+    evolution_strategy_for_modules,
+    run_ablations,
+)
+from paper_search.evolution import EvolutionStrategy
 
 
 REQUIRED_CASE_NAMES = [
@@ -51,6 +57,41 @@ def _modules(**overrides: bool) -> dict[str, bool]:
     modules = {name: False for name in PUBLIC_MODULES}
     modules.update(overrides)
     return modules
+
+
+@pytest.mark.parametrize(
+    ("fixed_two", "adaptive", "expected"),
+    [
+        (False, False, "fixed_one_round"),
+        (True, False, "fixed_two_round"),
+        (False, True, "adaptive"),
+    ],
+)
+def test_maps_public_flags_to_offline_strategy(
+    fixed_two: bool,
+    adaptive: bool,
+    expected: EvolutionStrategy,
+) -> None:
+    modules = _modules()
+    modules["fixed_two_round"] = fixed_two
+    modules["adaptive_evolution"] = adaptive
+
+    assert evolution_strategy_for_modules(modules) == expected
+
+
+def test_rejects_conflicting_evolution_flags() -> None:
+    modules = _modules(fixed_two_round=True, adaptive_evolution=True)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        evolution_strategy_for_modules(modules)
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_rejects_non_boolean_evolution_flags(value: object) -> None:
+    modules = {**_modules(), "fixed_two_round": value}
+
+    with pytest.raises(ValueError, match="must be booleans"):
+        evolution_strategy_for_modules(modules)
 
 
 def _case(name: str, **overrides: bool) -> AblationCase:

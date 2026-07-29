@@ -16,6 +16,7 @@ from paper_search.evolution import (
     MarginalGain,
     RoundExecution,
     RoundPlan,
+    RuleBasedNextRoundGenerator,
     extract_strong_constraints,
 )
 
@@ -47,8 +48,10 @@ def round_plan(round_number: int) -> RoundPlan:
 class FakeExecutor:
     def __init__(self, *, coverage_complete_after: int | None = None) -> None:
         self.coverage_complete_after = coverage_complete_after
+        self.plans: list[RoundPlan] = []
 
     async def execute(self, spec: QuerySpec, plan: RoundPlan) -> RoundExecution:
+        self.plans.append(plan)
         constraint = extract_strong_constraints(spec)[0]
         matched = (
             self.coverage_complete_after is not None
@@ -104,7 +107,10 @@ class FakeGainEvaluator:
 
 
 def build_fake_coordinator(
-    *, coverage_complete_after: int | None = None
+    *,
+    coverage_complete_after: int | None = None,
+    executor: FakeExecutor | None = None,
+    generator: FakeGenerator | RuleBasedNextRoundGenerator | None = None,
 ) -> EvolutionCoordinator:
     budget = HardBudgetController(
         SearchBudget(
@@ -121,9 +127,9 @@ def build_fake_coordinator(
         )
     )
     return EvolutionCoordinator(
-        executor=FakeExecutor(coverage_complete_after=coverage_complete_after),
+        executor=executor or FakeExecutor(coverage_complete_after=coverage_complete_after),
         coverage_analyzer=CoverageAnalyzer(covered_min_hits=1),
-        generator=FakeGenerator(),
+        generator=generator or FakeGenerator(),
         estimator=DeterministicRoundCostEstimator(
             search_calls_per_subquery=1,
             llm_calls_per_round=0,
@@ -186,3 +192,29 @@ def test_adaptive_stops_when_coverage_becomes_complete() -> None:
         "continue_evolution",
         "coverage_complete",
     ]
+
+
+def test_fixed_two_round_reuses_initial_plan_when_complete_coverage_has_no_target() -> None:
+    executor = FakeExecutor(coverage_complete_after=1)
+    initial_plan = round_plan(1)
+    coordinator = build_fake_coordinator(
+        executor=executor,
+        generator=RuleBasedNextRoundGenerator(),
+    )
+
+    result = asyncio.run(
+        coordinator.run(
+            spec=query_spec(),
+            initial_plan=initial_plan,
+            strategy="fixed_two_round",
+            max_rounds=4,
+            max_subqueries=2,
+            marginal_gain_threshold=0.5,
+        )
+    )
+
+    assert [round_execution.round_number for round_execution in result.rounds] == [1, 2]
+    assert result.stop_reason == "max_rounds_reached"
+    assert result.warnings == []
+    assert executor.plans[1].round_number == 2
+    assert executor.plans[1].subqueries == initial_plan.subqueries

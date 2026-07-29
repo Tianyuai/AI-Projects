@@ -38,10 +38,10 @@ that require an authorized operator, credentials, and a fresh provider cache.
 These checks can run now after the selected locked environment is prepared;
 they require no credential or external-provider authorization.
 
-- [ ] Run `uv run --no-sync --no-env-file python -m paper_search.health`.
-- [ ] Run `uv run --no-sync --no-env-file pytest -q`.
-- [ ] Run `uv run --no-sync --no-env-file ruff check .`.
-- [ ] Run `uv run --no-sync --no-env-file mypy src`.
+- [ ] Run `D:\Dev\uv\uv.exe run --no-sync --no-env-file python -m paper_search.health`.
+- [ ] Run `D:\Dev\uv\uv.exe run --no-sync --no-env-file pytest -q`.
+- [ ] Run `D:\Dev\uv\uv.exe run --no-sync --no-env-file ruff check .`.
+- [ ] Run `D:\Dev\uv\uv.exe run --no-sync --no-env-file mypy src`.
 - [ ] Preserve any skipped credential-gated online test as a skip, not as a
   successful provider check.
 
@@ -49,7 +49,7 @@ they require no credential or external-provider authorization.
 
 This gate can run now and exercises only the synthetic, loopback-only service.
 
-- [ ] Start `uv run --no-sync --no-env-file python -m paper_search.api.mock_server --host 127.0.0.1 --port 8000`.
+- [ ] Start `D:\Dev\uv\uv.exe run --no-sync --no-env-file python -m paper_search.api.mock_server --host 127.0.0.1 --port 8000`.
 - [ ] Check `http://127.0.0.1:8000/health/live` and
   `http://127.0.0.1:8000/health/ready` from a second local terminal.
 - [ ] Submit one synthetic `POST /v1/search` request and confirm its response

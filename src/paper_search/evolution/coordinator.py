@@ -7,7 +7,7 @@ from paper_search.domain.models import DomainModel, Paper, QuerySpec, UsageEstim
 
 from .coverage import CoverageAnalyzer
 from .costing import RoundCostEstimator
-from .generation import NextRoundGenerator
+from .generation import NextRoundGenerator, NoTargetedQueriesError
 from .models import (
     CandidateConstraintObservation,
     CoverageReport,
@@ -18,7 +18,7 @@ from .models import (
     RoundPlan,
     StopDecision,
 )
-from .stopping import decide_stop
+from .stopping import decide_stop, validate_run_controls
 
 ModelT = TypeVar("ModelT", bound=DomainModel)
 
@@ -135,6 +135,16 @@ def _failure(
     )
 
 
+def _fixed_two_round_fallback(
+    initial_plan: RoundPlan,
+    round_number: int,
+) -> RoundPlan:
+    return RoundPlan(
+        round_number=round_number,
+        subqueries=_snapshot_sequence(initial_plan.subqueries),
+    )
+
+
 class EvolutionCoordinator:
     def __init__(
         self,
@@ -163,6 +173,16 @@ class EvolutionCoordinator:
         max_subqueries: int,
         marginal_gain_threshold: float,
     ) -> EvolutionResult:
+        controls = validate_run_controls(
+            strategy=strategy,
+            max_rounds=max_rounds,
+            max_subqueries=max_subqueries,
+            marginal_gain_threshold=marginal_gain_threshold,
+        )
+        strategy = controls.strategy
+        max_rounds = controls.max_rounds
+        max_subqueries = controls.max_subqueries
+        marginal_gain_threshold = controls.marginal_gain_threshold
         rounds: list[RoundExecution] = []
         candidates: list[Paper] = []
         observations: list[CandidateConstraintObservation] = []
@@ -322,6 +342,22 @@ class EvolutionCoordinator:
                 if generated_plan.round_number != next_round_number:
                     raise ValueError("generated round number does not match request")
                 next_plan = _snapshot(generated_plan)
+            except NoTargetedQueriesError:
+                if strategy == "fixed_two_round" and coverage.is_complete:
+                    next_plan = _fixed_two_round_fallback(plans[0], next_round_number)
+                else:
+                    return _failure(
+                        stage="generation",
+                        failed_round=next_round_number,
+                        strategy=strategy,
+                        max_rounds=max_rounds,
+                        marginal_gain_threshold=marginal_gain_threshold,
+                        rounds=rounds,
+                        candidates=candidates,
+                        decisions=decisions,
+                        coverage=coverage,
+                        gain=gain,
+                    )
             except Exception:
                 return _failure(
                     stage="generation",

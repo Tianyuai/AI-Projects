@@ -35,8 +35,8 @@ def extract_strong_constraints(spec: QuerySpec) -> tuple[ConstraintRef, ...]:
     return tuple(result)
 
 
-def _constraint_key(constraint: ConstraintRef) -> tuple[str, str, str]:
-    return constraint.kind, constraint.value, constraint.normalized_value
+def _constraint_key(constraint: ConstraintRef) -> tuple[str, str]:
+    return constraint.kind, constraint.normalized_value
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,7 +64,7 @@ class CoverageAnalyzer:
             for paper_id in unique_candidate_ids
             for constraint in constraints
         }
-        observed: dict[tuple[str, tuple[str, str, str]], bool] = {}
+        observed: dict[tuple[str, tuple[str, str]], bool] = {}
         for observation in observations:
             cell_key = (observation.paper_id, _constraint_key(observation.constraint))
             if cell_key not in expected_keys:

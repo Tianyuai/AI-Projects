@@ -348,6 +348,8 @@ def run(
     *,
     strategy: str = "fixed_one_round",
     max_rounds: int = 2,
+    max_subqueries: int = 2,
+    marginal_gain_threshold: float = 0.5,
     spec: QuerySpec | None = None,
     initial_plan: RoundPlan | None = None,
 ) -> Any:
@@ -359,10 +361,48 @@ def run(
             initial_plan=run_plan,
             strategy=strategy,
             max_rounds=max_rounds,
-            max_subqueries=2,
-            marginal_gain_threshold=0.5,
+            max_subqueries=max_subqueries,
+            marginal_gain_threshold=marginal_gain_threshold,
         )
     )
+
+
+@pytest.mark.parametrize(
+    "controls",
+    [
+        {"strategy": "not-a-strategy"},
+        {"max_rounds": 0},
+        {"max_subqueries": 0},
+        {"marginal_gain_threshold": -0.1},
+    ],
+)
+def test_invalid_run_controls_fail_before_any_dependency_call(
+    controls: dict[str, object],
+) -> None:
+    executor = FakeExecutor([execution(1)])
+    coverage_analyzer = FakeCoverageAnalyzer()
+    generator = FakeGenerator()
+    estimator = FakeEstimator()
+    gain_evaluator = FakeGainEvaluator()
+    budget = FakeBudget()
+    instance = coordinator(
+        executor=executor,
+        coverage_analyzer=coverage_analyzer,
+        generator=generator,
+        estimator=estimator,
+        gain_evaluator=gain_evaluator,
+        budget=budget,
+    )
+
+    with pytest.raises(ValueError):
+        run(instance, **controls)  # type: ignore[arg-type]
+
+    assert executor.calls == []
+    assert coverage_analyzer.calls == []
+    assert generator.calls == []
+    assert estimator.calls == []
+    assert gain_evaluator.calls == []
+    assert budget.calls == []
 
 
 @pytest.mark.parametrize(

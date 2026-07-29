@@ -7,14 +7,21 @@ from paper_search.domain.models import DomainModel
 from .models import CoverageReport, EvolutionStrategy, MarginalGain, StopDecision, StopReason
 
 
-class _StopInputs(DomainModel):
+class _PolicyControls(DomainModel):
     strategy: EvolutionStrategy
+    max_rounds: int = Field(strict=True, gt=0)
+    marginal_gain_threshold: float = Field(strict=True, ge=0, allow_inf_nan=False)
+
+
+class _RunControls(_PolicyControls):
+    max_subqueries: int = Field(strict=True, gt=0)
+
+
+class _StopInputs(_PolicyControls):
     completed_rounds: int = Field(strict=True, ge=0)
     coverage: CoverageReport | None
     gain: MarginalGain | None
     budget_available: bool = Field(strict=True)
-    max_rounds: int = Field(strict=True, gt=0)
-    marginal_gain_threshold: float = Field(strict=True, ge=0, allow_inf_nan=False)
     failed_stage: str | None
 
 
@@ -25,6 +32,23 @@ class _StopPolicy:
         ("max_rounds_reached", "max_rounds_reached"),
         ("marginal_gain_below_threshold", "marginal_gain_below_threshold"),
         ("budget_insufficient", "budget_insufficient"),
+    )
+
+
+def validate_run_controls(
+    *,
+    strategy: EvolutionStrategy,
+    max_rounds: int,
+    max_subqueries: int,
+    marginal_gain_threshold: float,
+) -> _RunControls:
+    return _RunControls.model_validate(
+        {
+            "strategy": strategy,
+            "max_rounds": max_rounds,
+            "max_subqueries": max_subqueries,
+            "marginal_gain_threshold": marginal_gain_threshold,
+        }
     )
 
 

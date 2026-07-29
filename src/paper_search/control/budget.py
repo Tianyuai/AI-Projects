@@ -123,6 +123,25 @@ class HardBudgetController:
             self._reservations[reservation.reservation_id] = reservation
             return reservation
 
+    def can_reserve(self, estimate: UsageEstimate) -> bool:
+        """Return whether an estimate currently fits without creating a reservation."""
+        with self._lock:
+            self._expire_locked()
+            if self.stop_status() == "hard_stop":
+                return False
+            if estimate.llm_calls > 0 and estimate.cost_cny is None:
+                raise ReservationError("LLM reservations require a known cost estimate")
+            candidate = [
+                *self._committed,
+                *(item.reserved for item in self._reservations.values()),
+                estimate,
+            ]
+            try:
+                self._check_hard_limits(candidate)
+            except BudgetExceededError:
+                return False
+            return True
+
     def settle(self, reservation: BudgetReservation, actual: UsageActual) -> None:
         with self._lock:
             self._expire_locked()

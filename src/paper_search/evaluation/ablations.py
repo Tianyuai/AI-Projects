@@ -9,6 +9,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from paper_search.evaluation.experiments import ExperimentAggregate
+from paper_search.evolution import EvolutionStrategy
 
 
 PUBLIC_MODULES: tuple[str, ...] = (
@@ -26,6 +27,24 @@ PUBLIC_MODULES: tuple[str, ...] = (
 _SAFE_CASE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*\Z")
 _SAFE_MODULE_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 _PUBLIC_MODULE_SET = frozenset(PUBLIC_MODULES)
+
+
+def evolution_strategy_for_modules(
+    modules: Mapping[str, bool],
+) -> EvolutionStrategy:
+    """Map public evolution flags to an offline evolution strategy."""
+
+    fixed_two = modules.get("fixed_two_round")
+    adaptive = modules.get("adaptive_evolution")
+    if not isinstance(fixed_two, bool) or not isinstance(adaptive, bool):
+        raise ValueError("evolution flags must be booleans")
+    if fixed_two and adaptive:
+        raise ValueError("evolution flags are mutually exclusive")
+    if adaptive:
+        return "adaptive"
+    if fixed_two:
+        return "fixed_two_round"
+    return "fixed_one_round"
 
 
 def _validate_split_phase(

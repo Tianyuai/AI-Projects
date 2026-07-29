@@ -6,12 +6,14 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import BinaryIO, Literal, Protocol
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -189,6 +191,93 @@ def _resolve_cli_id_map(data_root: Path, raw_path: Path) -> Path:
     if not resolved.is_file():
         raise _CliInputError("identifier map file does not exist")
     return resolved
+
+
+def _normalize_windows_final_path(raw_path: str) -> str:
+    if raw_path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + raw_path[8:]
+    if raw_path.startswith("\\\\?\\"):
+        return raw_path[4:]
+    return raw_path
+
+
+if sys.platform == "win32":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    def _windows_final_path_from_file(source: BinaryIO) -> Path:
+        get_final_path = ctypes.WinDLL(
+            "kernel32",
+            use_last_error=True,
+        ).GetFinalPathNameByHandleW
+        get_final_path.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        get_final_path.restype = wintypes.DWORD
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(source.fileno()))
+        buffer_size = 260
+        while buffer_size <= 32_768:
+            buffer = ctypes.create_unicode_buffer(buffer_size)
+            path_length = get_final_path(handle, buffer, buffer_size, 0)
+            if path_length == 0:
+                error_code = ctypes.get_last_error()
+                raise OSError(error_code, "final file target is unavailable")
+            if path_length < buffer_size:
+                return Path(_normalize_windows_final_path(buffer.value))
+            buffer_size = path_length + 1
+        raise OSError("final file target is too long")
+
+else:
+
+    def _windows_final_path_from_file(source: BinaryIO) -> Path:
+        del source
+        raise OSError("Windows final file target lookup is unavailable")
+
+
+def _posix_final_path_from_file(source: BinaryIO) -> Path:
+    descriptor = source.fileno()
+    handle_stat = os.fstat(descriptor)
+    for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        try:
+            raw_target = os.readlink(descriptor_root / str(descriptor))
+        except OSError:
+            continue
+        if not os.path.isabs(raw_target):
+            continue
+        final_path = Path(os.path.normpath(raw_target))
+        try:
+            target_stat = final_path.stat()
+        except OSError:
+            continue
+        if (target_stat.st_dev, target_stat.st_ino) != (
+            handle_stat.st_dev,
+            handle_stat.st_ino,
+        ):
+            continue
+        return final_path
+    raise OSError("final file target is unavailable")
+
+
+def _final_path_from_open_file(source: BinaryIO) -> Path:
+    if os.name == "nt":
+        return _windows_final_path_from_file(source)
+    return _posix_final_path_from_file(source)
+
+
+def _read_confined_identifier_map(data_root: Path, raw_path: Path) -> bytes:
+    resolved_root = data_root.resolve()
+    resolved_path = _resolve_cli_id_map(resolved_root, raw_path)
+    with resolved_path.open("rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise _CliInputError("identifier map file does not exist")
+        final_path = _final_path_from_open_file(source)
+        if not final_path.is_relative_to(resolved_root):
+            raise _CliInputError("identifier map path must stay under data")
+        return source.read()
 
 
 def _require_id_map_coverage(
@@ -754,8 +843,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         identity = frozen_split.identity
         id_map: IdentifierMap | None = None
         if args.id_map is not None:
-            id_map_path = _resolve_cli_id_map(Path("data"), args.id_map)
-            id_map_bytes = id_map_path.read_bytes()
+            id_map_bytes = _read_confined_identifier_map(Path("data"), args.id_map)
             id_map = IdentifierMap.from_bytes(id_map_bytes)
             _require_id_map_coverage(frozen_split.gold, id_map)
             identity = identity.model_copy(

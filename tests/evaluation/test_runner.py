@@ -9,6 +9,7 @@ import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, IO
 
 import pytest
 
@@ -723,15 +724,18 @@ def test_cli_uses_original_identifier_map_bytes_after_file_replacement(
             }
         )
 
-    original_read_bytes = Path.read_bytes
+    original_read_map = runner_module._read_confined_identifier_map
 
-    def replace_map_after_read(path: Path) -> bytes:
-        content = original_read_bytes(path)
-        if path == map_path:
-            path.write_bytes(replacement_bytes)
+    def replace_map_after_read(data_root: Path, raw_path: Path) -> bytes:
+        content = original_read_map(data_root, raw_path)
+        map_path.write_bytes(replacement_bytes)
         return content
 
-    monkeypatch.setattr(Path, "read_bytes", replace_map_after_read)
+    monkeypatch.setattr(
+        runner_module,
+        "_read_confined_identifier_map",
+        replace_map_after_read,
+    )
     monkeypatch.setattr(
         runner_module,
         "OpenAlexProvider",
@@ -752,6 +756,129 @@ def test_cli_uses_original_identifier_map_bytes_after_file_replacement(
     assert run["identity"]["id_map_sha256"] == _sha256(original_bytes)
     assert metrics["summary"]["macro_recall"] == 1.0
     assert metrics["summary"]["micro_recall"] == 1.0
+
+
+def test_cli_rejects_opened_identifier_map_target_outside_data_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(
+        tmp_path,
+        gold_content=(
+            '{"query_id":"query-1","query":"graph retrieval",'
+            '"relevant_paper_ids":["arxiv:2501.10120"]}\n'
+        ),
+    )
+    map_path = tmp_path / "data" / "annotation_work" / "race-map.json"
+    map_path.parent.mkdir(parents=True)
+    map_path.write_text(
+        '{"arxiv:2501.10120":"openalex:W1"}',
+        encoding="utf-8",
+    )
+    outside_map = tmp_path / "outside-private-map.json"
+    outside_map.write_text(
+        '{"arxiv:2501.10120":"openalex:W1"}',
+        encoding="utf-8",
+    )
+    resolved_map_path = map_path.resolve()
+    original_open = Path.open
+
+    def open_swapped_map(
+        path: Path,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+    ) -> IO[Any]:
+        target = outside_map if path == resolved_map_path and mode == "rb" else path
+        return original_open(
+            target,
+            mode=mode,
+            buffering=buffering,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+        )
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+    monkeypatch.setattr(Path, "open", open_swapped_map)
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        lambda **kwargs: pytest.fail(f"provider constructed: {sorted(kwargs)}"),
+        raising=False,
+    )
+
+    assert _run_cli_from(
+        tmp_path,
+        id_map="data/annotation_work/race-map.json",
+    ) == 2
+    assert (
+        capsys.readouterr().err.strip()
+        == "evaluation failed: identifier map path must stay under data"
+    )
+
+
+def test_cli_rejects_identifier_map_when_final_handle_target_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(
+        tmp_path,
+        gold_content=(
+            '{"query_id":"query-1","query":"graph retrieval",'
+            '"relevant_paper_ids":["arxiv:2501.10120"]}\n'
+        ),
+    )
+    map_path = tmp_path / "data" / "annotation_work" / "map.json"
+    map_path.parent.mkdir(parents=True)
+    map_path.write_text(
+        '{"arxiv:2501.10120":"openalex:W1"}',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+
+    def fail_final_path(source: IO[bytes]) -> Path:
+        del source
+        raise OSError("final target unavailable")
+
+    monkeypatch.setattr(
+        runner_module,
+        "_final_path_from_open_file",
+        fail_final_path,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        lambda **kwargs: pytest.fail(f"provider constructed: {sorted(kwargs)}"),
+        raising=False,
+    )
+
+    assert _run_cli_from(
+        tmp_path,
+        id_map="data/annotation_work/map.json",
+    ) == 2
+    assert capsys.readouterr().err.strip() == "evaluation failed"
+
+
+@pytest.mark.parametrize(
+    ("raw_path", "expected"),
+    [
+        (r"\\?\C:\data\map.json", r"C:\data\map.json"),
+        (r"\\?\UNC\server\share\data\map.json", r"\\server\share\data\map.json"),
+    ],
+)
+def test_normalize_windows_final_path_prefixes(
+    raw_path: str,
+    expected: str,
+) -> None:
+    assert runner_module._normalize_windows_final_path(raw_path) == expected
 
 
 @pytest.mark.parametrize(
@@ -865,6 +992,31 @@ def test_cli_rejects_missing_identifier_map_before_provider(
     assert _run_cli_from(
         tmp_path,
         id_map="data/annotation_work/missing.json",
+    ) == 2
+    assert "identifier map file does not exist" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_cli_rejects_identifier_map_directory_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path)
+    map_directory = tmp_path / "data" / "annotation_work" / "map-directory"
+    map_directory.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        lambda **kwargs: pytest.fail(f"provider constructed: {sorted(kwargs)}"),
+        raising=False,
+    )
+
+    assert _run_cli_from(
+        tmp_path,
+        id_map="data/annotation_work/map-directory",
     ) == 2
     assert "identifier map file does not exist" in capsys.readouterr().err
     assert not (tmp_path / "out").exists()

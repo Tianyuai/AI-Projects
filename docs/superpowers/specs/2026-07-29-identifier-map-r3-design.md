@@ -24,11 +24,22 @@ and traversal outside `data/` are rejected before any network call. This
 interface matches the existing Week1 identifier-map plan and also works when
 `data/` is a junction to the frozen Week1 directory.
 
-The CLI reads and hashes the exact map bytes, validates them with
-`IdentifierMap.from_path`, and checks explicit alias coverage for every unique
-gold identifier. Missing coverage fails with a fixed, value-free error before
-provider construction. The runner never prints map entries or missing
-identifiers.
+Static path checks are followed by an open-handle check that closes the
+validation/open race. The runner opens the map once, determines the final target
+represented by that handle, verifies that target is still beneath the resolved
+`data/` root, and reads the bytes from the same handle. Windows resolves the
+handle with `GetFinalPathNameByHandleW` and normalizes `\\?\` drive and UNC
+forms. POSIX resolves a supported descriptor path and verifies that its
+device/inode matches the open descriptor. If the final target cannot be
+determined or validated, the map is rejected and the handle is closed.
+
+The CLI parses the immutable byte snapshot with `IdentifierMap.from_bytes`,
+hashes those same bytes, and checks explicit alias coverage for every unique gold
+identifier. Missing coverage fails with a fixed, value-free error before
+provider construction. The standalone metrics CLI uses the same one-read byte
+snapshot for parsing and hashing; invalid or unavailable map input produces a
+fixed, value-free error while non-map input diagnostics remain unchanged. The
+runner never prints map entries or missing identifiers.
 
 `IdentifierMap` exposes a boolean coverage method that normalizes the supplied
 identifier and reports whether it is an explicit alias. It does not expose or
@@ -66,8 +77,10 @@ Test-first coverage proves:
   mapped metrics;
 - the map hash appears in run identity and both formal input-hash objects;
 - an absent `--id-map` preserves existing artifact shapes;
-- absolute, traversing, missing, invalid, partial, conflicting, and cyclic maps
-  fail before any HTTP request;
+- absolute, traversing, missing, invalid, partial, conflicting, cyclic,
+  link-escaping, swapped, or unverifiable final-handle maps fail before any HTTP
+  request;
+- map parsing, metrics, and recorded hashes use one immutable byte snapshot;
 - errors contain no map entries, gold identifiers, query text, or credentials.
 
 Focused runner and dataset tests run before the complete offline Ruff, mypy, and

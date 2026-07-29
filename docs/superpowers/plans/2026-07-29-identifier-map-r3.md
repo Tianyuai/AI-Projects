@@ -4,14 +4,15 @@
 
 **Goal:** Bind the complete private Week1 identifier map into the formal evaluation identity and produce a verified nonzero mapped R3 development baseline.
 
-**Architecture:** Extend `IdentifierMap` with a non-disclosing coverage query, then add an optional confined CLI map input that is validated before provider construction and passed to existing deduplication and metric code. Map-enabled artifacts bind the exact map hash, while no-map artifacts retain their existing shape. R3 runs from a new Git-external root with a fresh cache and an atomic execution receipt.
+**Architecture:** Extend `IdentifierMap` with a non-disclosing coverage query, then add an optional confined CLI map input that is validated before provider construction and passed to existing deduplication and metric code. Static confinement is followed by validation of the final target represented by the one open map handle; parsing and hashing consume the immutable bytes read from that same handle. Map-enabled artifacts bind the exact map hash, while no-map artifacts retain their existing shape. R3 runs from a new Git-external root with a fresh cache and an atomic execution receipt.
 
 **Tech Stack:** Python 3.11+, Pydantic, pytest, httpx, SQLite snapshot cache, uv, PowerShell
 
 ## Global Constraints
 
 - The accepted CLI form is `--id-map data/annotation_work/dev_identifier_map.v1.json`.
-- The resolved map path must remain beneath the resolved process `data/` root.
+- The statically resolved map path and the final target represented by its open handle must remain beneath the resolved process `data/` root.
+- Map parsing and hashing must use one immutable byte snapshot read from that validated handle.
 - The private map body, entries, path, gold identifiers, query text, labels, raw provider responses, and credentials must not be printed or copied into formal metadata.
 - All 141 unique development-gold identifiers must be explicitly covered before provider construction.
 - The exact map hash is `sha256:` plus 64 lowercase hexadecimal characters and is recorded only when a map is supplied.
@@ -116,6 +117,7 @@ git commit -m "feat: expose identifier-map coverage"
 - Produces: optional CLI `--id-map PATH`
 - Produces: `RunIdentity.id_map_sha256: str | None = None`
 - Produces: `_resolve_cli_id_map(data_root: Path, raw_path: Path) -> Path`
+- Produces: `_read_confined_identifier_map(data_root: Path, raw_path: Path) -> bytes`
 - Produces: `_require_id_map_coverage(gold: Sequence[EvaluationQuery], id_map: IdentifierMap) -> None`
 - Changes: `_run_cli_evaluation(..., id_map: IdentifierMap | None) -> None`
 
@@ -418,8 +420,33 @@ def _resolve_cli_id_map(data_root: Path, raw_path: Path) -> Path:
     if not resolved.is_file():
         raise _CliInputError("identifier map file does not exist")
     return resolved
+```
 
+Keep this static check, then add a single-handle read boundary:
 
+```python
+def _read_confined_identifier_map(data_root: Path, raw_path: Path) -> bytes:
+    resolved_root = data_root.resolve()
+    resolved_path = _resolve_cli_id_map(resolved_root, raw_path)
+    with resolved_path.open("rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise _CliInputError("identifier map file does not exist")
+        final_path = _final_path_from_open_file(source)
+        if not final_path.is_relative_to(resolved_root):
+            raise _CliInputError("identifier map path must stay under data")
+        return source.read()
+```
+
+`_final_path_from_open_file` uses `GetFinalPathNameByHandleW` on Windows,
+normalizing both `\\?\C:\...` and `\\?\UNC\server\share\...` forms. On POSIX it
+reads `/proc/self/fd/<fd>` or `/dev/fd/<fd>` and requires the resolved target's
+device/inode to match `os.fstat(fd)`. Failure to determine or validate the final
+target is rejected. The `with` statement closes the handle on success and every
+failure path.
+
+Add the unchanged coverage check:
+
+```python
 def _require_id_map_coverage(
     gold: Sequence[EvaluationQuery],
     id_map: IdentifierMap,
@@ -475,9 +502,8 @@ provider, use:
 identity = frozen_split.identity
 id_map: IdentifierMap | None = None
 if args.id_map is not None:
-    id_map_path = _resolve_cli_id_map(Path("data"), args.id_map)
-    id_map_bytes = id_map_path.read_bytes()
-    id_map = IdentifierMap.from_path(id_map_path)
+    id_map_bytes = _read_confined_identifier_map(Path("data"), args.id_map)
+    id_map = IdentifierMap.from_bytes(id_map_bytes)
     _require_id_map_coverage(frozen_split.gold, id_map)
     identity = identity.model_copy(
         update={"id_map_sha256": _sha256_bytes(id_map_bytes)}
@@ -485,6 +511,12 @@ if args.id_map is not None:
 ```
 
 Pass `identity=identity` and `id_map=id_map` into `_run_cli_evaluation`.
+
+The standalone metrics CLI follows the same snapshot rule without runner path
+confinement: read `args.id_map` once into bytes, parse with
+`IdentifierMap.from_bytes`, and compute the namespaced SHA-256 from those bytes.
+Map read and validation failures become fixed, value-free CLI errors; existing
+gold and prediction diagnostics remain available.
 
 - [ ] **Step 9: Run focused runner tests and verify GREEN**
 

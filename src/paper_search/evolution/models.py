@@ -1,8 +1,14 @@
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import Field
 
-from paper_search.domain.models import DomainModel, NonEmptyStr, SubQuery
+from paper_search.domain.models import (
+    DomainModel,
+    NonEmptyStr,
+    Paper,
+    SubQuery,
+    UsageActual,
+)
 
 ConstraintKind = Literal[
     "must_have", "topics", "methods", "tasks", "datasets", "domains", "venues"
@@ -71,3 +77,21 @@ class StopDecision(DomainModel):
     marginal_gain_threshold: float = Field(ge=0, allow_inf_nan=False)
     checks: dict[str, bool]
     failed_stage: str | None = None
+
+
+class RoundExecution(DomainModel):
+    round_number: int = Field(strict=True, gt=0)
+    candidates: list[Paper]
+    observations: list[CandidateConstraintObservation]
+    usage: UsageActual
+    trace: list[dict[str, Any]]
+
+
+class EvolutionResult(DomainModel):
+    strategy: EvolutionStrategy
+    rounds: list[RoundExecution]
+    candidates: list[Paper]
+    decisions: list[StopDecision]
+    stop_reason: StopReason
+    warnings: list[str]
+    failed_round: int | None = Field(default=None, strict=True, gt=0)

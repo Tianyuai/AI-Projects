@@ -1,0 +1,440 @@
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Sequence
+from typing import Any
+
+import pytest
+
+from paper_search.domain.models import Paper, QuerySpec, UsageActual, UsageEstimate
+from paper_search.evolution import (
+    CandidateConstraintObservation,
+    ConstraintCoverage,
+    ConstraintRef,
+    CoverageReport,
+    EvolutionCoordinator,
+    MarginalGain,
+    RoundExecution,
+    RoundPlan,
+)
+
+
+def query_spec() -> QuerySpec:
+    return QuerySpec(
+        original_query="query",
+        research_goal="Find papers",
+        topics=["topic"],
+    )
+
+
+def round_plan(round_number: int) -> RoundPlan:
+    return RoundPlan(
+        round_number=round_number,
+        subqueries=[
+            {
+                "query_id": f"q-{round_number}",
+                "text": f"query {round_number}",
+                "query_type": "decomposed",
+                "target_constraints": ["topic"],
+                "priority": 1,
+                "provider_hint": "either",
+            }
+        ],
+    )
+
+
+def paper(canonical_id: str, title: str) -> Paper:
+    return Paper(canonical_id=canonical_id, title=title)
+
+
+def observation(paper_id: str, *, matched: bool) -> CandidateConstraintObservation:
+    return CandidateConstraintObservation(
+        paper_id=paper_id,
+        constraint=ConstraintRef(
+            kind="topics",
+            value="topic",
+            normalized_value="topic",
+        ),
+        matched=matched,
+    )
+
+
+def execution(
+    round_number: int,
+    *,
+    candidates: list[Paper] | None = None,
+    observations: list[CandidateConstraintObservation] | None = None,
+) -> RoundExecution:
+    round_candidates = candidates or [paper(f"p{round_number}", f"Paper {round_number}")]
+    round_observations = observations or [
+        observation(item.canonical_id, matched=False) for item in round_candidates
+    ]
+    return RoundExecution(
+        round_number=round_number,
+        candidates=round_candidates,
+        observations=round_observations,
+        usage=UsageActual(search_api_calls=1, elapsed_ms=10),
+        trace=[{"round": round_number}],
+    )
+
+
+def incomplete_coverage() -> CoverageReport:
+    constraint = ConstraintRef(
+        kind="topics",
+        value="topic",
+        normalized_value="topic",
+    )
+    return CoverageReport(
+        constraints=[
+            ConstraintCoverage(
+                constraint=constraint,
+                matched_candidate_ids=[],
+                hit_count=0,
+                status="uncovered",
+            )
+        ],
+        covered_count=0,
+        low_coverage_count=0,
+        uncovered_count=1,
+    )
+
+
+class FakeExecutor:
+    def __init__(
+        self,
+        executions: Sequence[RoundExecution],
+        *,
+        fail_on_call: int | None = None,
+    ) -> None:
+        self._executions = list(executions)
+        self._fail_on_call = fail_on_call
+        self.calls: list[tuple[QuerySpec, RoundPlan]] = []
+
+    async def execute(self, spec: QuerySpec, plan: RoundPlan) -> RoundExecution:
+        self.calls.append((spec, plan))
+        if len(self.calls) == self._fail_on_call:
+            raise RuntimeError("secret executor payload")
+        return self._executions[len(self.calls) - 1]
+
+
+class FakeCoverageAnalyzer:
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
+        self._fail_on_call = fail_on_call
+        self.calls: list[
+            tuple[QuerySpec, list[str], list[CandidateConstraintObservation]]
+        ] = []
+
+    def analyze(
+        self,
+        spec: QuerySpec,
+        candidate_ids: Sequence[str],
+        observations: Sequence[CandidateConstraintObservation],
+    ) -> CoverageReport:
+        self.calls.append((spec, list(candidate_ids), list(observations)))
+        if len(self.calls) == self._fail_on_call:
+            raise RuntimeError("secret coverage matrix")
+        return incomplete_coverage()
+
+
+class FakeGenerator:
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
+        self._fail_on_call = fail_on_call
+        self.calls: list[dict[str, Any]] = []
+
+    async def generate(
+        self,
+        *,
+        spec: QuerySpec,
+        coverage: CoverageReport,
+        prior_plans: Sequence[RoundPlan],
+        round_number: int,
+        max_subqueries: int,
+    ) -> RoundPlan:
+        self.calls.append(
+            {
+                "spec": spec,
+                "coverage": coverage,
+                "prior_plans": list(prior_plans),
+                "round_number": round_number,
+                "max_subqueries": max_subqueries,
+            }
+        )
+        if len(self.calls) == self._fail_on_call:
+            raise RuntimeError("secret generation prompt")
+        return round_plan(round_number)
+
+
+class FakeEstimator:
+    def __init__(self, *, fail_on_call: int | None = None) -> None:
+        self._fail_on_call = fail_on_call
+        self.calls: list[tuple[RoundPlan, int]] = []
+
+    def estimate(self, plan: RoundPlan, completed_round_count: int) -> UsageEstimate:
+        self.calls.append((plan, completed_round_count))
+        if len(self.calls) == self._fail_on_call:
+            raise RuntimeError("secret estimate details")
+        return UsageEstimate(search_api_calls=1, elapsed_ms=10)
+
+
+class FakeGainEvaluator:
+    def __init__(self, *, fail_on_call: int | None = None, score: float = 1.0) -> None:
+        self._fail_on_call = fail_on_call
+        self._score = score
+        self.calls: list[
+            tuple[frozenset[str], frozenset[str], RoundExecution]
+        ] = []
+
+    def evaluate(
+        self,
+        previous_ids: frozenset[str],
+        current_ids: frozenset[str],
+        execution: RoundExecution,
+    ) -> MarginalGain:
+        self.calls.append((previous_ids, current_ids, execution))
+        if len(self.calls) == self._fail_on_call:
+            raise RuntimeError("secret gain labels")
+        new_count = len(current_ids - previous_ids)
+        return MarginalGain(
+            new_candidate_count=new_count,
+            new_high_relevance_count=new_count,
+            score=self._score,
+        )
+
+
+class FakeBudget:
+    def __init__(
+        self,
+        availability: Sequence[bool] = (True, True, True),
+        *,
+        fail_on_call: int | None = None,
+    ) -> None:
+        self._availability = list(availability)
+        self._fail_on_call = fail_on_call
+        self.calls: list[UsageEstimate] = []
+
+    def can_reserve(self, estimate: UsageEstimate) -> bool:
+        self.calls.append(estimate)
+        if len(self.calls) == self._fail_on_call:
+            raise RuntimeError("secret budget state")
+        return self._availability[len(self.calls) - 1]
+
+
+def coordinator(
+    *,
+    executor: FakeExecutor | None = None,
+    coverage_analyzer: FakeCoverageAnalyzer | None = None,
+    generator: FakeGenerator | None = None,
+    estimator: FakeEstimator | None = None,
+    gain_evaluator: FakeGainEvaluator | None = None,
+    budget: FakeBudget | None = None,
+) -> EvolutionCoordinator:
+    return EvolutionCoordinator(
+        executor=executor or FakeExecutor([execution(1), execution(2)]),
+        coverage_analyzer=coverage_analyzer or FakeCoverageAnalyzer(),
+        generator=generator or FakeGenerator(),
+        estimator=estimator or FakeEstimator(),
+        gain_evaluator=gain_evaluator or FakeGainEvaluator(),
+        budget=budget or FakeBudget(),
+    )
+
+
+def run(
+    instance: EvolutionCoordinator,
+    *,
+    strategy: str = "fixed_one_round",
+    max_rounds: int = 2,
+) -> Any:
+    return asyncio.run(
+        instance.run(
+            spec=query_spec(),
+            initial_plan=round_plan(1),
+            strategy=strategy,
+            max_rounds=max_rounds,
+            max_subqueries=2,
+            marginal_gain_threshold=0.5,
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("stage", "instance"),
+    [
+        (
+            "estimate",
+            coordinator(estimator=FakeEstimator(fail_on_call=1)),
+        ),
+        (
+            "preflight",
+            coordinator(budget=FakeBudget(fail_on_call=1)),
+        ),
+        (
+            "execution",
+            coordinator(executor=FakeExecutor([execution(1)], fail_on_call=1)),
+        ),
+    ],
+)
+def test_precommit_dependency_failure_returns_empty_sanitized_result(
+    stage: str,
+    instance: EvolutionCoordinator,
+) -> None:
+    result = run(instance)
+
+    assert result.rounds == []
+    assert result.candidates == []
+    assert result.stop_reason == "round_failed"
+    assert result.failed_round == 1
+    assert result.warnings == [f"{stage}: dependency failure"]
+    assert result.decisions[-1].failed_stage == stage
+    assert "secret" not in " ".join(result.warnings)
+
+
+def test_preflight_rejection_stops_before_executor_runs() -> None:
+    fake_executor = FakeExecutor([execution(1)])
+    result = run(
+        coordinator(
+            executor=fake_executor,
+            budget=FakeBudget(availability=[False]),
+        )
+    )
+
+    assert result.rounds == []
+    assert result.candidates == []
+    assert result.stop_reason == "budget_insufficient"
+    assert result.failed_round is None
+    assert result.warnings == []
+    assert fake_executor.calls == []
+
+
+def test_execution_round_mismatch_does_not_commit_any_state() -> None:
+    result = run(coordinator(executor=FakeExecutor([execution(2)])))
+
+    assert result.rounds == []
+    assert result.candidates == []
+    assert result.stop_reason == "round_failed"
+    assert result.failed_round == 1
+    assert result.warnings == ["execution: dependency failure"]
+    assert result.decisions[-1].failed_stage == "execution"
+
+
+def test_later_executor_failure_preserves_committed_first_seen_state() -> None:
+    first_paper = paper("p1", "First title")
+    first_execution = execution(
+        1,
+        candidates=[first_paper],
+        observations=[observation("p1", matched=False)],
+    )
+    result = run(
+        coordinator(
+            executor=FakeExecutor(
+                [first_execution, execution(2)],
+                fail_on_call=2,
+            )
+        ),
+        strategy="fixed_two_round",
+    )
+
+    assert result.rounds == [first_execution]
+    assert result.candidates == [first_paper]
+    assert result.candidates[0] is first_paper
+    assert result.stop_reason == "round_failed"
+    assert result.failed_round == 2
+    assert result.warnings == ["execution: dependency failure"]
+    assert result.decisions[-1].failed_stage == "execution"
+
+
+@pytest.mark.parametrize(
+    ("stage", "updates"),
+    [
+        ("coverage", {"coverage_analyzer": FakeCoverageAnalyzer(fail_on_call=1)}),
+        ("gain", {"gain_evaluator": FakeGainEvaluator(fail_on_call=1)}),
+        ("generation", {"generator": FakeGenerator(fail_on_call=1)}),
+        ("estimate", {"estimator": FakeEstimator(fail_on_call=2)}),
+        ("preflight", {"budget": FakeBudget(fail_on_call=2)}),
+    ],
+)
+def test_postcommit_dependency_failure_preserves_first_seen_state(
+    stage: str,
+    updates: dict[str, object],
+) -> None:
+    first_paper = paper("p1", "First title")
+    first_execution = execution(
+        1,
+        candidates=[first_paper],
+        observations=[observation("p1", matched=False)],
+    )
+    fake_executor = FakeExecutor([first_execution, execution(2)])
+    instance = coordinator(executor=fake_executor, **updates)  # type: ignore[arg-type]
+
+    result = run(instance, strategy="fixed_two_round")
+
+    assert result.rounds == [first_execution]
+    assert result.candidates == [first_paper]
+    assert result.candidates[0] is first_paper
+    assert result.stop_reason == "round_failed"
+    assert result.failed_round == (2 if stage in {"generation", "estimate", "preflight"} else 1)
+    assert result.warnings == [f"{stage}: dependency failure"]
+    assert result.decisions[-1].failed_stage == stage
+    assert "secret" not in " ".join(result.warnings)
+
+
+def test_next_round_budget_rejection_preserves_committed_round() -> None:
+    first_execution = execution(1)
+    fake_executor = FakeExecutor([first_execution, execution(2)])
+
+    result = run(
+        coordinator(
+            executor=fake_executor,
+            budget=FakeBudget(availability=[True, False]),
+        ),
+        strategy="fixed_two_round",
+    )
+
+    assert result.rounds == [first_execution]
+    assert result.candidates == first_execution.candidates
+    assert result.stop_reason == "budget_insufficient"
+    assert result.failed_round is None
+    assert result.warnings == []
+    assert len(fake_executor.calls) == 1
+    assert [decision.reason_code for decision in result.decisions] == [
+        "budget_insufficient"
+    ]
+
+
+def test_duplicate_candidates_and_observations_keep_first_seen_objects() -> None:
+    first_paper = paper("duplicate", "First title")
+    later_paper = paper("duplicate", "Later title")
+    first_observation = observation("duplicate", matched=False)
+    conflicting_observation = observation("duplicate", matched=True)
+    analyzer = FakeCoverageAnalyzer()
+    gain = FakeGainEvaluator()
+
+    result = run(
+        coordinator(
+            executor=FakeExecutor(
+                [
+                    execution(
+                        1,
+                        candidates=[first_paper],
+                        observations=[first_observation],
+                    ),
+                    execution(
+                        2,
+                        candidates=[later_paper],
+                        observations=[conflicting_observation],
+                    ),
+                ]
+            ),
+            coverage_analyzer=analyzer,
+            gain_evaluator=gain,
+        ),
+        strategy="fixed_two_round",
+    )
+
+    assert result.stop_reason == "max_rounds_reached"
+    assert result.candidates == [first_paper]
+    assert result.candidates[0] is first_paper
+    assert analyzer.calls[-1][1] == ["duplicate"]
+    assert analyzer.calls[-1][2] == [first_observation]
+    assert analyzer.calls[-1][2][0] is first_observation
+    assert gain.calls[-1][0] == frozenset({"duplicate"})
+    assert gain.calls[-1][1] == frozenset({"duplicate"})

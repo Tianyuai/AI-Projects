@@ -237,17 +237,23 @@ def _fixed_git_sha(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_module, "_current_git_sha", lambda: GIT_SHA, raising=False)
 
 
-def _run_cli_from(root: Path, *, split: str = "dev") -> int:
-    return runner_module.main(
-        [
-            "--config",
-            str(CONFIG),
-            "--split",
-            split,
-            "--output",
-            "out",
-        ]
-    )
+def _run_cli_from(
+    root: Path,
+    *,
+    split: str = "dev",
+    id_map: str | None = None,
+) -> int:
+    argv = [
+        "--config",
+        str(CONFIG),
+        "--split",
+        split,
+        "--output",
+        "out",
+    ]
+    if id_map is not None:
+        argv.extend(["--id-map", id_map])
+    return runner_module.main(argv)
 
 
 def test_cli_refuses_unfrozen_dev_manifest(
@@ -568,7 +574,7 @@ def test_frozen_split_returns_complete_typed_run_identity(tmp_path: Path) -> Non
 
     assert frozen.gold_path == gold.resolve()
     assert [record.query_id for record in frozen.gold] == ["query-1"]
-    assert frozen.identity.model_dump(mode="json") == {
+    assert frozen.identity.model_dump(mode="json", exclude_none=True) == {
         "dataset_revision": "dataset-r1",
         "git_sha": GIT_SHA,
         "gold_sha256": _sha256(gold.read_bytes()),
@@ -600,17 +606,201 @@ def test_behavior_constants_are_publicly_exported() -> None:
     assert lexical.TOKENIZER_VERSION == "unicode-nfkc-alnum-v1"
 
 
-def test_cli_parser_exposes_only_required_week1_options() -> None:
+def test_cli_parser_exposes_required_options_and_optional_id_map() -> None:
     parser = runner_module._build_parser()
 
-    options = {
-        option
+    actions = {
+        option: action
         for action in parser._actions
         for option in action.option_strings
-        if option != "--help" and option != "-h"
+        if option not in {"--help", "-h"}
     }
-    assert options == {"--config", "--split", "--output"}
-    assert all(action.required for action in parser._actions if action.dest != "help")
+    assert set(actions) == {"--config", "--split", "--output", "--id-map"}
+    assert all(actions[option].required for option in {"--config", "--split", "--output"})
+    assert actions["--id-map"].required is False
+
+
+def test_cli_binds_confined_identifier_map_into_metrics_and_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_cli_manifest(
+        tmp_path,
+        gold_content=(
+            '{"query_id":"query-1","query":"graph retrieval",'
+            '"relevant_paper_ids":["arxiv:2501.10120"]}\n'
+        ),
+    )
+    map_path = tmp_path / "data" / "annotation_work" / "dev-map.json"
+    map_path.parent.mkdir(parents=True)
+    map_path.write_text(
+        '{"arxiv:2501.10120":"openalex:W1"}',
+        encoding="utf-8",
+    )
+    map_hash = _sha256(map_path.read_bytes())
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+
+    def fake_provider_factory(**kwargs: object) -> FakeProvider:
+        del kwargs
+        return FakeProvider(
+            {
+                "graph retrieval": _provider_result(
+                    [_paper("openalex:W1", title="graph retrieval")],
+                    calls=1,
+                    latency_ms=1,
+                )
+            }
+        )
+
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        fake_provider_factory,
+        raising=False,
+    )
+
+    assert _run_cli_from(
+        tmp_path,
+        id_map="data/annotation_work/dev-map.json",
+    ) == 0
+
+    run = json.loads((tmp_path / "out" / "run.json").read_text(encoding="utf-8"))
+    metrics = json.loads(
+        (tmp_path / "out" / "metrics.json").read_text(encoding="utf-8")
+    )
+    assert run["identity"]["id_map_sha256"] == map_hash
+    assert run["input_hashes"]["id_map"] == map_hash
+    assert metrics["input_hashes"]["id_map"] == map_hash
+    assert metrics["summary"]["macro_recall"] == 1.0
+    assert metrics["summary"]["micro_recall"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "raw_path",
+    ["../outside-map.json", "C:/outside-map.json"],
+)
+def test_cli_rejects_identifier_map_outside_data_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    raw_path: str,
+) -> None:
+    _write_cli_manifest(tmp_path)
+    (tmp_path / "outside-map.json").write_text("{}", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        lambda **kwargs: pytest.fail(f"provider constructed: {sorted(kwargs)}"),
+        raising=False,
+    )
+
+    assert _run_cli_from(tmp_path, id_map=raw_path) == 2
+    assert "identifier map path must stay under data" in capsys.readouterr().err
+
+
+def test_cli_rejects_partial_identifier_map_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(
+        tmp_path,
+        gold_content=(
+            '{"query_id":"query-1","query":"graph retrieval",'
+            '"relevant_paper_ids":["arxiv:2501.10120"]}\n'
+        ),
+    )
+    map_path = tmp_path / "data" / "annotation_work" / "partial.json"
+    map_path.parent.mkdir(parents=True)
+    map_path.write_text(
+        '{"arxiv:2501.99999":"openalex:W1"}',
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        lambda **kwargs: pytest.fail(f"provider constructed: {sorted(kwargs)}"),
+        raising=False,
+    )
+
+    assert _run_cli_from(
+        tmp_path,
+        id_map="data/annotation_work/partial.json",
+    ) == 2
+    captured = capsys.readouterr()
+    assert "identifier map does not cover frozen gold identifiers" in captured.err
+    assert "2501.10120" not in captured.out + captured.err
+
+
+def test_cli_rejects_missing_identifier_map_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _write_cli_manifest(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        lambda **kwargs: pytest.fail(f"provider constructed: {sorted(kwargs)}"),
+        raising=False,
+    )
+
+    assert _run_cli_from(
+        tmp_path,
+        id_map="data/annotation_work/missing.json",
+    ) == 2
+    assert "identifier map file does not exist" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not-json",
+        (
+            '{"arxiv:2501.10120":"openalex:W1",'
+            '"https://arxiv.org/abs/2501.10120":"openalex:W2"}'
+        ),
+        (
+            '{"arxiv:2501.10120":"openalex:W1",'
+            '"openalex:W1":"arxiv:2501.10120"}'
+        ),
+    ],
+)
+def test_cli_redacts_invalid_identifier_map_before_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: str,
+) -> None:
+    _write_cli_manifest(tmp_path)
+    map_path = tmp_path / "data" / "annotation_work" / "invalid.json"
+    map_path.parent.mkdir(parents=True)
+    map_path.write_text(payload, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("OPENALEX_API_KEY", SENTINEL_API_KEY)
+    monkeypatch.setattr(
+        runner_module,
+        "OpenAlexProvider",
+        lambda **kwargs: pytest.fail(f"provider constructed: {sorted(kwargs)}"),
+        raising=False,
+    )
+
+    assert _run_cli_from(
+        tmp_path,
+        id_map="data/annotation_work/invalid.json",
+    ) == 2
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "evaluation failed"
+    assert payload not in captured.out + captured.err
+    assert not (tmp_path / "out").exists()
 
 
 def test_cli_loads_process_environment_and_builds_provider_without_secret_leak(
@@ -1375,7 +1565,10 @@ def test_run_evaluation_writes_deterministic_secret_safe_artifacts(
     assert run["contract_version"] == "week1-run-v2"
     assert run["config_hash"] == config.config_hash()
     assert run["input_hashes"] == expected_hashes
-    assert run["identity"] == _run_identity(gold).model_dump(mode="json")
+    assert run["identity"] == _run_identity(gold).model_dump(
+        mode="json",
+        exclude_none=True,
+    )
     assert run["rules"] == {
         "deduplication": {
             "fuzzy_title_threshold": FUZZY_TITLE_THRESHOLD,

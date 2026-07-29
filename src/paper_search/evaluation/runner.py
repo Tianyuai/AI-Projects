@@ -96,6 +96,7 @@ class RunIdentity(DomainModel):
     manifest_sha256: NonEmptyStr
     dataset_revision: NonEmptyStr
     zero_answer_policy: Literal["reject", "allow"]
+    id_map_sha256: NonEmptyStr | None = None
 
 
 class RunResult(DomainModel):
@@ -159,6 +160,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--split", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--id-map", type=Path)
     return parser
 
 
@@ -175,6 +177,33 @@ def _resolve_data_file(data_root: Path, raw_path: object, label: str) -> Path:
     if not resolved.is_file():
         raise _CliInputError(f"{label} file does not exist")
     return resolved
+
+
+def _resolve_cli_id_map(data_root: Path, raw_path: Path) -> Path:
+    if raw_path.is_absolute():
+        raise _CliInputError("identifier map path must stay under data")
+    resolved_root = data_root.resolve()
+    resolved = raw_path.resolve()
+    if not resolved.is_relative_to(resolved_root):
+        raise _CliInputError("identifier map path must stay under data")
+    if not resolved.is_file():
+        raise _CliInputError("identifier map file does not exist")
+    return resolved
+
+
+def _require_id_map_coverage(
+    gold: Sequence[EvaluationQuery],
+    id_map: IdentifierMap,
+) -> None:
+    identifiers = {
+        identifier
+        for record in gold
+        for identifier in record.relevant_paper_ids
+    }
+    if any(not id_map.covers(identifier) for identifier in identifiers):
+        raise _CliInputError(
+            "identifier map does not cover frozen gold identifiers"
+        )
 
 
 def _resolve_frozen_split(data_root: Path, split: str, git_sha: str) -> FrozenSplit:
@@ -434,6 +463,8 @@ def _artifact_payloads(
         "gold": result.identity.gold_sha256,
         "predictions": _sha256_bytes(prediction_bytes),
     }
+    if result.identity.id_map_sha256 is not None:
+        input_hashes["id_map"] = result.identity.id_map_sha256
     metrics_payload: dict[str, object] = {
         "contract_version": CONTRACT_VERSION,
         "input_hashes": input_hashes,
@@ -476,7 +507,7 @@ def _artifact_payloads(
         "artifacts": artifact_paths,
         "config_hash": config.config_hash(),
         "contract_version": "week1-run-v2",
-        "identity": result.identity.model_dump(mode="json"),
+        "identity": result.identity.model_dump(mode="json", exclude_none=True),
         "input_hashes": input_hashes,
         "rules": {
             "deduplication": {
@@ -699,6 +730,7 @@ async def _run_cli_evaluation(
     config: RuntimeConfig,
     api_key: str,
     output: Path,
+    id_map: IdentifierMap | None,
 ) -> None:
     timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -711,6 +743,7 @@ async def _run_cli_evaluation(
             cache=cache,
             config=config,
             output=output,
+            id_map=id_map,
         )
 
 
@@ -718,16 +751,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         frozen_split = _resolve_frozen_split(Path("data"), args.split, _current_git_sha())
+        identity = frozen_split.identity
+        id_map: IdentifierMap | None = None
+        if args.id_map is not None:
+            id_map_path = _resolve_cli_id_map(Path("data"), args.id_map)
+            id_map_bytes = id_map_path.read_bytes()
+            id_map = IdentifierMap.from_path(id_map_path)
+            _require_id_map_coverage(frozen_split.gold, id_map)
+            identity = identity.model_copy(
+                update={"id_map_sha256": _sha256_bytes(id_map_bytes)}
+            )
         config = load_runtime_config(args.config, env_file=None)
         if config.openalex_api_key is None:
             raise _CliInputError("OPENALEX_API_KEY is required")
         asyncio.run(
             _run_cli_evaluation(
                 frozen_split.gold,
-                identity=frozen_split.identity,
+                identity=identity,
                 config=config,
                 api_key=config.openalex_api_key.get_secret_value(),
                 output=args.output.resolve(),
+                id_map=id_map,
             )
         )
     except _CliInputError as error:

@@ -52,6 +52,19 @@ def test_cpu_first_validation_docs_are_copyable_and_consistent() -> None:
     assert "fresh clone" in readme.lower()
 
 
+def test_embedding_focused_verification_command_is_portable() -> None:
+    readme = Path("README.md").read_text(encoding="utf-8")
+    focused_command = (
+        "uv run --no-sync --no-env-file pytest tests/unit/test_embedding.py "
+        "tests/unit/test_sentence_transformer.py tests/evaluation/test_embedding_benchmark.py "
+        "tests/integration/test_orchestrator.py -q"
+    )
+
+    assert focused_command in readme
+    assert r"D:\AI Projects\Projects\.venv" not in readme
+    assert r"D:\Dev\uv\uv.exe" not in readme
+
+
 def test_human_annotation_docs_publish_the_exact_private_workflow() -> None:
     onboarding = Path("docs/TEAMMATE_ONBOARDING.md").read_text(encoding="utf-8")
     data_readme = Path("data/README.md").read_text(encoding="utf-8")

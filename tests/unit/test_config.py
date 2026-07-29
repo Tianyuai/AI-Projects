@@ -68,6 +68,72 @@ def test_config_hash_is_stable_and_excludes_secrets(tmp_path: Path) -> None:
     assert changed_secret.config_hash() == first_hash
 
 
+def test_embedding_config_defaults_off_and_is_hashed(tmp_path: Path) -> None:
+    config_path = write_runtime_files(tmp_path)
+
+    config = load_runtime_config(config_path, env_file=None)
+    enabled = config.model_copy(
+        update={
+            "embedding": config.embedding.model_copy(
+                update={"enabled": True}
+            )
+        }
+    )
+
+    assert config.embedding.enabled is False
+    assert config.embedding.device == "cpu"
+    assert config.embedding.batch_size == 16
+    assert config.embedding.fallback_to_cpu is True
+    assert enabled.config_hash() != config.config_hash()
+
+
+def test_embedding_config_accepts_explicit_cuda_with_cpu_fallback(
+    tmp_path: Path,
+) -> None:
+    config_path = write_runtime_files(
+        tmp_path,
+        extra_base="\n".join(
+            [
+                "embedding:",
+                "  enabled: true",
+                "  model_id: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+                "  device: cuda",
+                "  batch_size: 8",
+                "  fallback_to_cpu: true",
+            ]
+        ),
+    )
+
+    config = load_runtime_config(config_path, env_file=None)
+
+    assert config.embedding.enabled is True
+    assert config.embedding.device == "cuda"
+    assert config.embedding.batch_size == 8
+
+
+@pytest.mark.parametrize("batch_size", [0, 129, True])
+def test_embedding_config_rejects_unsafe_batch_size(
+    tmp_path: Path,
+    batch_size: object,
+) -> None:
+    config_path = write_runtime_files(
+        tmp_path,
+        extra_base="\n".join(
+            [
+                "embedding:",
+                "  enabled: false",
+                "  model_id: fixture/model",
+                "  device: cpu",
+                f"  batch_size: {str(batch_size).lower()}",
+                "  fallback_to_cpu: true",
+            ]
+        ),
+    )
+
+    with pytest.raises(ValidationError):
+        load_runtime_config(config_path, env_file=None)
+
+
 def test_unknown_yaml_field_is_rejected(tmp_path: Path) -> None:
     config_path = write_runtime_files(tmp_path, extra_base="unexpected: true")
 

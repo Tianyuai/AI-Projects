@@ -1,3 +1,10 @@
+embedding:
+  enabled: false
+  model_id: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+  device: cpu
+  batch_size: 16
+  fallback_to_cpu: true
+
 budget_profile: balanced
 llm_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 llm_model_primary: qwen3.7-plus

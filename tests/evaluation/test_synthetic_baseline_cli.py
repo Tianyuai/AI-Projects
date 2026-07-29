@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
+from paper_search.api.contracts import SearchRequest
+from paper_search.domain.models import StructuredSearchResponse
+from paper_search.evaluation.synthetic_baseline import _run_synthetic_batch
+from paper_search.evaluation.synthetic_mocks import build_synthetic_search_service
 
 SUBPROCESS_ENV = {**os.environ, "PYTHONPATH": str(Path("src").resolve())}
 
@@ -87,3 +94,40 @@ for name in ("SyntheticSearchService", "validate_synthetic_requests"):
     )
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize("failure_index", range(30))
+def test_uncached_batch_isolates_each_failure(
+    tmp_path: Path,
+    failure_index: int,
+) -> None:
+    requests = tuple(
+        SearchRequest(
+            query_id=f"failure-isolation-{index}",
+            query=f"Synthetic failure isolation query {index}",
+            budget_profile="low",
+            include_trace=False,
+        )
+        for index in range(31)
+    )
+    service = build_synthetic_search_service()
+    calls: list[str] = []
+
+    async def flaky_service(request: SearchRequest) -> StructuredSearchResponse:
+        calls.append(request.query_id)
+        if request.query_id == requests[failure_index].query_id:
+            raise TimeoutError("synthetic uncached failure")
+        return await service(request)
+
+    output = tmp_path / "predictions.jsonl"
+    records = asyncio.run(
+        _run_synthetic_batch(requests, search_service=flaky_service, output=output)
+    )
+
+    assert len(records) == len(requests)
+    assert calls == [request.query_id for request in requests]
+    assert [record.query_id for record in records] == [
+        request.query_id for request in requests
+    ]
+    assert records[failure_index].selected_paper_ids == []
+    assert output.exists()

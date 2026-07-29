@@ -47,6 +47,18 @@ if TYPE_CHECKING:
         evaluate,
         score_query,
     )
+    from paper_search.evaluation.experiments import (
+        ExperimentAggregate,
+        ExperimentRecord,
+        build_experiment_record,
+        write_experiment_record,
+    )
+    from paper_search.evaluation.statistics import (
+        BootstrapInterval,
+        MacroF1Comparison,
+        bootstrap_mean_interval,
+        compare_macro_f1,
+    )
     from paper_search.evaluation.synthetic_baseline import (
         SYNTHETIC_QUERIES,
         run_synthetic_baseline,
@@ -73,6 +85,22 @@ _METRIC_EXPORTS = frozenset(
         "deduplicate_ranked",
         "evaluate",
         "score_query",
+    }
+)
+_EXPERIMENT_EXPORTS = frozenset(
+    {
+        "ExperimentAggregate",
+        "ExperimentRecord",
+        "build_experiment_record",
+        "write_experiment_record",
+    }
+)
+_STATISTICS_EXPORTS = frozenset(
+    {
+        "BootstrapInterval",
+        "MacroF1Comparison",
+        "bootstrap_mean_interval",
+        "compare_macro_f1",
     }
 )
 _SYNTHETIC_BASELINE_EXPORTS = frozenset(
@@ -125,6 +153,34 @@ def __getattr__(name: str) -> object:
             "evaluate": evaluate,
             "score_query": score_query,
         }
+    elif name in _EXPERIMENT_EXPORTS:
+        from paper_search.evaluation.experiments import (
+            ExperimentAggregate,
+            ExperimentRecord,
+            build_experiment_record,
+            write_experiment_record,
+        )
+
+        exports = {
+            "ExperimentAggregate": ExperimentAggregate,
+            "ExperimentRecord": ExperimentRecord,
+            "build_experiment_record": build_experiment_record,
+            "write_experiment_record": write_experiment_record,
+        }
+    elif name in _STATISTICS_EXPORTS:
+        from paper_search.evaluation.statistics import (
+            BootstrapInterval,
+            MacroF1Comparison,
+            bootstrap_mean_interval,
+            compare_macro_f1,
+        )
+
+        exports = {
+            "BootstrapInterval": BootstrapInterval,
+            "MacroF1Comparison": MacroF1Comparison,
+            "bootstrap_mean_interval": bootstrap_mean_interval,
+            "compare_macro_f1": compare_macro_f1,
+        }
     elif name in _SYNTHETIC_BASELINE_EXPORTS:
         from paper_search.evaluation.synthetic_baseline import (
             SYNTHETIC_QUERIES,
@@ -147,11 +203,15 @@ __all__ = [
     "AgreementReport",
     "AnnotationRecord",
     "AnnotationValidationSummary",
+    "BootstrapInterval",
     "EvaluationQuery",
     "EvaluationResult",
+    "ExperimentAggregate",
+    "ExperimentRecord",
     "FieldAgreement",
     "IdentifierMap",
     "InternalPredictionRecord",
+    "MacroF1Comparison",
     "MetricSummary",
     "PaSaRecord",
     "PredictionRecord",
@@ -162,8 +222,11 @@ __all__ = [
     "answer_count_bucket",
     "cohen_kappa",
     "compare_annotations",
+    "compare_macro_f1",
     "deduplicate_ranked",
     "evaluate",
+    "bootstrap_mean_interval",
+    "build_experiment_record",
     "normalize_paper_id",
     "normalize_title",
     "prediction_from_response",
@@ -175,6 +238,7 @@ __all__ = [
     "run_synthetic_baseline",
     "validate_annotation_file",
     "write_frozen_bytes",
+    "write_experiment_record",
     "write_jsonl_atomic",
     "write_prediction_records",
     "write_response_predictions",

@@ -268,6 +268,43 @@ def test_identifier_map_resolves_normalized_chains(tmp_path: Path) -> None:
     assert mapping.resolve("doi:10.2000/unmapped") == "doi:10.2000/unmapped"
 
 
+def test_identifier_map_from_bytes_resolves_normalized_chains() -> None:
+    mapping = dataset_module.IdentifierMap.from_bytes(
+        (
+            b'{"https://doi.org/10.1000/A":"arxiv:2501.10120",'
+            b'"arxiv:2501.10120":"openalex:W1"}'
+        ),
+        source="fixture map",
+    )
+
+    assert mapping.resolve("doi:10.1000/a") == "openalex:W1"
+    assert mapping.resolve("arXiv:2501.10120v2") == "openalex:W1"
+
+
+def test_identifier_map_from_bytes_redacts_invalid_utf8() -> None:
+    with pytest.raises(ValueError) as error:
+        dataset_module.IdentifierMap.from_bytes(
+            b'{"arxiv:2501.10120":"openalex:W1"}\xff',
+            source="fixture map",
+        )
+
+    assert str(error.value) == "fixture map: invalid UTF-8"
+
+
+def test_identifier_map_reports_explicit_alias_coverage(tmp_path: Path) -> None:
+    path = tmp_path / "map.json"
+    path.write_text(
+        '{"arxiv:2501.10120":"openalex:W1"}',
+        encoding="utf-8",
+    )
+
+    identifier_map = dataset_module.IdentifierMap.from_path(path)
+
+    assert identifier_map.covers("https://arxiv.org/abs/2501.10120v2") is True
+    assert identifier_map.covers("openalex:W1") is False
+    assert identifier_map.covers("doi:10.2000/unmapped") is False
+
+
 def test_identifier_map_resolves_chain_beyond_python_recursion_limit(
     tmp_path: Path,
 ) -> None:

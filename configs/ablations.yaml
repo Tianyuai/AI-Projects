@@ -1,0 +1,100 @@
+baseline:
+  query_planning: false
+  multi_source: false
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: false
+  adaptive_evolution: false
+  low_budget: false
+  balanced: false
+query-planning:
+  query_planning: true
+  multi_source: false
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: false
+  adaptive_evolution: false
+  low_budget: false
+  balanced: false
+multi-source:
+  query_planning: false
+  multi_source: true
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: false
+  adaptive_evolution: false
+  low_budget: false
+  balanced: false
+embedding:
+  query_planning: false
+  multi_source: false
+  embedding: true
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: false
+  adaptive_evolution: false
+  low_budget: false
+  balanced: false
+citation-expansion:
+  query_planning: false
+  multi_source: false
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: false
+  adaptive_evolution: false
+  low_budget: false
+  balanced: false
+llm-rerank:
+  query_planning: false
+  multi_source: false
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: false
+  adaptive_evolution: false
+  low_budget: false
+  balanced: false
+fixed-two-round:
+  query_planning: false
+  multi_source: false
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: true
+  adaptive_evolution: false
+  low_budget: false
+  balanced: false
+adaptive-evolution:
+  query_planning: false
+  multi_source: false
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: false
+  adaptive_evolution: true
+  low_budget: false
+  balanced: false
+low-budget:
+  query_planning: false
+  multi_source: false
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: false
+  adaptive_evolution: false
+  low_budget: true
+  balanced: false
+balanced:
+  query_planning: false
+  multi_source: false
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  fixed_two_round: false
+  adaptive_evolution: false
+  low_budget: false
+  balanced: true

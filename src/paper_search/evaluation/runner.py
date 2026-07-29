@@ -6,12 +6,14 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import BinaryIO, Literal, Protocol
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -96,6 +98,7 @@ class RunIdentity(DomainModel):
     manifest_sha256: NonEmptyStr
     dataset_revision: NonEmptyStr
     zero_answer_policy: Literal["reject", "allow"]
+    id_map_sha256: NonEmptyStr | None = None
 
 
 class RunResult(DomainModel):
@@ -159,6 +162,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--split", required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--id-map", type=Path)
     return parser
 
 
@@ -175,6 +179,120 @@ def _resolve_data_file(data_root: Path, raw_path: object, label: str) -> Path:
     if not resolved.is_file():
         raise _CliInputError(f"{label} file does not exist")
     return resolved
+
+
+def _resolve_cli_id_map(data_root: Path, raw_path: Path) -> Path:
+    if raw_path.is_absolute():
+        raise _CliInputError("identifier map path must stay under data")
+    resolved_root = data_root.resolve()
+    resolved = raw_path.resolve()
+    if not resolved.is_relative_to(resolved_root):
+        raise _CliInputError("identifier map path must stay under data")
+    if not resolved.is_file():
+        raise _CliInputError("identifier map file does not exist")
+    return resolved
+
+
+def _normalize_windows_final_path(raw_path: str) -> str:
+    if raw_path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + raw_path[8:]
+    if raw_path.startswith("\\\\?\\"):
+        return raw_path[4:]
+    return raw_path
+
+
+if sys.platform == "win32":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    def _windows_final_path_from_file(source: BinaryIO) -> Path:
+        get_final_path = ctypes.WinDLL(
+            "kernel32",
+            use_last_error=True,
+        ).GetFinalPathNameByHandleW
+        get_final_path.argtypes = (
+            wintypes.HANDLE,
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+        )
+        get_final_path.restype = wintypes.DWORD
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(source.fileno()))
+        buffer_size = 260
+        while buffer_size <= 32_768:
+            buffer = ctypes.create_unicode_buffer(buffer_size)
+            path_length = get_final_path(handle, buffer, buffer_size, 0)
+            if path_length == 0:
+                error_code = ctypes.get_last_error()
+                raise OSError(error_code, "final file target is unavailable")
+            if path_length < buffer_size:
+                return Path(_normalize_windows_final_path(buffer.value))
+            buffer_size = path_length + 1
+        raise OSError("final file target is too long")
+
+else:
+
+    def _windows_final_path_from_file(source: BinaryIO) -> Path:
+        del source
+        raise OSError("Windows final file target lookup is unavailable")
+
+
+def _posix_final_path_from_file(source: BinaryIO) -> Path:
+    descriptor = source.fileno()
+    handle_stat = os.fstat(descriptor)
+    for descriptor_root in (Path("/proc/self/fd"), Path("/dev/fd")):
+        try:
+            raw_target = os.readlink(descriptor_root / str(descriptor))
+        except OSError:
+            continue
+        if not os.path.isabs(raw_target):
+            continue
+        final_path = Path(os.path.normpath(raw_target))
+        try:
+            target_stat = final_path.stat()
+        except OSError:
+            continue
+        if (target_stat.st_dev, target_stat.st_ino) != (
+            handle_stat.st_dev,
+            handle_stat.st_ino,
+        ):
+            continue
+        return final_path
+    raise OSError("final file target is unavailable")
+
+
+def _final_path_from_open_file(source: BinaryIO) -> Path:
+    if os.name == "nt":
+        return _windows_final_path_from_file(source)
+    return _posix_final_path_from_file(source)
+
+
+def _read_confined_identifier_map(data_root: Path, raw_path: Path) -> bytes:
+    resolved_root = data_root.resolve()
+    resolved_path = _resolve_cli_id_map(resolved_root, raw_path)
+    with resolved_path.open("rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise _CliInputError("identifier map file does not exist")
+        final_path = _final_path_from_open_file(source)
+        if not final_path.is_relative_to(resolved_root):
+            raise _CliInputError("identifier map path must stay under data")
+        return source.read()
+
+
+def _require_id_map_coverage(
+    gold: Sequence[EvaluationQuery],
+    id_map: IdentifierMap,
+) -> None:
+    identifiers = {
+        identifier
+        for record in gold
+        for identifier in record.relevant_paper_ids
+    }
+    if any(not id_map.covers(identifier) for identifier in identifiers):
+        raise _CliInputError(
+            "identifier map does not cover frozen gold identifiers"
+        )
 
 
 def _resolve_frozen_split(data_root: Path, split: str, git_sha: str) -> FrozenSplit:
@@ -434,6 +552,8 @@ def _artifact_payloads(
         "gold": result.identity.gold_sha256,
         "predictions": _sha256_bytes(prediction_bytes),
     }
+    if result.identity.id_map_sha256 is not None:
+        input_hashes["id_map"] = result.identity.id_map_sha256
     metrics_payload: dict[str, object] = {
         "contract_version": CONTRACT_VERSION,
         "input_hashes": input_hashes,
@@ -476,7 +596,7 @@ def _artifact_payloads(
         "artifacts": artifact_paths,
         "config_hash": config.config_hash(),
         "contract_version": "week1-run-v2",
-        "identity": result.identity.model_dump(mode="json"),
+        "identity": result.identity.model_dump(mode="json", exclude_none=True),
         "input_hashes": input_hashes,
         "rules": {
             "deduplication": {
@@ -699,6 +819,7 @@ async def _run_cli_evaluation(
     config: RuntimeConfig,
     api_key: str,
     output: Path,
+    id_map: IdentifierMap | None,
 ) -> None:
     timeout = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -711,6 +832,7 @@ async def _run_cli_evaluation(
             cache=cache,
             config=config,
             output=output,
+            id_map=id_map,
         )
 
 
@@ -718,16 +840,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         frozen_split = _resolve_frozen_split(Path("data"), args.split, _current_git_sha())
+        identity = frozen_split.identity
+        id_map: IdentifierMap | None = None
+        if args.id_map is not None:
+            id_map_bytes = _read_confined_identifier_map(Path("data"), args.id_map)
+            id_map = IdentifierMap.from_bytes(id_map_bytes)
+            _require_id_map_coverage(frozen_split.gold, id_map)
+            identity = identity.model_copy(
+                update={"id_map_sha256": _sha256_bytes(id_map_bytes)}
+            )
         config = load_runtime_config(args.config, env_file=None)
         if config.openalex_api_key is None:
             raise _CliInputError("OPENALEX_API_KEY is required")
         asyncio.run(
             _run_cli_evaluation(
                 frozen_split.gold,
-                identity=frozen_split.identity,
+                identity=identity,
                 config=config,
                 api_key=config.openalex_api_key.get_secret_value(),
                 output=args.output.resolve(),
+                id_map=id_map,
             )
         )
     except _CliInputError as error:

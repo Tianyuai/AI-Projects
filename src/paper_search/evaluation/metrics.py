@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -26,6 +27,10 @@ from paper_search.evaluation.official_adapter import (
 
 
 CONTRACT_VERSION = "task2-evaluation-v1"
+
+
+class _IdentifierMapInputError(ValueError):
+    """An identifier-map failure whose fixed message is safe to display."""
 
 
 class QueryMetrics(DomainModel):
@@ -268,19 +273,35 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_identifier_map_snapshot(path: Path) -> tuple[IdentifierMap, str]:
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise _IdentifierMapInputError("identifier map is unavailable") from error
+    try:
+        identifier_map = IdentifierMap.from_bytes(content)
+    except ValueError as error:
+        raise _IdentifierMapInputError("identifier map is invalid") from error
+    digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+    return identifier_map, digest
+
+
 def _run_cli(args: argparse.Namespace) -> None:
     gold = read_jsonl(args.gold, EvaluationQuery)
     external_predictions = read_jsonl(args.pred, InternalPredictionRecord)
     predictions = [adapt_prediction_record(record) for record in external_predictions]
-    identifier_map = IdentifierMap.from_path(args.id_map) if args.id_map else None
+    identifier_map: IdentifierMap | None = None
+    identifier_map_hash: str | None = None
+    if args.id_map:
+        identifier_map, identifier_map_hash = _load_identifier_map_snapshot(args.id_map)
     result = evaluate(gold, predictions, id_map=identifier_map)
 
     input_hashes = {
         "gold": sha256_file(args.gold),
         "predictions": sha256_file(args.pred),
     }
-    if args.id_map:
-        input_hashes["id_map"] = sha256_file(args.id_map)
+    if identifier_map_hash is not None:
+        input_hashes["id_map"] = identifier_map_hash
 
     payload: dict[str, Any] = {
         "contract_version": CONTRACT_VERSION,
@@ -299,6 +320,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         _run_cli(args)
+    except _IdentifierMapInputError as error:
+        print(f"evaluation failed: {error}", file=sys.stderr)
+        return 2
     except (OSError, ValueError) as error:
         print(f"evaluation failed: {error}", file=sys.stderr)
         return 2

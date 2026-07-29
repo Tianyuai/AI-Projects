@@ -1,0 +1,442 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+import pytest
+
+from paper_search.domain.models import Paper
+from paper_search.ranking.embedding import (
+    EmbeddingOutOfMemoryError,
+    EmbeddingRanker,
+    EmbeddingUnavailableError,
+)
+
+
+class FakeEncoder:
+    def __init__(
+        self,
+        *,
+        device: str,
+        vectors: dict[str, list[float]],
+        calls: list[tuple[str, list[str], int]],
+        closed: list[str],
+    ) -> None:
+        self.model_id = "fixture-embedding-v1"
+        self.device = device
+        self._vectors = vectors
+        self._calls = calls
+        self._closed = closed
+
+    def encode(
+        self,
+        texts: Sequence[str],
+        *,
+        batch_size: int,
+    ) -> list[list[float]]:
+        values = list(texts)
+        self._calls.append((self.device, values, batch_size))
+        return [self._vectors[value] for value in values]
+
+    def close(self) -> None:
+        self._closed.append(self.device)
+
+
+class RaisingEncoder:
+    def __init__(self, *, device: str, exc: Exception, closed: list[str]) -> None:
+        self.model_id = "fixture-embedding-v1"
+        self.device = device
+        self._exc = exc
+        self._closed = closed
+
+    def encode(
+        self,
+        texts: Sequence[str],
+        *,
+        batch_size: int,
+    ) -> list[list[float]]:
+        raise self._exc
+
+    def close(self) -> None:
+        self._closed.append(self.device)
+
+
+class FailingEncoder(FakeEncoder):
+    def __init__(self, *, error: Exception, **kwargs: object) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self._error = error
+
+    def encode(
+        self,
+        texts: Sequence[str],
+        *,
+        batch_size: int,
+    ) -> list[list[float]]:
+        del texts, batch_size
+        raise self._error
+
+
+def _paper(identifier: str, title: str, abstract: str | None) -> Paper:
+    return Paper(canonical_id=identifier, title=title, abstract=abstract)
+
+
+def test_embedding_ranker_uses_original_query_and_title_plus_abstract() -> None:
+    calls: list[tuple[str, list[str], int]] = []
+    closed: list[str] = []
+    vectors = {
+        "graph retrieval": [1.0, 0.0],
+        "Relevant\nsemantic graph retrieval": [1.0, 0.0],
+        "Unrelated\nprotein folding": [0.0, 1.0],
+    }
+    ranker = EmbeddingRanker(
+        encoder_factory=lambda device: FakeEncoder(
+            device=device,
+            vectors=vectors,
+            calls=calls,
+            closed=closed,
+        ),
+        model_id="fixture-embedding-v1",
+        preferred_device="cpu",
+        batch_size=2,
+        fallback_to_cpu=True,
+    )
+
+    result = ranker.rank(
+        "graph retrieval",
+        [
+            _paper("paper:unrelated", "Unrelated", "protein folding"),
+            _paper("paper:relevant", "Relevant", "semantic graph retrieval"),
+        ],
+    )
+
+    assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:relevant",
+        "paper:unrelated",
+    ]
+    assert calls == [
+        ("cpu", ["graph retrieval"], 1),
+        (
+            "cpu",
+            ["Unrelated\nprotein folding", "Relevant\nsemantic graph retrieval"],
+            2,
+        ),
+    ]
+    assert result.status == "applied"
+    assert result.device == "cpu"
+    assert result.fallback_used is False
+    assert result.warnings == []
+    assert closed == ["cpu"]
+
+
+def test_embedding_ranker_uses_title_when_abstract_is_missing_or_blank() -> None:
+    calls: list[tuple[str, list[str], int]] = []
+    vectors = {
+        "query": [1.0, 0.0],
+        "Missing": [1.0, 0.0],
+        "Blank": [0.0, 1.0],
+    }
+    ranker = EmbeddingRanker(
+        encoder_factory=lambda device: FakeEncoder(
+            device=device,
+            vectors=vectors,
+            calls=calls,
+            closed=[],
+        ),
+        model_id="fixture-embedding-v1",
+        preferred_device="cpu",
+        batch_size=8,
+        fallback_to_cpu=True,
+    )
+
+    result = ranker.rank(
+        "query",
+        [
+            _paper("paper:blank", "Blank", "   "),
+            _paper("paper:missing", "Missing", None),
+        ],
+    )
+
+    assert calls[1][1] == ["Blank", "Missing"]
+    assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:missing",
+        "paper:blank",
+    ]
+
+
+def test_embedding_ranker_batches_candidates_and_preserves_prior_order_on_ties() -> None:
+    calls: list[tuple[str, list[str], int]] = []
+    vectors = {
+        "query": [1.0, 0.0],
+        "First": [1.0, 0.0],
+        "Second": [1.0, 0.0],
+        "Third": [1.0, 0.0],
+    }
+    ranker = EmbeddingRanker(
+        encoder_factory=lambda device: FakeEncoder(
+            device=device,
+            vectors=vectors,
+            calls=calls,
+            closed=[],
+        ),
+        model_id="fixture-embedding-v1",
+        preferred_device="cpu",
+        batch_size=2,
+        fallback_to_cpu=True,
+    )
+    papers = [
+        _paper("paper:z", "First", None),
+        _paper("paper:a", "Second", None),
+        _paper("paper:m", "Third", None),
+    ]
+
+    result = ranker.rank("query", papers)
+
+    assert [call[1] for call in calls] == [
+        ["query"],
+        ["First", "Second"],
+        ["Third"],
+    ]
+    assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:z",
+        "paper:a",
+        "paper:m",
+    ]
+
+
+def test_embedding_ranker_returns_empty_without_loading_encoder() -> None:
+    loaded: list[str] = []
+    ranker = EmbeddingRanker(
+        encoder_factory=lambda device: loaded.append(device),  # type: ignore[arg-type,func-returns-value]
+        model_id="fixture-embedding-v1",
+        preferred_device="cpu",
+        batch_size=2,
+        fallback_to_cpu=True,
+    )
+
+    result = ranker.rank("query", [])
+
+    assert result.ranked == []
+    assert result.status == "applied"
+    assert loaded == []
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, True])
+def test_embedding_ranker_rejects_invalid_batch_size(batch_size: object) -> None:
+    with pytest.raises(ValueError, match="batch_size"):
+        EmbeddingRanker(
+            encoder_factory=lambda _device: object(),  # type: ignore[arg-type,return-value]
+            model_id="fixture-embedding-v1",
+            preferred_device="cpu",
+            batch_size=batch_size,  # type: ignore[arg-type]
+            fallback_to_cpu=True,
+        )
+
+
+def test_embedding_ranker_falls_back_to_cpu_after_cuda_unavailable() -> None:
+    calls: list[tuple[str, list[str], int]] = []
+    closed: list[str] = []
+    vectors = {
+        "query": [1.0, 0.0],
+        "Relevant\nsemantic graph retrieval": [1.0, 0.0],
+        "Unrelated\nprotein folding": [0.0, 1.0],
+    }
+
+    def encoder_factory(device: str) -> object:
+        if device == "cuda":
+            raise EmbeddingUnavailableError("sanitized")
+        return FakeEncoder(
+            device=device,
+            vectors=vectors,
+            calls=calls,
+            closed=closed,
+        )
+
+    ranker = EmbeddingRanker(
+        encoder_factory=encoder_factory,  # type: ignore[arg-type]
+        model_id="fixture-embedding-v1",
+        preferred_device="cuda",
+        batch_size=2,
+        fallback_to_cpu=True,
+    )
+
+    result = ranker.rank(
+        "query",
+        [
+            _paper("paper:unrelated", "Unrelated", "protein folding"),
+            _paper("paper:relevant", "Relevant", "semantic graph retrieval"),
+        ],
+    )
+
+    assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:relevant",
+        "paper:unrelated",
+    ]
+    assert result.status == "applied"
+    assert result.device == "cpu"
+    assert result.fallback_used is True
+    assert result.warnings == ["cuda_unavailable_cpu_fallback"]
+    assert calls == [
+        ("cpu", ["query"], 1),
+        (
+            "cpu",
+            ["Unrelated\nprotein folding", "Relevant\nsemantic graph retrieval"],
+            2,
+        ),
+    ]
+    assert closed == ["cpu"]
+
+
+def test_embedding_ranker_falls_back_to_cpu_after_cuda_out_of_memory() -> None:
+    closed: list[str] = []
+    vectors = {
+        "query": [1.0, 0.0],
+        "Relevant\nsemantic graph retrieval": [1.0, 0.0],
+        "Unrelated\nprotein folding": [0.0, 1.0],
+    }
+
+    def encoder_factory(device: str) -> object:
+        if device == "cuda":
+            return RaisingEncoder(
+                device=device,
+                exc=EmbeddingOutOfMemoryError("sanitized"),
+                closed=closed,
+            )
+        return FakeEncoder(
+            device=device,
+            vectors=vectors,
+            calls=[],
+            closed=closed,
+        )
+
+    ranker = EmbeddingRanker(
+        encoder_factory=encoder_factory,  # type: ignore[arg-type]
+        model_id="fixture-embedding-v1",
+        preferred_device="cuda",
+        batch_size=2,
+        fallback_to_cpu=True,
+    )
+
+    result = ranker.rank(
+        "query",
+        [
+            _paper("paper:unrelated", "Unrelated", "protein folding"),
+            _paper("paper:relevant", "Relevant", "semantic graph retrieval"),
+        ],
+    )
+
+    assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:relevant",
+        "paper:unrelated",
+    ]
+    assert result.status == "applied"
+    assert result.device == "cpu"
+    assert result.fallback_used is True
+    assert result.warnings == ["cuda_oom_cpu_fallback"]
+    assert closed == ["cuda", "cpu"]
+
+
+def test_cuda_oom_closes_encoder_then_retries_once_on_cpu() -> None:
+    created: list[str] = []
+    closed: list[str] = []
+    vectors = {"query": [1.0, 0.0], "Paper": [1.0, 0.0]}
+
+    def factory(device: str) -> FakeEncoder:
+        created.append(device)
+        common = {
+            "device": device,
+            "vectors": vectors,
+            "calls": [],
+            "closed": closed,
+        }
+        if device == "cuda":
+            return FailingEncoder(
+                error=EmbeddingOutOfMemoryError("sanitized"),
+                **common,
+            )
+        return FakeEncoder(**common)
+
+    result = EmbeddingRanker(
+        encoder_factory=factory,  # type: ignore[arg-type]
+        model_id="fixture-embedding-v1",
+        preferred_device="cuda",
+        batch_size=2,
+        fallback_to_cpu=True,
+    ).rank("query", [_paper("paper:1", "Paper", None)])
+
+    assert created == ["cuda", "cpu"]
+    assert closed == ["cuda", "cpu"]
+    assert result.status == "applied"
+    assert result.device == "cpu"
+    assert result.fallback_used is True
+    assert result.warnings == ["cuda_oom_cpu_fallback"]
+
+
+def test_embedding_ranker_degrades_when_cpu_fallback_also_fails() -> None:
+    closed: list[str] = []
+
+    def encoder_factory(device: str) -> object:
+        if device == "cuda":
+            raise EmbeddingUnavailableError("sanitized")
+        return RaisingEncoder(
+            device=device,
+            exc=EmbeddingUnavailableError("private cpu failure detail"),
+            closed=closed,
+        )
+
+    ranker = EmbeddingRanker(
+        encoder_factory=encoder_factory,  # type: ignore[arg-type]
+        model_id="fixture-embedding-v1",
+        preferred_device="cuda",
+        batch_size=2,
+        fallback_to_cpu=True,
+    )
+    papers = [
+        _paper("paper:z", "First", None),
+        _paper("paper:a", "Second", None),
+    ]
+
+    result = ranker.rank("query", papers)
+
+    assert result.status == "degraded"
+    assert result.device == "cpu"
+    assert result.fallback_used is True
+    assert result.warnings == ["cuda_unavailable_cpu_fallback", "cpu_encoder_unavailable"]
+    assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:z",
+        "paper:a",
+    ]
+    assert [item.similarity for item in result.ranked] == [0.0, 0.0]
+    assert "private" not in " ".join(result.warnings)
+
+
+def test_cpu_failure_returns_prior_order_without_exception_detail() -> None:
+    private_detail = "private device path"
+
+    def factory(device: str) -> FakeEncoder:
+        return FailingEncoder(
+            error=EmbeddingUnavailableError(private_detail),
+            device=device,
+            vectors={},
+            calls=[],
+            closed=[],
+        )
+
+    papers = [
+        _paper("paper:2", "Second", None),
+        _paper("paper:1", "First", None),
+    ]
+    result = EmbeddingRanker(
+        encoder_factory=factory,  # type: ignore[arg-type]
+        model_id="fixture-embedding-v1",
+        preferred_device="cpu",
+        batch_size=2,
+        fallback_to_cpu=True,
+    ).rank("query", papers)
+
+    assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:2",
+        "paper:1",
+    ]
+    assert all(item.similarity == 0.0 for item in result.ranked)
+    assert result.status == "degraded"
+    assert result.warnings == ["encoder_unavailable"]
+    assert private_detail not in result.model_dump_json()

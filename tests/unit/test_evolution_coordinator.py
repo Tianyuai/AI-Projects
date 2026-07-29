@@ -137,8 +137,14 @@ class FakeCoverageAnalyzer:
 
 
 class FakeGenerator:
-    def __init__(self, *, fail_on_call: int | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail_on_call: int | None = None,
+        round_number_offset: int = 0,
+    ) -> None:
         self._fail_on_call = fail_on_call
+        self._round_number_offset = round_number_offset
         self.calls: list[dict[str, Any]] = []
 
     async def generate(
@@ -161,7 +167,7 @@ class FakeGenerator:
         )
         if len(self.calls) == self._fail_on_call:
             raise RuntimeError("secret generation prompt")
-        return round_plan(round_number)
+        return round_plan(round_number + self._round_number_offset)
 
 
 class FakeEstimator:
@@ -219,6 +225,85 @@ class FakeBudget:
         return self._availability[len(self.calls) - 1]
 
 
+class MutatingEstimator(FakeEstimator):
+    def estimate(self, plan: RoundPlan, completed_round_count: int) -> UsageEstimate:
+        del completed_round_count
+        plan.subqueries[0].target_constraints.append("corrupted")
+        plan.subqueries.clear()
+        raise RuntimeError("secret estimate mutation")
+
+
+class MutatingExecutor(FakeExecutor):
+    async def execute(self, spec: QuerySpec, plan: RoundPlan) -> RoundExecution:
+        spec.topics.append("corrupted")
+        plan.subqueries[0].target_constraints.append("corrupted")
+        plan.subqueries.clear()
+        raise RuntimeError("secret execution mutation")
+
+
+class MutatingCoverageAnalyzer(FakeCoverageAnalyzer):
+    def analyze(
+        self,
+        spec: QuerySpec,
+        candidate_ids: Sequence[str],
+        observations: Sequence[CandidateConstraintObservation],
+    ) -> CoverageReport:
+        del candidate_ids
+        spec.topics.append("corrupted")
+        assert isinstance(observations, list)
+        observations.clear()
+        raise RuntimeError("secret coverage mutation")
+
+
+class MutatingGainEvaluator(FakeGainEvaluator):
+    def evaluate(
+        self,
+        previous_ids: frozenset[str],
+        current_ids: frozenset[str],
+        execution: RoundExecution,
+    ) -> MarginalGain:
+        del previous_ids, current_ids
+        execution.candidates[0].authors.append("Corrupt Author")
+        execution.observations.clear()
+        execution.trace[0]["round"] = "corrupted"
+        raise RuntimeError("secret gain mutation")
+
+
+class MutatingGenerator(FakeGenerator):
+    async def generate(
+        self,
+        *,
+        spec: QuerySpec,
+        coverage: CoverageReport,
+        prior_plans: Sequence[RoundPlan],
+        round_number: int,
+        max_subqueries: int,
+    ) -> RoundPlan:
+        del round_number, max_subqueries
+        spec.topics.append("corrupted")
+        coverage.constraints[0].matched_candidate_ids.append("corrupted")
+        assert isinstance(prior_plans, list)
+        prior_plans[0].subqueries[0].target_constraints.append("corrupted")
+        prior_plans.clear()
+        raise RuntimeError("secret generation mutation")
+
+
+class SharedEstimateEstimator(FakeEstimator):
+    def __init__(self, shared_estimate: UsageEstimate) -> None:
+        super().__init__()
+        self.shared_estimate = shared_estimate
+
+    def estimate(self, plan: RoundPlan, completed_round_count: int) -> UsageEstimate:
+        self.calls.append((plan, completed_round_count))
+        return self.shared_estimate
+
+
+class MutatingBudget(FakeBudget):
+    def can_reserve(self, estimate: UsageEstimate) -> bool:
+        estimate.__dict__["search_api_calls"] = 999
+        raise RuntimeError("secret budget mutation")
+
+
 def coordinator(
     *,
     executor: FakeExecutor | None = None,
@@ -243,11 +328,15 @@ def run(
     *,
     strategy: str = "fixed_one_round",
     max_rounds: int = 2,
+    spec: QuerySpec | None = None,
+    initial_plan: RoundPlan | None = None,
 ) -> Any:
+    run_spec = spec if spec is not None else query_spec()
+    run_plan = initial_plan if initial_plan is not None else round_plan(1)
     return asyncio.run(
         instance.run(
-            spec=query_spec(),
-            initial_plan=round_plan(1),
+            spec=run_spec,
+            initial_plan=run_plan,
             strategy=strategy,
             max_rounds=max_rounds,
             max_subqueries=2,
@@ -400,11 +489,172 @@ def test_next_round_budget_rejection_preserves_committed_round() -> None:
     ]
 
 
+@pytest.mark.parametrize("round_number_offset", [-1, 1])
+def test_invalid_generated_round_sequence_fails_before_estimation_or_execution(
+    round_number_offset: int,
+) -> None:
+    first_paper = paper("p1", "First title")
+    first_execution = execution(
+        1,
+        candidates=[first_paper],
+        observations=[observation("p1", matched=False)],
+    )
+    fake_executor = FakeExecutor([first_execution, execution(2)])
+    estimator = FakeEstimator()
+
+    result = run(
+        coordinator(
+            executor=fake_executor,
+            generator=FakeGenerator(round_number_offset=round_number_offset),
+            estimator=estimator,
+        ),
+        strategy="fixed_two_round",
+    )
+
+    assert result.rounds == [first_execution]
+    assert result.candidates == [first_paper]
+    assert result.stop_reason == "round_failed"
+    assert result.failed_round == 2
+    assert result.warnings == ["generation: dependency failure"]
+    assert result.decisions[-1].failed_stage == "generation"
+    assert len(estimator.calls) == 1
+    assert len(fake_executor.calls) == 1
+
+
+def test_estimator_mutation_then_failure_cannot_change_authoritative_plan() -> None:
+    spec = query_spec()
+    initial_plan = round_plan(1)
+    spec_before = spec.model_dump(mode="json")
+    plan_before = initial_plan.model_dump(mode="json")
+
+    result = run(
+        coordinator(estimator=MutatingEstimator()),
+        spec=spec,
+        initial_plan=initial_plan,
+    )
+
+    assert spec.model_dump(mode="json") == spec_before
+    assert initial_plan.model_dump(mode="json") == plan_before
+    assert result.rounds == []
+    assert result.candidates == []
+    assert result.warnings == ["estimate: dependency failure"]
+
+
+def test_executor_mutation_then_failure_cannot_change_authoritative_inputs() -> None:
+    spec = query_spec()
+    initial_plan = round_plan(1)
+    spec_before = spec.model_dump(mode="json")
+    plan_before = initial_plan.model_dump(mode="json")
+
+    result = run(
+        coordinator(executor=MutatingExecutor([execution(1)])),
+        spec=spec,
+        initial_plan=initial_plan,
+    )
+
+    assert spec.model_dump(mode="json") == spec_before
+    assert initial_plan.model_dump(mode="json") == plan_before
+    assert result.rounds == []
+    assert result.candidates == []
+    assert result.warnings == ["execution: dependency failure"]
+
+
+def test_coverage_mutation_then_failure_cannot_change_committed_state() -> None:
+    spec = query_spec()
+    first_execution = execution(1)
+    spec_before = spec.model_dump(mode="json")
+    execution_before = first_execution.model_dump(mode="json")
+
+    result = run(
+        coordinator(
+            executor=FakeExecutor([first_execution]),
+            coverage_analyzer=MutatingCoverageAnalyzer(),
+        ),
+        spec=spec,
+    )
+
+    assert spec.model_dump(mode="json") == spec_before
+    assert result.rounds[0].model_dump(mode="json") == execution_before
+    assert result.candidates[0].model_dump(mode="json") == execution_before["candidates"][0]
+    assert result.rounds[0].observations == first_execution.observations
+    assert result.warnings == ["coverage: dependency failure"]
+
+
+def test_gain_mutation_then_failure_cannot_change_committed_state() -> None:
+    first_paper = Paper(
+        canonical_id="p1",
+        title="First title",
+        authors=["Original Author"],
+    )
+    first_execution = execution(
+        1,
+        candidates=[first_paper],
+        observations=[observation("p1", matched=False)],
+    )
+    execution_before = first_execution.model_dump(mode="json")
+    candidates_before = [item.model_dump(mode="json") for item in first_execution.candidates]
+
+    result = run(
+        coordinator(
+            executor=FakeExecutor([first_execution]),
+            gain_evaluator=MutatingGainEvaluator(),
+        )
+    )
+
+    assert result.rounds[0].model_dump(mode="json") == execution_before
+    assert [item.model_dump(mode="json") for item in result.candidates] == candidates_before
+    assert result.rounds[0].observations == first_execution.observations
+    assert result.warnings == ["gain: dependency failure"]
+
+
+def test_generator_mutation_then_failure_cannot_change_prior_state() -> None:
+    spec = query_spec()
+    initial_plan = round_plan(1)
+    first_execution = execution(1)
+    spec_before = spec.model_dump(mode="json")
+    plan_before = initial_plan.model_dump(mode="json")
+    execution_before = first_execution.model_dump(mode="json")
+
+    result = run(
+        coordinator(
+            executor=FakeExecutor([first_execution]),
+            generator=MutatingGenerator(),
+        ),
+        strategy="fixed_two_round",
+        spec=spec,
+        initial_plan=initial_plan,
+    )
+
+    assert spec.model_dump(mode="json") == spec_before
+    assert initial_plan.model_dump(mode="json") == plan_before
+    assert result.rounds[0].model_dump(mode="json") == execution_before
+    assert result.candidates[0].model_dump(mode="json") == execution_before["candidates"][0]
+    assert result.warnings == ["generation: dependency failure"]
+
+
+def test_budget_mutation_then_failure_cannot_change_estimator_output() -> None:
+    shared_estimate = UsageEstimate(search_api_calls=1, elapsed_ms=10)
+    estimate_before = shared_estimate.model_dump(mode="json")
+
+    result = run(
+        coordinator(
+            estimator=SharedEstimateEstimator(shared_estimate),
+            budget=MutatingBudget(),
+        )
+    )
+
+    assert shared_estimate.model_dump(mode="json") == estimate_before
+    assert result.rounds == []
+    assert result.candidates == []
+    assert result.warnings == ["preflight: dependency failure"]
+
+
 def test_duplicate_candidates_and_observations_keep_first_seen_objects() -> None:
     first_paper = paper("duplicate", "First title")
     later_paper = paper("duplicate", "Later title")
     first_observation = observation("duplicate", matched=False)
     conflicting_observation = observation("duplicate", matched=True)
+    observation_before = first_observation.model_dump(mode="json")
     analyzer = FakeCoverageAnalyzer()
     gain = FakeGainEvaluator()
 
@@ -435,6 +685,6 @@ def test_duplicate_candidates_and_observations_keep_first_seen_objects() -> None
     assert result.candidates[0] is first_paper
     assert analyzer.calls[-1][1] == ["duplicate"]
     assert analyzer.calls[-1][2] == [first_observation]
-    assert analyzer.calls[-1][2][0] is first_observation
+    assert analyzer.calls[-1][2][0].model_dump(mode="json") == observation_before
     assert gain.calls[-1][0] == frozenset({"duplicate"})
     assert gain.calls[-1][1] == frozenset({"duplicate"})

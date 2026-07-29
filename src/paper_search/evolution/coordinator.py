@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Protocol
+from typing import Protocol, TypeVar
 
-from paper_search.domain.models import Paper, QuerySpec, UsageEstimate
+from paper_search.domain.models import DomainModel, Paper, QuerySpec, UsageEstimate
 
 from .coverage import CoverageAnalyzer
 from .costing import RoundCostEstimator
@@ -19,6 +19,8 @@ from .models import (
     StopDecision,
 )
 from .stopping import decide_stop
+
+ModelT = TypeVar("ModelT", bound=DomainModel)
 
 
 class RoundExecutor(Protocol):
@@ -36,6 +38,14 @@ class GainEvaluator(Protocol):
 
 class BudgetPreflight(Protocol):
     def can_reserve(self, estimate: UsageEstimate) -> bool: ...
+
+
+def _snapshot(model: ModelT) -> ModelT:
+    return model.model_copy(deep=True)
+
+
+def _snapshot_sequence(models: Sequence[ModelT]) -> list[ModelT]:
+    return [_snapshot(model) for model in models]
 
 
 def _merge_candidates(
@@ -157,13 +167,16 @@ class EvolutionCoordinator:
         candidates: list[Paper] = []
         observations: list[CandidateConstraintObservation] = []
         decisions: list[StopDecision] = []
-        plans = [initial_plan]
-        plan = initial_plan
+        private_spec = _snapshot(spec)
+        plan = _snapshot(initial_plan)
+        plans = [plan]
         coverage: CoverageReport | None = None
         gain: MarginalGain | None = None
 
         try:
-            estimate = self._estimator.estimate(plan, len(rounds))
+            estimate = _snapshot(
+                self._estimator.estimate(_snapshot(plan), len(rounds))
+            )
         except Exception:
             return _failure(
                 stage="estimate",
@@ -178,7 +191,7 @@ class EvolutionCoordinator:
                 gain=gain,
             )
         try:
-            budget_available = self._budget.can_reserve(estimate)
+            budget_available = self._budget.can_reserve(_snapshot(estimate))
         except Exception:
             return _failure(
                 stage="preflight",
@@ -213,7 +226,10 @@ class EvolutionCoordinator:
         while True:
             previous_ids = frozenset(paper.canonical_id for paper in candidates)
             try:
-                execution = await self._executor.execute(spec, plan)
+                execution = await self._executor.execute(
+                    _snapshot(private_spec),
+                    _snapshot(plan),
+                )
                 if execution.round_number != plan.round_number:
                     raise ValueError("execution round number does not match its plan")
             except Exception:
@@ -237,9 +253,9 @@ class EvolutionCoordinator:
 
             try:
                 coverage = self._coverage_analyzer.analyze(
-                    spec,
+                    _snapshot(private_spec),
                     [paper.canonical_id for paper in candidates],
-                    observations,
+                    _snapshot_sequence(observations),
                 )
             except Exception:
                 return _failure(
@@ -259,7 +275,7 @@ class EvolutionCoordinator:
                 gain = self._gain_evaluator.evaluate(
                     previous_ids,
                     current_ids,
-                    execution,
+                    _snapshot(execution),
                 )
             except Exception:
                 return _failure(
@@ -295,13 +311,16 @@ class EvolutionCoordinator:
 
             next_round_number = plan.round_number + 1
             try:
-                next_plan = await self._generator.generate(
-                    spec=spec,
-                    coverage=coverage,
-                    prior_plans=plans,
+                generated_plan = await self._generator.generate(
+                    spec=_snapshot(private_spec),
+                    coverage=_snapshot(coverage),
+                    prior_plans=_snapshot_sequence(plans),
                     round_number=next_round_number,
                     max_subqueries=max_subqueries,
                 )
+                if generated_plan.round_number != next_round_number:
+                    raise ValueError("generated round number does not match request")
+                next_plan = _snapshot(generated_plan)
             except Exception:
                 return _failure(
                     stage="generation",
@@ -317,7 +336,9 @@ class EvolutionCoordinator:
                 )
 
             try:
-                estimate = self._estimator.estimate(next_plan, len(rounds))
+                estimate = _snapshot(
+                    self._estimator.estimate(_snapshot(next_plan), len(rounds))
+                )
             except Exception:
                 return _failure(
                     stage="estimate",
@@ -332,7 +353,7 @@ class EvolutionCoordinator:
                     gain=gain,
                 )
             try:
-                budget_available = self._budget.can_reserve(estimate)
+                budget_available = self._budget.can_reserve(_snapshot(estimate))
             except Exception:
                 return _failure(
                     stage="preflight",

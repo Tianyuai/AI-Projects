@@ -136,6 +136,70 @@ def test_failure_takes_precedence_over_every_other_stop_reason() -> None:
     assert decision.reason_code == "round_failed"
 
 
+def test_max_rounds_takes_precedence_over_low_gain_and_budget() -> None:
+    decision = decide_stop(
+        strategy="adaptive",
+        completed_rounds=2,
+        coverage=incomplete_coverage(),
+        gain=gain(0.0),
+        budget_available=False,
+        max_rounds=2,
+        marginal_gain_threshold=0.5,
+        failed_stage=None,
+    )
+
+    assert decision.reason_code == "max_rounds_reached"
+    assert decision.checks["max_rounds_reached"] is True
+    assert decision.checks["marginal_gain_below_threshold"] is True
+    assert decision.checks["budget_insufficient"] is True
+
+
+def test_low_gain_takes_precedence_over_budget() -> None:
+    decision = decide_stop(
+        strategy="adaptive",
+        completed_rounds=0,
+        coverage=incomplete_coverage(),
+        gain=gain(0.0),
+        budget_available=False,
+        max_rounds=2,
+        marginal_gain_threshold=0.5,
+        failed_stage=None,
+    )
+
+    assert decision.reason_code == "marginal_gain_below_threshold"
+    assert decision.checks["marginal_gain_below_threshold"] is True
+    assert decision.checks["budget_insufficient"] is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("strategy", "not-a-strategy"),
+        ("completed_rounds", "2"),
+        ("budget_available", 1),
+        ("max_rounds", "2"),
+        ("marginal_gain_threshold", "0.5"),
+    ],
+)
+def test_invalid_raw_policy_inputs_fail_at_a_stable_validation_boundary(
+    field: str, value: object
+) -> None:
+    inputs: dict[str, object] = {
+        "strategy": "adaptive",
+        "completed_rounds": 0,
+        "coverage": None,
+        "gain": None,
+        "budget_available": True,
+        "max_rounds": 2,
+        "marginal_gain_threshold": 0.5,
+        "failed_stage": None,
+    }
+    inputs[field] = value
+
+    with pytest.raises(ValueError):
+        decide_stop(**inputs)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("max_rounds", [0, -1])
 def test_adaptive_requires_positive_max_rounds(max_rounds: int) -> None:
     with pytest.raises(ValueError):

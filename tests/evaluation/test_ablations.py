@@ -86,9 +86,29 @@ def test_rejects_conflicting_evolution_flags() -> None:
         evolution_strategy_for_modules(modules)
 
 
+@pytest.mark.parametrize("flag_name", ["fixed_two_round", "adaptive_evolution"])
 @pytest.mark.parametrize("value", [None, 0, 1, "true"])
-def test_rejects_non_boolean_evolution_flags(value: object) -> None:
-    modules = {**_modules(), "fixed_two_round": value}
+def test_rejects_non_boolean_evolution_flags(flag_name: str, value: object) -> None:
+    modules = {**_modules(), flag_name: value}
+
+    with pytest.raises(ValueError, match="must be booleans"):
+        evolution_strategy_for_modules(modules)
+
+
+@pytest.mark.parametrize(
+    ("missing_flag", "valid_flag"),
+    [
+        ("fixed_two_round", "adaptive_evolution"),
+        ("adaptive_evolution", "fixed_two_round"),
+    ],
+)
+def test_rejects_missing_evolution_flags(
+    missing_flag: str,
+    valid_flag: str,
+) -> None:
+    modules = _modules()
+    modules.pop(missing_flag)
+    modules[valid_flag] = False
 
     with pytest.raises(ValueError, match="must be booleans"):
         evolution_strategy_for_modules(modules)

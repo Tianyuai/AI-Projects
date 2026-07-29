@@ -318,6 +318,10 @@ class IdentifierMap:
 
         return cls({alias: resolved[alias] for alias in direct})
 
+    def covers(self, value: str) -> bool:
+        """Return whether value is an explicit normalized map alias."""
+        return normalize_paper_id(value) in self._resolved
+
     def resolve(self, value: str) -> str:
         """Normalize an identifier and return its terminal mapped value."""
         normalized = normalize_paper_id(value)

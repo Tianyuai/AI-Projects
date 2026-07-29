@@ -268,6 +268,20 @@ def test_identifier_map_resolves_normalized_chains(tmp_path: Path) -> None:
     assert mapping.resolve("doi:10.2000/unmapped") == "doi:10.2000/unmapped"
 
 
+def test_identifier_map_reports_explicit_alias_coverage(tmp_path: Path) -> None:
+    path = tmp_path / "map.json"
+    path.write_text(
+        '{"arxiv:2501.10120":"openalex:W1"}',
+        encoding="utf-8",
+    )
+
+    identifier_map = dataset_module.IdentifierMap.from_path(path)
+
+    assert identifier_map.covers("https://arxiv.org/abs/2501.10120v2") is True
+    assert identifier_map.covers("openalex:W1") is False
+    assert identifier_map.covers("doi:10.2000/unmapped") is False
+
+
 def test_identifier_map_resolves_chain_beyond_python_recursion_limit(
     tmp_path: Path,
 ) -> None:

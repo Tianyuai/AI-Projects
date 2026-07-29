@@ -56,12 +56,15 @@ class DeterministicRoundCostEstimator:
         ):
             raise ValueError("completed_round_count must be a nonnegative integer")
         count = len(plan.subqueries)
+        cost_cny = self._cost_cny_per_subquery * count
+        if not math.isfinite(cost_cny):
+            raise ValueError("estimated cost_cny must be a finite nonnegative number")
         return UsageEstimate(
             search_api_calls=self._search_calls_per_subquery * count,
             llm_calls=self._llm_calls_per_round,
             input_tokens=self._input_tokens_per_subquery * count,
             output_tokens=self._output_tokens_per_subquery * count,
-            cost_cny=self._cost_cny_per_subquery * count,
+            cost_cny=cost_cny,
             elapsed_ms=self._elapsed_ms_per_subquery * count,
         )
 
@@ -73,11 +76,12 @@ def _nonnegative_integer(name: str, value: object) -> int:
 
 
 def _nonnegative_finite_number(name: str, value: object) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value < 0
-    ):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a finite nonnegative number")
-    return float(value)
+    try:
+        normalized = float(value)
+    except OverflowError as error:
+        raise ValueError(f"{name} must be a finite nonnegative number") from error
+    if not math.isfinite(normalized) or normalized < 0:
+        raise ValueError(f"{name} must be a finite nonnegative number")
+    return normalized

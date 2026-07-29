@@ -161,6 +161,21 @@ def test_can_reserve_matches_reserve_without_mutating_state() -> None:
     assert controller.can_reserve(UsageEstimate(search_api_calls=1)) is False
 
 
+def test_can_reserve_expires_at_limit_reservation_without_replacing_it() -> None:
+    controller_type, _, _ = budget_preflight_api()
+    current = datetime(2026, 7, 29, tzinfo=UTC)
+    controller = controller_type(
+        make_budget(max_search_api_calls=1, target_search_api_calls=1),
+        clock=lambda: current,
+        reservation_ttl_seconds=1,
+    )
+    controller.reserve("expiring", UsageEstimate(search_api_calls=1))
+    current += timedelta(seconds=2)
+
+    assert controller.can_reserve(UsageEstimate(search_api_calls=1)) is True
+    assert controller.reserved_usage == UsageEstimate()
+
+
 @pytest.mark.parametrize(
     ("estimate", "budget_updates"),
     [

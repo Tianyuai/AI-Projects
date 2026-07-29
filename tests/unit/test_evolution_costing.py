@@ -83,6 +83,16 @@ def test_cost_assumption_must_be_finite_nonnegative_number(value: object) -> Non
         estimator(cost_cny_per_subquery=value)
 
 
+def test_cost_assumption_rejects_integer_that_overflows_float() -> None:
+    with pytest.raises(ValueError, match="cost_cny_per_subquery must be a finite nonnegative number"):
+        estimator(cost_cny_per_subquery=10**1000)
+
+
+def test_estimate_rejects_cost_product_that_overflows_float() -> None:
+    with pytest.raises(ValueError, match="estimated cost_cny must be a finite nonnegative number"):
+        estimator(cost_cny_per_subquery=1e308).estimate(round_plan_with_three_queries(), 0)
+
+
 @pytest.mark.parametrize("value", [True, False, 1.0, -1])
 def test_completed_round_count_must_be_nonnegative_integer(value: object) -> None:
     with pytest.raises(ValueError, match="completed_round_count must be a nonnegative integer"):

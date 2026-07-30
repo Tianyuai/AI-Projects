@@ -445,10 +445,10 @@ def test_loads_fully_bound_synthetic_versioned_v2_fixture(tmp_path: Path) -> Non
     [
         "report_noncanonical",
         "report_hash",
-        "report_non_utc",
+        "report_timestamp_binding",
         "report_approver",
-        "report_audit",
         "report_partition_binding",
+        "report_identifier_binding",
         "partition_hash",
         "partition_count",
         "partition_blank",
@@ -464,10 +464,11 @@ def test_loads_fully_bound_synthetic_versioned_v2_fixture(tmp_path: Path) -> Non
 )
 def test_v2_loader_rejects_complete_binding_mutation_matrix(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     mutation: str,
 ) -> None:
     data_root, manifest = _write_bound_v2_tree(tmp_path)
-    report_path, report = _v2_report(data_root, manifest)
+    _, report = _v2_report(data_root, manifest)
     partitions = manifest["partitions"]
     identifier_map = manifest["identifier_map"]
     approval_binding = manifest["approval"]
@@ -476,6 +477,20 @@ def test_v2_loader_rejects_complete_binding_mutation_matrix(
     assert isinstance(approval_binding, dict)
     dev = next(
         item for item in partitions if isinstance(item, dict) and item["name"] == "dev"
+    )
+    report_validated = False
+    original_validate_report = freeze_schema._validated_report_bytes
+
+    def record_validated_report(content: bytes) -> object:
+        nonlocal report_validated
+        validated = original_validate_report(content)
+        report_validated = True
+        return validated
+
+    monkeypatch.setattr(
+        freeze_schema,
+        "_validated_report_bytes",
+        record_validated_report,
     )
 
     if mutation == "report_noncanonical":
@@ -487,19 +502,19 @@ def test_v2_loader_rejects_complete_binding_mutation_matrix(
         )
     elif mutation == "report_hash":
         approval_binding["report_sha256"] = _sha256(b"different-report")
-    elif mutation == "report_non_utc":
-        report["approved_at"] = "2026-07-30T00:00:00"
+    elif mutation == "report_timestamp_binding":
+        report["approved_at"] = "2026-07-30T00:00:01Z"
         _bind_v2_report(data_root, manifest, report)
     elif mutation == "report_approver":
         report["approver_ref"] = "different-operator"
         _bind_v2_report(data_root, manifest, report)
-    elif mutation == "report_audit":
-        report["audit_sha256"] = _sha256(b"different-audit")
-        report_path.write_bytes(_canonical_document(report))
     elif mutation == "report_partition_binding":
         hashes = report["partition_hashes"]
         assert isinstance(hashes, dict)
         hashes["dev"] = _sha256(b"different-partition")
+        _bind_v2_report(data_root, manifest, report)
+    elif mutation == "report_identifier_binding":
+        report["identifier_map_sha256"] = _sha256(b"different-map")
         _bind_v2_report(data_root, manifest, report)
     elif mutation == "partition_hash":
         dev["sha256"] = _sha256(b"different-partition")
@@ -556,6 +571,13 @@ def test_v2_loader_rejects_complete_binding_mutation_matrix(
 
     with pytest.raises(ValueError, match="freeze manifest is invalid"):
         load_freeze_manifest(data_root / "manifest.json", data_root=data_root)
+    if mutation in {
+        "report_timestamp_binding",
+        "report_approver",
+        "report_partition_binding",
+        "report_identifier_binding",
+    }:
+        assert report_validated
 
 
 def test_confined_report_publication_never_overwrites_different_existing_bytes(

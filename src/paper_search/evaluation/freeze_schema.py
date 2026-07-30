@@ -431,6 +431,25 @@ def _windows_file_id(handle: int) -> tuple[int, bytes]:
     return result.volume_serial_number, bytes(result.file_id.identifier)
 
 
+def _delete_windows_handle(handle: int) -> bool:
+    """Mark the exact open file object for deletion without resolving its path."""
+    import ctypes
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    disposition = FileDispositionInfo(1)
+    return bool(
+        kernel32.SetFileInformationByHandle(
+            ctypes.c_void_p(handle),
+            4,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        )
+    )
+
+
 def _delete_windows_path_if_file_id(
     path: Path,
     expected_file_id: tuple[int, bytes],
@@ -796,7 +815,7 @@ def publish_confined_bytes_no_overwrite(
             )
             handle = create_file(
                 str(temporary_path),
-                0x40000000,
+                0x40000000 | 0x00010000,
                 0x00000001 | 0x00000002 | 0x00000004,
                 None,
                 1,
@@ -807,13 +826,11 @@ def publish_confined_bytes_no_overwrite(
                 raise ValueError("freeze manifest is invalid")
             descriptor: int | None = None
             try:
+                retained_temp_id = _windows_file_id(int(handle))
                 descriptor = msvcrt.open_osfhandle(
                     int(handle), os.O_WRONLY | getattr(os, "O_BINARY", 0)
                 )
                 handle = invalid
-                retained_temp_id = _windows_file_id(
-                    msvcrt.get_osfhandle(descriptor)
-                )
                 _write_descriptor(descriptor, content)
                 temporary_relative = temporary_path.relative_to(root).as_posix()
                 (
@@ -857,6 +874,7 @@ def publish_confined_bytes_no_overwrite(
                 if descriptor is not None:
                     os.close(descriptor)
                 elif handle != invalid:
+                    _delete_windows_handle(int(handle))
                     kernel32.CloseHandle(ctypes.c_void_p(handle))
         finally:
             try:

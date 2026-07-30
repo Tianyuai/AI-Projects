@@ -899,7 +899,10 @@ def _restore_manifest_without_overwrite(
     manifest_path: Path,
 ) -> bool:
     if manifest_path.exists():
-        return True
+        try:
+            return manifest_path.samefile(backup_path)
+        except OSError:
+            return False
     if not backup_path.exists():
         return False
     try:
@@ -1101,12 +1104,28 @@ def _replace_manifest_guarded(
             before_manifest_replace()
         with _stable_evidence_files(stable_evidence):
             try:
-                os.replace(manifest_path, backup_path)
-                manifest_taken = True
+                try:
+                    os.replace(manifest_path, backup_path)
+                except OSError:
+                    try:
+                        manifest_taken = backup_path.read_bytes() == prepared_bytes
+                    except OSError:
+                        manifest_taken = False
+                    raise
+                else:
+                    manifest_taken = True
                 if backup_path.read_bytes() != prepared_bytes:
                     raise RuntimeError("freeze approval failed")
-                os.link(temporary_path, manifest_path)
-                published = True
+                try:
+                    os.link(temporary_path, manifest_path)
+                except OSError:
+                    try:
+                        published = manifest_path.samefile(temporary_path)
+                    except OSError:
+                        published = False
+                    raise
+                else:
+                    published = True
             except OSError:
                 raise RuntimeError("freeze approval failed") from None
         if not manifest_path.samefile(temporary_path) or manifest_path.read_bytes() != frozen_bytes:

@@ -454,14 +454,166 @@ def test_idempotent_migration_rejects_artifact_mutation_matrix(
         _migrate(case)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits held-path mutation")
+@pytest.mark.parametrize("artifact", ["manifest", "report", "partition", "identifier_map"])
+@pytest.mark.parametrize("mutation", ["rewrite", "replace"])
+def test_idempotent_migration_rejects_mutation_between_stable_pre_and_post_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact: str,
+    mutation: str,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    _migrate(case)
+    root = case.prepared.data_root
+    target = {
+        "manifest": root / "manifest.json",
+        "report": root / case.approval_report_path,
+        "partition": root / "dev" / "gold.jsonl",
+        "identifier_map": root / case.identifier_map.path,
+    }[artifact]
+    original_stable = freeze_module._stable_evidence_files
+    injected = False
+
+    @contextmanager
+    def inject_after_precheck(
+        evidence: object,
+    ) -> Iterator[None]:
+        nonlocal injected
+        with original_stable(evidence):
+            yield
+            if mutation == "rewrite":
+                target.write_bytes(b"post-check-mutation")
+            else:
+                replacement = target.with_name(f"{target.name}.post-check")
+                replacement.write_bytes(target.read_bytes())
+                os.replace(replacement, target)
+            injected = True
+
+    monkeypatch.setattr(
+        freeze_module,
+        "_stable_evidence_files",
+        inject_after_precheck,
+    )
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+    assert injected
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows FILE_ID post-check contract")
+def test_windows_idempotent_migration_rejects_native_manifest_replace_after_precheck(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    _migrate(case)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    original_stable = freeze_module._stable_evidence_files
+    injected = False
+
+    @contextmanager
+    def inject_after_precheck(
+        evidence: object,
+    ) -> Iterator[None]:
+        nonlocal injected
+        with original_stable(evidence):
+            yield
+            replacement = root / "manifest.post-check.json"
+            replacement.write_bytes(manifest_path.read_bytes())
+            _native_replace_windows(replacement, manifest_path)
+            injected = True
+
+    monkeypatch.setattr(
+        freeze_module,
+        "_stable_evidence_files",
+        inject_after_precheck,
+    )
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+    assert injected
+
+
+def test_idempotent_migration_rejects_rebound_approval_audit(
+    tmp_path: Path,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    _migrate(case)
+    root = case.prepared.data_root
+    report_path = root / case.approval_report_path
+    report = json.loads(report_path.read_bytes())
+    assert isinstance(report, dict)
+    report["audit_sha256"] = _sha256(b"different-legacy-audit")
+    report_bytes = freeze_module._json_bytes(report)
+    report_path.write_bytes(report_bytes)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    assert isinstance(manifest, dict)
+    approval_binding = manifest["approval"]
+    assert isinstance(approval_binding, dict)
+    approval_binding["report_sha256"] = _sha256(report_bytes)
+    manifest_path.write_bytes(freeze_module._json_bytes(manifest))
+
+    assert isinstance(
+        load_freeze_manifest(manifest_path, data_root=root),
+        FreezeManifestV2,
+    )
+    with pytest.raises(ValueError, match="freeze migration failed"):
+        _migrate(case)
+
+
+def test_v1_migration_rejects_wrong_approval_audit_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    wrong_approval = case.approval.model_copy(
+        update={"audit_sha256": _sha256(b"different-legacy-audit")}
+    )
+    migration_manifest_called = False
+    original_migration_manifest = freeze_module._migration_manifest
+
+    def record_migration_manifest(*args: object, **kwargs: object) -> object:
+        nonlocal migration_manifest_called
+        migration_manifest_called = True
+        return original_migration_manifest(*args, **kwargs)
+
+    monkeypatch.setattr(
+        freeze_module,
+        "_migration_manifest",
+        record_migration_manifest,
+    )
+
+    with pytest.raises(ValueError, match="freeze migration failed"):
+        migrate_v1_to_v2(
+            case.legacy,
+            data_root=case.prepared.data_root,
+            approval=wrong_approval,
+            identifier_map=case.identifier_map,
+            dataset_revision=case.dataset_revision,
+            approval_report_path=case.approval_report_path,
+        )
+
+    assert not migration_manifest_called
+    assert (
+        case.prepared.data_root / "manifest.json"
+    ).read_bytes() == case.legacy_manifest_bytes
+    assert not (case.prepared.data_root / case.approval_report_path).exists()
+
+
 @pytest.mark.parametrize("report_state", ["created", "matched"])
-def test_migration_manifest_failure_preserves_v1_and_exact_retry_succeeds(
+@pytest.mark.parametrize("failure_boundary", ["after_backup", "after_final_link"])
+def test_migration_guarded_publish_failure_restores_v1_and_exact_retry_succeeds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     report_state: str,
+    failure_boundary: str,
 ) -> None:
     case = _migration_fixture(tmp_path)
     root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
     report_path = root / case.approval_report_path
     expected_report = freeze_module._json_bytes(
         case.approval.model_dump(mode="json")
@@ -469,28 +621,94 @@ def test_migration_manifest_failure_preserves_v1_and_exact_retry_succeeds(
     if report_state == "matched":
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_bytes(expected_report)
-    original_publish = freeze_module._replace_manifest_guarded
+    original_replace = freeze_module.os.replace
+    original_link = freeze_module.os.link
 
-    def fail_manifest_publish(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise RuntimeError("synthetic manifest publisher failure")
+    def fail_after_backup(source: object, target: object) -> None:
+        original_replace(source, target)
+        if (
+            Path(source) == manifest_path
+            and Path(target).name.startswith(".manifest.json.prepared.")
+        ):
+            raise OSError("synthetic post-backup failure")
 
-    monkeypatch.setattr(
-        freeze_module,
-        "_replace_manifest_guarded",
-        fail_manifest_publish,
-    )
-    with pytest.raises(RuntimeError, match="synthetic manifest publisher failure"):
+    def fail_after_final_link(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        original_link(source, target, *args, **kwargs)
+        if (
+            Path(target) == manifest_path
+            and Path(source).name.startswith(".manifest.json.")
+            and ".prepared." not in Path(source).name
+        ):
+            raise OSError("synthetic post-link failure")
+
+    if failure_boundary == "after_backup":
+        monkeypatch.setattr(freeze_module.os, "replace", fail_after_backup)
+    else:
+        monkeypatch.setattr(freeze_module.os, "link", fail_after_final_link)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
         _migrate(case)
 
-    assert (root / "manifest.json").read_bytes() == case.legacy_manifest_bytes
+    assert manifest_path.read_bytes() == case.legacy_manifest_bytes
     assert report_path.read_bytes() == expected_report
 
+    monkeypatch.setattr(freeze_module.os, "replace", original_replace)
+    monkeypatch.setattr(freeze_module.os, "link", original_link)
+    assert isinstance(_migrate(case), FreezeManifestV2)
+
+
+def test_migration_guarded_publish_preserves_concurrent_manifest_owner_and_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    concurrent_bytes = b"concurrent-manifest-owner"
+    original_link = freeze_module.os.link
+    injected = False
+
+    def insert_concurrent_owner(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal injected
+        if (
+            Path(target) == manifest_path
+            and Path(source).name.startswith(".manifest.json.")
+            and ".prepared." not in Path(source).name
+            and not injected
+        ):
+            manifest_path.write_bytes(concurrent_bytes)
+            injected = True
+        original_link(source, target, *args, **kwargs)
+
     monkeypatch.setattr(
-        freeze_module,
-        "_replace_manifest_guarded",
-        original_publish,
+        freeze_module.os,
+        "link",
+        insert_concurrent_owner,
     )
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    assert injected
+    assert manifest_path.read_bytes() == concurrent_bytes
+    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
+    assert (root / case.approval_report_path).is_file()
+
+    monkeypatch.setattr(freeze_module.os, "link", original_link)
+    manifest_path.unlink()
+    os.replace(recovery[0], manifest_path)
     assert isinstance(_migrate(case), FreezeManifestV2)
 
 
@@ -557,6 +775,96 @@ def test_windows_migration_rejects_final_report_native_replacement_and_keeps_v1(
     with original_open(root, case.approval_report_path) as final_artifact:
         assert final_artifact.windows_file_id == attacker_id
         assert final_artifact.content == approval_bytes
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows raw-handle cleanup contract")
+@pytest.mark.parametrize("failure_stage", ["open_osfhandle", "initial_file_id"])
+@pytest.mark.parametrize("concurrent_owner", [False, True])
+def test_windows_migration_cleans_report_temp_when_raw_handle_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    concurrent_owner: bool,
+) -> None:
+    import ctypes
+    import msvcrt
+
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    report_parent = root / "freeze_reports"
+    original_open_osfhandle = msvcrt.open_osfhandle
+    original_file_id = freeze_schema_module._windows_file_id
+    triggered = False
+    replaced_temp_path: Path | None = None
+    attacker = root / "concurrent-temp-owner.tmp"
+    attacker_bytes = b"concurrent-temp-owner"
+    if concurrent_owner:
+        attacker.write_bytes(attacker_bytes)
+
+    def report_temp_path(handle: int) -> Path | None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        buffer = ctypes.create_unicode_buffer(32768)
+        if not kernel32.GetFinalPathNameByHandleW(
+            ctypes.c_void_p(handle), buffer, len(buffer), 0
+        ):
+            return None
+        path = Path(
+            freeze_schema_module._normalized_windows_path(buffer.value)
+        )
+        return path if path.name.startswith(".v2-approval.json.") else None
+
+    def inject_concurrent_owner(path: Path) -> None:
+        nonlocal replaced_temp_path
+        if concurrent_owner:
+            _native_replace_windows(attacker, path)
+            replaced_temp_path = path
+
+    def fail_open_osfhandle(handle: int, flags: int) -> int:
+        nonlocal triggered
+        path = report_temp_path(handle)
+        if (
+            failure_stage == "open_osfhandle"
+            and not triggered
+            and path is not None
+        ):
+            inject_concurrent_owner(path)
+            triggered = True
+            raise OSError("synthetic open_osfhandle failure")
+        return original_open_osfhandle(handle, flags)
+
+    def fail_initial_file_id(handle: int) -> tuple[int, bytes]:
+        nonlocal triggered
+        path = report_temp_path(handle)
+        if (
+            failure_stage == "initial_file_id"
+            and not triggered
+            and path is not None
+        ):
+            inject_concurrent_owner(path)
+            triggered = True
+            raise OSError("synthetic initial FILE_ID failure")
+        return original_file_id(handle)
+
+    monkeypatch.setattr(msvcrt, "open_osfhandle", fail_open_osfhandle)
+    monkeypatch.setattr(
+        freeze_schema_module,
+        "_windows_file_id",
+        fail_initial_file_id,
+    )
+
+    with pytest.raises(RuntimeError, match="freeze migration failed"):
+        _migrate(case)
+
+    assert triggered
+    assert (root / "manifest.json").read_bytes() == case.legacy_manifest_bytes
+    assert not (root / case.approval_report_path).exists()
+    temporaries = list(report_parent.glob(".v2-approval.json.*.tmp"))
+    if concurrent_owner:
+        assert temporaries == [replaced_temp_path]
+        assert replaced_temp_path is not None
+        assert replaced_temp_path.read_bytes() == attacker_bytes
+    else:
+        assert not temporaries
 
 
 def test_audit_candidate_builds_safe_result_without_writing(tmp_path: Path) -> None:

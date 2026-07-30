@@ -1,39 +1,36 @@
 {
-  "access": "gated-hugging-face-dataset",
-  "license": "CC-BY-NC-SA-4.0",
-  "partitions": {
-    "dev": {
-      "count": 60,
-      "gold_path": "dev/gold.jsonl",
-      "gold_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "ids_path": "splits/dev.ids.json",
-      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "labels_complete": true,
-      "zero_answer_policy": "reject"
-    },
-    "simulated_test": {
-      "count": 50,
-      "gold_path": "simulated_test/gold.jsonl",
-      "gold_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "ids_path": "splits/simulated_test.ids.json",
-      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "labels_complete": true,
-      "zero_answer_policy": "reject"
-    },
-    "validation": {
-      "count": 30,
-      "gold_path": "validation/gold.jsonl",
-      "gold_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "ids_path": "splits/validation.ids.json",
-      "ids_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "labels_complete": true,
-      "zero_answer_policy": "reject"
-    }
+  "annotation_status": "frozen",
+  "approval": {
+    "approved_at": "2026-07-30T00:00:00Z",
+    "approver_ref": "example-operator",
+    "report_path": "freeze_reports/example-v2-approval.json",
+    "report_sha256": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
   },
-  "random_seed": 20260714,
-  "repo_id": "CarlanLark/pasa-dataset",
-  "revision": "232428b0c867268c3b8ded90db4d98c1b30501d6",
-  "sampling_algorithm": "answer-count-largest-remainder-v1",
-  "source_files": [],
-  "status": "waiting_for_human_label_freeze"
+  "created_at": "2026-07-30T00:00:00Z",
+  "dataset_revision": "sanitized-example-revision",
+  "freeze_status": "approved",
+  "gold_sha256": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "identifier_map": {
+    "entry_count": 2,
+    "path": "identifier_maps/example-map.json",
+    "sha256": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  },
+  "partition_immutability": "content_addressed",
+  "partitions": [
+    {
+      "name": "dev",
+      "path": "partitions/dev.gold.jsonl",
+      "query_count": 3,
+      "sha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "zero_answer_policy": "forbid"
+    },
+    {
+      "name": "validation",
+      "path": "partitions/validation.gold.jsonl",
+      "query_count": 2,
+      "sha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "zero_answer_policy": "allow"
+    }
+  ],
+  "schema_version": "paper-search-freeze-v2"
 }

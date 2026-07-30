@@ -7,6 +7,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from types import ModuleType
 from typing import cast
@@ -21,8 +22,15 @@ from paper_search.evaluation.freeze import (
     approve_freeze,
     audit_freeze_candidate,
     build_approval_plan,
+    migrate_v1_to_v2,
     main,
     parse_zero_answer_policies,
+)
+from paper_search.evaluation.freeze_schema import (
+    FreezeApprovalReportV2,
+    IdentifierMapBindingV2,
+    FreezeManifestV2,
+    load_freeze_manifest,
 )
 
 
@@ -258,6 +266,73 @@ def _approval_plan(fixture: PreparedFixture) -> FreezeApprovalPlan:
     return build_approval_plan(
         audit,
         report_relative_path="freeze_reports/synthetic-freeze.json",
+    )
+
+
+def test_migrate_approved_v1_freeze_to_v2_with_bound_evidence(tmp_path: Path) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    legacy = load_freeze_manifest(
+        fixture.data_root / "manifest.json",
+        data_root=fixture.data_root,
+    )
+    report_path = fixture.data_root / "freeze_reports" / "synthetic-freeze.json"
+    identifier_map_path = fixture.data_root / "identifier-map.json"
+    identifier_map_bytes = b'{"legacy:1":"canonical:1"}'
+    identifier_map_path.write_bytes(identifier_map_bytes)
+    assert hasattr(legacy, "partitions")
+    partitions = legacy.partitions
+    approval = FreezeApprovalReportV2(
+        schema_version="freeze-approval-v2",
+        approval_requested=True,
+        approved_at=datetime(2026, 7, 30, tzinfo=UTC),
+        approver_ref="operator-1",
+        audit_sha256=_sha256(report_path.read_bytes()),
+        partition_hashes={
+            "dev": partitions["dev"].gold_sha256,
+            "validation": partitions["validation"].gold_sha256,
+        },
+        identifier_map_sha256=_sha256(identifier_map_bytes),
+    )
+
+    migrated = migrate_v1_to_v2(
+        legacy,
+        data_root=fixture.data_root,
+        approval=approval,
+        identifier_map=IdentifierMapBindingV2(
+            path="identifier-map.json",
+            sha256=_sha256(identifier_map_bytes),
+            entry_count=1,
+        ),
+        dataset_revision="v2-revision-1",
+        approval_report_path="freeze_reports/v2-approval.json",
+    )
+
+    assert isinstance(migrated, FreezeManifestV2)
+    assert [partition.name for partition in migrated.partitions] == ["dev", "validation"]
+    assert [partition.zero_answer_policy for partition in migrated.partitions] == [
+        "forbid",
+        "forbid",
+    ]
+    assert (fixture.data_root / "freeze_reports" / "v2-approval.json").is_file()
+    assert load_freeze_manifest(
+        fixture.data_root / "manifest.json", data_root=fixture.data_root
+    ) == migrated
+    assert (
+        migrate_v1_to_v2(
+            legacy,
+            data_root=fixture.data_root,
+            approval=approval,
+            identifier_map=IdentifierMapBindingV2(
+                path="identifier-map.json",
+                sha256=_sha256(identifier_map_bytes),
+                entry_count=1,
+            ),
+            dataset_revision="v2-revision-1",
+            approval_report_path="freeze_reports/v2-approval.json",
+        )
+        == migrated
     )
 
 

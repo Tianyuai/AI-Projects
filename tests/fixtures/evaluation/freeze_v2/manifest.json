@@ -1,0 +1,36 @@
+{
+  "annotation_status": "frozen",
+  "approval": {
+    "approved_at": "2026-07-30T00:00:00Z",
+    "approver_ref": "fixture-operator",
+    "report_path": "freeze_reports/approval.json",
+    "report_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+  },
+  "created_at": "2026-07-30T00:00:00Z",
+  "dataset_revision": "fixture-revision",
+  "freeze_status": "approved",
+  "gold_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "identifier_map": {
+    "entry_count": 1,
+    "path": "identifier-map.json",
+    "sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "partition_immutability": "content_addressed",
+  "partitions": [
+    {
+      "name": "dev",
+      "path": "dev/gold.jsonl",
+      "query_count": 1,
+      "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "zero_answer_policy": "forbid"
+    },
+    {
+      "name": "validation",
+      "path": "validation/gold.jsonl",
+      "query_count": 1,
+      "sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "zero_answer_policy": "allow"
+    }
+  ],
+  "schema_version": "paper-search-freeze-v2"
+}

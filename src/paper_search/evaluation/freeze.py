@@ -16,7 +16,7 @@ from typing import Literal, NoReturn, TypeVar, cast
 
 from pydantic import BaseModel, PositiveInt, ValidationError
 
-from paper_search.domain.models import DomainModel, NonEmptyStr
+from paper_search.domain.models import DomainModel, NonEmptyStr, SafeRelativePath
 from paper_search.evaluation.annotation import (
     AgreementReport,
     AnnotationRecord,
@@ -26,6 +26,18 @@ from paper_search.evaluation.annotation import (
 from paper_search.evaluation.dataset import (
     EvaluationQuery,
     write_frozen_bytes,
+)
+from paper_search.evaluation.freeze_schema import (
+    FreezeApprovalBindingV2,
+    FreezeApprovalReportV2,
+    FreezeManifestV1,
+    FreezeManifestV2,
+    FrozenPartitionV2,
+    IdentifierMapBindingV2,
+    canonical_gold_set_sha256,
+    parse_freeze_manifest_bytes,
+    read_confined_bytes,
+    sha256_bytes,
 )
 
 
@@ -1277,6 +1289,316 @@ def approve_freeze(
             plan=plan,
             before_manifest_replace=before_manifest_replace,
         )
+
+
+def _migration_path(data_root: Path, relative_path: SafeRelativePath) -> Path:
+    root = data_root.resolve()
+    candidate = (root / relative_path).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise ValueError("freeze migration failed") from None
+    return candidate
+
+
+def _migration_evidence(
+    data_root: Path,
+    relative_path: SafeRelativePath,
+    expected_sha256: str,
+) -> tuple[bytes, _EvidenceIdentity]:
+    try:
+        content = read_confined_bytes(data_root, relative_path)
+    except ValueError:
+        raise ValueError("freeze migration failed") from None
+    if sha256_bytes(content) != expected_sha256:
+        raise ValueError("freeze migration failed")
+    return content, _EvidenceIdentity(
+        path=_migration_path(data_root, relative_path),
+        sha256=expected_sha256,
+    )
+
+
+def _migration_json(content: bytes) -> object:
+    try:
+        return json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("freeze migration failed") from None
+
+
+def _migration_identifiers(content: bytes, expected_count: int) -> list[str]:
+    value = _migration_json(content)
+    if (
+        not isinstance(value, list)
+        or len(value) != expected_count
+        or not all(isinstance(item, str) and item.strip() for item in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValueError("freeze migration failed")
+    return cast(list[str], value)
+
+
+def _migration_partition(
+    data_root: Path,
+    name: Literal["dev", "validation", "simulated_test"],
+    partition: object,
+) -> tuple[bytes, _EvidenceIdentity, _EvidenceIdentity]:
+    if not hasattr(partition, "gold_path"):
+        raise ValueError("freeze migration failed")
+    gold_path = cast(SafeRelativePath, getattr(partition, "gold_path"))
+    gold_hash = cast(str, getattr(partition, "gold_sha256"))
+    ids_path = cast(SafeRelativePath, getattr(partition, "ids_path"))
+    ids_hash = cast(str, getattr(partition, "ids_sha256"))
+    count = cast(int, getattr(partition, "count"))
+    policy = cast(str, getattr(partition, "zero_answer_policy"))
+    gold_content, gold_evidence = _migration_evidence(data_root, gold_path, gold_hash)
+    ids_content, ids_evidence = _migration_evidence(data_root, ids_path, ids_hash)
+    identifiers = _migration_identifiers(ids_content, count)
+    try:
+        rows = [_mapping(_migration_json(line)) for line in gold_content.splitlines() if line]
+        records = [EvaluationQuery.model_validate(row) for row in rows]
+    except (ValidationError, ValueError):
+        raise ValueError("freeze migration failed") from None
+    if (
+        not records
+        or len(records) != count
+        or [record.query_id for record in records] != identifiers
+        or len({record.query_id for record in records}) != count
+        or (policy == "reject" and any(not record.relevant_paper_ids for record in records))
+    ):
+        raise ValueError("freeze migration failed")
+    del name
+    return gold_content, gold_evidence, ids_evidence
+
+
+def _migration_source_evidence(
+    data_root: Path,
+    v1: FreezeManifestV1,
+) -> list[_EvidenceIdentity]:
+    evidence: list[_EvidenceIdentity] = []
+    for source in v1.source_files:
+        content, identity = _migration_evidence(data_root, source.raw_path, source.sha256)
+        if len(content) != source.byte_count or len(content.splitlines()) != source.row_count:
+            raise ValueError("freeze migration failed")
+        evidence.append(identity)
+    for name, package in v1.work_packages.items():
+        ids_content, ids_identity = _migration_evidence(
+            data_root, package.ids_path, package.ids_sha256
+        )
+        _migration_identifiers(ids_content, package.count)
+        evidence.append(ids_identity)
+        if name == "overlap":
+            if package.source_path is not None or package.source_sha256 is not None:
+                raise ValueError("freeze migration failed")
+            continue
+        if package.source_path is None or package.source_sha256 is None:
+            raise ValueError("freeze migration failed")
+        source_content, source_identity = _migration_evidence(
+            data_root, package.source_path, package.source_sha256
+        )
+        if len(source_content.splitlines()) != package.count:
+            raise ValueError("freeze migration failed")
+        evidence.append(source_identity)
+    return evidence
+
+
+def _validated_v1_report(
+    data_root: Path,
+    v1: FreezeManifestV1,
+) -> tuple[bytes, _EvidenceIdentity]:
+    report_bytes, report_identity = _migration_evidence(
+        data_root,
+        v1.freeze_report_path,
+        v1.freeze_report_sha256,
+    )
+    try:
+        report = FreezeAuditReport.model_validate(_migration_json(report_bytes))
+    except ValidationError:
+        raise ValueError("freeze migration failed") from None
+    if (
+        _json_bytes(report.model_dump(mode="json")) != report_bytes
+        or report.approval_requested is not True
+        or report.prepared_manifest_sha256 != v1.prepared_manifest_sha256
+        or report.dataset_revision != v1.revision
+        or set(report.partitions) != set(v1.partitions)
+    ):
+        raise ValueError("freeze migration failed")
+    for name, partition in v1.partitions.items():
+        audit_partition = report.partitions[name]
+        if (
+            audit_partition.count != partition.count
+            or audit_partition.gold_path != partition.gold_path
+            or audit_partition.gold_sha256 != partition.gold_sha256
+            or audit_partition.ids_path != partition.ids_path
+            or audit_partition.ids_sha256 != partition.ids_sha256
+            or audit_partition.zero_answer_policy != partition.zero_answer_policy
+            or audit_partition.labels_complete is not True
+        ):
+            raise ValueError("freeze migration failed")
+    return report_bytes, report_identity
+
+
+def _validated_identifier_map(
+    data_root: Path,
+    identifier_map: IdentifierMapBindingV2,
+) -> tuple[bytes, _EvidenceIdentity]:
+    content, identity = _migration_evidence(
+        data_root, identifier_map.path, identifier_map.sha256
+    )
+    value = _migration_json(content)
+    if (
+        not isinstance(value, dict)
+        or len(value) != identifier_map.entry_count
+        or not value
+        or not all(
+            isinstance(key, str)
+            and key.strip()
+            and isinstance(target, str)
+            and target.strip()
+            for key, target in value.items()
+        )
+    ):
+        raise ValueError("freeze migration failed")
+    return content, identity
+
+
+def _migration_manifest(
+    v1: FreezeManifestV1,
+    *,
+    approval: FreezeApprovalReportV2,
+    identifier_map: IdentifierMapBindingV2,
+    dataset_revision: str,
+    approval_report_path: SafeRelativePath,
+    dev_gold_sha256: str,
+    validation_gold_sha256: str,
+) -> tuple[FreezeManifestV2, bytes, bytes]:
+    if not dataset_revision.strip() or approval.approval_requested is not True:
+        raise ValueError("freeze migration failed")
+    if approval.partition_hashes != {
+        "dev": dev_gold_sha256,
+        "validation": validation_gold_sha256,
+    } or approval.identifier_map_sha256 != identifier_map.sha256:
+        raise ValueError("freeze migration failed")
+    report_bytes = _json_bytes(approval.model_dump(mode="json"))
+    manifest = FreezeManifestV2(
+        schema_version="paper-search-freeze-v2",
+        dataset_revision=dataset_revision,
+        created_at=approval.approved_at,
+        annotation_status="frozen",
+        freeze_status="approved",
+        partitions=[
+            FrozenPartitionV2(
+                name="dev",
+                path=v1.partitions["dev"].gold_path,
+                query_count=v1.partitions["dev"].count,
+                sha256=dev_gold_sha256,
+                zero_answer_policy=(
+                    "forbid"
+                    if v1.partitions["dev"].zero_answer_policy == "reject"
+                    else "allow"
+                ),
+            ),
+            FrozenPartitionV2(
+                name="validation",
+                path=v1.partitions["validation"].gold_path,
+                query_count=v1.partitions["validation"].count,
+                sha256=validation_gold_sha256,
+                zero_answer_policy=(
+                    "forbid"
+                    if v1.partitions["validation"].zero_answer_policy == "reject"
+                    else "allow"
+                ),
+            ),
+        ],
+        gold_sha256=canonical_gold_set_sha256(dev_gold_sha256, validation_gold_sha256),
+        identifier_map=identifier_map,
+        partition_immutability="content_addressed",
+        approval=FreezeApprovalBindingV2(
+            report_path=approval_report_path,
+            report_sha256=sha256_bytes(report_bytes),
+            approved_at=approval.approved_at,
+            approver_ref=approval.approver_ref,
+        ),
+    )
+    return manifest, report_bytes, _json_bytes(manifest.model_dump(mode="json"))
+
+
+def migrate_v1_to_v2(
+    v1: FreezeManifestV1,
+    *,
+    data_root: Path,
+    approval: FreezeApprovalReportV2,
+    identifier_map: IdentifierMapBindingV2,
+    dataset_revision: str,
+    approval_report_path: SafeRelativePath,
+) -> FreezeManifestV2:
+    """Verify an approved legacy freeze and atomically publish its V2 successor."""
+    root = data_root.resolve()
+    manifest_path = root / "manifest.json"
+    report_path = _migration_path(root, approval_report_path)
+    if report_path == manifest_path:
+        raise ValueError("freeze migration failed")
+    with _exclusive_freeze_lock(root):
+        try:
+            current_bytes = read_confined_bytes(root, "manifest.json")
+            current = parse_freeze_manifest_bytes(current_bytes)
+        except ValueError:
+            raise ValueError("freeze migration failed") from None
+        if not isinstance(current, (FreezeManifestV1, FreezeManifestV2)):
+            raise ValueError("freeze migration failed")
+        if isinstance(current, FreezeManifestV1) and current != v1:
+            raise ValueError("freeze migration failed")
+        legacy_report_bytes, legacy_report_evidence = _validated_v1_report(root, v1)
+        del legacy_report_bytes
+        partition_content: dict[str, bytes] = {}
+        evidence: list[_EvidenceIdentity] = [legacy_report_evidence]
+        for name in ("dev", "validation", "simulated_test"):
+            content, gold_evidence, ids_evidence = _migration_partition(
+                root, name, v1.partitions[name]
+            )
+            partition_content[name] = content
+            evidence.extend((gold_evidence, ids_evidence))
+        evidence.extend(_migration_source_evidence(root, v1))
+        _, identifier_evidence = _validated_identifier_map(root, identifier_map)
+        evidence.append(identifier_evidence)
+        dev_hash = sha256_bytes(partition_content["dev"])
+        validation_hash = sha256_bytes(partition_content["validation"])
+        if approval.audit_sha256 != v1.freeze_report_sha256:
+            raise ValueError("freeze migration failed")
+        migrated, approval_bytes, migrated_bytes = _migration_manifest(
+            v1,
+            approval=approval,
+            identifier_map=identifier_map,
+            dataset_revision=dataset_revision,
+            approval_report_path=approval_report_path,
+            dev_gold_sha256=dev_hash,
+            validation_gold_sha256=validation_hash,
+        )
+        if isinstance(current, FreezeManifestV2):
+            try:
+                existing_report = read_confined_bytes(root, approval_report_path)
+            except ValueError:
+                raise ValueError("freeze migration failed") from None
+            if (
+                current == migrated
+                and current_bytes == migrated_bytes
+                and existing_report == approval_bytes
+            ):
+                return migrated
+            raise ValueError("freeze migration failed")
+        try:
+            with _stable_report_parent(root, report_path):
+                write_frozen_bytes(report_path, approval_bytes)
+                if read_confined_bytes(root, approval_report_path) != approval_bytes:
+                    raise RuntimeError("freeze migration failed")
+        except (OSError, RuntimeError, ValueError):
+            raise RuntimeError("freeze migration failed") from None
+        _replace_manifest_guarded(
+            manifest_path,
+            current_bytes,
+            migrated_bytes,
+            evidence=evidence,
+        )
+        return migrated
 
 
 def _prepared_partition_names(data_root: Path) -> set[str]:

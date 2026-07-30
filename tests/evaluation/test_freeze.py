@@ -764,6 +764,205 @@ def test_migration_recovery_link_race_preserves_owner_and_v1_backup(
     assert recovery[0].read_bytes() == case.legacy_manifest_bytes
 
 
+def test_migration_post_replace_probe_failure_preserves_v1_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    original_replace = freeze_module.os.replace
+    original_read_bytes = Path.read_bytes
+    original_stat = Path.stat
+    fail_backup_probes = False
+
+    def replace_then_fail(source: object, target: object) -> None:
+        nonlocal fail_backup_probes
+        original_replace(source, target)
+        if (
+            Path(source) == manifest_path
+            and Path(target).name.startswith(".manifest.json.prepared.")
+        ):
+            fail_backup_probes = True
+            raise OSError("synthetic post-replace failure")
+
+    def fail_recovery_read(path: Path) -> bytes:
+        if fail_backup_probes and path.name.startswith(".manifest.json.prepared."):
+            raise OSError("synthetic backup read failure")
+        return original_read_bytes(path)
+
+    def fail_recovery_stat(
+        path: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        if fail_backup_probes and path.name.startswith(".manifest.json.prepared."):
+            raise OSError("synthetic backup identity failure")
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(freeze_module.os, "replace", replace_then_fail)
+    monkeypatch.setattr(Path, "read_bytes", fail_recovery_read)
+    monkeypatch.setattr(Path, "stat", fail_recovery_stat)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    fail_backup_probes = False
+    assert not manifest_path.exists()
+    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
+
+
+def test_migration_failed_replace_cleans_original_empty_backup_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    original_replace = freeze_module.os.replace
+    replacement_blocked = False
+
+    def fail_before_replace(source: object, target: object) -> None:
+        nonlocal replacement_blocked
+        if (
+            Path(source) == manifest_path
+            and Path(target).name.startswith(".manifest.json.prepared.")
+        ):
+            replacement_blocked = True
+            raise OSError("synthetic pre-replace failure")
+        original_replace(source, target)
+
+    monkeypatch.setattr(freeze_module.os, "replace", fail_before_replace)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    assert replacement_blocked
+    assert manifest_path.read_bytes() == case.legacy_manifest_bytes
+    assert not list(root.glob(".manifest.json.prepared.*.tmp"))
+
+
+def test_migration_failed_replace_preserves_owner_replacing_backup_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    owner = root / "backup-placeholder-owner.tmp"
+    owner_bytes = b"backup-placeholder-owner"
+    owner.write_bytes(owner_bytes)
+    original_replace = freeze_module.os.replace
+    owner_inserted = False
+
+    def owner_replaces_placeholder(source: object, target: object) -> None:
+        nonlocal owner_inserted
+        target_path = Path(target)
+        if (
+            Path(source) == manifest_path
+            and target_path.name.startswith(".manifest.json.prepared.")
+        ):
+            original_replace(owner, target_path)
+            owner_inserted = True
+            raise OSError("synthetic replace collision")
+        original_replace(source, target)
+
+    monkeypatch.setattr(freeze_module.os, "replace", owner_replaces_placeholder)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    assert owner_inserted
+    assert manifest_path.read_bytes() == case.legacy_manifest_bytes
+    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == owner_bytes
+
+
+def test_migration_failed_replace_preserves_unprobeable_backup_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    original_replace = freeze_module.os.replace
+    original_stat = Path.stat
+    fail_backup_probe = False
+
+    def fail_before_replace(source: object, target: object) -> None:
+        nonlocal fail_backup_probe
+        if (
+            Path(source) == manifest_path
+            and Path(target).name.startswith(".manifest.json.prepared.")
+        ):
+            fail_backup_probe = True
+            raise OSError("synthetic pre-replace failure")
+        original_replace(source, target)
+
+    def fail_placeholder_stat(
+        path: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        if fail_backup_probe and path.name.startswith(".manifest.json.prepared."):
+            raise OSError("synthetic placeholder identity failure")
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(freeze_module.os, "replace", fail_before_replace)
+    monkeypatch.setattr(Path, "stat", fail_placeholder_stat)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    fail_backup_probe = False
+    assert manifest_path.read_bytes() == case.legacy_manifest_bytes
+    retained = list(root.glob(".manifest.json.prepared.*.tmp"))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == b""
+
+
+def test_migration_commit_cleanup_preserves_replaced_backup_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    owner = root / "commit-cleanup-owner.tmp"
+    owner_bytes = b"commit-cleanup-backup-owner"
+    owner.write_bytes(owner_bytes)
+    original_rename_no_overwrite = freeze_module._rename_no_overwrite
+    owner_inserted = False
+
+    def owner_replaces_before_cleanup(source: Path, target: Path) -> str:
+        nonlocal owner_inserted
+        if (
+            source.name.startswith(".manifest.json.prepared.")
+            and not owner_inserted
+        ):
+            if os.name == "nt":
+                _native_replace_windows(owner, source)
+            else:
+                os.replace(owner, source)
+            owner_inserted = True
+        return original_rename_no_overwrite(source, target)
+
+    monkeypatch.setattr(
+        freeze_module,
+        "_rename_no_overwrite",
+        owner_replaces_before_cleanup,
+    )
+
+    assert isinstance(_migrate(case), FreezeManifestV2)
+
+    assert owner_inserted
+    retained = list(root.glob(".manifest.json.prepared.*.tmp"))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == owner_bytes
+
+
 def test_migration_restored_v1_backup_survives_owner_replacement_before_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

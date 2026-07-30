@@ -154,6 +154,19 @@ class _EvidenceIdentity:
 
 
 @dataclass(frozen=True)
+class _FileIdentity:
+    device: int
+    inode: int
+
+
+@dataclass(frozen=True)
+class _FileState:
+    identity: _FileIdentity
+    size: int
+    regular: bool
+
+
+@dataclass(frozen=True)
 class FreezeAuditResult:
     """Pure audit output; it contains no approved report path or final bytes."""
 
@@ -1014,6 +1027,79 @@ def _best_effort_unlink(path: Path) -> None:
         return
 
 
+def _file_state(metadata: os.stat_result) -> _FileState:
+    return _FileState(
+        identity=_FileIdentity(
+            device=metadata.st_dev,
+            inode=metadata.st_ino,
+        ),
+        size=metadata.st_size,
+        regular=stat.S_ISREG(metadata.st_mode),
+    )
+
+
+def _probe_file_state(path: Path) -> _FileState | None:
+    try:
+        return _file_state(path.stat(follow_symlinks=False))
+    except OSError:
+        return None
+
+
+def _state_matches_owned_file(
+    state: _FileState | None,
+    expected_identity: _FileIdentity,
+    *,
+    require_empty: bool,
+) -> bool:
+    return bool(
+        state is not None
+        and state.identity == expected_identity
+        and state.regular
+        and (not require_empty or state.size == 0)
+    )
+
+
+def _move_owned_file_to_cleanup_quarantine(path: Path) -> Path | None:
+    for _ in range(8):
+        quarantine = path.with_name(
+            f"{path.name}.cleanup.{secrets.token_hex(16)}.tmp"
+        )
+        outcome = _rename_no_overwrite(path, quarantine)
+        if outcome == "moved":
+            return quarantine
+        if outcome == "failed":
+            return None
+    return None
+
+
+def _cleanup_owned_file(
+    path: Path,
+    expected_identity: _FileIdentity | None,
+    *,
+    require_empty: bool,
+) -> bool:
+    if expected_identity is None:
+        return False
+    if not _state_matches_owned_file(
+        _probe_file_state(path),
+        expected_identity,
+        require_empty=require_empty,
+    ):
+        return False
+    quarantine = _move_owned_file_to_cleanup_quarantine(path)
+    if quarantine is None:
+        return False
+    if not _state_matches_owned_file(
+        _probe_file_state(quarantine),
+        expected_identity,
+        require_empty=require_empty,
+    ):
+        _rename_no_overwrite(quarantine, path)
+        return False
+    _best_effort_unlink(quarantine)
+    return True
+
+
 def _best_effort_close_descriptor(descriptor: int) -> None:
     try:
         os.close(descriptor)
@@ -1173,8 +1259,15 @@ def _replace_manifest_guarded(
         prefix=f".{manifest_path.name}.prepared.",
         suffix=".tmp",
     )
-    os.close(backup_descriptor)
     backup_path = Path(backup_name)
+    try:
+        backup_placeholder_state = _file_state(os.fstat(backup_descriptor))
+    finally:
+        os.close(backup_descriptor)
+    backup_cleanup_identity: _FileIdentity | None = (
+        backup_placeholder_state.identity
+    )
+    backup_cleanup_requires_empty = True
     manifest_taken = False
     published = False
     committed = False
@@ -1188,9 +1281,17 @@ def _replace_manifest_guarded(
             before_manifest_replace()
         with _stable_evidence_files(stable_evidence):
             try:
+                source_manifest_state = _probe_file_state(manifest_path)
                 try:
                     os.replace(manifest_path, backup_path)
                 except OSError:
+                    backup_state = _probe_file_state(backup_path)
+                    placeholder_unchanged = _state_matches_owned_file(
+                        backup_state,
+                        backup_placeholder_state.identity,
+                        require_empty=True,
+                    )
+                    preserve_backup = not placeholder_unchanged
                     try:
                         manifest_taken = backup_path.read_bytes() == prepared_bytes
                     except OSError:
@@ -1198,6 +1299,16 @@ def _replace_manifest_guarded(
                     raise
                 else:
                     manifest_taken = True
+                    backup_state = _probe_file_state(backup_path)
+                    backup_cleanup_identity = (
+                        source_manifest_state.identity
+                        if source_manifest_state is not None
+                        and source_manifest_state.regular
+                        and backup_state is not None
+                        and backup_state.identity == source_manifest_state.identity
+                        else None
+                    )
+                    backup_cleanup_requires_empty = False
                 if backup_path.read_bytes() != prepared_bytes:
                     raise RuntimeError("freeze approval failed")
                 try:
@@ -1217,7 +1328,11 @@ def _replace_manifest_guarded(
         committed = True
         _best_effort_unlink(temporary_path)
         temporary_path = Path()
-        _best_effort_unlink(backup_path)
+        _cleanup_owned_file(
+            backup_path,
+            backup_cleanup_identity,
+            require_empty=backup_cleanup_requires_empty,
+        )
         backup_path = Path()
     except BaseException:
         if not committed and manifest_taken:
@@ -1234,7 +1349,11 @@ def _replace_manifest_guarded(
             if temporary_path != Path():
                 _best_effort_unlink(temporary_path)
             if backup_path != Path() and not preserve_backup:
-                _best_effort_unlink(backup_path)
+                _cleanup_owned_file(
+                    backup_path,
+                    backup_cleanup_identity,
+                    require_empty=backup_cleanup_requires_empty,
+                )
 
 
 @contextmanager

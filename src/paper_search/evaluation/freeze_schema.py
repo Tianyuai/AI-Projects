@@ -790,9 +790,10 @@ def publish_confined_bytes_no_overwrite(
             descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_descriptor)
         except FileExistsError:  # pragma: no cover - a random retry is impractical to force
             raise RuntimeError("freeze manifest is invalid") from None
+        temporary_identity = os.fstat(descriptor)
+        status: Literal["created", "matched"]
         try:
             _write_descriptor(descriptor, content)
-            temporary_identity = os.fstat(descriptor)
             observed = os.stat(
                 temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
             )
@@ -812,17 +813,19 @@ def publish_confined_bytes_no_overwrite(
             except FileExistsError:
                 with open_confined_artifact(data_root, normalized) as artifact:
                     if artifact.content == content:
-                        return "matched"
-                raise FileExistsError("refusing to overwrite frozen file") from None
-            final_identity = os.stat(
-                filename, dir_fd=parent_descriptor, follow_symlinks=False
-            )
-            if (final_identity.st_dev, final_identity.st_ino) != (
-                temporary_identity.st_dev,
-                temporary_identity.st_ino,
-            ):
-                raise ValueError("freeze manifest is invalid")
-            return "created"
+                        status = "matched"
+                    else:
+                        raise FileExistsError("refusing to overwrite frozen file")
+            else:
+                final_identity = os.stat(
+                    filename, dir_fd=parent_descriptor, follow_symlinks=False
+                )
+                if (final_identity.st_dev, final_identity.st_ino) != (
+                    temporary_identity.st_dev,
+                    temporary_identity.st_ino,
+                ):
+                    raise ValueError("freeze manifest is invalid")
+                status = "created"
         finally:
             os.close(descriptor)
             try:
@@ -834,9 +837,10 @@ def publish_confined_bytes_no_overwrite(
                     temporary_identity.st_ino,
                 ):
                     os.unlink(temporary_name, dir_fd=parent_descriptor)
-            except (FileNotFoundError, UnboundLocalError):
+            except FileNotFoundError:
                 pass
         os.fsync(parent_descriptor)
+        return status
     finally:
         os.close(parent_descriptor)
 

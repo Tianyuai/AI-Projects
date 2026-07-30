@@ -1637,13 +1637,15 @@ def migrate_v1_to_v2(
                     )
                 except ValueError:
                     raise ValueError("freeze migration failed") from None
-                if (
-                    current == migrated
-                    and current_bytes == migrated_bytes
-                    and existing_report.content == approval_bytes
-                ):
-                    return migrated
-                raise ValueError("freeze migration failed")
+                evidence.append(existing_report)
+                with _stable_evidence_files(evidence):
+                    if not (
+                        current == migrated
+                        and current_bytes == migrated_bytes
+                        and existing_report.content == approval_bytes
+                    ):
+                        raise ValueError("freeze migration failed")
+                return migrated
             try:
                 _, published_report = stack.enter_context(
                     publish_confined_artifact_no_overwrite(

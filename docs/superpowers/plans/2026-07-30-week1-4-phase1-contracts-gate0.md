@@ -381,9 +381,8 @@ class BaselineBinding(DomainModel):
     optional_modules: BaselineOptionalModules
 
 
-class CandidateLock(DomainModel):
+class _LiveInputLockBase(DomainModel):
     schema_version: Literal["integrated-lock-v1"]
-    lock_kind: Literal["candidate"]
     created_at: datetime
     source_git_sha: NonEmptyStr
     runtime_allow_live: Literal[True]
@@ -396,7 +395,11 @@ class CandidateLock(DomainModel):
     approval_ref: NonEmptyStr
 
 
-class ValidationLock(CandidateLock):
+class CandidateLock(_LiveInputLockBase):
+    lock_kind: Literal["candidate"]
+
+
+class ValidationLock(_LiveInputLockBase):
     lock_kind: Literal["validation"]
     frozen_data: FrozenDataBinding  # split must be validation
     promoted_from_dev_run_id: NonEmptyStr

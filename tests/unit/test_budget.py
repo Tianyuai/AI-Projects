@@ -382,3 +382,16 @@ def test_recovery_rejects_duplicate_reservation_ids() -> None:
 
     with pytest.raises(ValueError, match="invalid budget controller state"):
         controller_type.from_state(make_budget(), state)
+
+
+def test_recovery_migrates_legacy_v1_state_without_formal_live_flag() -> None:
+    controller_type, _, _ = budget_api()
+    controller = controller_type(make_budget())
+    reservation = controller.reserve("provider.search", UsageEstimate(search_api_calls=1))
+    state = controller.export_state()
+    state.pop("formal_live")
+
+    restored = controller_type.from_state(make_budget(), state)
+
+    assert restored.formal_live is False
+    assert restored.reserved_usage.search_api_calls == reservation.reserved.search_api_calls

@@ -108,6 +108,28 @@ def test_policy_identity_ignores_rate_order_but_includes_semantic_fields() -> No
     assert pricing_policy_sha256(changed) != pricing_policy_sha256(policy)
 
 
+def test_policy_identity_normalizes_equivalent_timezones_and_money_text() -> None:
+    _, pricing_policy, _, _, _, pricing_policy_sha256 = pricing_api()
+    policy = load_fixture_policy()
+    equivalent = pricing_policy.model_validate(
+        {
+            **policy.model_dump(mode="python"),
+            "effective_at": datetime.fromisoformat("2026-07-01T08:00:00+08:00"),
+            "rates": [
+                {
+                    **rate.model_dump(mode="python"),
+                    "price_cny_per_unit": Decimal("0.0001")
+                    if rate.unit == "request" and rate.dependency == "llm"
+                    else rate.price_cny_per_unit,
+                }
+                for rate in policy.rates
+            ],
+        }
+    )
+
+    assert pricing_policy_sha256(equivalent) == pricing_policy_sha256(policy)
+
+
 def test_policy_models_are_strict_and_loader_rejects_naive_or_float_yaml(tmp_path: Path) -> None:
     module = pricing_module()
 
@@ -273,6 +295,14 @@ def test_quality_policy_encodes_every_approved_rule_and_requires_resolution(tmp_
         "latency-p95-target-ms",
         "batch-hard-failure-rate",
         "batch-partial-result-rate",
+        "doi-exact-merge-rate",
+        "rerank-relevance-judgement-accuracy",
+        "cached-repeat-latency-p50-ms",
+        "adaptive-macro-f1-delta",
+        "adaptive-internal-score-delta",
+        "adaptive-f1-decline",
+        "adaptive-failure-rate-increase",
+        "bilingual-query-f1-drop",
     }
     assert expected <= set(by_id)
     assert by_id["model-produced-analysis-rate"].threshold == Decimal("0.99")
@@ -303,6 +333,8 @@ def test_quality_policy_encodes_every_approved_rule_and_requires_resolution(tmp_
         "dev-macro-f1-min",
         "batch-hard-failure-rate",
         "batch-partial-result-rate",
+        "doi-exact-merge-rate",
+        "adaptive-internal-score-delta",
         "promotion-median-macro-f1-delta",
     ],
 )
@@ -343,3 +375,17 @@ def test_quality_policy_rejects_empty_rules_and_invalid_resolution(tmp_path: Pat
     invalid_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     with pytest.raises(ValueError, match="resolution"):
         load_quality_gate_policy(invalid_path)
+
+
+def test_quality_policy_rejects_superseded_rule_with_missing_target(tmp_path: Path) -> None:
+    _, _, _, _, load_quality_gate_policy, _ = pricing_api()
+    raw = yaml.safe_load(QUALITY_POLICY_PATH.read_bytes())
+    assert isinstance(raw, dict)
+    rules = raw["rules"]
+    assert isinstance(rules, list)
+    raw["rules"] = [rule for rule in rules if rule["rule_id"] != "macro-recall-positive"]
+    missing_target_path = tmp_path / "missing-superseded-target.yaml"
+    missing_target_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="superseded quality rule target is missing"):
+        load_quality_gate_policy(missing_target_path)

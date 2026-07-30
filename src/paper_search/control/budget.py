@@ -240,7 +240,9 @@ class HardBudgetController:
         """Restore validated state without bypassing budget accounting invariants."""
         reservation_ttl_seconds = state.get("reservation_ttl_seconds")
         fail_closed = state.get("fail_closed")
-        formal_live = state.get("formal_live")
+        # Version 1 states predate formal-live settlement.  Their only safe
+        # migration is the explicit non-formal compatibility mode.
+        formal_live = state.get("formal_live", False)
         if (
             state.get("version") != 1
             or not isinstance(reservation_ttl_seconds, int)

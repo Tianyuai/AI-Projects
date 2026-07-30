@@ -400,6 +400,70 @@ rules:
     applies_to: [frozen_audit]
     source_refs: [PRD:14.3, PRD:15.2]
     resolution: reporting-only
+  - rule_id: doi-exact-merge-rate
+    classification: reporting_only
+    measure: doi_exact_merge_rate
+    operator: eq
+    threshold: 1
+    applies_to: [frozen_audit]
+    source_refs: [PRD:FR-04, PRD:15.2]
+    resolution: reporting-only
+  - rule_id: rerank-relevance-judgement-accuracy
+    classification: promotion
+    measure: rerank_relevance_judgement_accuracy
+    operator: gte
+    threshold: "0.85"
+    applies_to: [optional]
+    source_refs: [PRD:FR-07, PRD:15.2]
+    resolution: optional-promotion-only
+  - rule_id: cached-repeat-latency-p50-ms
+    classification: reporting_only
+    measure: cached_repeat_latency_p50_ms
+    operator: lte
+    threshold: 8000
+    applies_to: [dev, validation]
+    source_refs: [PRD:NFR-03]
+    resolution: reporting-only
+  - rule_id: adaptive-macro-f1-delta
+    classification: promotion
+    measure: adaptive_macro_f1_delta
+    operator: gte
+    threshold: "0.02"
+    applies_to: [optional]
+    source_refs: [PRD:Task-12]
+    resolution: optional-promotion-only
+  - rule_id: adaptive-internal-score-delta
+    classification: promotion
+    measure: adaptive_internal_score_delta
+    operator: gte
+    threshold: "0.02"
+    applies_to: [optional]
+    source_refs: [PRD:Task-12]
+    resolution: optional-promotion-only
+  - rule_id: adaptive-f1-decline
+    classification: promotion
+    measure: adaptive_f1_decline
+    operator: lte
+    threshold: "0.005"
+    applies_to: [optional]
+    source_refs: [PRD:Task-12]
+    resolution: optional-promotion-only
+  - rule_id: adaptive-failure-rate-increase
+    classification: promotion
+    measure: adaptive_failure_rate_increase
+    operator: lte
+    threshold: "0.01"
+    applies_to: [optional]
+    source_refs: [PRD:Task-12]
+    resolution: optional-promotion-only
+  - rule_id: bilingual-query-f1-drop
+    classification: reporting_only
+    measure: bilingual_query_f1_drop
+    operator: lte
+    threshold: "0.05"
+    applies_to: [frozen_audit]
+    source_refs: [PRD:14.3]
+    resolution: reporting-only
   - rule_id: promotion-bootstrap-samples
     classification: promotion
     measure: bootstrap_samples

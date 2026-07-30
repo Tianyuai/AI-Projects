@@ -179,6 +179,14 @@ AUTHORITATIVE_QUALITY_CATALOG: tuple[AuthoritativeQualityRow, ...] = (
     _quality_row("batch-partial-result-rate", "reporting_only", "partial_result_rate", "lte", Decimal("0.05"), ("dev", "validation"), ("PRD:15.3",), "reporting-only"),
     _quality_row("unseen-domain-macro-f1-drop", "reporting_only", "unseen_domain_macro_f1_drop", "lte", Decimal("0.05"), ("frozen_audit",), ("PRD:14.3",), "reporting-only"),
     _quality_row("query-type-macro-f1-drop", "reporting_only", "query_type_macro_f1_drop", "lte", Decimal("0.02"), ("frozen_audit",), ("PRD:14.3", "PRD:15.2"), "reporting-only"),
+    _quality_row("doi-exact-merge-rate", "reporting_only", "doi_exact_merge_rate", "eq", 1, ("frozen_audit",), ("PRD:FR-04", "PRD:15.2"), "reporting-only"),
+    _quality_row("rerank-relevance-judgement-accuracy", "promotion", "rerank_relevance_judgement_accuracy", "gte", Decimal("0.85"), ("optional",), ("PRD:FR-07", "PRD:15.2"), "optional-promotion-only"),
+    _quality_row("cached-repeat-latency-p50-ms", "reporting_only", "cached_repeat_latency_p50_ms", "lte", 8000, ("dev", "validation"), ("PRD:NFR-03",), "reporting-only"),
+    _quality_row("adaptive-macro-f1-delta", "promotion", "adaptive_macro_f1_delta", "gte", Decimal("0.02"), ("optional",), ("PRD:Task-12",), "optional-promotion-only"),
+    _quality_row("adaptive-internal-score-delta", "promotion", "adaptive_internal_score_delta", "gte", Decimal("0.02"), ("optional",), ("PRD:Task-12",), "optional-promotion-only"),
+    _quality_row("adaptive-f1-decline", "promotion", "adaptive_f1_decline", "lte", Decimal("0.005"), ("optional",), ("PRD:Task-12",), "optional-promotion-only"),
+    _quality_row("adaptive-failure-rate-increase", "promotion", "adaptive_failure_rate_increase", "lte", Decimal("0.01"), ("optional",), ("PRD:Task-12",), "optional-promotion-only"),
+    _quality_row("bilingual-query-f1-drop", "reporting_only", "bilingual_query_f1_drop", "lte", Decimal("0.05"), ("frozen_audit",), ("PRD:14.3",), "reporting-only"),
 )
 
 
@@ -193,6 +201,13 @@ class QualityGatePolicy(_PolicyModel):
         by_id = {rule.rule_id: rule for rule in self.rules}
         if len(by_id) != len(self.rules):
             raise ValueError("quality gate policy contains duplicate rule IDs")
+        for rule in self.rules:
+            if rule.resolution.startswith("superseded-by-"):
+                target_rule_id = rule.resolution.removeprefix("superseded-by-")
+                if target_rule_id not in by_id:
+                    raise ValueError(
+                        f"superseded quality rule target is missing: {target_rule_id}"
+                    )
         catalog = {row.rule_id: row for row in AUTHORITATIVE_QUALITY_CATALOG}
         missing = sorted(set(catalog) - set(by_id))
         if missing:
@@ -334,8 +349,26 @@ def load_quality_gate_policy(path: Path) -> QualityGatePolicy:
 def canonical_pricing_policy_bytes(policy: PricingPolicy) -> bytes:
     """Return stable UTF-8 JSON bytes for the immutable policy identity."""
 
-    payload: dict[str, Any] = policy.model_dump(mode="json")
-    rates = payload.get("rates")
+    def canonical_money(value: Decimal) -> str:
+        return format(value.quantize(Decimal("0.000001")), "f")
+
+    payload: dict[str, Any] = {
+        "schema_version": policy.schema_version,
+        "currency": policy.currency,
+        "effective_at": policy.effective_at.astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        "source_identity": policy.source_identity,
+        "rounding_quantum_cny": canonical_money(policy.rounding_quantum_cny),
+        "rates": [
+            {
+                "dependency": rate.dependency,
+                "model_or_adapter": rate.model_or_adapter,
+                "unit": rate.unit,
+                "price_cny_per_unit": canonical_money(rate.price_cny_per_unit),
+            }
+            for rate in policy.rates
+        ],
+    }
+    rates = payload["rates"]
     assert isinstance(rates, list)
     rates.sort(
         key=lambda rate: (

@@ -308,6 +308,8 @@ class BoundArtifact:
     ancestor_descriptors: list[int] = field(default_factory=list)
     path_identities: tuple[tuple[int, int], ...] = ()
     windows_final_paths: tuple[str, ...] = ()
+    windows_file_id: tuple[int, bytes] | None = None
+    replaceable_manifest: bool = False
     _closed: bool = field(default=False, init=False, repr=False)
 
     def verify_path_identity(self) -> None:
@@ -387,7 +389,9 @@ def _open_posix_confined(
             for metadata in (os.fstat(item) for item in descriptors)
         )
         final_descriptor = descriptors.pop()
-        return final_descriptor, descriptors, identities
+        ancestors = descriptors
+        descriptors = []
+        return final_descriptor, ancestors, identities
     except OSError:
         raise ValueError("freeze manifest is invalid") from None
     finally:
@@ -403,12 +407,37 @@ def _normalized_windows_path(value: str) -> str:
     return os.path.normcase(os.path.abspath(value))
 
 
+def _windows_file_id(handle: int) -> tuple[int, bytes]:
+    import ctypes
+
+    class FileId128(ctypes.Structure):
+        _fields_ = [("identifier", ctypes.c_byte * 16)]
+
+    class FileIdInfo(ctypes.Structure):
+        _fields_ = [
+            ("volume_serial_number", ctypes.c_ulonglong),
+            ("file_id", FileId128),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    result = FileIdInfo()
+    if not kernel32.GetFileInformationByHandleEx(
+        ctypes.c_void_p(handle),
+        18,  # FileIdInfo
+        ctypes.byref(result),
+        ctypes.sizeof(result),
+    ):
+        raise OSError(ctypes.get_last_error(), "GetFileInformationByHandleEx failed")
+    return result.volume_serial_number, bytes(result.file_id.identifier)
+
+
 def _open_windows_confined(
     data_root: Path,
     relative_path: SafeRelativePath,
     *,
     allow_target_delete_share: bool = False,
-) -> tuple[int, list[int], tuple[str, ...]]:
+    allow_target_write_share: bool = False,
+) -> tuple[int, list[int], tuple[str, ...], tuple[int, bytes]]:
     import ctypes
     import msvcrt
 
@@ -450,7 +479,11 @@ def _open_windows_confined(
                 str(candidate),
                 0x80000000,
                 0x00000001
-                | (0x00000002 if not final or allow_target_delete_share else 0)
+                | (
+                    0x00000002
+                    if not final or allow_target_delete_share or allow_target_write_share
+                    else 0
+                )
                 | (0x00000004 if final and allow_target_delete_share else 0),
                 None,
                 3,
@@ -480,11 +513,17 @@ def _open_windows_confined(
             kernel32.CloseHandle(ctypes.c_void_p(handle))
             handles.pop()
             raise
-        ancestors = handles[:-1]
+        handles.pop()
+        try:
+            file_id = _windows_file_id(msvcrt.get_osfhandle(descriptor))
+        except OSError:
+            os.close(descriptor)
+            raise
+        ancestors = handles
         for ancestor in reversed(ancestors):
             kernel32.CloseHandle(ctypes.c_void_p(ancestor))
         handles = []
-        return descriptor, [], (final_paths[-1],)
+        return descriptor, [], (final_paths[-1],), file_id
     except OSError:
         raise ValueError("freeze manifest is invalid") from None
     finally:
@@ -493,20 +532,29 @@ def _open_windows_confined(
 
 
 def _verify_windows_artifact_identity(artifact: BoundArtifact) -> None:
-    import ctypes
     import msvcrt
 
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    get_final_path = kernel32.GetFinalPathNameByHandleW
-    buffer = ctypes.create_unicode_buffer(32768)
-    handles = [msvcrt.get_osfhandle(artifact.descriptor)]
-    if len(artifact.windows_final_paths) != 1:
+    if len(artifact.windows_final_paths) != 1 or artifact.windows_file_id is None:
         raise ValueError("freeze manifest is invalid")
-    for handle, expected in zip(handles, artifact.windows_final_paths, strict=True):
-        if not get_final_path(ctypes.c_void_p(handle), buffer, len(buffer), 0):
+    try:
+        retained_id = _windows_file_id(msvcrt.get_osfhandle(artifact.descriptor))
+        descriptor, ancestors, paths, current_id = _open_windows_confined(
+            artifact.data_root,
+            artifact.relative_path,
+            allow_target_delete_share=artifact.replaceable_manifest,
+        )
+    except OSError:
+        raise ValueError("freeze manifest is invalid") from None
+    try:
+        if (
+            ancestors
+            or paths != artifact.windows_final_paths
+            or retained_id != artifact.windows_file_id
+            or current_id != retained_id
+        ):
             raise ValueError("freeze manifest is invalid")
-        if _normalized_windows_path(buffer.value) != expected:
-            raise ValueError("freeze manifest is invalid")
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager
@@ -515,6 +563,7 @@ def open_confined_artifact(
     relative_path: SafeRelativePath,
     *,
     replaceable_manifest: bool = False,
+    allow_target_write_share: bool = False,
 ) -> Iterator[BoundArtifact]:
     """Open each path component safely and keep the evidence descriptor alive."""
     try:
@@ -523,11 +572,13 @@ def open_confined_artifact(
             raise ValueError("freeze manifest is invalid")
         path_identities: tuple[tuple[int, int], ...] = ()
         windows_final_paths: tuple[str, ...] = ()
+        windows_file_id: tuple[int, bytes] | None = None
         if os.name == "nt":
-            descriptor, ancestors, windows_final_paths = _open_windows_confined(
+            descriptor, ancestors, windows_final_paths, windows_file_id = _open_windows_confined(
                 data_root,
                 normalized,
                 allow_target_delete_share=replaceable_manifest,
+                allow_target_write_share=allow_target_write_share,
             )
         else:
             descriptor, ancestors, path_identities = _open_posix_confined(
@@ -551,6 +602,8 @@ def open_confined_artifact(
             ancestor_descriptors=ancestors,
             path_identities=path_identities,
             windows_final_paths=windows_final_paths,
+            windows_file_id=windows_file_id,
+            replaceable_manifest=replaceable_manifest,
         )
     except (OSError, ValueError):
         for ancestor in reversed(ancestors):
@@ -682,7 +735,7 @@ def publish_confined_bytes_no_overwrite(
             handle = create_file(
                 str(temporary_path),
                 0x40000000,
-                0x00000001,
+                0x00000001 | 0x00000002 | 0x00000004,
                 None,
                 1,
                 0x00200000,
@@ -697,21 +750,28 @@ def publish_confined_bytes_no_overwrite(
                 )
                 handle = invalid
                 _write_descriptor(descriptor, content)
+                if _windows_file_id(msvcrt.get_osfhandle(descriptor)) is None:
+                    raise ValueError("freeze manifest is invalid")
+                create_hard_link = kernel32.CreateHardLinkW
+                if not create_hard_link(str(target), str(temporary_path), None):
+                    try:
+                        with open_confined_artifact(root, normalized) as artifact:
+                            if artifact.content == content:
+                                return "matched"
+                    except ValueError:
+                        pass
+                    raise FileExistsError("refusing to overwrite frozen file") from None
+                with open_confined_artifact(
+                    root, normalized, allow_target_write_share=True
+                ) as artifact:
+                    if artifact.content != content:
+                        raise ValueError("freeze manifest is invalid")
+                return "created"
             finally:
                 if descriptor is not None:
                     os.close(descriptor)
                 elif handle != invalid:
                     kernel32.CloseHandle(ctypes.c_void_p(handle))
-            create_hard_link = kernel32.CreateHardLinkW
-            if not create_hard_link(str(target), str(temporary_path), None):
-                try:
-                    with open_confined_artifact(root, normalized) as artifact:
-                        if artifact.content == content:
-                            return "matched"
-                except ValueError:
-                    pass
-                raise FileExistsError("refusing to overwrite frozen file") from None
-            return "created"
         finally:
             try:
                 if temporary_path is not None:
@@ -732,25 +792,51 @@ def publish_confined_bytes_no_overwrite(
             raise RuntimeError("freeze manifest is invalid") from None
         try:
             _write_descriptor(descriptor, content)
+            temporary_identity = os.fstat(descriptor)
+            observed = os.stat(
+                temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
+            )
+            if (observed.st_dev, observed.st_ino) != (
+                temporary_identity.st_dev,
+                temporary_identity.st_ino,
+            ):
+                raise ValueError("freeze manifest is invalid")
+            try:
+                os.link(
+                    temporary_name,
+                    filename,
+                    src_dir_fd=parent_descriptor,
+                    dst_dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+            except FileExistsError:
+                with open_confined_artifact(data_root, normalized) as artifact:
+                    if artifact.content == content:
+                        return "matched"
+                raise FileExistsError("refusing to overwrite frozen file") from None
+            final_identity = os.stat(
+                filename, dir_fd=parent_descriptor, follow_symlinks=False
+            )
+            if (final_identity.st_dev, final_identity.st_ino) != (
+                temporary_identity.st_dev,
+                temporary_identity.st_ino,
+            ):
+                raise ValueError("freeze manifest is invalid")
+            return "created"
         finally:
             os.close(descriptor)
-        try:
-            os.link(
-                temporary_name,
-                filename,
-                src_dir_fd=parent_descriptor,
-                dst_dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-        except FileExistsError:
-            with open_confined_artifact(data_root, normalized) as artifact:
-                if artifact.content == content:
-                    return "matched"
-            raise FileExistsError("refusing to overwrite frozen file") from None
-        finally:
-            os.unlink(temporary_name, dir_fd=parent_descriptor)
+            try:
+                observed = os.stat(
+                    temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
+                )
+                if (observed.st_dev, observed.st_ino) == (
+                    temporary_identity.st_dev,
+                    temporary_identity.st_ino,
+                ):
+                    os.unlink(temporary_name, dir_fd=parent_descriptor)
+            except (FileNotFoundError, UnboundLocalError):
+                pass
         os.fsync(parent_descriptor)
-        return "created"
     finally:
         os.close(parent_descriptor)
 

@@ -417,3 +417,98 @@ def test_normal_evidence_cannot_be_replaced_while_bound(tmp_path: Path) -> None:
             os.replace(data_root, tmp_path / "data-renamed")
 
     assert evidence.read_bytes() == b"current"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor ownership")
+def test_posix_bound_artifacts_own_ancestor_descriptors_until_closed(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    (data_root / "one").mkdir()
+    (data_root / "two").mkdir()
+    (data_root / "one" / "evidence.json").write_bytes(b"one")
+    (data_root / "two" / "evidence.json").write_bytes(b"two")
+
+    with open_confined_artifact(data_root, "one/evidence.json") as first:
+        with open_confined_artifact(data_root, "two/evidence.json") as second:
+            assert first.ancestor_descriptors
+            assert second.ancestor_descriptors
+            for descriptor in [*first.ancestor_descriptors, *second.ancestor_descriptors]:
+                os.fstat(descriptor)
+            first.close()
+            os.fstat(second.descriptor)
+            for descriptor in second.ancestor_descriptors:
+                os.fstat(descriptor)
+            second.close()
+
+    reused = os.open(data_root / "one" / "evidence.json", os.O_RDONLY)
+    try:
+        first.close()
+        second.close()
+        os.fstat(reused)
+    finally:
+        os.close(reused)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows FILE_ID_INFO")
+def test_windows_file_id_rejects_native_replacement_of_current_path(tmp_path: Path) -> None:
+    import ctypes
+
+    class FileRenameInfoEx(ctypes.Structure):
+        _fields_ = [
+            ("flags", ctypes.c_uint32),
+            ("root_directory", ctypes.c_void_p),
+            ("file_name_length", ctypes.c_uint32),
+            ("file_name", ctypes.c_wchar * 1),
+        ]
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    manifest = data_root / "manifest.json"
+    manifest.write_bytes(b"current")
+    replacement = data_root / "replacement.tmp"
+    replacement.write_bytes(b"replacement")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    handle = kernel32.CreateFileW(
+        str(replacement),
+        0x00010000,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle == invalid:
+        pytest.fail(f"CreateFileW failed: {ctypes.get_last_error()}")
+    target_bytes = (str(manifest) + "\0").encode("utf-16-le")
+    buffer = ctypes.create_string_buffer(
+        ctypes.sizeof(FileRenameInfoEx) - ctypes.sizeof(ctypes.c_wchar) + len(target_bytes)
+    )
+    request = FileRenameInfoEx.from_buffer(buffer)
+    request.flags = 0x00000001 | 0x00000002
+    request.root_directory = None
+    request.file_name_length = len(target_bytes) - 2
+    ctypes.memmove(
+        ctypes.addressof(buffer) + FileRenameInfoEx.file_name.offset,
+        target_bytes,
+        len(target_bytes),
+    )
+    try:
+        with open_confined_artifact(
+            data_root, "manifest.json", replaceable_manifest=True
+        ) as artifact:
+            result = kernel32.SetFileInformationByHandle(
+                ctypes.c_void_p(handle), 22, ctypes.byref(request), len(buffer)
+            )
+            if not result:
+                error = ctypes.get_last_error()
+                if error in {1, 50, 87, 120}:
+                    pytest.skip(f"FileRenameInfoEx unavailable: WinError {error}")
+                pytest.fail(f"FileRenameInfoEx failed: WinError {error}")
+            with pytest.raises(ValueError, match="freeze manifest is invalid"):
+                artifact.verify_path_identity()
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))

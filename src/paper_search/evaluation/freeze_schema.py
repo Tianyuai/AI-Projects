@@ -555,16 +555,15 @@ def _open_windows_confined(
         for index, part in enumerate(relative_path.split("/")):
             candidate = candidate / part
             final = index == len(relative_path.split("/")) - 1
+            share_mode = 0x00000001
+            if not final or allow_target_write_share:
+                share_mode |= 0x00000002
+            if final and allow_target_delete_share:
+                share_mode |= 0x00000004
             handle = create_file(
                 str(candidate),
                 0x80000000,
-                0x00000001
-                | (
-                    0x00000002
-                    if not final or allow_target_delete_share or allow_target_write_share
-                    else 0
-                )
-                | (0x00000004 if final and allow_target_delete_share else 0),
+                share_mode,
                 None,
                 3,
                 (backup_semantics if not final else 0) | open_reparse,

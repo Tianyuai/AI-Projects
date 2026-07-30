@@ -879,6 +879,44 @@ def test_only_current_manifest_may_opt_in_to_delete_sharing_for_guarded_replace(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows sharing contract")
+def test_replaceable_manifest_denies_native_write_but_allows_rename(
+    tmp_path: Path,
+) -> None:
+    import ctypes
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    manifest = data_root / "manifest.json"
+    manifest.write_bytes(b"current")
+    backup = data_root / "manifest.backup.json"
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.restype = ctypes.c_void_p
+    invalid = ctypes.c_void_p(-1).value
+
+    with open_confined_artifact(
+        data_root, "manifest.json", replaceable_manifest=True
+    ) as artifact:
+        write_handle = create_file(
+            str(manifest),
+            0x40000000,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            0,
+            None,
+        )
+        if write_handle != invalid:
+            kernel32.CloseHandle(ctypes.c_void_p(write_handle))
+        assert write_handle == invalid
+        assert ctypes.get_last_error() == 32
+        os.replace(manifest, backup)
+        assert artifact.content == b"current"
+
+    assert backup.read_bytes() == b"current"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing contract")
 def test_normal_evidence_cannot_be_replaced_while_bound(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     data_root.mkdir()

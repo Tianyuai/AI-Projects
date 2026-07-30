@@ -682,6 +682,242 @@ def test_migration_guarded_publish_failure_restores_v1_and_exact_retry_succeeds(
     assert isinstance(_migrate(case), FreezeManifestV2)
 
 
+def test_migration_bound_manifest_hash_only_postcheck_rejects_descriptor_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    original_link = freeze_module.os.link
+    original_sha256_descriptor = freeze_module._sha256_descriptor
+    descriptor_changed = False
+    legacy_sha256 = _sha256(case.legacy_manifest_bytes)
+
+    def mark_descriptor_changed_after_publish(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal descriptor_changed
+        original_link(source, target, *args, **kwargs)
+        source_path = Path(source)
+        if (
+            Path(target) == manifest_path
+            and source_path.name.startswith(".manifest.json.")
+            and ".prepared." not in source_path.name
+        ):
+            descriptor_changed = True
+
+    def changed_bound_descriptor_hash(descriptor: int) -> str:
+        digest = original_sha256_descriptor(descriptor)
+        if descriptor_changed and digest == legacy_sha256:
+            return _sha256(b"changed-bound-manifest-descriptor")
+        return digest
+
+    monkeypatch.setattr(
+        freeze_module.os,
+        "link",
+        mark_descriptor_changed_after_publish,
+    )
+    monkeypatch.setattr(
+        freeze_module,
+        "_sha256_descriptor",
+        changed_bound_descriptor_hash,
+    )
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    assert descriptor_changed
+    assert not manifest_path.exists()
+    assert _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+
+
+def test_migration_changed_bound_descriptor_blocks_rollback_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    original_link = freeze_module.os.link
+    original_sha256_descriptor = freeze_module._sha256_descriptor
+    publish_failed = False
+    legacy_sha256 = _sha256(case.legacy_manifest_bytes)
+
+    def fail_manifest_publish(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal publish_failed
+        source_path = Path(source)
+        if (
+            Path(target) == manifest_path
+            and source_path.name.startswith(".manifest.json.")
+            and ".prepared." not in source_path.name
+        ):
+            publish_failed = True
+            raise OSError("synthetic manifest publish failure")
+        original_link(source, target, *args, **kwargs)
+
+    def changed_bound_descriptor_hash(descriptor: int) -> str:
+        digest = original_sha256_descriptor(descriptor)
+        if publish_failed and digest == legacy_sha256:
+            return _sha256(b"changed-bound-manifest-descriptor")
+        return digest
+
+    monkeypatch.setattr(freeze_module.os, "link", fail_manifest_publish)
+    monkeypatch.setattr(
+        freeze_module,
+        "_sha256_descriptor",
+        changed_bound_descriptor_hash,
+    )
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    assert publish_failed
+    assert not manifest_path.exists()
+    assert _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits held-inode mutation")
+def test_migration_never_restores_backup_mutated_before_publish_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    attacker_bytes = b"attacker-mutated-retained-v1-inode"
+    original_link = freeze_module.os.link
+    mutated_backup: Path | None = None
+
+    def mutate_backup_then_fail_publish(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal mutated_backup
+        source_path = Path(source)
+        if (
+            Path(target) == manifest_path
+            and source_path.name.startswith(".manifest.json.")
+            and ".prepared." not in source_path.name
+        ):
+            candidates = list(root.glob(".manifest.json.prepared.*.tmp"))
+            assert len(candidates) == 1
+            mutated_backup = candidates[0]
+            mutated_backup.write_bytes(attacker_bytes)
+            raise OSError("synthetic manifest publish failure")
+        original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        freeze_module.os,
+        "link",
+        mutate_backup_then_fail_publish,
+    )
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    assert mutated_backup is not None
+    assert not manifest_path.exists()
+    assert mutated_backup.read_bytes() == attacker_bytes
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits held-inode mutation")
+def test_migration_quarantines_restore_mutated_before_postcheck(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    attacker_bytes = b"attacker-mutated-restored-v1-inode"
+    original_link = freeze_module.os.link
+    restore_mutated = False
+
+    def fail_publish_then_mutate_restored_backup(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal restore_mutated
+        source_path = Path(source)
+        if Path(target) == manifest_path and source_path.name.startswith(
+            ".manifest.json.prepared."
+        ):
+            original_link(source, target, *args, **kwargs)
+            source_path.write_bytes(attacker_bytes)
+            restore_mutated = True
+            return
+        if (
+            Path(target) == manifest_path
+            and source_path.name.startswith(".manifest.json.")
+            and ".prepared." not in source_path.name
+        ):
+            raise OSError("synthetic manifest publish failure")
+        original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        freeze_module.os,
+        "link",
+        fail_publish_then_mutate_restored_backup,
+    )
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    assert restore_mutated
+    assert not manifest_path.exists()
+    recoveries = _manifest_recoveries_with_bytes(root, attacker_bytes)
+    assert len(recoveries) >= 1
+
+
+def test_migration_unmodified_bound_manifest_restores_v1_after_link_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    original_link = freeze_module.os.link
+    publish_failed = False
+
+    def fail_manifest_publish(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal publish_failed
+        source_path = Path(source)
+        if (
+            Path(target) == manifest_path
+            and source_path.name.startswith(".manifest.json.")
+            and ".prepared." not in source_path.name
+        ):
+            publish_failed = True
+            raise OSError("synthetic manifest publish failure")
+        original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(freeze_module.os, "link", fail_manifest_publish)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    assert publish_failed
+    assert manifest_path.read_bytes() == case.legacy_manifest_bytes
+    assert _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+
+
 def test_migration_guarded_publish_preserves_concurrent_manifest_owner_and_backup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1161,7 +1397,9 @@ def test_migration_restored_v1_backup_survives_owner_replacement_before_cleanup(
         _migrate(case)
 
     assert owner_inserted
-    assert manifest_path.read_bytes() == owner_bytes
+    assert not manifest_path.exists()
+    owner_recovery = _manifest_recoveries_with_bytes(root, owner_bytes)
+    assert owner_recovery
     recovery = _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
     assert recovery
 
@@ -2016,8 +2254,7 @@ def test_approve_rejects_mutation_at_pre_replace_boundary(tmp_path: Path) -> Non
     assert report_path.read_bytes() == plan.report_bytes
     assert manifest_path.read_bytes() == b"changed"
     recovery = list(fixture.data_root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(recovery) == 1
-    assert recovery[0].read_bytes() == b"changed"
+    assert recovery == []
 
 
 def test_approve_leaves_complete_report_if_manifest_replace_fails(

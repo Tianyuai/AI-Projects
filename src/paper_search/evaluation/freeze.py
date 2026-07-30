@@ -908,25 +908,104 @@ def _stable_evidence_files(
             os.close(descriptor)
 
 
+@contextmanager
+def _stable_bound_artifact_hash(
+    artifact: BoundArtifact | None,
+) -> Iterator[None]:
+    """Hold a replaceable artifact by descriptor without binding its old path."""
+    if artifact is not None and (
+        _sha256_descriptor(artifact.descriptor) != artifact.sha256
+    ):
+        raise RuntimeError("freeze approval failed")
+    yield
+    if artifact is not None and (
+        _sha256_descriptor(artifact.descriptor) != artifact.sha256
+    ):
+        raise RuntimeError("freeze approval failed")
+
+
+def _manifest_recovery_matches(
+    backup_path: Path,
+    *,
+    expected_identity: _FileIdentity,
+    expected_bytes: bytes,
+    expected_sha256: str,
+    retained_manifest: BoundArtifact | None,
+) -> bool:
+    try:
+        if retained_manifest is not None and (
+            _sha256_descriptor(retained_manifest.descriptor) != expected_sha256
+        ):
+            return False
+        if not _state_matches_owned_file(
+            _probe_file_state(backup_path),
+            expected_identity,
+        ):
+            return False
+        content = backup_path.read_bytes()
+    except OSError:
+        return False
+    return content == expected_bytes and _sha256_bytes(content) == expected_sha256
+
+
 def _restore_manifest_without_overwrite(
     backup_path: Path,
     manifest_path: Path,
+    *,
+    expected_identity: _FileIdentity,
+    expected_bytes: bytes,
+    expected_sha256: str,
+    retained_manifest: BoundArtifact | None,
 ) -> bool:
+    if not _manifest_recovery_matches(
+        backup_path,
+        expected_identity=expected_identity,
+        expected_bytes=expected_bytes,
+        expected_sha256=expected_sha256,
+        retained_manifest=retained_manifest,
+    ):
+        return False
     if manifest_path.exists():
         try:
-            return manifest_path.samefile(backup_path)
+            restored = manifest_path.samefile(backup_path)
         except OSError:
             return False
-    if not backup_path.exists():
+    else:
+        try:
+            os.link(backup_path, manifest_path)
+        except OSError:
+            try:
+                restored = manifest_path.samefile(backup_path)
+            except OSError:
+                return False
+        else:
+            restored = True
+    if not restored:
         return False
     try:
-        os.link(backup_path, manifest_path)
-        return manifest_path.samefile(backup_path)
+        manifest_content = manifest_path.read_bytes()
+        manifest_matches = (
+            manifest_path.samefile(backup_path)
+            and _state_matches_owned_file(
+                _probe_file_state(manifest_path),
+                expected_identity,
+            )
+            and manifest_content == expected_bytes
+            and _sha256_bytes(manifest_content) == expected_sha256
+            and _manifest_recovery_matches(
+                backup_path,
+                expected_identity=expected_identity,
+                expected_bytes=expected_bytes,
+                expected_sha256=expected_sha256,
+                retained_manifest=retained_manifest,
+            )
+        )
     except OSError:
-        try:
-            return manifest_path.samefile(backup_path)
-        except OSError:
-            return False
+        manifest_matches = False
+    if manifest_matches:
+        return True
+    _move_manifest_to_quarantine_no_overwrite(manifest_path)
+    return False
 
 
 def _rename_no_overwrite(
@@ -1221,9 +1300,11 @@ def _replace_manifest_guarded(
     evidence: Sequence[_EvidenceIdentity | BoundArtifact] = (),
     bound_manifest: BoundArtifact | None = None,
 ) -> None:
+    prepared_sha256 = _sha256_bytes(prepared_bytes)
     if bound_manifest is not None:
         if (
             bound_manifest.content != prepared_bytes
+            or bound_manifest.sha256 != prepared_sha256
             or _sha256_descriptor(bound_manifest.descriptor) != bound_manifest.sha256
         ):
             raise RuntimeError("freeze approval failed")
@@ -1269,10 +1350,27 @@ def _replace_manifest_guarded(
         temporary_file = None
         if before_manifest_replace is not None:
             before_manifest_replace()
-        with _stable_evidence_files(stable_evidence):
+        with (
+            _stable_evidence_files(stable_evidence),
+            _stable_bound_artifact_hash(bound_manifest),
+        ):
             try:
                 source_manifest_state = _probe_file_state(manifest_path)
                 if source_manifest_state is None or not source_manifest_state.regular:
+                    raise RuntimeError("freeze approval failed")
+                if bound_manifest is None:
+                    current_manifest = manifest_path.read_bytes()
+                    if (
+                        current_manifest != prepared_bytes
+                        or _sha256_bytes(current_manifest) != prepared_sha256
+                    ):
+                        raise RuntimeError("freeze approval failed")
+                if bound_manifest is not None and source_manifest_state.identity != (
+                    _FileIdentity(
+                        device=bound_manifest.device,
+                        inode=bound_manifest.inode,
+                    )
+                ):
                     raise RuntimeError("freeze approval failed")
                 for _ in range(8):
                     backup_candidate = manifest_path.with_name(
@@ -1299,7 +1397,15 @@ def _replace_manifest_guarded(
                     break
                 else:
                     raise RuntimeError("freeze approval failed")
-                if backup_path.read_bytes() != prepared_bytes:
+                if backup_identity is None:
+                    raise RuntimeError("freeze approval failed")
+                if not _manifest_recovery_matches(
+                    backup_path,
+                    expected_identity=backup_identity,
+                    expected_bytes=prepared_bytes,
+                    expected_sha256=prepared_sha256,
+                    retained_manifest=bound_manifest,
+                ):
                     raise RuntimeError("freeze approval failed")
                 try:
                     os.link(temporary_path, manifest_path)
@@ -1332,10 +1438,14 @@ def _replace_manifest_guarded(
         if not committed and manifest_taken:
             if published:
                 _quarantine_published_manifest(manifest_path, temporary_path)
-            if backup_path is not None:
+            if backup_path is not None and backup_identity is not None:
                 _restore_manifest_without_overwrite(
                     backup_path,
                     manifest_path,
+                    expected_identity=backup_identity,
+                    expected_bytes=prepared_bytes,
+                    expected_sha256=prepared_sha256,
+                    retained_manifest=bound_manifest,
                 )
         raise
     finally:

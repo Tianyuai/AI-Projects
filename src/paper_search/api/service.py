@@ -4,7 +4,7 @@ from collections.abc import Callable
 from typing import Protocol
 
 from paper_search.api.contracts import BudgetProfile, SearchRequest
-from paper_search.domain.models import StructuredSearchResponse
+from paper_search.application import StructuredSearchResponse
 from paper_search.pipeline.orchestrator import MinimalSearchResult
 from paper_search.pipeline.response import to_structured_response
 

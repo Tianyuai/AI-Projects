@@ -10,12 +10,11 @@ from fastapi.responses import JSONResponse
 
 from paper_search.api.contracts import (
     LiveHealthResponse,
-    ProviderHealthStatus,
     ReadyHealthResponse,
     SearchRequest,
     UnavailableResponse,
 )
-from paper_search.domain.models import StructuredSearchResponse
+from paper_search.application import DependencyStatus, StructuredSearchResponse
 
 
 _UNAVAILABLE_RESPONSE = UnavailableResponse()
@@ -30,12 +29,15 @@ class SearchService(Protocol):
 
 ReadinessProbe = Callable[[], Mapping[str, bool]]
 
+_DEPENDENCIES = ("llm", "openalex", "semantic_scholar")
+_MOCK_SNAPSHOT_SET_ID = "mock-snapshot-v1"
+
 
 def _provider_statuses(
     readiness_probe: ReadinessProbe | None,
-) -> dict[str, ProviderHealthStatus]:
+) -> dict[str, bool] | None:
     if readiness_probe is None:
-        return {}
+        return None
     try:
         raw_providers = dict(readiness_probe())
         normalized: list[tuple[str, bool]] = []
@@ -44,17 +46,40 @@ def _provider_statuses(
                 type(name) is not str
                 or not name.strip()
                 or type(available) is not bool
+                or name.strip() not in _DEPENDENCIES
             ):
                 raise ValueError("invalid readiness probe mapping")
             normalized.append((name.strip(), available))
         if len({name for name, _ in normalized}) != len(normalized):
             raise ValueError("duplicate normalized provider name")
-        return {
-            name: "ready" if available else "degraded"
-            for name, available in sorted(normalized)
-        }
+        return dict(normalized)
     except Exception:
-        return {}
+        return None
+
+
+def _dependency_statuses(
+    search_service: SearchService | None,
+    readiness_probe: ReadinessProbe | None,
+) -> list[DependencyStatus]:
+    probe = _provider_statuses(readiness_probe)
+    def state_for(name: str) -> str:
+        if search_service is None:
+            return "failed"
+        if name == "llm":
+            return "ready"
+        if probe is None:
+            return "failed"
+        return "ready" if probe.get(name, False) else "degraded"
+
+    return [
+        DependencyStatus(
+            dependency=name,
+            state=state_for(name),
+            cache_hit=False,
+            error_codes=[],
+        )
+        for name in _DEPENDENCIES
+    ]
 
 
 def create_app(
@@ -78,15 +103,17 @@ def create_app(
         responses={503: {"model": ReadyHealthResponse}},
     )
     async def ready() -> ReadyHealthResponse | JSONResponse:
-        providers = _provider_statuses(readiness_probe)
+        dependencies = _dependency_statuses(search_service, readiness_probe)
         is_ready = (
             search_service is not None
-            and bool(providers)
-            and all(status == "ready" for status in providers.values())
+            and all(item.state == "ready" for item in dependencies)
         )
         response = ReadyHealthResponse(
             status="ready" if is_ready else "degraded",
-            providers=providers,
+            execution_mode="replay",
+            snapshot_set_id=_MOCK_SNAPSHOT_SET_ID,
+            dependencies=dependencies,
+            last_authorized_probe_at=None,
         )
         if is_ready:
             return response

@@ -111,6 +111,16 @@ def test_service_forwards_profile_and_identity_and_suppresses_trace() -> None:
     assert response.git_sha == "abc1234"
     assert response.selected_paper_ids == ["openalex:W1"]
     assert response.search_trace == []
+    assert response.run_id == "mock-run-1"
+    assert response.execution_mode == "replay"
+    assert response.snapshot_set_id == "mock-snapshot-v1"
+    assert response.planner_status == "primary"
+    assert response.planner_fallback is False
+    assert [status.dependency for status in response.dependency_status] == [
+        "llm",
+        "openalex",
+        "semantic_scholar",
+    ]
 
 
 def test_service_creates_a_fresh_orchestrator_for_every_request() -> None:

@@ -74,12 +74,24 @@ def test_to_structured_response_preserves_known_fields_without_fabrication() -> 
     )
 
     assert response.query_id == "query-1"
+    assert response.run_id == "mock-run-1"
+    assert response.execution_mode == "replay"
+    assert response.snapshot_set_id == "mock-snapshot-v1"
+    assert response.snapshot_captured_at is None
     assert response.selected_paper_ids == ["openalex:W1", "s2:S1"]
     assert response.query_analysis == minimal_result.query_analysis
     assert response.search_trace == minimal_result.trace
     assert response.usage == minimal_result.usage
     assert response.stop_reason == minimal_result.stop_reason
     assert response.is_partial == minimal_result.is_partial
+    assert response.planner_status == "primary"
+    assert response.planner_fallback is False
+    assert [status.dependency for status in response.dependency_status] == [
+        "llm",
+        "openalex",
+        "semantic_scholar",
+    ]
+    assert response.prompt_version == minimal_result.prompt_version
     assert response.warnings == minimal_result.warnings
     assert response.config_hash == minimal_result.config_hash
     assert response.git_sha == "abc1234"

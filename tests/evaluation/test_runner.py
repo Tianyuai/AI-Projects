@@ -8,6 +8,7 @@ import importlib
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, IO
 
@@ -1736,7 +1737,7 @@ def test_run_evaluation_sums_all_known_costs(tmp_path: Path) -> None:
         )
     )
 
-    assert result.usage.cost_cny == pytest.approx(0.03)
+    assert result.usage.cost_cny == pytest.approx(Decimal("0.03"))
 
 
 def test_run_evaluation_preserves_unknown_mixed_cost(tmp_path: Path) -> None:

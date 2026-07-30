@@ -18,6 +18,7 @@ def test_search_request_has_prd_defaults_and_strips_identity() -> None:
         "query": "graph retrieval",
         "budget_profile": "balanced",
         "include_trace": True,
+        "mode": "replay",
     }
 
 
@@ -41,23 +42,26 @@ def test_health_contracts_are_strict() -> None:
     assert LiveHealthResponse().model_dump() == {"status": "ok"}
     response = ReadyHealthResponse(
         status="degraded",
-        providers={
-            "openalex": "ready",
-            "semantic_scholar": "degraded",
-        },
+        execution_mode="replay",
+        snapshot_set_id="mock-snapshot-v1",
+        dependencies=[],
+        last_authorized_probe_at=None,
     )
 
     assert response.model_dump() == {
         "status": "degraded",
-        "providers": {
-            "openalex": "ready",
-            "semantic_scholar": "degraded",
-        },
+        "execution_mode": "replay",
+        "snapshot_set_id": "mock-snapshot-v1",
+        "dependencies": [],
+        "last_authorized_probe_at": None,
     }
     with pytest.raises(ValidationError):
         ReadyHealthResponse.model_validate(
             {
                 "status": "ready",
-                "providers": {"openalex": "unknown"},
+                "execution_mode": "invalid",
+                "snapshot_set_id": None,
+                "dependencies": [],
+                "last_authorized_probe_at": None,
             }
         )

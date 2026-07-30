@@ -1,6 +1,7 @@
 import importlib
 import threading
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -92,7 +93,7 @@ def test_settle_releases_estimate_and_commits_actual_usage() -> None:
     assert controller.committed_usage.llm_calls == 1
     assert controller.committed_usage.input_tokens == 40
     assert controller.committed_usage.output_tokens == 10
-    assert controller.committed_usage.cost_cny == pytest.approx(0.4)
+    assert controller.committed_usage.cost_cny == pytest.approx(Decimal("0.4"))
 
 
 def test_settle_rejects_usage_above_reservation_and_keeps_it_active() -> None:
@@ -136,7 +137,7 @@ def test_budget_accounting_inputs_are_immutable_after_settlement() -> None:
         controller.budget = make_budget(max_llm_calls=100, target_llm_calls=1)
 
     assert controller.committed_usage.llm_calls == 1
-    assert controller.committed_usage.cost_cny == pytest.approx(0.4)
+    assert controller.committed_usage.cost_cny == pytest.approx(Decimal("0.4"))
 
 
 def test_llm_reservation_requires_known_cost() -> None:
@@ -314,7 +315,7 @@ def test_unknown_cost_is_separate_from_known_cost_after_settlement() -> None:
     controller.settle(unknown, UsageActual(search_api_calls=1, cost_cny=None))
 
     assert controller.committed_usage.cost_cny is None
-    assert controller.known_committed_cost_cny == pytest.approx(0.2)
+    assert controller.known_committed_cost_cny == pytest.approx(Decimal("0.2"))
     assert controller.unknown_cost_actions == ["unknown"]
 
 

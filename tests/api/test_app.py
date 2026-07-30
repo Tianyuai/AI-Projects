@@ -112,19 +112,47 @@ def test_ready_requires_service_and_all_nonempty_provider_states() -> None:
     assert ready.status_code == 200
     assert ready.json() == {
         "status": "ready",
-        "providers": {
-            "openalex": "ready",
-            "semantic_scholar": "ready",
-        },
+        "execution_mode": "replay",
+        "snapshot_set_id": "mock-snapshot-v1",
+        "dependencies": [
+            {"dependency": "llm", "state": "ready", "cache_hit": False, "error_codes": []},
+            {"dependency": "openalex", "state": "ready", "cache_hit": False, "error_codes": []},
+            {
+                "dependency": "semantic_scholar",
+                "state": "ready",
+                "cache_hit": False,
+                "error_codes": [],
+            },
+        ],
+        "last_authorized_probe_at": None,
     }
-    assert list(ready.json()["providers"]) == ["openalex", "semantic_scholar"]
+    assert [item["dependency"] for item in ready.json()["dependencies"]] == [
+        "llm",
+        "openalex",
+        "semantic_scholar",
+    ]
 
     degraded = asyncio.run(
         _request(create_app(), "GET", "/health/ready")
     )
 
     assert degraded.status_code == 503
-    assert degraded.json() == {"status": "degraded", "providers": {}}
+    assert degraded.json() == {
+        "status": "degraded",
+        "execution_mode": "replay",
+        "snapshot_set_id": "mock-snapshot-v1",
+        "dependencies": [
+            {"dependency": "llm", "state": "failed", "cache_hit": False, "error_codes": []},
+            {"dependency": "openalex", "state": "failed", "cache_hit": False, "error_codes": []},
+            {
+                "dependency": "semantic_scholar",
+                "state": "failed",
+                "cache_hit": False,
+                "error_codes": [],
+            },
+        ],
+        "last_authorized_probe_at": None,
+    }
 
 
 def test_ready_reports_false_provider_and_probe_failure_as_degraded() -> None:
@@ -156,13 +184,27 @@ def test_ready_reports_false_provider_and_probe_failure_as_degraded() -> None:
     assert unavailable.status_code == 503
     assert unavailable.json() == {
         "status": "degraded",
-        "providers": {
-            "openalex": "ready",
-            "semantic_scholar": "degraded",
-        },
+        "execution_mode": "replay",
+        "snapshot_set_id": "mock-snapshot-v1",
+        "dependencies": [
+            {"dependency": "llm", "state": "ready", "cache_hit": False, "error_codes": []},
+            {"dependency": "openalex", "state": "ready", "cache_hit": False, "error_codes": []},
+            {
+                "dependency": "semantic_scholar",
+                "state": "degraded",
+                "cache_hit": False,
+                "error_codes": [],
+            },
+        ],
+        "last_authorized_probe_at": None,
     }
     assert failed.status_code == 503
-    assert failed.json() == {"status": "degraded", "providers": {}}
+    assert failed.json()["status"] == "degraded"
+    assert [item["state"] for item in failed.json()["dependencies"]] == [
+        "ready",
+        "failed",
+        "failed",
+    ]
     assert "private readiness detail" not in failed.text
 
 
@@ -194,7 +236,12 @@ def test_ready_fails_closed_for_malformed_probe_mapping(
     )
 
     assert response.status_code == 503
-    assert response.json() == {"status": "degraded", "providers": {}}
+    assert response.json()["status"] == "degraded"
+    assert [item["state"] for item in response.json()["dependencies"]] == [
+        "ready",
+        "failed",
+        "failed",
+    ]
 
 
 def test_default_module_app_is_explicitly_degraded() -> None:
@@ -205,7 +252,12 @@ def test_default_module_app_is_explicitly_degraded() -> None:
     )
 
     assert response.status_code == 503
-    assert response.json() == {"status": "degraded", "providers": {}}
+    assert response.json()["status"] == "degraded"
+    assert [item["state"] for item in response.json()["dependencies"]] == [
+        "failed",
+        "failed",
+        "failed",
+    ]
 
 
 def test_search_validates_request_and_serializes_fixed_response() -> None:

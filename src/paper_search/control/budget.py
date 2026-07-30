@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 import threading
 from uuid import uuid4
 
@@ -41,8 +42,11 @@ def _aggregate(usages: Iterable[UsageEstimate]) -> UsageEstimate:
     )
 
 
-def _known_cost(usages: Iterable[UsageEstimate]) -> float:
-    return sum(item.cost_cny for item in usages if item.cost_cny is not None)
+def _known_cost(usages: Iterable[UsageEstimate]) -> Decimal:
+    return sum(
+        (item.cost_cny for item in usages if item.cost_cny is not None),
+        Decimal("0"),
+    )
 
 
 class HardBudgetController:
@@ -88,7 +92,7 @@ class HardBudgetController:
             return UsageActual.model_validate(summary.model_dump())
 
     @property
-    def known_committed_cost_cny(self) -> float:
+    def known_committed_cost_cny(self) -> Decimal:
         with self._lock:
             return _known_cost(self._committed)
 

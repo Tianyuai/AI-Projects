@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Annotated, Any, Generic, Literal, TypeVar
+from decimal import Decimal
+from pathlib import PurePosixPath
+from typing import Annotated, Generic, Literal, TypeVar
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
     StringConstraints,
+    AfterValidator,
     model_validator,
 )
 
 
 NonEmptyStr = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+Sha256 = Annotated[str, StringConstraints(pattern=r"^sha256:[0-9a-f]{64}$")]
 NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
 StrictNonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
@@ -22,6 +26,43 @@ StrictNonNegativeFloat = Annotated[
 ]
 UnitFloat = Annotated[float, Field(ge=0, le=1)]
 ProviderName = Literal["openalex", "semantic_scholar"]
+SearchMode = Literal["replay", "live"]
+DependencyName = Literal["llm", "openalex", "semantic_scholar"]
+DependencyState = Literal["ready", "replayed", "degraded", "failed"]
+PlannerStatus = Literal["primary", "repaired", "rules_fallback"]
+DependencyErrorCode = Literal[
+    "timeout",
+    "network_error",
+    "rate_limited",
+    "server_error",
+    "authentication_error",
+    "invalid_request",
+    "invalid_response",
+    "invalid_record",
+    "missing_record",
+    "empty_response",
+    "invalid_json",
+    "budget_exhausted",
+    "provider_error",
+]
+
+
+def validate_safe_relative_path(value: str) -> str:
+    """Normalize a portable relative path while rejecting traversal and roots."""
+    normalized = value.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or path.is_absolute()
+        or str(path) == "."
+        or any(part == ".." or ":" in part for part in path.parts)
+    ):
+        raise ValueError("snapshot path must be a safe relative path")
+    return path.as_posix()
+
+
+SafeRelativePath = Annotated[str, AfterValidator(validate_safe_relative_path)]
+MoneyCny = Annotated[Decimal, Field(ge=Decimal("0"), decimal_places=6)]
 
 
 class DomainModel(BaseModel):
@@ -186,7 +227,7 @@ class UsageEstimate(DomainModel):
     llm_calls: StrictNonNegativeInt = 0
     input_tokens: StrictNonNegativeInt = 0
     output_tokens: StrictNonNegativeInt = 0
-    cost_cny: StrictNonNegativeFloat | None = None
+    cost_cny: MoneyCny | None = None
     elapsed_ms: StrictNonNegativeInt = 0
 
 
@@ -207,6 +248,26 @@ class ErrorDetail(DomainModel):
     retryable: bool
     provider: NonEmptyStr
     request_id: str | None = None
+
+
+class DependencyStatus(DomainModel):
+    dependency: DependencyName
+    state: DependencyState
+    cache_hit: bool
+    error_codes: list[DependencyErrorCode]
+
+
+_DEPENDENCY_ORDER = {"llm": 0, "openalex": 1, "semantic_scholar": 2}
+
+
+def validate_dependency_status_order(statuses: list[DependencyStatus]) -> None:
+    dependencies = [status.dependency for status in statuses]
+    if len(set(dependencies)) != len(dependencies) or dependencies != sorted(
+        dependencies, key=_DEPENDENCY_ORDER.__getitem__
+    ):
+        raise ValueError(
+            "dependency status order must be llm, openalex, semantic_scholar"
+        )
 
 
 class CitationExpansion(DomainModel):
@@ -240,19 +301,43 @@ class QueryAnalysisResult(DomainModel):
 
 
 class StructuredSearchResponse(DomainModel):
+    run_id: NonEmptyStr = "legacy-run"
     query_id: NonEmptyStr
+    execution_mode: SearchMode = "replay"
+    snapshot_set_id: NonEmptyStr = "legacy-snapshot"
+    snapshot_captured_at: datetime | None = None
     query_analysis: QueryAnalysisResult
     selected_paper_ids: list[NonEmptyStr]
     high_relevance: list[RankedPaper]
     partial_relevance: list[RankedPaper]
     citation_edges: list[ResolvedCitationEdge]
-    search_trace: list[dict[str, Any]]
+    search_trace: list[dict[str, object]]
     usage: UsageActual
     stop_reason: NonEmptyStr
     is_partial: bool
-    warnings: list[str]
-    config_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    planner_fallback: bool = False
+    planner_status: PlannerStatus = "primary"
+    dependency_status: list[DependencyStatus] = Field(default_factory=list)
+    warnings: list[NonEmptyStr]
+    prompt_version: NonEmptyStr = "legacy-prompt"
+    config_hash: Sha256
     git_sha: NonEmptyStr
+
+    @model_validator(mode="after")
+    def validate_execution_invariants(self) -> StructuredSearchResponse:
+        validate_dependency_status_order(self.dependency_status)
+        if self.planner_status == "rules_fallback":
+            if not self.planner_fallback or not self.is_partial:
+                raise ValueError(
+                    "rules_fallback requires planner_fallback and is_partial"
+                )
+            if "planner_rules_fallback" not in self.warnings:
+                raise ValueError(
+                    "rules_fallback requires planner_rules_fallback warning"
+                )
+        elif self.planner_fallback:
+            raise ValueError("only rules_fallback may set planner_fallback")
+        return self
 
 
 for _model in (

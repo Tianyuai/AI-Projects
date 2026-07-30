@@ -43,10 +43,19 @@ def test_create_mock_app_reports_both_fixed_providers_ready() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "status": "ready",
-        "providers": {
-            "openalex": "ready",
-            "semantic_scholar": "ready",
-        },
+        "execution_mode": "replay",
+        "snapshot_set_id": "mock-snapshot-v1",
+        "dependencies": [
+            {"dependency": "llm", "state": "ready", "cache_hit": False, "error_codes": []},
+            {"dependency": "openalex", "state": "ready", "cache_hit": False, "error_codes": []},
+            {
+                "dependency": "semantic_scholar",
+                "state": "ready",
+                "cache_hit": False,
+                "error_codes": [],
+            },
+        ],
+        "last_authorized_probe_at": None,
     }
 
 

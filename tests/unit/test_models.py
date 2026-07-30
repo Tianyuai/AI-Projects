@@ -1,6 +1,7 @@
 import importlib
 import importlib.util
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -142,10 +143,13 @@ def test_usage_rejects_negative_values_and_preserves_unknown_cost() -> None:
     usage = models.UsageEstimate(search_api_calls=1)
 
     assert usage.cost_cny is None
+    assert models.UsageActual(cost_cny=0.1).cost_cny == Decimal("0.1")
     with pytest.raises(ValidationError):
         models.UsageEstimate(input_tokens=-1)
     with pytest.raises(ValidationError):
         models.UsageActual(cost_cny=-0.01)
+    with pytest.raises(ValidationError):
+        models.UsageActual(cost_cny=Decimal("0.0000001"))
 
 
 def test_search_budget_uses_prd_defaults_but_requires_token_and_cost_limits() -> None:

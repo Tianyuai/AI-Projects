@@ -1,29 +1,25 @@
-"""Strict HTTP request and health contracts."""
+"""Compatibility exports for strict application-layer HTTP contracts."""
 
 from typing import Literal, TypeAlias
 
-from paper_search.domain.models import DomainModel, NonEmptyStr
+from paper_search.application.contracts import ReadyHealthResponse, SearchRequest
+from paper_search.domain.models import DomainModel
+
+__all__ = [
+    "BudgetProfile",
+    "LiveHealthResponse",
+    "ProviderHealthStatus",
+    "ReadyHealthResponse",
+    "SearchRequest",
+    "UnavailableResponse",
+]
 
 
 BudgetProfile: TypeAlias = Literal["low", "balanced"]
 ProviderHealthStatus: TypeAlias = Literal["ready", "degraded"]
 
-
-class SearchRequest(DomainModel):
-    query_id: NonEmptyStr
-    query: NonEmptyStr
-    budget_profile: BudgetProfile = "balanced"
-    include_trace: bool = True
-
-
 class LiveHealthResponse(DomainModel):
     status: Literal["ok"] = "ok"
-
-
-class ReadyHealthResponse(DomainModel):
-    status: Literal["ready", "degraded"]
-    providers: dict[NonEmptyStr, ProviderHealthStatus]
-
 
 class UnavailableResponse(DomainModel):
     detail: Literal["search temporarily unavailable"] = (

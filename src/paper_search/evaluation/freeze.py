@@ -1310,11 +1310,8 @@ def _replace_manifest_guarded(
     owned_descriptor: int | None = descriptor
     temporary_file: BinaryIO | None = None
     temporary_identity: _FileIdentity | None = None
-    backup_candidate: Path | None = None
     backup_path: Path | None = None
     backup_identity: _FileIdentity | None = None
-    source_manifest_state: _FileState | None = None
-    manifest_taken = False
     committed = False
     try:
         temporary_state = _file_state(os.fstat(descriptor))
@@ -1366,7 +1363,6 @@ def _replace_manifest_guarded(
                     if outcome == "failed":
                         raise RuntimeError("freeze approval failed")
                     backup_path = backup_candidate
-                    manifest_taken = True
                     backup_state = _probe_file_state(backup_path)
                     if not _state_matches_owned_file(
                         backup_state,
@@ -1387,34 +1383,13 @@ def _replace_manifest_guarded(
                     retained_manifest=bound_manifest,
                 ):
                     raise RuntimeError("freeze approval failed")
-                try:
-                    os.link(temporary_path, manifest_path)
-                except OSError:
-                    if not (
-                        temporary_identity is not None
-                        and backup_identity is not None
-                        and _owned_manifest_matches(
-                            manifest_path,
-                            expected_identity=temporary_identity,
-                            expected_bytes=frozen_bytes,
-                            expected_sha256=frozen_sha256,
-                        )
-                        and _manifest_recovery_matches(
-                            backup_path,
-                            expected_identity=backup_identity,
-                            expected_bytes=prepared_bytes,
-                            expected_sha256=prepared_sha256,
-                            retained_manifest=bound_manifest,
-                        )
-                    ):
-                        raise
             except OSError:
                 raise RuntimeError("freeze approval failed") from None
         if (
             temporary_identity is None
             or backup_identity is None
             or not _owned_manifest_matches(
-                manifest_path,
+                temporary_path,
                 expected_identity=temporary_identity,
                 expected_bytes=frozen_bytes,
                 expected_sha256=frozen_sha256,
@@ -1428,23 +1403,28 @@ def _replace_manifest_guarded(
             )
         ):
             raise RuntimeError("freeze approval failed")
-        committed = True
-    except BaseException:
-        if (
-            not manifest_taken
-            and backup_candidate is not None
-            and source_manifest_state is not None
-            and _state_matches_owned_file(
-                _probe_file_state(backup_candidate),
-                source_manifest_state.identity,
-            )
-        ):
-            backup_path = backup_candidate
-            backup_identity = source_manifest_state.identity
-            manifest_taken = True
-        if not committed and manifest_taken:
-            _quarantine_published_manifest(manifest_path, temporary_path)
-        raise
+        try:
+            os.link(temporary_path, manifest_path)
+        except OSError as error:
+            if _owned_manifest_matches(
+                manifest_path,
+                expected_identity=temporary_identity,
+                expected_bytes=frozen_bytes,
+                expected_sha256=frozen_sha256,
+            ):
+                committed = True
+            else:
+                raise RuntimeError("freeze approval failed") from error
+        else:
+            if not _owned_manifest_matches(
+                manifest_path,
+                expected_identity=temporary_identity,
+                expected_bytes=frozen_bytes,
+                expected_sha256=frozen_sha256,
+            ):
+                _quarantine_published_manifest(manifest_path, temporary_path)
+                raise RuntimeError("freeze approval failed")
+            committed = True
     finally:
         if temporary_file is not None:
             _best_effort_close_file(temporary_file)
@@ -1965,7 +1945,6 @@ def recover_freeze_manifest(
     manifest_path = root / "manifest.json"
     if recovery_path == "manifest.json":
         raise ValueError("freeze recovery failed")
-    created = False
     try:
         with _exclusive_freeze_lock(root):
             with ExitStack() as stack:
@@ -1981,91 +1960,89 @@ def recover_freeze_manifest(
                     )
                 except ValueError:
                     raise ValueError("freeze recovery failed") from None
-                final_artifact: BoundArtifact | None = None
+                with _stable_evidence_files(evidence):
+                    pass
+                if not _artifact_matches_content(
+                    recovery,
+                    expected_bytes=recovery.content,
+                    expected_sha256=expected_sha256,
+                ):
+                    raise RuntimeError("freeze recovery failed")
+                if manifest_path.exists():
+                    try:
+                        existing = stack.enter_context(
+                            open_confined_artifact(root, "manifest.json")
+                        )
+                    except ValueError:
+                        raise FileExistsError("freeze recovery failed") from None
+                    if not _artifact_matches_content(
+                        existing,
+                        expected_bytes=recovery.content,
+                        expected_sha256=expected_sha256,
+                    ):
+                        raise FileExistsError("freeze recovery failed")
+                    with _stable_evidence_files((existing,)):
+                        pass
+                    return "matched"
+                recovery_source = root.joinpath(
+                    *recovery.relative_path.split("/")
+                )
                 try:
-                    with _stable_evidence_files(evidence):
+                    os.link(recovery_source, manifest_path)
+                except OSError as error:
+                    try:
+                        final_artifact = stack.enter_context(
+                            open_confined_artifact(root, "manifest.json")
+                        )
+                    except ValueError:
                         if manifest_path.exists():
-                            try:
-                                existing = stack.enter_context(
-                                    open_confined_artifact(root, "manifest.json")
-                                )
-                            except ValueError:
-                                raise FileExistsError(
-                                    "freeze recovery failed"
-                                ) from None
-                            if not _artifact_matches_content(
-                                existing,
-                                expected_bytes=recovery.content,
-                                expected_sha256=expected_sha256,
-                            ):
-                                raise FileExistsError("freeze recovery failed")
-                            with _stable_evidence_files((existing,)):
-                                return "matched"
-                        try:
-                            os.link(
-                                root.joinpath(*recovery.relative_path.split("/")),
-                                manifest_path,
-                            )
-                        except OSError as error:
-                            try:
-                                final_artifact = stack.enter_context(
-                                    open_confined_artifact(root, "manifest.json")
-                                )
-                            except ValueError:
-                                if manifest_path.exists():
-                                    raise FileExistsError(
-                                        "freeze recovery failed"
-                                    ) from None
-                                raise RuntimeError(
-                                    "freeze recovery failed"
-                                ) from error
-                            if not (
-                                _bound_artifacts_share_identity(
-                                    recovery,
-                                    final_artifact,
-                                )
-                                and _artifact_matches_content(
-                                    final_artifact,
-                                    expected_bytes=recovery.content,
-                                    expected_sha256=expected_sha256,
-                                )
-                            ):
-                                if isinstance(error, FileExistsError):
-                                    raise FileExistsError(
-                                        "freeze recovery failed"
-                                    ) from None
-                                raise RuntimeError(
-                                    "freeze recovery failed"
-                                ) from error
-                            created = True
-                        else:
-                            created = True
-                            try:
-                                final_artifact = stack.enter_context(
-                                    open_confined_artifact(root, "manifest.json")
-                                )
-                            except ValueError:
-                                raise RuntimeError(
-                                    "freeze recovery failed"
-                                ) from None
-                        if final_artifact is None or not (
-                            _bound_artifacts_share_identity(
-                                recovery,
-                                final_artifact,
-                            )
-                            and _artifact_matches_content(
-                                final_artifact,
-                                expected_bytes=recovery.content,
-                                expected_sha256=expected_sha256,
-                            )
-                        ):
-                            raise RuntimeError("freeze recovery failed")
-                        with _stable_evidence_files((final_artifact,)):
-                            pass
-                except BaseException:
-                    if created:
-                        _move_manifest_to_quarantine_no_overwrite(manifest_path)
-                    raise
+                            raise FileExistsError(
+                                "freeze recovery failed"
+                            ) from None
+                        raise RuntimeError("freeze recovery failed") from error
+                    if not (
+                        _bound_artifacts_share_identity(
+                            recovery,
+                            final_artifact,
+                        )
+                        and _artifact_matches_content(
+                            final_artifact,
+                            expected_bytes=recovery.content,
+                            expected_sha256=expected_sha256,
+                        )
+                    ):
+                        if isinstance(error, FileExistsError):
+                            raise FileExistsError(
+                                "freeze recovery failed"
+                            ) from None
+                        raise RuntimeError("freeze recovery failed") from error
+                    return "created"
+                try:
+                    final_artifact = stack.enter_context(
+                        open_confined_artifact(root, "manifest.json")
+                    )
+                except ValueError:
+                    _quarantine_published_manifest(
+                        manifest_path,
+                        recovery_source,
+                    )
+                    raise RuntimeError("freeze recovery failed") from None
+                if not (
+                    _bound_artifacts_share_identity(
+                        recovery,
+                        final_artifact,
+                    )
+                    and _artifact_matches_content(
+                        final_artifact,
+                        expected_bytes=recovery.content,
+                        expected_sha256=expected_sha256,
+                    )
+                ):
+                    _quarantine_published_manifest(
+                        manifest_path,
+                        recovery_source,
+                    )
+                    raise RuntimeError("freeze recovery failed")
                 return "created"
     except FileExistsError:
         raise FileExistsError("freeze recovery failed") from None

@@ -665,13 +665,24 @@ def load_freeze_manifest(path: Path, *, data_root: Path) -> FreezeManifest: ...
 def migrate_v1_to_v2(
     v1: FreezeManifestV1,
     *,
+    data_root: Path,
     approval: FreezeApprovalReportV2,
     identifier_map: IdentifierMapBindingV2,
     dataset_revision: str,
+    approval_report_path: SafeRelativePath,
 ) -> FreezeManifestV2: ...
 ```
 
 The migration requires an already approved V1 freeze, verifies every old hash again, adds the V2-only identifier-map evidence, writes a new V2 approval report, and delegates guarded publication to the existing atomic/no-overwrite machinery.
+
+**Approved correction:** the migration binds all evidence and publication to
+`data_root`; the source and publication target remain the existing fixed
+`data_root/manifest.json`. `approval_report_path` is a POSIX-relative path
+confined beneath that root and identifies the new V2 approval report. These two
+parameters are required because an in-memory V1 model alone cannot safely
+reopen evidence, reject path or symlink escape, write the approval report, or
+perform guarded publication. Concurrency hooks remain private implementation
+details rather than public parameters.
 
 **Steps:**
 

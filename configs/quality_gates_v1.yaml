@@ -60,7 +60,7 @@ rules:
     classification: baseline_quality
     measure: valid_model_produced_query_analysis_rate
     operator: gte
-    threshold: 0.99
+    threshold: "0.99"
     applies_to: [dev, validation]
     source_refs: [PRD:FR-01, integrated-design:authoritative-quality-gates:model-analysis]
     resolution: enforced
@@ -68,7 +68,7 @@ rules:
     classification: baseline_quality
     measure: audited_strong_constraint_recall
     operator: gte
-    threshold: 0.90
+    threshold: "0.90"
     applies_to: [frozen_audit]
     source_refs: [PRD:FR-01, integrated-design:authoritative-quality-gates:strong-constraint]
     resolution: enforced
@@ -76,7 +76,7 @@ rules:
     classification: baseline_quality
     measure: parseable_configured_retrieval_response_rate
     operator: gte
-    threshold: 0.95
+    threshold: "0.95"
     applies_to: [dev, validation]
     source_refs: [PRD:FR-03, integrated-design:authoritative-quality-gates:retrieval-response]
     resolution: enforced
@@ -84,7 +84,7 @@ rules:
     classification: baseline_quality
     measure: audited_fuzzy_merge_accuracy
     operator: gte
-    threshold: 0.98
+    threshold: "0.98"
     applies_to: [frozen_audit]
     source_refs: [PRD:FR-04, integrated-design:authoritative-quality-gates:fuzzy-merge]
     resolution: enforced
@@ -100,7 +100,7 @@ rules:
     classification: baseline_quality
     measure: hard_filter_absolute_recall_loss
     operator: lte
-    threshold: 0.02
+    threshold: "0.02"
     applies_to: [dev, validation]
     source_refs: [PRD:FR-05, integrated-design:authoritative-quality-gates:hard-filter]
     resolution: enforced
@@ -110,7 +110,7 @@ rules:
     operator: gt
     threshold: 0
     applies_to: [dev, validation]
-    source_refs: [integrated-design:authoritative-quality-gates:macro-recall]
+    source_refs: [R3:identifier-map-recall, integrated-design:authoritative-quality-gates:macro-recall]
     resolution: enforced
   - rule_id: micro-recall-positive
     classification: baseline_quality
@@ -118,7 +118,7 @@ rules:
     operator: gt
     threshold: 0
     applies_to: [dev, validation]
-    source_refs: [integrated-design:authoritative-quality-gates:micro-recall]
+    source_refs: [R3:identifier-map-recall, integrated-design:authoritative-quality-gates:micro-recall]
     resolution: enforced
   - rule_id: report-macro-precision
     classification: reporting_only
@@ -143,7 +143,7 @@ rules:
     threshold: 0
     applies_to: [dev, validation]
     source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
-    resolution: reporting-only; superseded by macro-recall-positive
+    resolution: superseded-by-macro-recall-positive
   - rule_id: report-micro-recall
     classification: reporting_only
     measure: micro_recall
@@ -151,15 +151,15 @@ rules:
     threshold: 0
     applies_to: [dev, validation]
     source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
-    resolution: reporting-only; superseded by micro-recall-positive
+    resolution: superseded-by-micro-recall-positive
   - rule_id: report-macro-f1
     classification: reporting_only
     measure: macro_f1
     operator: gte
     threshold: 0
     applies_to: [dev, validation]
-    source_refs: [PRD:score-objective, PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
-    resolution: reporting-only; no minimum Week 1 F1 is invented
+    source_refs: [PRD:14.0, PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
   - rule_id: report-micro-f1
     classification: reporting_only
     measure: micro_f1
@@ -167,7 +167,7 @@ rules:
     threshold: 0
     applies_to: [dev, validation]
     source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
-    resolution: reporting-only; no minimum Week 1 F1 is invented
+    resolution: reporting-only
   - rule_id: report-recall-at-5
     classification: reporting_only
     measure: recall_at_5
@@ -198,15 +198,15 @@ rules:
     operator: gte
     threshold: 0
     applies_to: [dev, validation]
-    source_refs: [PRD:FR-03, integrated-design:authoritative-quality-gates:reporting]
-    resolution: reporting-only; cardinality is enforced separately
+    source_refs: [PRD:15.3, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
   - rule_id: report-partial-result-rate
     classification: reporting_only
     measure: partial_result_rate
     operator: gte
     threshold: 0
     applies_to: [dev, validation]
-    source_refs: [PRD:FR-11, integrated-design:authoritative-quality-gates:reporting]
+    source_refs: [PRD:15.3, integrated-design:authoritative-quality-gates:reporting]
     resolution: reporting-only
   - rule_id: report-planner-fallback-rate
     classification: reporting_only
@@ -239,7 +239,7 @@ rules:
     threshold: 0
     applies_to: [dev, validation]
     source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
-    resolution: reporting-only; hard caps are enforced separately
+    resolution: reporting-only
   - rule_id: report-tokens
     classification: reporting_only
     measure: actual_tokens
@@ -247,7 +247,7 @@ rules:
     threshold: 0
     applies_to: [dev, validation]
     source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
-    resolution: reporting-only; hard caps are enforced separately
+    resolution: reporting-only
   - rule_id: report-valued-cost
     classification: reporting_only
     measure: valued_cost_cny
@@ -255,7 +255,7 @@ rules:
     threshold: 0
     applies_to: [dev, validation]
     source_refs: [PRD:NFR-03, integrated-design:authoritative-quality-gates:reporting]
-    resolution: reporting-only; hard caps are enforced separately
+    resolution: reporting-only
   - rule_id: report-cache-hit-rate
     classification: reporting_only
     measure: cache_hit_rate
@@ -268,7 +268,7 @@ rules:
     classification: promotion
     measure: median_macro_f1_delta_over_three_runs
     operator: gte
-    threshold: 0.01
+    threshold: "0.01"
     applies_to: [optional]
     source_refs: [PRD:FR-02, PRD:model-promotion-gate, integrated-design:promotion-gate]
     resolution: optional-promotion-only
@@ -276,7 +276,7 @@ rules:
     classification: promotion
     measure: bootstrap_95_ci_lower_bound
     operator: gte
-    threshold: -0.005
+    threshold: "-0.005"
     applies_to: [optional]
     source_refs: [PRD:FR-02, integrated-design:promotion-gate]
     resolution: optional-promotion-only
@@ -284,10 +284,122 @@ rules:
     classification: promotion
     measure: validation_macro_f1_drop
     operator: lte
-    threshold: 0.01
+    threshold: "0.01"
     applies_to: [optional]
     source_refs: [PRD:FR-02, PRD:model-promotion-gate, integrated-design:promotion-gate]
     resolution: optional-promotion-only
+  - rule_id: dev-macro-f1-min
+    classification: reporting_only
+    measure: dev_macro_f1
+    operator: gte
+    threshold: "0.30"
+    applies_to: [dev]
+    source_refs: [PRD:14.0]
+    resolution: reporting-only
+  - rule_id: dev-macro-f1-delta
+    classification: reporting_only
+    measure: dev_macro_f1_delta_vs_raw_openalex
+    operator: gte
+    threshold: "0.03"
+    applies_to: [dev]
+    source_refs: [PRD:14.0]
+    resolution: reporting-only
+  - rule_id: validation-macro-f1-delta
+    classification: reporting_only
+    measure: validation_macro_f1_delta_vs_raw_openalex
+    operator: gte
+    threshold: "0.02"
+    applies_to: [validation]
+    source_refs: [PRD:14.0]
+    resolution: reporting-only
+  - rule_id: structured-schema-valid-rate
+    classification: reporting_only
+    measure: schema_valid_rate
+    operator: eq
+    threshold: 1
+    applies_to: [dev, validation]
+    source_refs: [PRD:14.2]
+    resolution: reporting-only
+  - rule_id: structured-valid-paper-link-rate
+    classification: reporting_only
+    measure: valid_paper_link_rate
+    operator: gte
+    threshold: "0.99"
+    applies_to: [dev, validation]
+    source_refs: [PRD:14.2]
+    resolution: reporting-only
+  - rule_id: structured-reason-complete-rate
+    classification: reporting_only
+    measure: reason_complete_rate
+    operator: gte
+    threshold: "0.95"
+    applies_to: [dev, validation]
+    source_refs: [PRD:14.2]
+    resolution: reporting-only
+  - rule_id: structured-verifiable-citation-edge-rate
+    classification: reporting_only
+    measure: verifiable_citation_edge_rate
+    operator: eq
+    threshold: 1
+    applies_to: [dev, validation]
+    source_refs: [PRD:14.2]
+    resolution: reporting-only
+  - rule_id: structured-fabrication-count
+    classification: reporting_only
+    measure: fabricated_paper_or_relation_count
+    operator: eq
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:14.2, PRD:15.2]
+    resolution: reporting-only
+  - rule_id: latency-p50-target-ms
+    classification: reporting_only
+    measure: latency_p50_ms
+    operator: lte
+    threshold: 30000
+    applies_to: [dev, validation]
+    source_refs: [PRD:NFR-03, PRD:15.3]
+    resolution: reporting-only
+  - rule_id: latency-p95-target-ms
+    classification: reporting_only
+    measure: latency_p95_ms
+    operator: lte
+    threshold: 80000
+    applies_to: [dev, validation]
+    source_refs: [PRD:NFR-03, PRD:15.3]
+    resolution: reporting-only
+  - rule_id: batch-hard-failure-rate
+    classification: reporting_only
+    measure: hard_failure_rate
+    operator: lte
+    threshold: "0.02"
+    applies_to: [dev, validation]
+    source_refs: [PRD:15.3]
+    resolution: reporting-only
+  - rule_id: batch-partial-result-rate
+    classification: reporting_only
+    measure: partial_result_rate
+    operator: lte
+    threshold: "0.05"
+    applies_to: [dev, validation]
+    source_refs: [PRD:15.3]
+    resolution: reporting-only
+  - rule_id: unseen-domain-macro-f1-drop
+    classification: reporting_only
+    measure: unseen_domain_macro_f1_drop
+    operator: lte
+    threshold: "0.05"
+    applies_to: [frozen_audit]
+    source_refs: [PRD:14.3]
+    resolution: reporting-only
+  - rule_id: query-type-macro-f1-drop
+    classification: reporting_only
+    measure: query_type_macro_f1_drop
+    operator: lte
+    threshold: "0.02"
+    applies_to: [frozen_audit]
+    source_refs: [PRD:14.3, PRD:15.2]
+    resolution: reporting-only
   - rule_id: promotion-bootstrap-samples
     classification: promotion
     measure: bootstrap_samples

@@ -40,6 +40,10 @@ def pricing_api() -> tuple[type[Any], type[Any], type[Exception], Any, Any, Any]
     )
 
 
+def pricing_module() -> Any:
+    return importlib.import_module("paper_search.control.pricing")
+
+
 def load_fixture_policy() -> Any:
     _, _, _, load_pricing_policy, _, _ = pricing_api()
     return load_pricing_policy(FIXTURE_PATH)
@@ -85,6 +89,93 @@ def test_policy_identity_is_canonical_and_deterministic(tmp_path: Path) -> None:
     assert pricing_policy_sha256(load_pricing_policy(FIXTURE_PATH)) == pricing_policy_sha256(
         load_pricing_policy(copied_path)
     )
+
+
+def test_policy_identity_ignores_rate_order_but_includes_semantic_fields() -> None:
+    _, pricing_policy, _, _, _, pricing_policy_sha256 = pricing_api()
+    policy = load_fixture_policy()
+    reordered = pricing_policy.model_validate(
+        {
+            **policy.model_dump(mode="python"),
+            "rates": [rate.model_dump(mode="python") for rate in reversed(policy.rates)],
+        }
+    )
+    changed = pricing_policy.model_validate(
+        {**policy.model_dump(mode="python"), "source_identity": "different-operator-evidence"}
+    )
+
+    assert pricing_policy_sha256(reordered) == pricing_policy_sha256(policy)
+    assert pricing_policy_sha256(changed) != pricing_policy_sha256(policy)
+
+
+def test_policy_models_are_strict_and_loader_rejects_naive_or_float_yaml(tmp_path: Path) -> None:
+    module = pricing_module()
+
+    with pytest.raises(ValidationError):
+        module.PricingRate.model_validate(
+            {
+                "dependency": "llm",
+                "model_or_adapter": "qwen-test-v1",
+                "unit": "input_token",
+                "price_cny_per_unit": 0.000002,
+            }
+        )
+    with pytest.raises(ValidationError):
+        module.PricingRate.model_validate(
+            {
+                "dependency": "llm",
+                "model_or_adapter": "qwen-test-v1",
+                "unit": "token",
+                "price_cny_per_unit": Decimal("0.000002"),
+            }
+        )
+    with pytest.raises(ValidationError):
+        module.QualityGateRule.model_validate(
+            {
+                "rule_id": "strict-threshold",
+                "classification": "reporting_only",
+                "measure": "test",
+                "operator": "gte",
+                "threshold": 0.99,
+                "applies_to": ["dev"],
+                "source_refs": ["test"],
+                "resolution": "reporting-only",
+            }
+        )
+
+    raw = yaml.safe_load(FIXTURE_PATH.read_bytes())
+    assert isinstance(raw, dict)
+    raw["effective_at"] = "2026-07-01T00:00:00"
+    naive_path = tmp_path / "naive.yaml"
+    naive_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="timezone"):
+        module.load_pricing_policy(naive_path)
+
+    raw = yaml.safe_load(FIXTURE_PATH.read_bytes())
+    assert isinstance(raw, dict)
+    rates = raw["rates"]
+    assert isinstance(rates, list)
+    rates[0]["price_cny_per_unit"] = 0.000002
+    float_path = tmp_path / "float-price.yaml"
+    float_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="Decimal string"):
+        module.load_pricing_policy(float_path)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (Decimal("0.0000005"), Decimal("0.000000")),
+        (Decimal("0.0000015"), Decimal("0.000002")),
+    ],
+)
+def test_policy_boundary_quantization_uses_round_half_even(
+    value: Decimal, expected: Decimal
+) -> None:
+    module = pricing_module()
+    assert hasattr(module, "quantize_cost_cny"), "quantize_cost_cny must be implemented"
+
+    assert module.quantize_cost_cny(value, Decimal("0.000001")) == expected
 
 
 def test_unknown_model_or_missing_priced_unit_fails_closed() -> None:
@@ -170,6 +261,18 @@ def test_quality_policy_encodes_every_approved_rule_and_requires_resolution(tmp_
         "promotion-bootstrap-lower-bound",
         "promotion-validation-macro-f1-drop",
         "promotion-bootstrap-samples",
+        "dev-macro-f1-min",
+        "dev-macro-f1-delta",
+        "validation-macro-f1-delta",
+        "structured-schema-valid-rate",
+        "structured-valid-paper-link-rate",
+        "structured-reason-complete-rate",
+        "structured-verifiable-citation-edge-rate",
+        "structured-fabrication-count",
+        "latency-p50-target-ms",
+        "latency-p95-target-ms",
+        "batch-hard-failure-rate",
+        "batch-partial-result-rate",
     }
     assert expected <= set(by_id)
     assert by_id["model-produced-analysis-rate"].threshold == Decimal("0.99")
@@ -187,5 +290,56 @@ def test_quality_policy_encodes_every_approved_rule_and_requires_resolution(tmp_
     invalid_path = tmp_path / "unresolved.yaml"
     invalid_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
+    with pytest.raises(ValueError, match="resolution"):
+        load_quality_gate_policy(invalid_path)
+
+
+@pytest.mark.parametrize(
+    "rule_id",
+    [
+        "prediction-cardinality",
+        "model-produced-analysis-rate",
+        "structured-schema-valid-rate",
+        "dev-macro-f1-min",
+        "batch-hard-failure-rate",
+        "batch-partial-result-rate",
+        "promotion-median-macro-f1-delta",
+    ],
+)
+def test_quality_policy_fails_closed_when_an_authoritative_catalog_row_is_deleted(
+    tmp_path: Path, rule_id: str
+) -> None:
+    _, _, _, _, load_quality_gate_policy, _ = pricing_api()
+    raw = yaml.safe_load(QUALITY_POLICY_PATH.read_bytes())
+    assert isinstance(raw, dict)
+    rules = raw["rules"]
+    assert isinstance(rules, list)
+    reduced = [rule for rule in rules if rule["rule_id"] != rule_id]
+    assert len(reduced) == len(rules) - 1
+    raw["rules"] = reduced
+    missing_path = tmp_path / f"missing-{rule_id}.yaml"
+    missing_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="missing authoritative quality rule"):
+        load_quality_gate_policy(missing_path)
+
+
+def test_quality_policy_rejects_empty_rules_and_invalid_resolution(tmp_path: Path) -> None:
+    _, _, _, _, load_quality_gate_policy, _ = pricing_api()
+    raw = yaml.safe_load(QUALITY_POLICY_PATH.read_bytes())
+    assert isinstance(raw, dict)
+    raw["rules"] = []
+    empty_path = tmp_path / "empty.yaml"
+    empty_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing authoritative quality rule"):
+        load_quality_gate_policy(empty_path)
+
+    raw = yaml.safe_load(QUALITY_POLICY_PATH.read_bytes())
+    assert isinstance(raw, dict)
+    rules = raw["rules"]
+    assert isinstance(rules, list)
+    rules[0]["resolution"] = "unclassified"
+    invalid_path = tmp_path / "invalid-resolution.yaml"
+    invalid_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
     with pytest.raises(ValueError, match="resolution"):
         load_quality_gate_policy(invalid_path)

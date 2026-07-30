@@ -18,7 +18,7 @@ from typing import BinaryIO, Literal, NoReturn, TypeVar, cast
 
 from pydantic import BaseModel, PositiveInt, ValidationError
 
-from paper_search.domain.models import DomainModel, NonEmptyStr, SafeRelativePath
+from paper_search.domain.models import DomainModel, NonEmptyStr, SafeRelativePath, Sha256
 from paper_search.evaluation.annotation import (
     AgreementReport,
     AnnotationRecord,
@@ -948,6 +948,45 @@ def _manifest_recovery_matches(
     return content == expected_bytes and _sha256_bytes(content) == expected_sha256
 
 
+def _canonical_manifest_document(content: bytes) -> dict[str, object]:
+    try:
+        payload = parse_json_object_bytes(content)
+    except ValueError:
+        raise RuntimeError("freeze approval failed") from None
+    if _json_bytes(payload) != content:
+        raise RuntimeError("freeze approval failed")
+    return payload
+
+
+def _canonical_freeze_manifest(content: bytes) -> FreezeManifestV1 | FreezeManifestV2:
+    _canonical_manifest_document(content)
+    try:
+        manifest = parse_freeze_manifest_bytes(content)
+    except ValueError:
+        raise RuntimeError("freeze approval failed") from None
+    return manifest
+
+
+def _owned_manifest_matches(
+    path: Path,
+    *,
+    expected_identity: _FileIdentity,
+    expected_bytes: bytes,
+    expected_sha256: str,
+) -> bool:
+    if not _state_matches_owned_file(
+        _probe_file_state(path),
+        expected_identity,
+    ):
+        return False
+    try:
+        content = path.read_bytes()
+        _canonical_manifest_document(content)
+    except (OSError, RuntimeError):
+        return False
+    return content == expected_bytes and _sha256_bytes(content) == expected_sha256
+
+
 def _rename_no_overwrite(
     source: Path,
     target: Path,
@@ -1241,6 +1280,8 @@ def _replace_manifest_guarded(
     bound_manifest: BoundArtifact | None = None,
 ) -> None:
     prepared_sha256 = _sha256_bytes(prepared_bytes)
+    frozen_sha256 = _sha256_bytes(frozen_bytes)
+    _canonical_manifest_document(frozen_bytes)
     if bound_manifest is not None:
         if (
             bound_manifest.content != prepared_bytes
@@ -1349,10 +1390,43 @@ def _replace_manifest_guarded(
                 try:
                     os.link(temporary_path, manifest_path)
                 except OSError:
-                    raise
+                    if not (
+                        temporary_identity is not None
+                        and backup_identity is not None
+                        and _owned_manifest_matches(
+                            manifest_path,
+                            expected_identity=temporary_identity,
+                            expected_bytes=frozen_bytes,
+                            expected_sha256=frozen_sha256,
+                        )
+                        and _manifest_recovery_matches(
+                            backup_path,
+                            expected_identity=backup_identity,
+                            expected_bytes=prepared_bytes,
+                            expected_sha256=prepared_sha256,
+                            retained_manifest=bound_manifest,
+                        )
+                    ):
+                        raise
             except OSError:
                 raise RuntimeError("freeze approval failed") from None
-        if not manifest_path.samefile(temporary_path) or manifest_path.read_bytes() != frozen_bytes:
+        if (
+            temporary_identity is None
+            or backup_identity is None
+            or not _owned_manifest_matches(
+                manifest_path,
+                expected_identity=temporary_identity,
+                expected_bytes=frozen_bytes,
+                expected_sha256=frozen_sha256,
+            )
+            or not _manifest_recovery_matches(
+                backup_path,
+                expected_identity=backup_identity,
+                expected_bytes=prepared_bytes,
+                expected_sha256=prepared_sha256,
+                retained_manifest=bound_manifest,
+            )
+        ):
             raise RuntimeError("freeze approval failed")
         committed = True
     except BaseException:
@@ -1817,6 +1891,190 @@ def _migration_manifest(
         ),
     )
     return manifest, report_bytes, _json_bytes(manifest.model_dump(mode="json"))
+
+
+def _bound_artifacts_share_identity(
+    first: BoundArtifact,
+    second: BoundArtifact,
+) -> bool:
+    if os.name == "nt":
+        return (
+            first.windows_file_id is not None
+            and first.windows_file_id == second.windows_file_id
+        )
+    return (first.device, first.inode) == (second.device, second.inode)
+
+
+def _artifact_matches_content(
+    artifact: BoundArtifact,
+    *,
+    expected_bytes: bytes,
+    expected_sha256: str,
+) -> bool:
+    try:
+        artifact.verify_path_identity()
+        descriptor_sha256 = _sha256_descriptor(artifact.descriptor)
+    except (OSError, ValueError):
+        return False
+    return (
+        artifact.content == expected_bytes
+        and artifact.sha256 == expected_sha256
+        and descriptor_sha256 == expected_sha256
+    )
+
+
+def _validated_v1_recovery(
+    data_root: Path,
+    recovery: BoundArtifact,
+    *,
+    expected_sha256: Sha256,
+    stack: ExitStack,
+) -> tuple[FreezeManifestV1, list[BoundArtifact]]:
+    if not _artifact_matches_content(
+        recovery,
+        expected_bytes=recovery.content,
+        expected_sha256=expected_sha256,
+    ):
+        raise ValueError("freeze recovery failed")
+    try:
+        manifest = _canonical_freeze_manifest(recovery.content)
+    except RuntimeError:
+        raise ValueError("freeze recovery failed") from None
+    if not isinstance(manifest, FreezeManifestV1):
+        raise ValueError("freeze recovery failed")
+    evidence = [recovery, _validated_v1_report(data_root, manifest, stack=stack)]
+    for name in ("dev", "validation", "simulated_test"):
+        _, gold_evidence, ids_evidence = _migration_partition(
+            data_root,
+            manifest.partitions[name],
+            stack=stack,
+        )
+        evidence.extend((gold_evidence, ids_evidence))
+    evidence.extend(_migration_source_evidence(data_root, manifest, stack=stack))
+    return manifest, evidence
+
+
+def recover_freeze_manifest(
+    *,
+    data_root: Path,
+    recovery_path: SafeRelativePath,
+    expected_sha256: Sha256,
+) -> Literal["created", "matched"]:
+    """Validate and publish one approved legacy V1 recovery without overwrite."""
+    root = data_root.resolve()
+    manifest_path = root / "manifest.json"
+    if recovery_path == "manifest.json":
+        raise ValueError("freeze recovery failed")
+    created = False
+    try:
+        with _exclusive_freeze_lock(root):
+            with ExitStack() as stack:
+                try:
+                    recovery = stack.enter_context(
+                        open_confined_artifact(root, recovery_path)
+                    )
+                    _, evidence = _validated_v1_recovery(
+                        root,
+                        recovery,
+                        expected_sha256=expected_sha256,
+                        stack=stack,
+                    )
+                except ValueError:
+                    raise ValueError("freeze recovery failed") from None
+                final_artifact: BoundArtifact | None = None
+                try:
+                    with _stable_evidence_files(evidence):
+                        if manifest_path.exists():
+                            try:
+                                existing = stack.enter_context(
+                                    open_confined_artifact(root, "manifest.json")
+                                )
+                            except ValueError:
+                                raise FileExistsError(
+                                    "freeze recovery failed"
+                                ) from None
+                            if not _artifact_matches_content(
+                                existing,
+                                expected_bytes=recovery.content,
+                                expected_sha256=expected_sha256,
+                            ):
+                                raise FileExistsError("freeze recovery failed")
+                            with _stable_evidence_files((existing,)):
+                                return "matched"
+                        try:
+                            os.link(
+                                root.joinpath(*recovery.relative_path.split("/")),
+                                manifest_path,
+                            )
+                        except OSError as error:
+                            try:
+                                final_artifact = stack.enter_context(
+                                    open_confined_artifact(root, "manifest.json")
+                                )
+                            except ValueError:
+                                if manifest_path.exists():
+                                    raise FileExistsError(
+                                        "freeze recovery failed"
+                                    ) from None
+                                raise RuntimeError(
+                                    "freeze recovery failed"
+                                ) from error
+                            if not (
+                                _bound_artifacts_share_identity(
+                                    recovery,
+                                    final_artifact,
+                                )
+                                and _artifact_matches_content(
+                                    final_artifact,
+                                    expected_bytes=recovery.content,
+                                    expected_sha256=expected_sha256,
+                                )
+                            ):
+                                if isinstance(error, FileExistsError):
+                                    raise FileExistsError(
+                                        "freeze recovery failed"
+                                    ) from None
+                                raise RuntimeError(
+                                    "freeze recovery failed"
+                                ) from error
+                            created = True
+                        else:
+                            created = True
+                            try:
+                                final_artifact = stack.enter_context(
+                                    open_confined_artifact(root, "manifest.json")
+                                )
+                            except ValueError:
+                                raise RuntimeError(
+                                    "freeze recovery failed"
+                                ) from None
+                        if final_artifact is None or not (
+                            _bound_artifacts_share_identity(
+                                recovery,
+                                final_artifact,
+                            )
+                            and _artifact_matches_content(
+                                final_artifact,
+                                expected_bytes=recovery.content,
+                                expected_sha256=expected_sha256,
+                            )
+                        ):
+                            raise RuntimeError("freeze recovery failed")
+                        with _stable_evidence_files((final_artifact,)):
+                            pass
+                except BaseException:
+                    if created:
+                        _move_manifest_to_quarantine_no_overwrite(manifest_path)
+                    raise
+                return "created"
+    except FileExistsError:
+        raise FileExistsError("freeze recovery failed") from None
+    except ValueError:
+        raise ValueError("freeze recovery failed") from None
+    except RuntimeError:
+        raise RuntimeError("freeze recovery failed") from None
+    except OSError:
+        raise RuntimeError("freeze recovery failed") from None
 
 
 def migrate_v1_to_v2(

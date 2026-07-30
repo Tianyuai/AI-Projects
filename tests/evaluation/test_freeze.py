@@ -344,6 +344,44 @@ def _manifest_recoveries_with_bytes(root: Path, content: bytes) -> list[Path]:
     ]
 
 
+def _leave_exact_v1_recovery(
+    case: MigrationFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    original_link = freeze_module.os.link
+
+    def fail_manifest_publish(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        source_path = Path(source)
+        if (
+            Path(target) == manifest_path
+            and source_path.name.startswith(".manifest.json.")
+            and ".prepared." not in source_path.name
+        ):
+            raise OSError("synthetic manifest publish failure")
+        original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(freeze_module.os, "link", fail_manifest_publish)
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+    monkeypatch.setattr(freeze_module.os, "link", original_link)
+
+    assert not manifest_path.exists()
+    recoveries = [
+        path
+        for path in _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+        if path.name.startswith(".manifest.json.prepared.")
+    ]
+    assert len(recoveries) == 1
+    return recoveries[0]
+
+
 def _native_replace_windows(source: Path, target: Path) -> None:
     import ctypes
 
@@ -612,7 +650,7 @@ def test_v1_migration_rejects_wrong_approval_audit_binding(
 
 
 @pytest.mark.parametrize("report_state", ["created", "matched"])
-@pytest.mark.parametrize("failure_boundary", ["after_backup", "after_final_link"])
+@pytest.mark.parametrize("failure_boundary", ["after_backup", "before_final_link"])
 def test_migration_guarded_failure_preserves_v1_recovery_for_operator_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -644,19 +682,19 @@ def test_migration_guarded_failure_preserves_v1_recovery_for_operator_retry(
             raise OSError("synthetic post-backup failure")
         return outcome
 
-    def fail_after_final_link(
+    def fail_before_final_link(
         source: object,
         target: object,
         *args: object,
         **kwargs: object,
     ) -> None:
-        original_link(source, target, *args, **kwargs)
         if (
             Path(target) == manifest_path
             and Path(source).name.startswith(".manifest.json.")
             and ".prepared." not in Path(source).name
         ):
-            raise OSError("synthetic post-link failure")
+            raise OSError("synthetic pre-link failure")
+        original_link(source, target, *args, **kwargs)
 
     if failure_boundary == "after_backup":
         monkeypatch.setattr(
@@ -665,14 +703,18 @@ def test_migration_guarded_failure_preserves_v1_recovery_for_operator_retry(
             fail_after_backup,
         )
     else:
-        monkeypatch.setattr(freeze_module.os, "link", fail_after_final_link)
+        monkeypatch.setattr(freeze_module.os, "link", fail_before_final_link)
 
     with pytest.raises(RuntimeError, match="freeze approval failed"):
         _migrate(case)
 
     assert not manifest_path.exists()
     assert report_path.read_bytes() == expected_report
-    recovery = _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+    recovery = [
+        path
+        for path in _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+        if path.name.startswith(".manifest.json.prepared.")
+    ]
     assert recovery
 
     monkeypatch.setattr(
@@ -689,8 +731,271 @@ def test_migration_guarded_failure_preserves_v1_recovery_for_operator_retry(
     assert _sha256(verified_recovery.read_bytes()) == _sha256(
         case.legacy_manifest_bytes
     )
-    original_link(verified_recovery, manifest_path)
+    recovery_relative = verified_recovery.relative_to(root).as_posix()
+    assert (
+        freeze_module.recover_freeze_manifest(
+            data_root=root,
+            recovery_path=recovery_relative,
+            expected_sha256=_sha256(case.legacy_manifest_bytes),
+        )
+        == "created"
+    )
+    assert (
+        freeze_module.recover_freeze_manifest(
+            data_root=root,
+            recovery_path=recovery_relative,
+            expected_sha256=_sha256(case.legacy_manifest_bytes),
+        )
+        == "matched"
+    )
     assert isinstance(_migrate(case), FreezeManifestV2)
+
+
+def test_migration_post_action_link_error_commits_verified_v2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    original_link = freeze_module.os.link
+    linked_then_raised = False
+
+    def link_then_raise(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal linked_then_raised
+        original_link(source, target, *args, **kwargs)
+        source_path = Path(source)
+        if (
+            Path(target) == manifest_path
+            and source_path.name.startswith(".manifest.json.")
+            and ".prepared." not in source_path.name
+        ):
+            linked_then_raised = True
+            raise OSError("synthetic post-link error")
+
+    def quarantine_must_not_run(_: Path) -> None:
+        raise AssertionError("verified post-action publication must not quarantine")
+
+    monkeypatch.setattr(freeze_module.os, "link", link_then_raise)
+    monkeypatch.setattr(
+        freeze_module,
+        "_move_manifest_to_quarantine_no_overwrite",
+        quarantine_must_not_run,
+    )
+
+    migrated = _migrate(case)
+
+    assert linked_then_raised
+    assert isinstance(migrated, FreezeManifestV2)
+    assert load_freeze_manifest(manifest_path, data_root=root) == migrated
+
+
+@pytest.mark.parametrize(
+    "invalid_recovery",
+    ["wrong_hash", "noncanonical_v1", "non_v1"],
+)
+def test_recover_freeze_manifest_rejects_invalid_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_recovery: str,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    recovery = _leave_exact_v1_recovery(case, monkeypatch)
+    expected_sha256 = _sha256(case.legacy_manifest_bytes)
+    if invalid_recovery == "wrong_hash":
+        expected_sha256 = _sha256(b"wrong-operator-hash")
+    elif invalid_recovery == "noncanonical_v1":
+        payload = json.loads(recovery.read_bytes())
+        recovery.write_text(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+        expected_sha256 = _sha256(recovery.read_bytes())
+    else:
+        recovery.write_bytes(b'{"not":"a-frozen-v1-manifest"}\n')
+        expected_sha256 = _sha256(recovery.read_bytes())
+
+    with pytest.raises(ValueError, match="freeze recovery failed"):
+        freeze_module.recover_freeze_manifest(
+            data_root=root,
+            recovery_path=recovery.relative_to(root).as_posix(),
+            expected_sha256=expected_sha256,
+        )
+
+    assert not manifest_path.exists()
+
+
+def test_recover_freeze_manifest_validates_legacy_evidence_bindings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    recovery = _leave_exact_v1_recovery(case, monkeypatch)
+    (root / "dev" / "gold.jsonl").write_bytes(b"mutated-gold-evidence\n")
+
+    with pytest.raises(ValueError, match="freeze recovery failed"):
+        freeze_module.recover_freeze_manifest(
+            data_root=root,
+            recovery_path=recovery.relative_to(root).as_posix(),
+            expected_sha256=_sha256(case.legacy_manifest_bytes),
+        )
+
+    assert not manifest_path.exists()
+    assert recovery.read_bytes() == case.legacy_manifest_bytes
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permits held-path replacement")
+def test_recover_freeze_manifest_rejects_recovery_path_replaced_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    recovery = _leave_exact_v1_recovery(case, monkeypatch)
+    replacement = root / "replacement-recovery.tmp"
+    replacement.write_bytes(case.legacy_manifest_bytes)
+    original_link = freeze_module.os.link
+    replaced = False
+
+    def replace_recovery_then_link(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal replaced
+        if Path(target) == manifest_path and Path(source) == recovery:
+            os.replace(replacement, recovery)
+            replaced = True
+        original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(freeze_module.os, "link", replace_recovery_then_link)
+
+    with pytest.raises(RuntimeError, match="freeze recovery failed"):
+        freeze_module.recover_freeze_manifest(
+            data_root=root,
+            recovery_path=recovery.relative_to(root).as_posix(),
+            expected_sha256=_sha256(case.legacy_manifest_bytes),
+        )
+
+    assert replaced
+    assert not manifest_path.exists()
+    assert recovery.read_bytes() == case.legacy_manifest_bytes
+
+
+def test_recover_freeze_manifest_never_overwrites_concurrent_manifest_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    recovery = _leave_exact_v1_recovery(case, monkeypatch)
+    owner_bytes = b"concurrent-recovery-owner"
+    original_link = freeze_module.os.link
+    owner_inserted = False
+
+    def owner_wins_before_recovery_link(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal owner_inserted
+        if Path(source) == recovery and Path(target) == manifest_path:
+            manifest_path.write_bytes(owner_bytes)
+            owner_inserted = True
+        original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        freeze_module.os,
+        "link",
+        owner_wins_before_recovery_link,
+    )
+
+    with pytest.raises(FileExistsError, match="freeze recovery failed"):
+        freeze_module.recover_freeze_manifest(
+            data_root=root,
+            recovery_path=recovery.relative_to(root).as_posix(),
+            expected_sha256=_sha256(case.legacy_manifest_bytes),
+        )
+
+    assert owner_inserted
+    assert manifest_path.read_bytes() == owner_bytes
+    assert recovery.read_bytes() == case.legacy_manifest_bytes
+
+
+def test_recover_freeze_manifest_accepts_post_action_link_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    recovery = _leave_exact_v1_recovery(case, monkeypatch)
+    original_link = freeze_module.os.link
+    linked_then_raised = False
+
+    def link_recovery_then_raise(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal linked_then_raised
+        original_link(source, target, *args, **kwargs)
+        if Path(source) == recovery and Path(target) == manifest_path:
+            linked_then_raised = True
+            raise OSError("synthetic recovery post-link error")
+
+    monkeypatch.setattr(freeze_module.os, "link", link_recovery_then_raise)
+
+    status = freeze_module.recover_freeze_manifest(
+        data_root=root,
+        recovery_path=recovery.relative_to(root).as_posix(),
+        expected_sha256=_sha256(case.legacy_manifest_bytes),
+    )
+
+    assert linked_then_raised
+    assert status == "created"
+    assert recovery.exists()
+    assert manifest_path.samefile(recovery)
+    assert isinstance(
+        load_freeze_manifest(manifest_path, data_root=root),
+        FreezeManifestV1,
+    )
+
+
+def test_recover_freeze_manifest_matches_exact_existing_different_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    recovery = _leave_exact_v1_recovery(case, monkeypatch)
+    manifest_path.write_bytes(recovery.read_bytes())
+    assert not manifest_path.samefile(recovery)
+
+    status = freeze_module.recover_freeze_manifest(
+        data_root=root,
+        recovery_path=recovery.relative_to(root).as_posix(),
+        expected_sha256=_sha256(case.legacy_manifest_bytes),
+    )
+
+    assert status == "matched"
+    assert manifest_path.read_bytes() == case.legacy_manifest_bytes
+    assert recovery.read_bytes() == case.legacy_manifest_bytes
 
 
 def test_migration_bound_manifest_hash_only_postcheck_rejects_descriptor_change(
@@ -1389,7 +1694,9 @@ def test_migration_quarantine_failure_keeps_uncommitted_v2_and_v1_recovery(
     root = case.prepared.data_root
     manifest_path = root / "manifest.json"
     original_link = freeze_module.os.link
+    original_recovery_matches = freeze_module._manifest_recovery_matches
     quarantine_attempted = False
+    linked = False
 
     def fail_after_published_manifest_link(
         source: object,
@@ -1397,6 +1704,7 @@ def test_migration_quarantine_failure_keeps_uncommitted_v2_and_v1_recovery(
         *args: object,
         **kwargs: object,
     ) -> None:
+        nonlocal linked
         original_link(source, target, *args, **kwargs)
         source_path = Path(source)
         if (
@@ -1404,7 +1712,13 @@ def test_migration_quarantine_failure_keeps_uncommitted_v2_and_v1_recovery(
             and source_path.name.startswith(".manifest.json.")
             and ".prepared." not in source_path.name
         ):
+            linked = True
             raise OSError("synthetic post-link failure")
+
+    def fail_backup_verification_after_link(*args: object, **kwargs: object) -> bool:
+        if linked:
+            return False
+        return original_recovery_matches(*args, **kwargs)
 
     def fail_manifest_quarantine(path: Path) -> None:
         nonlocal quarantine_attempted
@@ -1421,6 +1735,11 @@ def test_migration_quarantine_failure_keeps_uncommitted_v2_and_v1_recovery(
         freeze_module,
         "_move_manifest_to_quarantine_no_overwrite",
         fail_manifest_quarantine,
+    )
+    monkeypatch.setattr(
+        freeze_module,
+        "_manifest_recovery_matches",
+        fail_backup_verification_after_link,
     )
 
     with pytest.raises(RuntimeError, match="freeze approval failed"):
@@ -1448,8 +1767,10 @@ def test_migration_owner_replacing_between_identity_and_removal_is_preserved(
     owner_bytes = b"samefile-unlink-owner"
     owner.write_bytes(owner_bytes)
     original_link = freeze_module.os.link
+    original_recovery_matches = freeze_module._manifest_recovery_matches
     original_rename_no_overwrite = freeze_module._rename_no_overwrite
     owner_inserted = False
+    linked = False
 
     def fail_after_final_link(
         source: object,
@@ -1457,13 +1778,20 @@ def test_migration_owner_replacing_between_identity_and_removal_is_preserved(
         *args: object,
         **kwargs: object,
     ) -> None:
+        nonlocal linked
         original_link(source, target, *args, **kwargs)
         if (
             Path(target) == manifest_path
             and Path(source).name.startswith(".manifest.json.")
             and ".prepared." not in Path(source).name
         ):
+            linked = True
             raise OSError("synthetic post-link failure")
+
+    def fail_backup_verification_after_link(*args: object, **kwargs: object) -> bool:
+        if linked:
+            return False
+        return original_recovery_matches(*args, **kwargs)
 
     def insert_owner_before_quarantine(source: Path, target: Path) -> str:
         nonlocal owner_inserted
@@ -1484,6 +1812,11 @@ def test_migration_owner_replacing_between_identity_and_removal_is_preserved(
         freeze_module,
         "_rename_no_overwrite",
         insert_owner_before_quarantine,
+    )
+    monkeypatch.setattr(
+        freeze_module,
+        "_manifest_recovery_matches",
+        fail_backup_verification_after_link,
     )
 
     with pytest.raises(RuntimeError, match="freeze approval failed"):
@@ -1507,9 +1840,11 @@ def test_migration_preserves_owner_quarantine_when_third_party_wins_restore(
     owner.write_bytes(owner_bytes)
     third_party_bytes = b"third-party-manifest-owner"
     original_link = freeze_module.os.link
+    original_recovery_matches = freeze_module._manifest_recovery_matches
     original_rename_no_overwrite = freeze_module._rename_no_overwrite
     owner_quarantined = False
     third_party_inserted = False
+    linked = False
 
     def fail_after_final_link_and_block_owner_restore(
         source: object,
@@ -1517,7 +1852,7 @@ def test_migration_preserves_owner_quarantine_when_third_party_wins_restore(
         *args: object,
         **kwargs: object,
     ) -> None:
-        nonlocal third_party_inserted
+        nonlocal linked, third_party_inserted
         source_path = Path(source)
         if (
             Path(target) == manifest_path
@@ -1533,7 +1868,13 @@ def test_migration_preserves_owner_quarantine_when_third_party_wins_restore(
             and ".prepared." not in source_path.name
             and ".rollback." not in source_path.name
         ):
+            linked = True
             raise OSError("synthetic post-link failure")
+
+    def fail_backup_verification_after_link(*args: object, **kwargs: object) -> bool:
+        if linked:
+            return False
+        return original_recovery_matches(*args, **kwargs)
 
     def replace_owner_before_quarantine(source: Path, target: Path) -> str:
         nonlocal owner_quarantined
@@ -1558,6 +1899,11 @@ def test_migration_preserves_owner_quarantine_when_third_party_wins_restore(
         freeze_module,
         "_rename_no_overwrite",
         replace_owner_before_quarantine,
+    )
+    monkeypatch.setattr(
+        freeze_module,
+        "_manifest_recovery_matches",
+        fail_backup_verification_after_link,
     )
 
     with pytest.raises(RuntimeError, match="freeze approval failed"):

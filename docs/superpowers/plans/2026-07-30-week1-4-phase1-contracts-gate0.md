@@ -752,6 +752,10 @@ git commit -m "feat: add versioned V2 freeze schema"
 
 - Create: `src/paper_search/evaluation/gate0.py`
 - Create: `tests/evaluation/test_gate0.py`
+- Modify: `src/paper_search/evaluation/freeze_schema.py`
+- Modify: `tests/evaluation/test_freeze_schema.py`
+- Modify: `src/paper_search/control/pricing.py`
+- Modify: `tests/unit/test_pricing.py`
 - Modify: `tests/evaluation/test_dataset.py`
 - Modify: `.gitignore`
 
@@ -813,6 +817,16 @@ The report sorts partition evidence and blocking reasons deterministically. Read
 
 - [ ] Add a complete synthetic passing fixture and one failing case for every reason code.
 - [ ] Add tests that all partition query IDs resolve through the exact bound identifier map and that counts/hashes are calculated from bytes read once.
+- [ ] Add one context-managed validated-freeze evidence interface that keeps the
+  exact bound manifest, approval, partition, and identifier-map artifacts open
+  through the caller's decision. Refactor `load_freeze_manifest()` to delegate
+  to this shared implementation; do not add a second or weaker V2 validator.
+- [ ] Add byte-oriented pricing and quality-policy parsing interfaces and make
+  the existing path loaders delegate to them, so Gate 0 can hash and validate
+  the same bound bytes without reopening a pathname.
+- [ ] Preserve structured failure attribution from the shared validation pass
+  so Gate 0 can emit the required isolated reason codes without rereading
+  evidence or copying freeze-validation logic.
 - [ ] Add a sanitization test containing fake authorization headers, credential-shaped strings, gated query text, and absolute paths; assert none appear in serialized output.
 - [ ] Add a mutation test proving `data/manifest.json` and status docs are unchanged when Gate 0 fails.
 - [ ] Run focused tests.
@@ -849,7 +863,7 @@ Expected result: test and static-check commands exit 0; the real-evidence Gate 0
 - [ ] Commit.
 
 ```powershell
-git add src/paper_search/evaluation/gate0.py tests/evaluation/test_gate0.py tests/evaluation/test_dataset.py .gitignore
+git add src/paper_search/evaluation/gate0.py tests/evaluation/test_gate0.py src/paper_search/evaluation/freeze_schema.py tests/evaluation/test_freeze_schema.py src/paper_search/control/pricing.py tests/unit/test_pricing.py tests/evaluation/test_dataset.py .gitignore
 git commit -m "feat: add fail-closed Gate 0 verification"
 ```
 

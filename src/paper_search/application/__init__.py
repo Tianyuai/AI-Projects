@@ -12,6 +12,16 @@ from paper_search.application.contracts import (
     SearchSuccess,
     SnapshotRef,
 )
+from paper_search.application.locks import (
+    ArtifactBinding,
+    CandidateLock,
+    InputLock,
+    ReplayLock,
+    ValidationLock,
+    canonical_lock_bytes,
+    load_input_lock,
+    lock_sha256,
+)
 from paper_search.domain.models import (
     DependencyErrorCode,
     DependencyName,
@@ -31,6 +41,9 @@ __all__ = [
     "DependencyName",
     "DependencyState",
     "DependencyStatus",
+    "ArtifactBinding",
+    "CandidateLock",
+    "InputLock",
     "MoneyCny",
     "PlannerStatus",
     "ReadyHealthResponse",
@@ -46,4 +59,9 @@ __all__ = [
     "Sha256",
     "SnapshotRef",
     "StructuredSearchResponse",
+    "ReplayLock",
+    "ValidationLock",
+    "canonical_lock_bytes",
+    "load_input_lock",
+    "lock_sha256",
 ]

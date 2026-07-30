@@ -1,0 +1,52 @@
+schema_version: integrated-lock-v1
+lock_kind: candidate
+created_at: 2026-07-30T00:00:00Z
+source_git_sha: task2-fixture-commit
+runtime_allow_live: true
+frozen_data:
+  manifest: {path: data/manifest.json, sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+  identifier_map: {path: data/identifier-map.json, sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+  split: dev
+  query_count: 2
+  partition_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+baseline:
+  primary_model: qwen3.7-plus
+  fallback_model: qwen3.6-flash
+  prompt_version: query-analyze-v1
+  strategy: fixed-one-round
+  planner:
+    prompt_config: {path: configs/prompts/query_analyze.yaml, sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+    normal_subqueries_min: 3
+    normal_subqueries_max: 5
+    configured_subqueries_max: 6
+    repair_attempts: 1
+    rules_fallback_enabled: true
+  retrieval:
+    openalex_endpoint: /works
+    semantic_scholar_endpoint: /graph/v1/paper/search
+    openalex_calls_min: 3
+    openalex_calls_max: 6
+    semantic_scholar_calls_max: 2
+    max_results_per_subquery: 50
+    max_raw_candidates: 300
+    max_deduplicated_candidates: 200
+    max_output_papers: 50
+  timeout: {connect_seconds: 5, read_seconds: 20, write_seconds: 20, pool_seconds: 5}
+  retry:
+    max_attempts: 3
+    retryable_statuses: [429, 5xx]
+    retry_timeouts: true
+    backoff_rule: min(8,2^retry_index)+jitter[0,1)
+  optional_modules:
+    embedding: false
+    citation_expansion: false
+    constraint_reranking: false
+    fixed_two_round: false
+    adaptive_evolution: false
+budget_config: {path: configs/budget_balanced.yaml, sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+pricing_policy: {path: configs/pricing_v1.yaml, sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+quality_gates: {path: configs/quality_gates_v1.yaml, sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"}
+capture_policy:
+  snapshot_schema: dependency-snapshot-v2
+  capture_policy_sha256: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+approval_ref: operator-approval-2026-07-30

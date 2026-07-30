@@ -8,10 +8,27 @@ from pydantic import ValidationError
 
 from paper_search.config import (
     BudgetConfig,
+    RuntimeConfig,
+    RuntimeSettings,
     canonical_config_hash,
     load_budget,
     validate_year_range,
 )
+
+
+def test_runtime_settings_rejects_non_reproducible_timeout_or_retry_values() -> None:
+    assert RuntimeSettings.model_validate({"artifact_root": "artifacts"}).allow_live is False
+
+    with pytest.raises(ValidationError):
+        RuntimeSettings.model_validate(
+            {"artifact_root": "artifacts", "connect_timeout_seconds": 6}
+        )
+
+
+def test_runtime_config_exposes_required_reproducible_sections() -> None:
+    assert {"runtime", "policy_bindings", "capture_policy", "routing", "retry"} <= set(
+        RuntimeConfig.model_fields
+    )
 
 
 def test_config_hash_is_stable_for_key_order_and_utf8() -> None:

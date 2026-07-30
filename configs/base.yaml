@@ -5,6 +5,33 @@ embedding:
   batch_size: 16
   fallback_to_cpu: true
 
+runtime:
+  allow_live: false
+  artifact_root: artifacts
+
+policy_bindings:
+  budget_config: configs/budget_balanced.yaml
+  pricing_policy: configs/pricing_v1.yaml
+  quality_gates: configs/quality_gates_v1.yaml
+
+capture_policy:
+  snapshot_schema: dependency-snapshot-v2
+
+routing:
+  openalex_calls_min: 3
+  openalex_calls_max: 6
+  semantic_scholar_calls_max: 2
+  max_results_per_subquery: 50
+  max_raw_candidates: 300
+  max_deduplicated_candidates: 200
+  max_output_papers: 50
+
+retry:
+  max_attempts: 3
+  retryable_statuses: [429, 5xx]
+  retry_timeouts: true
+  backoff_rule: min(8,2^retry_index)+jitter[0,1)
+
 budget_profile: balanced
 llm_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
 llm_model_primary: qwen3.7-plus

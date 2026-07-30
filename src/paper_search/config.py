@@ -18,7 +18,7 @@ from pydantic import (
     SecretStr,
 )
 
-from paper_search.domain.models import SearchBudget
+from paper_search.domain.models import SafeRelativePath, SearchBudget
 
 
 BudgetConfig = SearchBudget
@@ -42,12 +42,78 @@ class EmbeddingConfig(BaseModel):
     fallback_to_cpu: bool = True
 
 
+class RuntimeSettings(BaseModel):
+    """Non-secret capability settings that participate in runtime identity."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    allow_live: bool = False
+    artifact_root: Path
+    connect_timeout_seconds: Literal[5] = 5
+    read_timeout_seconds: Literal[20] = 20
+    write_timeout_seconds: Literal[20] = 20
+    pool_timeout_seconds: Literal[5] = 5
+    max_attempts: Literal[3] = 3
+
+
+class PolicyBindings(BaseModel):
+    """Versioned policy locations included in reproducible configuration."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    budget_config: SafeRelativePath = "configs/budget_balanced.yaml"
+    pricing_policy: SafeRelativePath = "configs/pricing_v1.yaml"
+    quality_gates: SafeRelativePath = "configs/quality_gates_v1.yaml"
+
+
+class CapturePolicyConfig(BaseModel):
+    """The snapshot contract used by future capture runs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    snapshot_schema: Literal["dependency-snapshot-v2"] = "dependency-snapshot-v2"
+
+
+class RoutingConfig(BaseModel):
+    """Frozen provider routing and result limits for the integrated baseline."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    openalex_calls_min: Literal[3] = 3
+    openalex_calls_max: Literal[6] = 6
+    semantic_scholar_calls_max: Literal[2] = 2
+    max_results_per_subquery: Literal[50] = 50
+    max_raw_candidates: Literal[300] = 300
+    max_deduplicated_candidates: Literal[200] = 200
+    max_output_papers: Literal[50] = 50
+
+
+class RetryConfig(BaseModel):
+    """Frozen retry policy independent of process credentials."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_attempts: Literal[3] = 3
+    retryable_statuses: tuple[Literal[429], Literal["5xx"]] = (429, "5xx")
+    retry_timeouts: Literal[True] = True
+    backoff_rule: Literal["min(8,2^retry_index)+jitter[0,1)"] = (
+        "min(8,2^retry_index)+jitter[0,1)"
+    )
+
+
 class RuntimeConfig(BaseModel):
     """Validated non-secret project config plus secrets loaded from the environment."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
+    runtime: RuntimeSettings = Field(
+        default_factory=lambda: RuntimeSettings(artifact_root=Path("artifacts"))
+    )
+    policy_bindings: PolicyBindings = Field(default_factory=PolicyBindings)
+    capture_policy: CapturePolicyConfig = Field(default_factory=CapturePolicyConfig)
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    retry: RetryConfig = Field(default_factory=RetryConfig)
     budget_profile: Literal["low", "balanced"]
     budget: SearchBudget
     llm_base_url: str = Field(min_length=1)
@@ -144,15 +210,22 @@ def load_runtime_config(
     data["budget"] = load_budget(config_path.parent / f"budget_{profile}.yaml")
 
     dotenv = dotenv_values(env_file) if env_file is not None else {}
-    env_mapping = {
+    secret_env_mapping = {
         "OPENALEX_API_KEY": "openalex_api_key",
         "SEMANTIC_SCHOLAR_API_KEY": "semantic_scholar_api_key",
         "LLM_API_KEY": "llm_api_key",
+    }
+    frozen_identity_env_names = {
         "LLM_BASE_URL": "llm_base_url",
         "LLM_MODEL_PRIMARY": "llm_model_primary",
         "LLM_MODEL_FALLBACK": "llm_model_fallback",
     }
-    for env_name, field_name in env_mapping.items():
+    for env_name in frozen_identity_env_names:
+        if os.environ.get(env_name) or dotenv.get(env_name):
+            raise ValueError(
+                f"environment override is forbidden for frozen setting: {env_name}"
+            )
+    for env_name, field_name in secret_env_mapping.items():
         value = os.environ.get(env_name) or dotenv.get(env_name)
         if value:
             data[field_name] = value

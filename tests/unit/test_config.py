@@ -20,6 +20,9 @@ def write_runtime_files(directory: Path, *, extra_base: str = "", budget: str = 
                 "llm_base_url: https://example.test/v1",
                 "llm_model_primary: base-primary",
                 "llm_model_fallback: base-fallback",
+                "runtime:",
+                "  allow_live: false",
+                "  artifact_root: artifacts",
                 extra_base,
             ]
         ),
@@ -38,7 +41,9 @@ def write_runtime_files(directory: Path, *, extra_base: str = "", budget: str = 
     return base
 
 
-def test_environment_variables_override_yaml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_environment_variables_load_secrets_but_cannot_override_frozen_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     config_path = write_runtime_files(tmp_path)
     monkeypatch.setenv("OPENALEX_API_KEY", "openalex-secret")
     monkeypatch.setenv("LLM_API_KEY", "llm-secret")
@@ -46,11 +51,17 @@ def test_environment_variables_override_yaml(monkeypatch: pytest.MonkeyPatch, tm
     monkeypatch.setenv("LLM_MODEL_PRIMARY", "env-primary")
     monkeypatch.setenv("LLM_MODEL_FALLBACK", "env-fallback")
 
+    with pytest.raises(ValueError, match="frozen"):
+        load_runtime_config(config_path, env_file=None)
+
+    monkeypatch.delenv("LLM_BASE_URL")
+    monkeypatch.delenv("LLM_MODEL_PRIMARY")
+    monkeypatch.delenv("LLM_MODEL_FALLBACK")
     config = load_runtime_config(config_path, env_file=None)
 
-    assert config.llm_base_url == "https://env.example.test/v1"
-    assert config.llm_model_primary == "env-primary"
-    assert config.llm_model_fallback == "env-fallback"
+    assert config.llm_base_url == "https://example.test/v1"
+    assert config.llm_model_primary == "base-primary"
+    assert config.llm_model_fallback == "base-fallback"
     assert config.openalex_api_key is not None
     assert config.openalex_api_key.get_secret_value() == "openalex-secret"
     assert config.llm_api_key is not None
@@ -85,6 +96,50 @@ def test_embedding_config_defaults_off_and_is_hashed(tmp_path: Path) -> None:
     assert config.embedding.batch_size == 16
     assert config.embedding.fallback_to_cpu is True
     assert enabled.config_hash() != config.config_hash()
+
+
+def test_runtime_settings_and_policy_bindings_are_reproducible(tmp_path: Path) -> None:
+    config_path = write_runtime_files(tmp_path)
+
+    config = load_runtime_config(config_path, env_file=None)
+    changed_runtime = config.model_copy(
+        update={"runtime": config.runtime.model_copy(update={"allow_live": True})}
+    )
+    changed_policy = config.model_copy(
+        update={
+            "policy_bindings": config.policy_bindings.model_copy(
+                update={"pricing_policy": "configs/pricing_v2.yaml"}
+            )
+        }
+    )
+
+    assert config.runtime.allow_live is False
+    assert config.runtime.artifact_root == Path("artifacts")
+    assert config.runtime.connect_timeout_seconds == 5
+    assert config.runtime.read_timeout_seconds == 20
+    assert config.runtime.write_timeout_seconds == 20
+    assert config.runtime.pool_timeout_seconds == 5
+    assert config.runtime.max_attempts == 3
+    assert config.capture_policy.snapshot_schema == "dependency-snapshot-v2"
+    assert config.routing.openalex_calls_min == 3
+    assert config.routing.openalex_calls_max == 6
+    assert config.retry.retryable_statuses == (429, "5xx")
+    assert changed_runtime.config_hash() != config.config_hash()
+    assert changed_policy.config_hash() != config.config_hash()
+
+
+def test_base_config_preserves_the_balanced_integrated_baseline() -> None:
+    config = load_runtime_config(Path("configs/base.yaml"), env_file=None)
+
+    assert config.budget.max_search_api_calls == 12
+    assert config.budget.max_llm_calls == 5
+    assert config.budget.max_iterations == 2
+    assert config.routing.openalex_calls_max == 6
+    assert config.budget.max_elapsed_seconds == 90
+    assert config.budget.soft_deadline_seconds == 80
+    assert config.budget.max_total_tokens == 24_000
+    assert config.budget.max_output_papers == 50
+    assert config.budget.max_cost_cny == pytest.approx(0.30)
 
 
 def test_embedding_config_accepts_explicit_cuda_with_cpu_fallback(
@@ -158,9 +213,25 @@ def test_runtime_config_rejects_unknown_fields() -> None:
                 "llm_base_url": "https://example.test/v1",
                 "llm_model_primary": "primary",
                 "llm_model_fallback": "fallback",
+                "runtime": {"artifact_root": "artifacts"},
                 "unexpected": True,
             }
         )
+
+
+def test_direct_runtime_config_constructors_receive_safe_runtime_defaults() -> None:
+    config = config_module.RuntimeConfig.model_validate(
+        {
+            "budget_profile": "balanced",
+            "budget": {"max_total_tokens": 100, "max_cost_cny": 0.1},
+            "llm_base_url": "https://example.test/v1",
+            "llm_model_primary": "primary",
+            "llm_model_fallback": "fallback",
+        }
+    )
+
+    assert config.runtime.allow_live is False
+    assert config.runtime.artifact_root == Path("artifacts")
 
 
 @pytest.mark.parametrize(
@@ -174,7 +245,7 @@ def test_yaml_cannot_contain_api_secrets(tmp_path: Path, secret_field: str) -> N
         load_runtime_config(config_path, env_file=None)
 
 
-def test_process_environment_overrides_dotenv_and_dotenv_overrides_yaml(
+def test_process_environment_overrides_dotenv_for_secrets_only(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -187,11 +258,15 @@ def test_process_environment_overrides_dotenv_and_dotenv_overrides_yaml(
     monkeypatch.delenv("LLM_MODEL_PRIMARY", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
 
+    with pytest.raises(ValueError, match="frozen"):
+        load_runtime_config(config_path, env_file=env_path)
+
+    env_path.write_text("LLM_API_KEY=dotenv-secret\n", encoding="utf-8")
     dotenv_config = load_runtime_config(config_path, env_file=env_path)
-    monkeypatch.setenv("LLM_MODEL_PRIMARY", "process-primary")
+    monkeypatch.setenv("LLM_API_KEY", "process-secret")
     process_config = load_runtime_config(config_path, env_file=env_path)
 
-    assert dotenv_config.llm_model_primary == "dotenv-primary"
     assert dotenv_config.llm_api_key is not None
     assert dotenv_config.llm_api_key.get_secret_value() == "dotenv-secret"
-    assert process_config.llm_model_primary == "process-primary"
+    assert process_config.llm_api_key is not None
+    assert process_config.llm_api_key.get_secret_value() == "process-secret"

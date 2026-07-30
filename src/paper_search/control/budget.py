@@ -218,7 +218,7 @@ class HardBudgetController:
         with self._lock:
             self._expire_locked()
             return {
-                "version": 1,
+                "version": 2,
                 "reservation_ttl_seconds": self.reservation_ttl_seconds,
                 "formal_live": self.formal_live,
                 "fail_closed": self._fail_closed,
@@ -238,17 +238,24 @@ class HardBudgetController:
         clock: Clock | None = None,
     ) -> HardBudgetController:
         """Restore validated state without bypassing budget accounting invariants."""
+        version = state.get("version")
+        if type(version) is not int or version not in {1, 2}:
+            raise ValueError("invalid budget controller state version")
+
         reservation_ttl_seconds = state.get("reservation_ttl_seconds")
         fail_closed = state.get("fail_closed")
-        # Version 1 states predate formal-live settlement.  Their only safe
-        # migration is the explicit non-formal compatibility mode.
-        formal_live = state.get("formal_live", False)
-        if (
-            state.get("version") != 1
-            or not isinstance(reservation_ttl_seconds, int)
-            or not isinstance(fail_closed, bool)
-            or not isinstance(formal_live, bool)
-        ):
+        # Version 1 predates formal-live settlement.  States created during
+        # the transition may contain a strict boolean flag, which is retained
+        # so formal-live state cannot be silently downgraded on recovery.
+        if version == 1:
+            formal_live = state.get("formal_live", False)
+        else:
+            if "formal_live" not in state:
+                raise ValueError("invalid budget controller state formal_live")
+            formal_live = state["formal_live"]
+        if not isinstance(formal_live, bool):
+            raise ValueError("invalid budget controller state formal_live")
+        if type(reservation_ttl_seconds) is not int or not isinstance(fail_closed, bool):
             raise ValueError("invalid budget controller state")
         controller = cls(
             budget,

@@ -384,14 +384,64 @@ def test_recovery_rejects_duplicate_reservation_ids() -> None:
         controller_type.from_state(make_budget(), state)
 
 
-def test_recovery_migrates_legacy_v1_state_without_formal_live_flag() -> None:
-    controller_type, _, _ = budget_api()
-    controller = controller_type(make_budget())
-    reservation = controller.reserve("provider.search", UsageEstimate(search_api_calls=1))
-    state = controller.export_state()
-    state.pop("formal_live")
+def legacy_v1_state(**updates: object) -> dict[str, object]:
+    state: dict[str, object] = {
+        "version": 1,
+        "reservation_ttl_seconds": 120,
+        "fail_closed": False,
+        "reservations": [],
+        "committed": [],
+    }
+    state.update(updates)
+    return state
 
-    restored = controller_type.from_state(make_budget(), state)
+
+def test_recovery_migrates_true_legacy_v1_state_without_formal_live_flag() -> None:
+    controller_type, _, _ = budget_api()
+
+    restored = controller_type.from_state(make_budget(), legacy_v1_state())
 
     assert restored.formal_live is False
-    assert restored.reserved_usage.search_api_calls == reservation.reserved.search_api_calls
+
+
+def test_recovery_preserves_strict_v1_formal_live_when_present() -> None:
+    controller_type, _, _ = budget_api()
+
+    restored = controller_type.from_state(
+        make_budget(), legacy_v1_state(formal_live=True)
+    )
+
+    assert restored.formal_live is True
+
+
+def test_exported_v2_formal_live_state_preserves_unknown_cost_rejection() -> None:
+    controller_type, _, reservation_error = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+
+    state = controller.export_state()
+    restored = controller_type.from_state(make_budget(), state)
+    reservation = restored.reserve("provider.search", UsageEstimate(search_api_calls=1))
+
+    assert state["version"] == 2
+    with pytest.raises(reservation_error, match="formal live"):
+        restored.settle(reservation, UsageActual())
+
+
+@pytest.mark.parametrize("formal_live", [None, "true", 1])
+def test_recovery_rejects_v2_missing_or_non_boolean_formal_live(
+    formal_live: object,
+) -> None:
+    controller_type, _, _ = budget_api()
+    state = legacy_v1_state(version=2)
+    if formal_live is not None:
+        state["formal_live"] = formal_live
+
+    with pytest.raises(ValueError, match="formal_live"):
+        controller_type.from_state(make_budget(), state)
+
+
+def test_recovery_rejects_unknown_budget_state_version() -> None:
+    controller_type, _, _ = budget_api()
+
+    with pytest.raises(ValueError, match="version"):
+        controller_type.from_state(make_budget(), legacy_v1_state(version=3))

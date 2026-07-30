@@ -684,6 +684,33 @@ reopen evidence, reject path or symlink escape, write the approval report, or
 perform guarded publication. Concurrency hooks remain private implementation
 details rather than public parameters.
 
+**Approved V1 normalization and aggregate identity:** `FreezeManifestV1`
+models the exact already-frozen legacy manifest accepted by the existing
+validator: the exact top-level source, partition, work-package, prepared
+manifest, and approval-report bindings, with strict nested fields and no
+extras. Legacy bytes do not contain a schema discriminator. The loader may add
+`schema_version="paper-search-freeze-v1"` only to the in-memory projection
+after the original bytes pass the exact legacy field validation and
+`status=="frozen"`; it never rewrites V1 bytes. An unversioned prepared,
+unapproved, or structurally different manifest is rejected. Migration
+revalidates all three legacy partitions but projects only `dev` and
+`validation` into V2; legacy zero-answer policy `reject` maps to V2 `forbid`.
+
+`FreezeManifestV2.gold_sha256` is the SHA-256 of the UTF-8 bytes of this
+semantic projection, using the exact-byte hashes obtained by reopening the two
+gold files:
+
+```json
+{"partitions":[{"name":"dev","sha256":"sha256:..."},{"name":"validation","sha256":"sha256:..."}],"schema_version":"paper-search-gold-set-v1"}
+```
+
+The projection uses fixed partition order `dev`, `validation`,
+`json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+allow_nan=False)`, and no trailing newline. V2 approval
+`partition_hashes` must equal those same exact-byte hashes.
+`FreezeApprovalReportV2.audit_sha256` equals the SHA-256 of the exact approved
+V1 freeze-report bytes already bound by the legacy manifest.
+
 **Steps:**
 
 - [ ] Add failing tests for exact V2 fields, V1 readability, rejection of unapproved V1 input, revalidation after read, path confinement, approval-report matching, id-map identity, no-overwrite, idempotent exact match, and concurrent replacement.

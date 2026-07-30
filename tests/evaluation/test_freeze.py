@@ -336,6 +336,14 @@ def _migrate(case: MigrationFixture) -> FreezeManifestV2:
     )
 
 
+def _manifest_recoveries_with_bytes(root: Path, content: bytes) -> list[Path]:
+    return [
+        candidate
+        for candidate in root.glob(".manifest.json.*")
+        if candidate.is_file() and candidate.read_bytes() == content
+    ]
+
+
 def _native_replace_windows(source: Path, target: Path) -> None:
     import ctypes
 
@@ -621,16 +629,18 @@ def test_migration_guarded_publish_failure_restores_v1_and_exact_retry_succeeds(
     if report_state == "matched":
         report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_bytes(expected_report)
-    original_replace = freeze_module.os.replace
+    original_rename_no_overwrite = freeze_module._rename_no_overwrite
     original_link = freeze_module.os.link
 
-    def fail_after_backup(source: object, target: object) -> None:
-        original_replace(source, target)
+    def fail_after_backup(source: Path, target: Path) -> str:
+        outcome = original_rename_no_overwrite(source, target)
         if (
-            Path(source) == manifest_path
-            and Path(target).name.startswith(".manifest.json.prepared.")
+            source == manifest_path
+            and target.name.startswith(".manifest.json.prepared.")
+            and outcome == "moved"
         ):
             raise OSError("synthetic post-backup failure")
+        return outcome
 
     def fail_after_final_link(
         source: object,
@@ -647,7 +657,11 @@ def test_migration_guarded_publish_failure_restores_v1_and_exact_retry_succeeds(
             raise OSError("synthetic post-link failure")
 
     if failure_boundary == "after_backup":
-        monkeypatch.setattr(freeze_module.os, "replace", fail_after_backup)
+        monkeypatch.setattr(
+            freeze_module,
+            "_rename_no_overwrite",
+            fail_after_backup,
+        )
     else:
         monkeypatch.setattr(freeze_module.os, "link", fail_after_final_link)
 
@@ -656,11 +670,14 @@ def test_migration_guarded_publish_failure_restores_v1_and_exact_retry_succeeds(
 
     assert manifest_path.read_bytes() == case.legacy_manifest_bytes
     assert report_path.read_bytes() == expected_report
-    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(recovery) == 1
-    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
+    recovery = _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+    assert recovery
 
-    monkeypatch.setattr(freeze_module.os, "replace", original_replace)
+    monkeypatch.setattr(
+        freeze_module,
+        "_rename_no_overwrite",
+        original_rename_no_overwrite,
+    )
     monkeypatch.setattr(freeze_module.os, "link", original_link)
     assert isinstance(_migrate(case), FreezeManifestV2)
 
@@ -704,9 +721,8 @@ def test_migration_guarded_publish_preserves_concurrent_manifest_owner_and_backu
 
     assert injected
     assert manifest_path.read_bytes() == concurrent_bytes
-    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(recovery) == 1
-    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
+    recovery = _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+    assert recovery
     assert (root / case.approval_report_path).is_file()
 
     monkeypatch.setattr(freeze_module.os, "link", original_link)
@@ -723,17 +739,19 @@ def test_migration_recovery_link_race_preserves_owner_and_v1_backup(
     root = case.prepared.data_root
     manifest_path = root / "manifest.json"
     owner_bytes = b"recovery-link-owner"
-    original_replace = freeze_module.os.replace
+    original_rename_no_overwrite = freeze_module._rename_no_overwrite
     original_link = freeze_module.os.link
     owner_inserted = False
 
-    def fail_after_backup(source: object, target: object) -> None:
-        original_replace(source, target)
+    def fail_after_backup(source: Path, target: Path) -> str:
+        outcome = original_rename_no_overwrite(source, target)
         if (
-            Path(source) == manifest_path
-            and Path(target).name.startswith(".manifest.json.prepared.")
+            source == manifest_path
+            and target.name.startswith(".manifest.json.prepared.")
+            and outcome == "moved"
         ):
             raise OSError("synthetic post-backup failure")
+        return outcome
 
     def owner_wins_recovery_link(
         source: object,
@@ -751,7 +769,11 @@ def test_migration_recovery_link_race_preserves_owner_and_v1_backup(
             owner_inserted = True
         original_link(source, target, *args, **kwargs)
 
-    monkeypatch.setattr(freeze_module.os, "replace", fail_after_backup)
+    monkeypatch.setattr(
+        freeze_module,
+        "_rename_no_overwrite",
+        fail_after_backup,
+    )
     monkeypatch.setattr(freeze_module.os, "link", owner_wins_recovery_link)
 
     with pytest.raises(RuntimeError, match="freeze approval failed"):
@@ -759,9 +781,8 @@ def test_migration_recovery_link_race_preserves_owner_and_v1_backup(
 
     assert owner_inserted
     assert manifest_path.read_bytes() == owner_bytes
-    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(recovery) == 1
-    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
+    recovery = _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+    assert recovery
 
 
 def test_migration_post_replace_probe_failure_preserves_v1_backup(
@@ -771,20 +792,22 @@ def test_migration_post_replace_probe_failure_preserves_v1_backup(
     case = _migration_fixture(tmp_path)
     root = case.prepared.data_root
     manifest_path = root / "manifest.json"
-    original_replace = freeze_module.os.replace
+    original_rename_no_overwrite = freeze_module._rename_no_overwrite
     original_read_bytes = Path.read_bytes
     original_stat = Path.stat
     fail_backup_probes = False
 
-    def replace_then_fail(source: object, target: object) -> None:
+    def replace_then_fail(source: Path, target: Path) -> str:
         nonlocal fail_backup_probes
-        original_replace(source, target)
+        outcome = original_rename_no_overwrite(source, target)
         if (
-            Path(source) == manifest_path
-            and Path(target).name.startswith(".manifest.json.prepared.")
+            source == manifest_path
+            and target.name.startswith(".manifest.json.prepared.")
+            and outcome == "moved"
         ):
             fail_backup_probes = True
             raise OSError("synthetic post-replace failure")
+        return outcome
 
     def fail_recovery_read(path: Path) -> bytes:
         if fail_backup_probes and path.name.startswith(".manifest.json.prepared."):
@@ -800,7 +823,11 @@ def test_migration_post_replace_probe_failure_preserves_v1_backup(
             raise OSError("synthetic backup identity failure")
         return original_stat(path, follow_symlinks=follow_symlinks)
 
-    monkeypatch.setattr(freeze_module.os, "replace", replace_then_fail)
+    monkeypatch.setattr(
+        freeze_module,
+        "_rename_no_overwrite",
+        replace_then_fail,
+    )
     monkeypatch.setattr(Path, "read_bytes", fail_recovery_read)
     monkeypatch.setattr(Path, "stat", fail_recovery_stat)
 
@@ -809,119 +836,8 @@ def test_migration_post_replace_probe_failure_preserves_v1_backup(
 
     fail_backup_probes = False
     assert not manifest_path.exists()
-    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(recovery) == 1
-    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
-
-
-def test_migration_failed_replace_cleans_original_empty_backup_placeholder(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    case = _migration_fixture(tmp_path)
-    root = case.prepared.data_root
-    manifest_path = root / "manifest.json"
-    original_replace = freeze_module.os.replace
-    replacement_blocked = False
-
-    def fail_before_replace(source: object, target: object) -> None:
-        nonlocal replacement_blocked
-        if (
-            Path(source) == manifest_path
-            and Path(target).name.startswith(".manifest.json.prepared.")
-        ):
-            replacement_blocked = True
-            raise OSError("synthetic pre-replace failure")
-        original_replace(source, target)
-
-    monkeypatch.setattr(freeze_module.os, "replace", fail_before_replace)
-
-    with pytest.raises(RuntimeError, match="freeze approval failed"):
-        _migrate(case)
-
-    assert replacement_blocked
-    assert manifest_path.read_bytes() == case.legacy_manifest_bytes
-    assert not list(root.glob(".manifest.json.prepared.*.tmp"))
-
-
-def test_migration_failed_replace_preserves_owner_replacing_backup_placeholder(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    case = _migration_fixture(tmp_path)
-    root = case.prepared.data_root
-    manifest_path = root / "manifest.json"
-    owner = root / "backup-placeholder-owner.tmp"
-    owner_bytes = b"backup-placeholder-owner"
-    owner.write_bytes(owner_bytes)
-    original_replace = freeze_module.os.replace
-    owner_inserted = False
-
-    def owner_replaces_placeholder(source: object, target: object) -> None:
-        nonlocal owner_inserted
-        target_path = Path(target)
-        if (
-            Path(source) == manifest_path
-            and target_path.name.startswith(".manifest.json.prepared.")
-        ):
-            original_replace(owner, target_path)
-            owner_inserted = True
-            raise OSError("synthetic replace collision")
-        original_replace(source, target)
-
-    monkeypatch.setattr(freeze_module.os, "replace", owner_replaces_placeholder)
-
-    with pytest.raises(RuntimeError, match="freeze approval failed"):
-        _migrate(case)
-
-    assert owner_inserted
-    assert manifest_path.read_bytes() == case.legacy_manifest_bytes
-    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(recovery) == 1
-    assert recovery[0].read_bytes() == owner_bytes
-
-
-def test_migration_failed_replace_preserves_unprobeable_backup_placeholder(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    case = _migration_fixture(tmp_path)
-    root = case.prepared.data_root
-    manifest_path = root / "manifest.json"
-    original_replace = freeze_module.os.replace
-    original_stat = Path.stat
-    fail_backup_probe = False
-
-    def fail_before_replace(source: object, target: object) -> None:
-        nonlocal fail_backup_probe
-        if (
-            Path(source) == manifest_path
-            and Path(target).name.startswith(".manifest.json.prepared.")
-        ):
-            fail_backup_probe = True
-            raise OSError("synthetic pre-replace failure")
-        original_replace(source, target)
-
-    def fail_placeholder_stat(
-        path: Path,
-        *,
-        follow_symlinks: bool = True,
-    ) -> os.stat_result:
-        if fail_backup_probe and path.name.startswith(".manifest.json.prepared."):
-            raise OSError("synthetic placeholder identity failure")
-        return original_stat(path, follow_symlinks=follow_symlinks)
-
-    monkeypatch.setattr(freeze_module.os, "replace", fail_before_replace)
-    monkeypatch.setattr(Path, "stat", fail_placeholder_stat)
-
-    with pytest.raises(RuntimeError, match="freeze approval failed"):
-        _migrate(case)
-
-    fail_backup_probe = False
-    assert manifest_path.read_bytes() == case.legacy_manifest_bytes
-    retained = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(retained) == 1
-    assert retained[0].read_bytes() == b""
+    recovery = _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+    assert recovery
 
 
 def test_migration_commit_cleanup_preserves_replaced_backup_owner(
@@ -958,9 +874,239 @@ def test_migration_commit_cleanup_preserves_replaced_backup_owner(
     assert isinstance(_migrate(case), FreezeManifestV2)
 
     assert owner_inserted
-    retained = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(retained) == 1
-    assert retained[0].read_bytes() == owner_bytes
+    retained = _manifest_recoveries_with_bytes(root, owner_bytes)
+    assert retained
+
+
+def test_backup_candidate_collision_preserves_owner_and_uses_fresh_name(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    root = fixture.data_root
+    manifest_path = root / "manifest.json"
+    owner_bytes = b"backup-candidate-owner"
+    original_rename_no_overwrite = freeze_module._rename_no_overwrite
+    collided_candidate: Path | None = None
+    backup_attempts = 0
+
+    def occupy_first_candidate_then_rename(source: Path, target: Path) -> str:
+        nonlocal backup_attempts, collided_candidate
+        if source == manifest_path and target.name.startswith(
+            ".manifest.json.prepared."
+        ):
+            backup_attempts += 1
+            if backup_attempts == 1:
+                target.write_bytes(owner_bytes)
+                collided_candidate = target
+        return original_rename_no_overwrite(source, target)
+
+    monkeypatch.setattr(
+        freeze_module,
+        "_rename_no_overwrite",
+        occupy_first_candidate_then_rename,
+    )
+
+    freeze_module._replace_manifest_guarded(
+        manifest_path,
+        plan.prepared_manifest_bytes,
+        plan.frozen_manifest_bytes,
+    )
+
+    assert backup_attempts >= 2
+    assert collided_candidate is not None
+    assert collided_candidate.read_bytes() == owner_bytes
+    assert manifest_path.read_bytes() == plan.frozen_manifest_bytes
+    recoveries = list(root.glob(".manifest.json.prepared.*"))
+    assert any(
+        path != collided_candidate
+        and path.read_bytes() == plan.prepared_manifest_bytes
+        for path in recoveries
+    )
+
+
+def test_backup_quarantine_owner_replacing_after_second_probe_is_never_unlinked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    root = fixture.data_root
+    manifest_path = root / "manifest.json"
+    owner = root / "post-probe-cleanup-owner.tmp"
+    owner_bytes = b"owner-after-cleanup-identity-probe"
+    owner.write_bytes(owner_bytes)
+    original_probe = freeze_module._probe_file_state
+    owner_inserted = False
+    owner_quarantine: Path | None = None
+
+    def replace_after_quarantine_probe(
+        path: Path,
+    ) -> object:
+        nonlocal owner_inserted, owner_quarantine
+        state = original_probe(path)
+        if (
+            not owner_inserted
+            and path.name.startswith(".manifest.json.prepared.")
+            and ".cleanup." in path.name
+            and state is not None
+        ):
+            if os.name == "nt":
+                _native_replace_windows(owner, path)
+            else:
+                os.replace(owner, path)
+            owner_inserted = True
+            owner_quarantine = path
+        return state
+
+    monkeypatch.setattr(
+        freeze_module,
+        "_probe_file_state",
+        replace_after_quarantine_probe,
+    )
+
+    freeze_module._replace_manifest_guarded(
+        manifest_path,
+        plan.prepared_manifest_bytes,
+        plan.frozen_manifest_bytes,
+    )
+
+    assert owner_inserted
+    assert owner_quarantine is not None
+    assert owner_quarantine.read_bytes() == owner_bytes
+    assert manifest_path.read_bytes() == plan.frozen_manifest_bytes
+
+
+def test_manifest_publisher_initial_fstat_failure_closes_descriptor_and_retains_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    root = fixture.data_root
+    manifest_path = root / "manifest.json"
+    original_mkstemp = freeze_module.tempfile.mkstemp
+    original_fstat = freeze_module.os.fstat
+    first_descriptor: int | None = None
+    first_path: Path | None = None
+    triggered = False
+
+    def capture_first_mkstemp(*args: object, **kwargs: object) -> tuple[int, str]:
+        nonlocal first_descriptor, first_path
+        descriptor, name = original_mkstemp(*args, **kwargs)
+        if first_descriptor is None:
+            first_descriptor = descriptor
+            first_path = Path(name)
+        return descriptor, name
+
+    def fail_first_fstat(descriptor: int) -> os.stat_result:
+        nonlocal triggered
+        if descriptor == first_descriptor and not triggered:
+            triggered = True
+            raise OSError("synthetic initial manifest temp fstat failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(freeze_module.tempfile, "mkstemp", capture_first_mkstemp)
+    monkeypatch.setattr(freeze_module.os, "fstat", fail_first_fstat)
+
+    with pytest.raises(OSError, match="synthetic initial manifest temp fstat failure"):
+        freeze_module._replace_manifest_guarded(
+            manifest_path,
+            plan.prepared_manifest_bytes,
+            plan.frozen_manifest_bytes,
+        )
+
+    assert triggered
+    assert first_descriptor is not None
+    with pytest.raises(OSError):
+        original_fstat(first_descriptor)
+    assert first_path is not None
+    assert first_path.read_bytes() == b""
+    assert manifest_path.read_bytes() == plan.prepared_manifest_bytes
+    assert not list(root.glob(".manifest.json.prepared.*"))
+
+
+def test_manifest_publisher_backup_name_failure_quarantines_v2_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    root = fixture.data_root
+    manifest_path = root / "manifest.json"
+    original_token_hex = freeze_module.secrets.token_hex
+    calls = 0
+
+    def fail_first_name_generation(length: int) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("synthetic backup name generation failure")
+        return original_token_hex(length)
+
+    monkeypatch.setattr(freeze_module.secrets, "token_hex", fail_first_name_generation)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        freeze_module._replace_manifest_guarded(
+            manifest_path,
+            plan.prepared_manifest_bytes,
+            plan.frozen_manifest_bytes,
+        )
+
+    assert manifest_path.read_bytes() == plan.prepared_manifest_bytes
+    recoveries = list(root.glob(".manifest.json.*.tmp"))
+    assert any(path.read_bytes() == plan.frozen_manifest_bytes for path in recoveries)
+    assert not list(root.glob(".manifest.json.prepared.*"))
+
+
+def test_manifest_publisher_close_failure_quarantines_v2_temporary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _prepared_tree(tmp_path)
+    plan = _approval_plan(fixture)
+    root = fixture.data_root
+    manifest_path = root / "manifest.json"
+    original_fdopen = freeze_module.os.fdopen
+
+    class CloseThenFail:
+        def __init__(self, descriptor: int, mode: str) -> None:
+            self._file = original_fdopen(descriptor, mode)
+
+        def __enter__(self) -> CloseThenFail:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+            self.close()
+
+        def close(self) -> None:
+            self._file.close()
+            raise OSError("synthetic manifest temp close failure")
+
+        def write(self, content: bytes) -> int:
+            return self._file.write(content)
+
+        def flush(self) -> None:
+            self._file.flush()
+
+        def fileno(self) -> int:
+            return self._file.fileno()
+
+    monkeypatch.setattr(freeze_module.os, "fdopen", CloseThenFail)
+
+    with pytest.raises(OSError, match="synthetic manifest temp close failure"):
+        freeze_module._replace_manifest_guarded(
+            manifest_path,
+            plan.prepared_manifest_bytes,
+            plan.frozen_manifest_bytes,
+        )
+
+    assert manifest_path.read_bytes() == plan.prepared_manifest_bytes
+    recoveries = list(root.glob(".manifest.json.*.tmp"))
+    assert any(path.read_bytes() == plan.frozen_manifest_bytes for path in recoveries)
+    assert not list(root.glob(".manifest.json.prepared.*"))
 
 
 def test_migration_restored_v1_backup_survives_owner_replacement_before_cleanup(
@@ -1016,9 +1162,8 @@ def test_migration_restored_v1_backup_survives_owner_replacement_before_cleanup(
 
     assert owner_inserted
     assert manifest_path.read_bytes() == owner_bytes
-    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(recovery) == 1
-    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
+    recovery = _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+    assert recovery
 
 
 def test_migration_owner_replacing_between_identity_and_removal_is_preserved(
@@ -1076,9 +1221,8 @@ def test_migration_owner_replacing_between_identity_and_removal_is_preserved(
 
     assert owner_inserted
     assert manifest_path.read_bytes() == owner_bytes
-    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(recovery) == 1
-    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
+    recovery = _manifest_recoveries_with_bytes(root, case.legacy_manifest_bytes)
+    assert recovery
 
 
 def test_migration_preserves_owner_quarantine_when_third_party_wins_restore(
@@ -1155,9 +1299,11 @@ def test_migration_preserves_owner_quarantine_when_third_party_wins_restore(
     owner_recovery = list(root.glob(".manifest.json.rollback.*.tmp"))
     assert len(owner_recovery) == 1
     assert owner_recovery[0].read_bytes() == owner_bytes
-    v1_recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
-    assert len(v1_recovery) == 1
-    assert v1_recovery[0].read_bytes() == case.legacy_manifest_bytes
+    v1_recovery = _manifest_recoveries_with_bytes(
+        root,
+        case.legacy_manifest_bytes,
+    )
+    assert v1_recovery
 
 
 def test_migration_rejects_different_orphan_report_and_preserves_v1(
@@ -1802,8 +1948,20 @@ def test_approve_writes_report_then_manifest_and_is_idempotent(tmp_path: Path) -
 
     assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
     assert report_path.read_bytes() == plan.report_bytes
-    assert (fixture.data_root / "manifest.json").read_bytes() == plan.frozen_manifest_bytes
-    assert not list(fixture.data_root.rglob("*.tmp"))
+    manifest_path = fixture.data_root / "manifest.json"
+    assert manifest_path.read_bytes() == plan.frozen_manifest_bytes
+    prepared_recovery = _manifest_recoveries_with_bytes(
+        fixture.data_root,
+        plan.prepared_manifest_bytes,
+    )
+    frozen_recovery = _manifest_recoveries_with_bytes(
+        fixture.data_root,
+        plan.frozen_manifest_bytes,
+    )
+    assert prepared_recovery
+    assert frozen_recovery
+    assert any(path.samefile(manifest_path) for path in frozen_recovery)
+    assert all(not path.samefile(manifest_path) for path in prepared_recovery)
     assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
 
 
@@ -2086,7 +2244,14 @@ def test_approve_rejects_evidence_mutation_at_pre_replace_boundary(
         )
 
     assert (fixture.data_root / "manifest.json").read_bytes() == (plan.prepared_manifest_bytes)
-    assert not list(fixture.data_root.rglob("*.tmp"))
+    recovery = _manifest_recoveries_with_bytes(
+        fixture.data_root,
+        plan.frozen_manifest_bytes,
+    )
+    assert recovery
+    assert all(
+        not path.samefile(fixture.data_root / "manifest.json") for path in recovery
+    )
 
 
 def test_cli_approve_is_idempotent_across_invocations(
@@ -2261,71 +2426,40 @@ def test_audit_binds_agreement_threshold_to_point_eight(
         _audit(fixture)
 
 
-def test_backup_cleanup_failure_does_not_misreport_committed_freeze(
+def test_committed_freeze_retains_non_authoritative_v1_and_v2_recovery(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fixture = _prepared_tree(tmp_path)
     plan = _approval_plan(fixture)
-    original_unlink = Path.unlink
-
-    def fail_backup_unlink(
-        path: Path,
-        missing_ok: bool = False,
-    ) -> None:
-        if ".manifest.json.prepared." in path.name:
-            raise OSError("synthetic backup cleanup failure")
-        original_unlink(path, missing_ok=missing_ok)
-
-    monkeypatch.setattr(Path, "unlink", fail_backup_unlink)
-
+    manifest_path = fixture.data_root / "manifest.json"
     assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
-    assert (fixture.data_root / "manifest.json").read_bytes() == plan.frozen_manifest_bytes
-    monkeypatch.setattr(Path, "unlink", original_unlink)
-    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
-    remaining = list(fixture.data_root.glob(".manifest.json.prepared.*.tmp"))
-    assert (not remaining) if os.name == "nt" else len(remaining) == 1
-
-
-def test_frozen_temporary_cleanup_failure_is_retried_on_matched_freeze(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fixture = _prepared_tree(tmp_path)
-    plan = _approval_plan(fixture)
-    original_unlink = Path.unlink
-
-    def fail_frozen_temporary_unlink(
-        path: Path,
-        missing_ok: bool = False,
-    ) -> None:
-        if (
-            path.name.startswith(".manifest.json.")
-            and ".manifest.json.prepared." not in path.name
-        ):
-            raise OSError("synthetic frozen temporary cleanup failure")
-        original_unlink(path, missing_ok=missing_ok)
-
-    monkeypatch.setattr(Path, "unlink", fail_frozen_temporary_unlink)
-
-    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
-    assert (fixture.data_root / "manifest.json").read_bytes() == plan.frozen_manifest_bytes
-    monkeypatch.setattr(Path, "unlink", original_unlink)
-    frozen_temporaries = [
-        candidate
-        for candidate in fixture.data_root.glob(".manifest.json.*.tmp")
-        if ".manifest.json.prepared." not in candidate.name
-    ]
-    assert len(frozen_temporaries) == 1
-    assert frozen_temporaries[0].samefile(fixture.data_root / "manifest.json")
+    assert manifest_path.read_bytes() == plan.frozen_manifest_bytes
+    prepared_recovery = _manifest_recoveries_with_bytes(
+        fixture.data_root,
+        plan.prepared_manifest_bytes,
+    )
+    frozen_recovery = _manifest_recoveries_with_bytes(
+        fixture.data_root,
+        plan.frozen_manifest_bytes,
+    )
+    assert prepared_recovery
+    assert frozen_recovery
+    assert all(not path.samefile(manifest_path) for path in prepared_recovery)
+    assert any(path.samefile(manifest_path) for path in frozen_recovery)
 
     assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
-    remaining = [
-        candidate
-        for candidate in fixture.data_root.glob(".manifest.json.*.tmp")
-        if ".manifest.json.prepared." not in candidate.name
-    ]
-    assert (not remaining) if os.name == "nt" else len(remaining) == 1
+    if os.name == "nt":
+        assert not _manifest_recoveries_with_bytes(
+            fixture.data_root,
+            plan.prepared_manifest_bytes,
+        )
+        assert not _manifest_recoveries_with_bytes(
+            fixture.data_root,
+            plan.frozen_manifest_bytes,
+        )
+    else:
+        assert prepared_recovery
+        assert frozen_recovery
 
 
 def test_matched_freeze_preserves_nonmatching_manifest_temporary(
@@ -2349,6 +2483,7 @@ def test_matched_freeze_does_not_delete_candidate_replaced_after_hash(
     fixture = _prepared_tree(tmp_path)
     plan = _approval_plan(fixture)
     assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
     candidate = fixture.data_root / ".manifest.json.race.tmp"
     candidate.write_bytes(plan.frozen_manifest_bytes)
     replacement = fixture.data_root / "replacement.tmp"
@@ -2442,6 +2577,7 @@ def test_matched_freeze_rejects_oversized_temporary_before_hashing(
     fixture = _prepared_tree(tmp_path)
     plan = _approval_plan(fixture)
     assert approve_freeze(data_root=fixture.data_root, plan=plan) == "created"
+    assert approve_freeze(data_root=fixture.data_root, plan=plan) == "matched"
     oversized = fixture.data_root / ".manifest.json.oversized.tmp"
     oversized.write_bytes(b"x" * (1024 * 1024 + 1))
 

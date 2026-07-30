@@ -1221,9 +1221,10 @@ def _replace_manifest_guarded(
         backup_path = Path()
     except BaseException:
         if not committed and manifest_taken:
+            preserve_backup = True
             if published:
                 _quarantine_published_manifest(manifest_path, temporary_path)
-            preserve_backup = not _restore_manifest_without_overwrite(
+            _restore_manifest_without_overwrite(
                 backup_path,
                 manifest_path,
             )

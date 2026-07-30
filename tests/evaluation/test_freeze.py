@@ -656,6 +656,9 @@ def test_migration_guarded_publish_failure_restores_v1_and_exact_retry_succeeds(
 
     assert manifest_path.read_bytes() == case.legacy_manifest_bytes
     assert report_path.read_bytes() == expected_report
+    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
 
     monkeypatch.setattr(freeze_module.os, "replace", original_replace)
     monkeypatch.setattr(freeze_module.os, "link", original_link)
@@ -761,6 +764,64 @@ def test_migration_recovery_link_race_preserves_owner_and_v1_backup(
     assert recovery[0].read_bytes() == case.legacy_manifest_bytes
 
 
+def test_migration_restored_v1_backup_survives_owner_replacement_before_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = _migration_fixture(tmp_path)
+    root = case.prepared.data_root
+    manifest_path = root / "manifest.json"
+    owner = root / "post-restore-owner.tmp"
+    owner_bytes = b"owner-after-successful-v1-restore"
+    owner.write_bytes(owner_bytes)
+    original_link = freeze_module.os.link
+    original_samefile = Path.samefile
+    owner_inserted = False
+
+    def fail_published_manifest_link(
+        source: object,
+        target: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        source_path = Path(source)
+        if (
+            Path(target) == manifest_path
+            and source_path.name.startswith(".manifest.json.")
+            and ".prepared." not in source_path.name
+        ):
+            raise OSError("synthetic manifest publish failure")
+        original_link(source, target, *args, **kwargs)
+
+    def replace_after_restored_identity_check(path: Path, other: object) -> bool:
+        nonlocal owner_inserted
+        result = original_samefile(path, other)
+        if (
+            not owner_inserted
+            and result
+            and path == manifest_path
+            and Path(other).name.startswith(".manifest.json.prepared.")
+        ):
+            if os.name == "nt":
+                _native_replace_windows(owner, manifest_path)
+            else:
+                os.replace(owner, manifest_path)
+            owner_inserted = True
+        return result
+
+    monkeypatch.setattr(freeze_module.os, "link", fail_published_manifest_link)
+    monkeypatch.setattr(Path, "samefile", replace_after_restored_identity_check)
+
+    with pytest.raises(RuntimeError, match="freeze approval failed"):
+        _migrate(case)
+
+    assert owner_inserted
+    assert manifest_path.read_bytes() == owner_bytes
+    recovery = list(root.glob(".manifest.json.prepared.*.tmp"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == case.legacy_manifest_bytes
+
+
 def test_migration_owner_replacing_between_identity_and_removal_is_preserved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -833,9 +894,7 @@ def test_migration_preserves_owner_quarantine_when_third_party_wins_restore(
     owner.write_bytes(owner_bytes)
     third_party_bytes = b"third-party-manifest-owner"
     original_link = freeze_module.os.link
-    original_rename = freeze_module.os.rename
-    original_samefile = Path.samefile
-    published_identity_checks = 0
+    original_rename_no_overwrite = freeze_module._rename_no_overwrite
     owner_quarantined = False
     third_party_inserted = False
 
@@ -863,11 +922,11 @@ def test_migration_preserves_owner_quarantine_when_third_party_wins_restore(
         ):
             raise OSError("synthetic post-link failure")
 
-    def replace_owner_before_quarantine(source: object, target: object) -> None:
+    def replace_owner_before_quarantine(source: Path, target: Path) -> str:
         nonlocal owner_quarantined
         if (
-            Path(source) == manifest_path
-            and Path(target).name.startswith(".manifest.json.rollback.")
+            source == manifest_path
+            and target.name.startswith(".manifest.json.rollback.")
             and not owner_quarantined
         ):
             if os.name == "nt":
@@ -875,33 +934,18 @@ def test_migration_preserves_owner_quarantine_when_third_party_wins_restore(
             else:
                 os.replace(owner, manifest_path)
             owner_quarantined = True
-        original_rename(source, target)
-
-    def legacy_insert_owner_after_identity_check(path: Path, other: object) -> bool:
-        nonlocal published_identity_checks
-        result = original_samefile(path, other)
-        other_path = Path(other)
-        if (
-            not owner_quarantined
-            and result
-            and other_path.name.startswith(".manifest.json.")
-            and ".prepared." not in other_path.name
-        ):
-            published_identity_checks += 1
-            if published_identity_checks == 2:
-                if os.name == "nt":
-                    _native_replace_windows(owner, manifest_path)
-                else:
-                    os.replace(owner, manifest_path)
-        return result
+        return original_rename_no_overwrite(source, target)
 
     monkeypatch.setattr(
         freeze_module.os,
         "link",
         fail_after_final_link_and_block_owner_restore,
     )
-    monkeypatch.setattr(freeze_module.os, "rename", replace_owner_before_quarantine)
-    monkeypatch.setattr(Path, "samefile", legacy_insert_owner_after_identity_check)
+    monkeypatch.setattr(
+        freeze_module,
+        "_rename_no_overwrite",
+        replace_owner_before_quarantine,
+    )
 
     with pytest.raises(RuntimeError, match="freeze approval failed"):
         _migrate(case)
@@ -1614,7 +1658,9 @@ def test_approve_rejects_mutation_at_pre_replace_boundary(tmp_path: Path) -> Non
     report_path = fixture.data_root / "freeze_reports" / "synthetic-freeze.json"
     assert report_path.read_bytes() == plan.report_bytes
     assert manifest_path.read_bytes() == b"changed"
-    assert not list(fixture.data_root.rglob("*.tmp"))
+    recovery = list(fixture.data_root.glob(".manifest.json.prepared.*.tmp"))
+    assert len(recovery) == 1
+    assert recovery[0].read_bytes() == b"changed"
 
 
 def test_approve_leaves_complete_report_if_manifest_replace_fails(

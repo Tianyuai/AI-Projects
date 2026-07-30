@@ -22,6 +22,7 @@ from paper_search.application.locks import (
 
 
 FIXTURE_ROOT = Path(__file__).parents[1] / "fixtures" / "application"
+PROJECT_ROOT = Path(__file__).parents[2]
 ZERO_SHA256 = "sha256:" + "0" * 64
 
 
@@ -44,6 +45,16 @@ def artifact_payloads() -> dict[str, bytes]:
 
 def sha256(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def test_lock_fixtures_pin_the_real_quality_gate_policy_hash() -> None:
+    expected = sha256((PROJECT_ROOT / "configs" / "quality_gates_v1.yaml").read_bytes())
+
+    for fixture_name in ("candidate.lock.yaml", "validation.lock.yaml", "replay.lock.yaml"):
+        raw = fixture_data(fixture_name)
+        quality_gates = raw["quality_gates"]
+        assert isinstance(quality_gates, dict)
+        assert quality_gates["sha256"] == expected
 
 
 def write_artifact_root(root: Path) -> dict[str, bytes]:

@@ -1,0 +1,298 @@
+schema_version: quality-gates-v1
+rules:
+  - rule_id: prediction-cardinality
+    classification: formal_validity
+    measure: predictions_per_frozen_query_in_order
+    operator: eq
+    threshold: 1
+    applies_to: [dev, validation]
+    source_refs: [integrated-design:authoritative-quality-gates:prediction-cardinality]
+    resolution: enforced
+  - rule_id: hard-failure-cardinality
+    classification: formal_validity
+    measure: supplemental_failure_records_per_hard_failed_query
+    operator: eq
+    threshold: 1
+    applies_to: [dev, validation]
+    source_refs: [integrated-design:authoritative-quality-gates:hard-failure-cardinality]
+    resolution: enforced
+  - rule_id: integrity-failures
+    classification: formal_validity
+    measure: integrity_failures
+    operator: eq
+    threshold: 0
+    applies_to: [dev, validation, frozen_audit]
+    source_refs: [integrated-design:authoritative-quality-gates:integrity]
+    resolution: enforced
+  - rule_id: provenance-failures
+    classification: formal_validity
+    measure: provenance_failures
+    operator: eq
+    threshold: 0
+    applies_to: [dev, validation, frozen_audit]
+    source_refs: [integrated-design:authoritative-quality-gates:provenance]
+    resolution: enforced
+  - rule_id: sanitization-failures
+    classification: formal_validity
+    measure: sanitization_failures
+    operator: eq
+    threshold: 0
+    applies_to: [dev, validation, frozen_audit]
+    source_refs: [integrated-design:authoritative-quality-gates:sanitization]
+    resolution: enforced
+  - rule_id: unaccounted-usage-failures
+    classification: formal_validity
+    measure: unaccounted_usage_failures
+    operator: eq
+    threshold: 0
+    applies_to: [dev, validation, frozen_audit]
+    source_refs: [integrated-design:authoritative-quality-gates:unaccounted-usage]
+    resolution: enforced
+  - rule_id: budget-ledgers-within-cap
+    classification: formal_validity
+    measure: budget_ledgers_over_hard_cap
+    operator: eq
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [integrated-design:authoritative-quality-gates:budget-ledgers]
+    resolution: enforced
+  - rule_id: model-produced-analysis-rate
+    classification: baseline_quality
+    measure: valid_model_produced_query_analysis_rate
+    operator: gte
+    threshold: 0.99
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-01, integrated-design:authoritative-quality-gates:model-analysis]
+    resolution: enforced
+  - rule_id: strong-constraint-recall
+    classification: baseline_quality
+    measure: audited_strong_constraint_recall
+    operator: gte
+    threshold: 0.90
+    applies_to: [frozen_audit]
+    source_refs: [PRD:FR-01, integrated-design:authoritative-quality-gates:strong-constraint]
+    resolution: enforced
+  - rule_id: retrieval-response-rate
+    classification: baseline_quality
+    measure: parseable_configured_retrieval_response_rate
+    operator: gte
+    threshold: 0.95
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-03, integrated-design:authoritative-quality-gates:retrieval-response]
+    resolution: enforced
+  - rule_id: fuzzy-merge-accuracy
+    classification: baseline_quality
+    measure: audited_fuzzy_merge_accuracy
+    operator: gte
+    threshold: 0.98
+    applies_to: [frozen_audit]
+    source_refs: [PRD:FR-04, integrated-design:authoritative-quality-gates:fuzzy-merge]
+    resolution: enforced
+  - rule_id: fuzzy-merge-audit-denominator
+    classification: formal_validity
+    measure: audited_fuzzy_merge_decision_count
+    operator: gt
+    threshold: 0
+    applies_to: [frozen_audit]
+    source_refs: [integrated-design:authoritative-quality-gates:fuzzy-merge]
+    resolution: enforced
+  - rule_id: hard-filter-recall-loss
+    classification: baseline_quality
+    measure: hard_filter_absolute_recall_loss
+    operator: lte
+    threshold: 0.02
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-05, integrated-design:authoritative-quality-gates:hard-filter]
+    resolution: enforced
+  - rule_id: macro-recall-positive
+    classification: baseline_quality
+    measure: macro_identifier_map_recall
+    operator: gt
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [integrated-design:authoritative-quality-gates:macro-recall]
+    resolution: enforced
+  - rule_id: micro-recall-positive
+    classification: baseline_quality
+    measure: micro_identifier_map_recall
+    operator: gt
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [integrated-design:authoritative-quality-gates:micro-recall]
+    resolution: enforced
+  - rule_id: report-macro-precision
+    classification: reporting_only
+    measure: macro_precision
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: report-micro-precision
+    classification: reporting_only
+    measure: micro_precision
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: report-macro-recall
+    classification: reporting_only
+    measure: macro_recall
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only; superseded by macro-recall-positive
+  - rule_id: report-micro-recall
+    classification: reporting_only
+    measure: micro_recall
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only; superseded by micro-recall-positive
+  - rule_id: report-macro-f1
+    classification: reporting_only
+    measure: macro_f1
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:score-objective, PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only; no minimum Week 1 F1 is invented
+  - rule_id: report-micro-f1
+    classification: reporting_only
+    measure: micro_f1
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only; no minimum Week 1 F1 is invented
+  - rule_id: report-recall-at-5
+    classification: reporting_only
+    measure: recall_at_5
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: report-recall-at-10
+    classification: reporting_only
+    measure: recall_at_10
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: report-recall-at-20
+    classification: reporting_only
+    measure: recall_at_20
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: report-hard-failure-rate
+    classification: reporting_only
+    measure: hard_failure_rate
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-03, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only; cardinality is enforced separately
+  - rule_id: report-partial-result-rate
+    classification: reporting_only
+    measure: partial_result_rate
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-11, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: report-planner-fallback-rate
+    classification: reporting_only
+    measure: planner_fallback_rate
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [integrated-design:baseline-composition, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: report-latency-p50
+    classification: reporting_only
+    measure: latency_p50_ms
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:NFR-03, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: report-latency-p95
+    classification: reporting_only
+    measure: latency_p95_ms
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:NFR-03, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: report-external-calls
+    classification: reporting_only
+    measure: external_calls
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only; hard caps are enforced separately
+  - rule_id: report-tokens
+    classification: reporting_only
+    measure: actual_tokens
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-12, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only; hard caps are enforced separately
+  - rule_id: report-valued-cost
+    classification: reporting_only
+    measure: valued_cost_cny
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:NFR-03, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only; hard caps are enforced separately
+  - rule_id: report-cache-hit-rate
+    classification: reporting_only
+    measure: cache_hit_rate
+    operator: gte
+    threshold: 0
+    applies_to: [dev, validation]
+    source_refs: [PRD:FR-03, integrated-design:authoritative-quality-gates:reporting]
+    resolution: reporting-only
+  - rule_id: promotion-median-macro-f1-delta
+    classification: promotion
+    measure: median_macro_f1_delta_over_three_runs
+    operator: gte
+    threshold: 0.01
+    applies_to: [optional]
+    source_refs: [PRD:FR-02, PRD:model-promotion-gate, integrated-design:promotion-gate]
+    resolution: optional-promotion-only
+  - rule_id: promotion-bootstrap-lower-bound
+    classification: promotion
+    measure: bootstrap_95_ci_lower_bound
+    operator: gte
+    threshold: -0.005
+    applies_to: [optional]
+    source_refs: [PRD:FR-02, integrated-design:promotion-gate]
+    resolution: optional-promotion-only
+  - rule_id: promotion-validation-macro-f1-drop
+    classification: promotion
+    measure: validation_macro_f1_drop
+    operator: lte
+    threshold: 0.01
+    applies_to: [optional]
+    source_refs: [PRD:FR-02, PRD:model-promotion-gate, integrated-design:promotion-gate]
+    resolution: optional-promotion-only
+  - rule_id: promotion-bootstrap-samples
+    classification: promotion
+    measure: bootstrap_samples
+    operator: eq
+    threshold: 1000
+    applies_to: [optional]
+    source_refs: [PRD:FR-02, integrated-design:promotion-gate]
+    resolution: optional-promotion-only

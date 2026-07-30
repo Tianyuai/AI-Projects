@@ -279,6 +279,21 @@ def test_unknown_actual_llm_cost_does_not_release_reservation() -> None:
     assert controller.unknown_cost_actions == ["llm.generate"]
 
 
+def test_formal_live_settlement_rejects_unaccounted_actual_cost() -> None:
+    controller_type, _, reservation_error = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+    reservation = controller.reserve(
+        "llm.generate",
+        UsageEstimate(llm_calls=1, cost_cny=0.5),
+    )
+
+    with pytest.raises(reservation_error, match="formal live"):
+        controller.settle(reservation, UsageActual(llm_calls=1, cost_cny=None))
+
+    assert controller.reserved_usage.llm_calls == 1
+    assert controller.committed_usage.llm_calls == 0
+
+
 def test_release_expiry_stop_status_and_recovery_are_deterministic() -> None:
     controller_type, exceeded_error, _ = budget_api()
     current = datetime(2026, 7, 23, tzinfo=UTC)

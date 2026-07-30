@@ -63,11 +63,13 @@ class HardBudgetController:
         *,
         reservation_ttl_seconds: int = 120,
         clock: Clock | None = None,
+        formal_live: bool = False,
     ) -> None:
         if reservation_ttl_seconds <= 0:
             raise ValueError("reservation_ttl_seconds must be positive")
         self._budget = SearchBudget.model_validate(budget.model_dump())
         self.reservation_ttl_seconds = reservation_ttl_seconds
+        self.formal_live = formal_live
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
         self._reservations: dict[str, BudgetReservation] = {}
@@ -154,6 +156,8 @@ class HardBudgetController:
                 raise ReservationError("reservation is unknown or already settled")
             if active != reservation:
                 raise ReservationError("reservation does not match the active reservation")
+            if self.formal_live and actual.cost_cny is None:
+                raise ReservationError("formal live settlement requires a valued actual cost")
             self._ensure_within_reservation(active.reserved, actual)
 
             other_reserved = [
@@ -216,6 +220,7 @@ class HardBudgetController:
             return {
                 "version": 1,
                 "reservation_ttl_seconds": self.reservation_ttl_seconds,
+                "formal_live": self.formal_live,
                 "fail_closed": self._fail_closed,
                 "reservations": [item.model_dump(mode="json") for item in self._reservations.values()],
                 "committed": [
@@ -235,16 +240,19 @@ class HardBudgetController:
         """Restore validated state without bypassing budget accounting invariants."""
         reservation_ttl_seconds = state.get("reservation_ttl_seconds")
         fail_closed = state.get("fail_closed")
+        formal_live = state.get("formal_live")
         if (
             state.get("version") != 1
             or not isinstance(reservation_ttl_seconds, int)
             or not isinstance(fail_closed, bool)
+            or not isinstance(formal_live, bool)
         ):
             raise ValueError("invalid budget controller state")
         controller = cls(
             budget,
             reservation_ttl_seconds=reservation_ttl_seconds,
             clock=clock,
+            formal_live=formal_live,
         )
         reservations = state.get("reservations")
         committed = state.get("committed")

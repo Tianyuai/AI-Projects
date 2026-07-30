@@ -9,7 +9,7 @@ import stat
 import sys
 import tempfile
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, NoReturn, TypeVar, cast
@@ -34,9 +34,11 @@ from paper_search.evaluation.freeze_schema import (
     FreezeManifestV2,
     FrozenPartitionV2,
     IdentifierMapBindingV2,
+    BoundArtifact,
     canonical_gold_set_sha256,
+    open_confined_artifact,
     parse_freeze_manifest_bytes,
-    read_confined_bytes,
+    publish_confined_bytes_no_overwrite,
     sha256_bytes,
 )
 
@@ -766,8 +768,18 @@ def _normalized_windows_path(value: str) -> str:
 
 @contextmanager
 def _stable_evidence_files(
-    evidence: Sequence[_EvidenceIdentity],
+    evidence: Sequence[_EvidenceIdentity | BoundArtifact],
 ) -> Iterator[None]:
+    bound = [item for item in evidence if isinstance(item, BoundArtifact)]
+    pathname_evidence = [item for item in evidence if isinstance(item, _EvidenceIdentity)]
+    if any(_sha256_descriptor(item.descriptor) != item.sha256 for item in bound):
+        raise RuntimeError("freeze approval failed")
+    if not pathname_evidence:
+        yield
+        if any(_sha256_descriptor(item.descriptor) != item.sha256 for item in bound):
+            raise RuntimeError("freeze approval failed")
+        return
+    evidence = pathname_evidence
     descriptors: list[int] = []
     try:
         if os.name == "nt":
@@ -852,6 +864,8 @@ def _stable_evidence_files(
         ):
             raise RuntimeError("freeze approval failed")
         yield
+        if any(_sha256_descriptor(item.descriptor) != item.sha256 for item in bound):
+            raise RuntimeError("freeze approval failed")
         if any(
             _sha256_descriptor(descriptor) != identity.sha256
             for descriptor, identity in zip(descriptors, evidence, strict=True)
@@ -1022,13 +1036,21 @@ def _replace_manifest_guarded(
     frozen_bytes: bytes,
     *,
     before_manifest_replace: Callable[[], object] | None = None,
-    evidence: Sequence[_EvidenceIdentity] = (),
+    evidence: Sequence[_EvidenceIdentity | BoundArtifact] = (),
+    bound_manifest: BoundArtifact | None = None,
 ) -> None:
-    try:
-        if manifest_path.read_bytes() != prepared_bytes:
+    if bound_manifest is not None:
+        if (
+            bound_manifest.content != prepared_bytes
+            or _sha256_descriptor(bound_manifest.descriptor) != bound_manifest.sha256
+        ):
             raise RuntimeError("freeze approval failed")
-    except OSError:
-        raise RuntimeError("freeze approval failed") from None
+    else:
+        try:
+            if manifest_path.read_bytes() != prepared_bytes:
+                raise RuntimeError("freeze approval failed")
+        except OSError:
+            raise RuntimeError("freeze approval failed") from None
 
     descriptor, temporary_name = tempfile.mkstemp(
         dir=manifest_path.parent,
@@ -1291,31 +1313,20 @@ def approve_freeze(
         )
 
 
-def _migration_path(data_root: Path, relative_path: SafeRelativePath) -> Path:
-    root = data_root.resolve()
-    candidate = (root / relative_path).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError:
-        raise ValueError("freeze migration failed") from None
-    return candidate
-
-
 def _migration_evidence(
     data_root: Path,
     relative_path: SafeRelativePath,
     expected_sha256: str,
-) -> tuple[bytes, _EvidenceIdentity]:
+    *,
+    stack: ExitStack,
+) -> BoundArtifact:
     try:
-        content = read_confined_bytes(data_root, relative_path)
+        artifact = stack.enter_context(open_confined_artifact(data_root, relative_path))
     except ValueError:
         raise ValueError("freeze migration failed") from None
-    if sha256_bytes(content) != expected_sha256:
+    if artifact.sha256 != expected_sha256:
         raise ValueError("freeze migration failed")
-    return content, _EvidenceIdentity(
-        path=_migration_path(data_root, relative_path),
-        sha256=expected_sha256,
-    )
+    return artifact
 
 
 def _migration_json(content: bytes) -> object:
@@ -1341,7 +1352,9 @@ def _migration_partition(
     data_root: Path,
     name: Literal["dev", "validation", "simulated_test"],
     partition: object,
-) -> tuple[bytes, _EvidenceIdentity, _EvidenceIdentity]:
+    *,
+    stack: ExitStack,
+) -> tuple[bytes, BoundArtifact, BoundArtifact]:
     if not hasattr(partition, "gold_path"):
         raise ValueError("freeze migration failed")
     gold_path = cast(SafeRelativePath, getattr(partition, "gold_path"))
@@ -1350,11 +1363,13 @@ def _migration_partition(
     ids_hash = cast(str, getattr(partition, "ids_sha256"))
     count = cast(int, getattr(partition, "count"))
     policy = cast(str, getattr(partition, "zero_answer_policy"))
-    gold_content, gold_evidence = _migration_evidence(data_root, gold_path, gold_hash)
-    ids_content, ids_evidence = _migration_evidence(data_root, ids_path, ids_hash)
-    identifiers = _migration_identifiers(ids_content, count)
+    gold_evidence = _migration_evidence(data_root, gold_path, gold_hash, stack=stack)
+    ids_evidence = _migration_evidence(data_root, ids_path, ids_hash, stack=stack)
+    identifiers = _migration_identifiers(ids_evidence.content, count)
     try:
-        rows = [_mapping(_migration_json(line)) for line in gold_content.splitlines() if line]
+        rows = [
+            _mapping(_migration_json(line)) for line in gold_evidence.content.splitlines() if line
+        ]
         records = [EvaluationQuery.model_validate(row) for row in rows]
     except (ValidationError, ValueError):
         raise ValueError("freeze migration failed") from None
@@ -1367,24 +1382,31 @@ def _migration_partition(
     ):
         raise ValueError("freeze migration failed")
     del name
-    return gold_content, gold_evidence, ids_evidence
+    return gold_evidence.content, gold_evidence, ids_evidence
 
 
 def _migration_source_evidence(
     data_root: Path,
     v1: FreezeManifestV1,
-) -> list[_EvidenceIdentity]:
-    evidence: list[_EvidenceIdentity] = []
+    *,
+    stack: ExitStack,
+) -> list[BoundArtifact]:
+    evidence: list[BoundArtifact] = []
     for source in v1.source_files:
-        content, identity = _migration_evidence(data_root, source.raw_path, source.sha256)
-        if len(content) != source.byte_count or len(content.splitlines()) != source.row_count:
+        identity = _migration_evidence(
+            data_root, source.raw_path, source.sha256, stack=stack
+        )
+        if (
+            len(identity.content) != source.byte_count
+            or len(identity.content.splitlines()) != source.row_count
+        ):
             raise ValueError("freeze migration failed")
         evidence.append(identity)
     for name, package in v1.work_packages.items():
-        ids_content, ids_identity = _migration_evidence(
-            data_root, package.ids_path, package.ids_sha256
+        ids_identity = _migration_evidence(
+            data_root, package.ids_path, package.ids_sha256, stack=stack
         )
-        _migration_identifiers(ids_content, package.count)
+        _migration_identifiers(ids_identity.content, package.count)
         evidence.append(ids_identity)
         if name == "overlap":
             if package.source_path is not None or package.source_sha256 is not None:
@@ -1392,10 +1414,10 @@ def _migration_source_evidence(
             continue
         if package.source_path is None or package.source_sha256 is None:
             raise ValueError("freeze migration failed")
-        source_content, source_identity = _migration_evidence(
-            data_root, package.source_path, package.source_sha256
+        source_identity = _migration_evidence(
+            data_root, package.source_path, package.source_sha256, stack=stack
         )
-        if len(source_content.splitlines()) != package.count:
+        if len(source_identity.content.splitlines()) != package.count:
             raise ValueError("freeze migration failed")
         evidence.append(source_identity)
     return evidence
@@ -1404,18 +1426,21 @@ def _migration_source_evidence(
 def _validated_v1_report(
     data_root: Path,
     v1: FreezeManifestV1,
-) -> tuple[bytes, _EvidenceIdentity]:
-    report_bytes, report_identity = _migration_evidence(
+    *,
+    stack: ExitStack,
+) -> BoundArtifact:
+    report_identity = _migration_evidence(
         data_root,
         v1.freeze_report_path,
         v1.freeze_report_sha256,
+        stack=stack,
     )
     try:
-        report = FreezeAuditReport.model_validate(_migration_json(report_bytes))
+        report = FreezeAuditReport.model_validate(_migration_json(report_identity.content))
     except ValidationError:
         raise ValueError("freeze migration failed") from None
     if (
-        _json_bytes(report.model_dump(mode="json")) != report_bytes
+        _json_bytes(report.model_dump(mode="json")) != report_identity.content
         or report.approval_requested is not True
         or report.prepared_manifest_sha256 != v1.prepared_manifest_sha256
         or report.dataset_revision != v1.revision
@@ -1434,17 +1459,19 @@ def _validated_v1_report(
             or audit_partition.labels_complete is not True
         ):
             raise ValueError("freeze migration failed")
-    return report_bytes, report_identity
+    return report_identity
 
 
 def _validated_identifier_map(
     data_root: Path,
     identifier_map: IdentifierMapBindingV2,
-) -> tuple[bytes, _EvidenceIdentity]:
-    content, identity = _migration_evidence(
-        data_root, identifier_map.path, identifier_map.sha256
+    *,
+    stack: ExitStack,
+) -> tuple[bytes, BoundArtifact]:
+    identity = _migration_evidence(
+        data_root, identifier_map.path, identifier_map.sha256, stack=stack
     )
-    value = _migration_json(content)
+    value = _migration_json(identity.content)
     if (
         not isinstance(value, dict)
         or len(value) != identifier_map.entry_count
@@ -1458,7 +1485,7 @@ def _validated_identifier_map(
         )
     ):
         raise ValueError("freeze migration failed")
-    return content, identity
+    return identity.content, identity
 
 
 def _migration_manifest(
@@ -1534,71 +1561,75 @@ def migrate_v1_to_v2(
     """Verify an approved legacy freeze and atomically publish its V2 successor."""
     root = data_root.resolve()
     manifest_path = root / "manifest.json"
-    report_path = _migration_path(root, approval_report_path)
-    if report_path == manifest_path:
+    if approval_report_path == "manifest.json":
         raise ValueError("freeze migration failed")
     with _exclusive_freeze_lock(root):
-        try:
-            current_bytes = read_confined_bytes(root, "manifest.json")
-            current = parse_freeze_manifest_bytes(current_bytes)
-        except ValueError:
-            raise ValueError("freeze migration failed") from None
-        if not isinstance(current, (FreezeManifestV1, FreezeManifestV2)):
-            raise ValueError("freeze migration failed")
-        if isinstance(current, FreezeManifestV1) and current != v1:
-            raise ValueError("freeze migration failed")
-        legacy_report_bytes, legacy_report_evidence = _validated_v1_report(root, v1)
-        del legacy_report_bytes
-        partition_content: dict[str, bytes] = {}
-        evidence: list[_EvidenceIdentity] = [legacy_report_evidence]
-        for name in ("dev", "validation", "simulated_test"):
-            content, gold_evidence, ids_evidence = _migration_partition(
-                root, name, v1.partitions[name]
-            )
-            partition_content[name] = content
-            evidence.extend((gold_evidence, ids_evidence))
-        evidence.extend(_migration_source_evidence(root, v1))
-        _, identifier_evidence = _validated_identifier_map(root, identifier_map)
-        evidence.append(identifier_evidence)
-        dev_hash = sha256_bytes(partition_content["dev"])
-        validation_hash = sha256_bytes(partition_content["validation"])
-        if approval.audit_sha256 != v1.freeze_report_sha256:
-            raise ValueError("freeze migration failed")
-        migrated, approval_bytes, migrated_bytes = _migration_manifest(
-            v1,
-            approval=approval,
-            identifier_map=identifier_map,
-            dataset_revision=dataset_revision,
-            approval_report_path=approval_report_path,
-            dev_gold_sha256=dev_hash,
-            validation_gold_sha256=validation_hash,
-        )
-        if isinstance(current, FreezeManifestV2):
+        with ExitStack() as stack:
             try:
-                existing_report = read_confined_bytes(root, approval_report_path)
+                current_artifact = stack.enter_context(
+                    open_confined_artifact(root, "manifest.json")
+                )
+                current_bytes = current_artifact.content
+                current = parse_freeze_manifest_bytes(current_bytes)
             except ValueError:
                 raise ValueError("freeze migration failed") from None
-            if (
-                current == migrated
-                and current_bytes == migrated_bytes
-                and existing_report == approval_bytes
-            ):
-                return migrated
-            raise ValueError("freeze migration failed")
-        try:
-            with _stable_report_parent(root, report_path):
-                write_frozen_bytes(report_path, approval_bytes)
-                if read_confined_bytes(root, approval_report_path) != approval_bytes:
-                    raise RuntimeError("freeze migration failed")
-        except (OSError, RuntimeError, ValueError):
-            raise RuntimeError("freeze migration failed") from None
-        _replace_manifest_guarded(
-            manifest_path,
-            current_bytes,
-            migrated_bytes,
-            evidence=evidence,
-        )
-        return migrated
+            if not isinstance(current, (FreezeManifestV1, FreezeManifestV2)):
+                raise ValueError("freeze migration failed")
+            if isinstance(current, FreezeManifestV1) and current != v1:
+                raise ValueError("freeze migration failed")
+            legacy_report_evidence = _validated_v1_report(root, v1, stack=stack)
+            partition_content: dict[str, bytes] = {}
+            evidence: list[BoundArtifact] = [current_artifact, legacy_report_evidence]
+            for name in ("dev", "validation", "simulated_test"):
+                content, gold_evidence, ids_evidence = _migration_partition(
+                    root, name, v1.partitions[name], stack=stack
+                )
+                partition_content[name] = content
+                evidence.extend((gold_evidence, ids_evidence))
+            evidence.extend(_migration_source_evidence(root, v1, stack=stack))
+            _, identifier_evidence = _validated_identifier_map(
+                root, identifier_map, stack=stack
+            )
+            evidence.append(identifier_evidence)
+            dev_hash = sha256_bytes(partition_content["dev"])
+            validation_hash = sha256_bytes(partition_content["validation"])
+            if approval.audit_sha256 != v1.freeze_report_sha256:
+                raise ValueError("freeze migration failed")
+            migrated, approval_bytes, migrated_bytes = _migration_manifest(
+                v1,
+                approval=approval,
+                identifier_map=identifier_map,
+                dataset_revision=dataset_revision,
+                approval_report_path=approval_report_path,
+                dev_gold_sha256=dev_hash,
+                validation_gold_sha256=validation_hash,
+            )
+            if isinstance(current, FreezeManifestV2):
+                try:
+                    existing_report = stack.enter_context(
+                        open_confined_artifact(root, approval_report_path)
+                    )
+                except ValueError:
+                    raise ValueError("freeze migration failed") from None
+                if (
+                    current == migrated
+                    and current_bytes == migrated_bytes
+                    and existing_report.content == approval_bytes
+                ):
+                    return migrated
+                raise ValueError("freeze migration failed")
+            try:
+                publish_confined_bytes_no_overwrite(root, approval_report_path, approval_bytes)
+            except (OSError, ValueError, FileExistsError):
+                raise RuntimeError("freeze migration failed") from None
+            _replace_manifest_guarded(
+                manifest_path,
+                current_bytes,
+                migrated_bytes,
+                evidence=evidence,
+                bound_manifest=current_artifact,
+            )
+            return migrated
 
 
 def _prepared_partition_names(data_root: Path) -> set[str]:

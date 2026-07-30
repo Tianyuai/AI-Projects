@@ -1,0 +1,12 @@
+{
+  "approval_requested": true,
+  "approved_at": "2026-07-30T00:00:00Z",
+  "approver_ref": "fixture-operator",
+  "audit_sha256": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+  "identifier_map_sha256": "sha256:ea5901fb101bba9bcd24c6fd1627be30830add846d18dfb554e4eccf9310d0bb",
+  "partition_hashes": {
+    "dev": "sha256:dbf474dcc0ce9e36f142419de08c678a435befe4b9ecd6326ac6a289ed2f3653",
+    "validation": "sha256:4e77c5adb29e4c683daa08f73f1cc0049e99c6a71a97eb2168148dec4d0d070d"
+  },
+  "schema_version": "freeze-approval-v2"
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from paper_search.evaluation.freeze_schema import (
     FrozenPartitionV2,
     canonical_gold_set_sha256,
     load_freeze_manifest,
+    publish_confined_bytes_no_overwrite,
 )
 
 
@@ -21,6 +23,88 @@ FIXTURE_ROOT = Path("tests/fixtures/evaluation/freeze_v2")
 
 def _sha256(content: bytes) -> str:
     return "sha256:" + hashlib.sha256(content).hexdigest()
+
+
+def _canonical_document(payload: object) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
+        + "\n"
+    ).encode()
+
+
+def _write_bound_v2_tree(tmp_path: Path) -> tuple[Path, dict[str, object]]:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    dev_bytes = b'{"query_id":"dev-1","query":"synthetic","relevant_paper_ids":["p1"]}\n'
+    validation_bytes = (
+        b'{"query_id":"validation-1","query":"synthetic","relevant_paper_ids":[]}\n'
+    )
+    identifier_map_bytes = b'{"legacy:1":"canonical:1"}'
+    for relative, content in (
+        ("dev/gold.jsonl", dev_bytes),
+        ("validation/gold.jsonl", validation_bytes),
+        ("identifier-map.json", identifier_map_bytes),
+    ):
+        path = data_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+    hashes = {
+        "dev": _sha256(dev_bytes),
+        "validation": _sha256(validation_bytes),
+        "identifier_map": _sha256(identifier_map_bytes),
+    }
+    approval = {
+        "schema_version": "freeze-approval-v2",
+        "approval_requested": True,
+        "approved_at": "2026-07-30T00:00:00Z",
+        "approver_ref": "fixture-operator",
+        "audit_sha256": _sha256(b"legacy-audit"),
+        "partition_hashes": {"dev": hashes["dev"], "validation": hashes["validation"]},
+        "identifier_map_sha256": hashes["identifier_map"],
+    }
+    approval_bytes = _canonical_document(approval)
+    approval_path = data_root / "freeze_reports" / "approval.json"
+    approval_path.parent.mkdir()
+    approval_path.write_bytes(approval_bytes)
+    manifest = {
+        "schema_version": "paper-search-freeze-v2",
+        "dataset_revision": "fixture-revision",
+        "created_at": "2026-07-30T00:00:00Z",
+        "annotation_status": "frozen",
+        "freeze_status": "approved",
+        "partitions": [
+            {
+                "name": "dev",
+                "path": "dev/gold.jsonl",
+                "query_count": 1,
+                "sha256": hashes["dev"],
+                "zero_answer_policy": "forbid",
+            },
+            {
+                "name": "validation",
+                "path": "validation/gold.jsonl",
+                "query_count": 1,
+                "sha256": hashes["validation"],
+                "zero_answer_policy": "allow",
+            },
+        ],
+        "gold_sha256": canonical_gold_set_sha256(hashes["dev"], hashes["validation"]),
+        "identifier_map": {
+            "path": "identifier-map.json",
+            "sha256": hashes["identifier_map"],
+            "entry_count": 1,
+        },
+        "partition_immutability": "content_addressed",
+        "approval": {
+            "report_path": "freeze_reports/approval.json",
+            "report_sha256": _sha256(approval_bytes),
+            "approved_at": "2026-07-30T00:00:00Z",
+            "approver_ref": "fixture-operator",
+        },
+    }
+    manifest_path = data_root / "manifest.json"
+    manifest_path.write_bytes(_canonical_document(manifest))
+    return data_root, manifest
 
 
 def _legacy_manifest() -> dict[str, object]:
@@ -190,13 +274,54 @@ def test_canonical_gold_identity_uses_fixed_partition_order() -> None:
     assert canonical_gold_set_sha256(dev, validation) == expected
 
 
-def test_loads_synthetic_versioned_v2_fixture(tmp_path: Path) -> None:
-    data_root = tmp_path / "data"
-    data_root.mkdir()
-    path = data_root / "manifest.json"
-    path.write_bytes((FIXTURE_ROOT / "manifest.json").read_bytes())
+def test_v2_loader_rejects_missing_bound_approval_report(tmp_path: Path) -> None:
+    data_root, _ = _write_bound_v2_tree(tmp_path)
+    (data_root / "freeze_reports" / "approval.json").unlink()
 
-    manifest = load_freeze_manifest(path, data_root=data_root)
+    with pytest.raises(ValueError, match="freeze manifest is invalid"):
+        load_freeze_manifest(data_root / "manifest.json", data_root=data_root)
+
+
+def test_v2_loader_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    data_root, _ = _write_bound_v2_tree(tmp_path)
+    (data_root / "manifest.json").write_bytes(
+        b'{"schema_version":"paper-search-freeze-v2","schema_version":"paper-search-freeze-v2"}'
+    )
+
+    with pytest.raises(ValueError, match="freeze manifest is invalid"):
+        load_freeze_manifest(data_root / "manifest.json", data_root=data_root)
+
+
+def test_loads_fully_bound_synthetic_versioned_v2_fixture(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    shutil.copytree(FIXTURE_ROOT, data_root)
+
+    manifest = load_freeze_manifest(data_root / "manifest.json", data_root=data_root)
 
     assert isinstance(manifest, FreezeManifestV2)
     assert manifest.partitions[0].name == "dev"
+
+
+def test_confined_report_publication_never_overwrites_different_existing_bytes(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+
+    assert (
+        publish_confined_bytes_no_overwrite(
+            data_root, "freeze_reports/approval.json", b"first"
+        )
+        == "created"
+    )
+    assert (
+        publish_confined_bytes_no_overwrite(
+            data_root, "freeze_reports/approval.json", b"first"
+        )
+        == "matched"
+    )
+    with pytest.raises(FileExistsError):
+        publish_confined_bytes_no_overwrite(
+            data_root, "freeze_reports/approval.json", b"different"
+        )
+    assert (data_root / "freeze_reports" / "approval.json").read_bytes() == b"first"

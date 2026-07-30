@@ -4,16 +4,16 @@
     "approved_at": "2026-07-30T00:00:00Z",
     "approver_ref": "fixture-operator",
     "report_path": "freeze_reports/approval.json",
-    "report_sha256": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    "report_sha256": "sha256:2d8161a83619be03f6eae66c3e609089e5f2a202a5860a9efd2daa62814798bd"
   },
   "created_at": "2026-07-30T00:00:00Z",
   "dataset_revision": "fixture-revision",
   "freeze_status": "approved",
-  "gold_sha256": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+  "gold_sha256": "sha256:84193b09815ea63451f05338bfb15e9d3b5584195a52bb1a2cfd53e5fb19e8ba",
   "identifier_map": {
     "entry_count": 1,
     "path": "identifier-map.json",
-    "sha256": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    "sha256": "sha256:ea5901fb101bba9bcd24c6fd1627be30830add846d18dfb554e4eccf9310d0bb"
   },
   "partition_immutability": "content_addressed",
   "partitions": [
@@ -21,14 +21,14 @@
       "name": "dev",
       "path": "dev/gold.jsonl",
       "query_count": 1,
-      "sha256": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "sha256": "sha256:dbf474dcc0ce9e36f142419de08c678a435befe4b9ecd6326ac6a289ed2f3653",
       "zero_answer_policy": "forbid"
     },
     {
       "name": "validation",
       "path": "validation/gold.jsonl",
       "query_count": 1,
-      "sha256": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "sha256": "sha256:4e77c5adb29e4c683daa08f73f1cc0049e99c6a71a97eb2168148dec4d0d070d",
       "zero_answer_policy": "allow"
     }
   ],

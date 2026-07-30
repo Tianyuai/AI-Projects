@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 from pydantic import BaseModel, ValidationError
 
+import paper_search.application as application
 from paper_search.application import (
     DependencyDiagnostic,
     DependencyStatus,
@@ -19,6 +20,7 @@ from paper_search.application import (
     SnapshotRef,
     StructuredSearchResponse,
 )
+from paper_search.application.contracts import SearchErrorCode as ContractSearchErrorCode
 from paper_search.domain.models import (
     QueryAnalysisResult,
     QuerySpec,
@@ -32,6 +34,11 @@ class PrimitivePayload(BaseModel):
     digest: Sha256
     path: SafeRelativePath
     amount: MoneyCny
+
+
+def test_application_reexports_search_error_code() -> None:
+    assert application.SearchErrorCode is ContractSearchErrorCode
+    assert "SearchErrorCode" in application.__all__
 
 
 def _analysis() -> QueryAnalysisResult:

@@ -1373,7 +1373,6 @@ def _migration_identifiers(content: bytes, expected_count: int) -> list[str]:
 
 def _migration_partition(
     data_root: Path,
-    name: Literal["dev", "validation", "simulated_test"],
     partition: LegacyPartitionV1,
     *,
     stack: ExitStack,
@@ -1402,7 +1401,6 @@ def _migration_partition(
         or (policy == "reject" and any(not record.relevant_paper_ids for record in records))
     ):
         raise ValueError("freeze migration failed")
-    del name
     return gold_evidence.content, gold_evidence, ids_evidence
 
 
@@ -1608,7 +1606,7 @@ def migrate_v1_to_v2(
             evidence: list[BoundArtifact] = [current_artifact, legacy_report_evidence]
             for name in ("dev", "validation", "simulated_test"):
                 content, gold_evidence, ids_evidence = _migration_partition(
-                    root, name, v1.partitions[name], stack=stack
+                    root, v1.partitions[name], stack=stack
                 )
                 partition_content[name] = content
                 evidence.extend((gold_evidence, ids_evidence))

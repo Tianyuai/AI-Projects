@@ -110,6 +110,141 @@ def _write_bound_v2_tree(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     return data_root, manifest
 
 
+def _write_v2_manifest(data_root: Path, manifest: dict[str, object]) -> None:
+    (data_root / "manifest.json").write_bytes(_canonical_document(manifest))
+
+
+def _v2_report(
+    data_root: Path,
+    manifest: dict[str, object],
+) -> tuple[Path, dict[str, object]]:
+    approval_binding = manifest["approval"]
+    assert isinstance(approval_binding, dict)
+    report_path = data_root / str(approval_binding["report_path"])
+    report = json.loads(report_path.read_bytes())
+    assert isinstance(report, dict)
+    return report_path, report
+
+
+def _bind_v2_report(
+    data_root: Path,
+    manifest: dict[str, object],
+    report: dict[str, object],
+    *,
+    content: bytes | None = None,
+) -> None:
+    report_path, _ = _v2_report(data_root, manifest)
+    report_bytes = _canonical_document(report) if content is None else content
+    report_path.write_bytes(report_bytes)
+    approval_binding = manifest["approval"]
+    assert isinstance(approval_binding, dict)
+    approval_binding["report_sha256"] = _sha256(report_bytes)
+
+
+def _bind_v2_partition(
+    data_root: Path,
+    manifest: dict[str, object],
+    name: str,
+    content: bytes,
+    *,
+    query_count: int,
+) -> None:
+    partitions = manifest["partitions"]
+    assert isinstance(partitions, list)
+    partition = next(
+        item for item in partitions if isinstance(item, dict) and item["name"] == name
+    )
+    partition_path = data_root / str(partition["path"])
+    partition_path.write_bytes(content)
+    partition_hash = _sha256(content)
+    partition["sha256"] = partition_hash
+    partition["query_count"] = query_count
+    _, report = _v2_report(data_root, manifest)
+    partition_hashes = report["partition_hashes"]
+    assert isinstance(partition_hashes, dict)
+    partition_hashes[name] = partition_hash
+    _bind_v2_report(data_root, manifest, report)
+    hashes = {
+        str(item["name"]): str(item["sha256"])
+        for item in partitions
+        if isinstance(item, dict)
+    }
+    manifest["gold_sha256"] = canonical_gold_set_sha256(
+        hashes["dev"], hashes["validation"]
+    )
+
+
+def _bind_v2_identifier_map(
+    data_root: Path,
+    manifest: dict[str, object],
+    content: bytes,
+    *,
+    entry_count: int,
+) -> None:
+    binding = manifest["identifier_map"]
+    assert isinstance(binding, dict)
+    (data_root / str(binding["path"])).write_bytes(content)
+    identity = _sha256(content)
+    binding["sha256"] = identity
+    binding["entry_count"] = entry_count
+    _, report = _v2_report(data_root, manifest)
+    report["identifier_map_sha256"] = identity
+    _bind_v2_report(data_root, manifest, report)
+
+
+def _native_replace_windows(source: Path, target: Path) -> None:
+    import ctypes
+
+    class FileRenameInfoEx(ctypes.Structure):
+        _fields_ = [
+            ("flags", ctypes.c_uint32),
+            ("root_directory", ctypes.c_void_p),
+            ("file_name_length", ctypes.c_uint32),
+            ("file_name", ctypes.c_wchar * 1),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    handle = kernel32.CreateFileW(
+        str(source),
+        0x00010000,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle == invalid:
+        pytest.fail(f"CreateFileW failed: {ctypes.get_last_error()}")
+    target_bytes = (str(target) + "\0").encode("utf-16-le")
+    buffer = ctypes.create_string_buffer(
+        ctypes.sizeof(FileRenameInfoEx)
+        - ctypes.sizeof(ctypes.c_wchar)
+        + len(target_bytes)
+    )
+    request = FileRenameInfoEx.from_buffer(buffer)
+    request.flags = 0x00000001 | 0x00000002
+    request.root_directory = None
+    request.file_name_length = len(target_bytes) - 2
+    ctypes.memmove(
+        ctypes.addressof(buffer) + FileRenameInfoEx.file_name.offset,
+        target_bytes,
+        len(target_bytes),
+    )
+    try:
+        result = kernel32.SetFileInformationByHandle(
+            ctypes.c_void_p(handle), 22, ctypes.byref(request), len(buffer)
+        )
+        if not result:
+            error = ctypes.get_last_error()
+            if error in {1, 50, 87, 120}:
+                pytest.skip(f"FileRenameInfoEx unavailable: WinError {error}")
+            pytest.fail(f"FileRenameInfoEx failed: WinError {error}")
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
 def _legacy_manifest() -> dict[str, object]:
     digest = _sha256(b"evidence")
     return {
@@ -305,6 +440,124 @@ def test_loads_fully_bound_synthetic_versioned_v2_fixture(tmp_path: Path) -> Non
     assert manifest.partitions[0].name == "dev"
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "report_noncanonical",
+        "report_hash",
+        "report_non_utc",
+        "report_approver",
+        "report_audit",
+        "report_partition_binding",
+        "partition_hash",
+        "partition_count",
+        "partition_blank",
+        "partition_duplicate",
+        "partition_order",
+        "identifier_hash",
+        "identifier_count",
+        "identifier_duplicate_key",
+        "identifier_invalid_key",
+        "identifier_invalid_value",
+        "gold_mismatch",
+    ],
+)
+def test_v2_loader_rejects_complete_binding_mutation_matrix(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    data_root, manifest = _write_bound_v2_tree(tmp_path)
+    report_path, report = _v2_report(data_root, manifest)
+    partitions = manifest["partitions"]
+    identifier_map = manifest["identifier_map"]
+    approval_binding = manifest["approval"]
+    assert isinstance(partitions, list)
+    assert isinstance(identifier_map, dict)
+    assert isinstance(approval_binding, dict)
+    dev = next(
+        item for item in partitions if isinstance(item, dict) and item["name"] == "dev"
+    )
+
+    if mutation == "report_noncanonical":
+        _bind_v2_report(
+            data_root,
+            manifest,
+            report,
+            content=json.dumps(report, sort_keys=True, separators=(",", ":")).encode(),
+        )
+    elif mutation == "report_hash":
+        approval_binding["report_sha256"] = _sha256(b"different-report")
+    elif mutation == "report_non_utc":
+        report["approved_at"] = "2026-07-30T00:00:00"
+        _bind_v2_report(data_root, manifest, report)
+    elif mutation == "report_approver":
+        report["approver_ref"] = "different-operator"
+        _bind_v2_report(data_root, manifest, report)
+    elif mutation == "report_audit":
+        report["audit_sha256"] = _sha256(b"different-audit")
+        report_path.write_bytes(_canonical_document(report))
+    elif mutation == "report_partition_binding":
+        hashes = report["partition_hashes"]
+        assert isinstance(hashes, dict)
+        hashes["dev"] = _sha256(b"different-partition")
+        _bind_v2_report(data_root, manifest, report)
+    elif mutation == "partition_hash":
+        dev["sha256"] = _sha256(b"different-partition")
+    elif mutation == "partition_count":
+        dev["query_count"] = 2
+    elif mutation == "partition_blank":
+        _bind_v2_partition(
+            data_root,
+            manifest,
+            "dev",
+            (data_root / str(dev["path"])).read_bytes() + b"\n",
+            query_count=1,
+        )
+    elif mutation == "partition_duplicate":
+        row = (data_root / str(dev["path"])).read_bytes()
+        _bind_v2_partition(
+            data_root,
+            manifest,
+            "dev",
+            row + row,
+            query_count=2,
+        )
+    elif mutation == "partition_order":
+        partitions.reverse()
+    elif mutation == "identifier_hash":
+        identifier_map["sha256"] = _sha256(b"different-map")
+    elif mutation == "identifier_count":
+        identifier_map["entry_count"] = 2
+    elif mutation == "identifier_duplicate_key":
+        _bind_v2_identifier_map(
+            data_root,
+            manifest,
+            b'{"legacy:1":"canonical:1","legacy:1":"canonical:2"}',
+            entry_count=1,
+        )
+    elif mutation == "identifier_invalid_key":
+        _bind_v2_identifier_map(
+            data_root,
+            manifest,
+            b'{"":"canonical:1"}',
+            entry_count=1,
+        )
+    elif mutation == "identifier_invalid_value":
+        _bind_v2_identifier_map(
+            data_root,
+            manifest,
+            b'{"legacy:1":""}',
+            entry_count=1,
+        )
+    else:
+        manifest["gold_sha256"] = _sha256(b"different-gold-set")
+
+    _write_v2_manifest(data_root, manifest)
+
+    with pytest.raises(ValueError, match="freeze manifest is invalid"):
+        load_freeze_manifest(data_root / "manifest.json", data_root=data_root)
+
+
 def test_confined_report_publication_never_overwrites_different_existing_bytes(
     tmp_path: Path,
 ) -> None:
@@ -350,6 +603,166 @@ def test_confined_report_publication_leaves_no_final_file_on_write_failure(
         )
 
     assert not (data_root / "freeze_reports" / "approval.json").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX publisher cleanup contract")
+@pytest.mark.parametrize("failure_stage", ["fstat", "write", "fsync", "close"])
+def test_posix_report_publisher_cleans_owned_temp_at_earliest_failure_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    report_parent = data_root / "freeze_reports"
+    original_open = freeze_schema.os.open
+    original_fstat = freeze_schema.os.fstat
+    original_fsync = freeze_schema.os.fsync
+    original_close = freeze_schema.os.close
+    owned_descriptor: int | None = None
+    owned_path: Path | None = None
+    concurrent_owner = report_parent / "concurrent-owner.tmp"
+    concurrent_owner.write_bytes(b"concurrent-owner") if report_parent.exists() else None
+    parent_fsynced = False
+
+    def replace_owned_path() -> None:
+        nonlocal owned_path
+        if owned_path is None:
+            candidates = list(report_parent.glob(".approval.json.*.tmp"))
+            assert len(candidates) == 1
+            owned_path = candidates[0]
+        if not concurrent_owner.exists():
+            concurrent_owner.write_bytes(b"concurrent-owner")
+        os.replace(concurrent_owner, owned_path)
+
+    def capture_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal owned_descriptor
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if isinstance(path, str) and path.startswith(".approval.json.") and path.endswith(
+            ".tmp"
+        ):
+            owned_descriptor = descriptor
+        return descriptor
+
+    def fail_fstat(descriptor: int) -> os.stat_result:
+        if failure_stage == "fstat" and descriptor == owned_descriptor:
+            replace_owned_path()
+            raise OSError("synthetic fstat failure")
+        return original_fstat(descriptor)
+
+    def fail_write(descriptor: int, content: bytes) -> None:
+        if failure_stage == "write":
+            replace_owned_path()
+            raise OSError("synthetic write failure")
+        freeze_schema._write_descriptor(descriptor, content)
+
+    def fail_fsync(descriptor: int) -> None:
+        nonlocal parent_fsynced
+        if descriptor == owned_descriptor and failure_stage == "fsync":
+            replace_owned_path()
+            raise OSError("synthetic fsync failure")
+        if descriptor != owned_descriptor:
+            parent_fsynced = True
+        original_fsync(descriptor)
+
+    def fail_close(descriptor: int) -> None:
+        if descriptor == owned_descriptor and failure_stage == "close":
+            replace_owned_path()
+            original_close(descriptor)
+            raise OSError("synthetic close failure")
+        original_close(descriptor)
+
+    monkeypatch.setattr(freeze_schema.os, "open", capture_open)
+    monkeypatch.setattr(freeze_schema.os, "fstat", fail_fstat)
+    if failure_stage == "write":
+        monkeypatch.setattr(freeze_schema, "_write_descriptor", fail_write)
+    monkeypatch.setattr(freeze_schema.os, "fsync", fail_fsync)
+    monkeypatch.setattr(freeze_schema.os, "close", fail_close)
+
+    with pytest.raises(OSError, match=f"synthetic {failure_stage} failure"):
+        freeze_schema.publish_confined_bytes_no_overwrite(
+            data_root,
+            "freeze_reports/approval.json",
+            b"complete-report",
+        )
+
+    assert not (report_parent / "approval.json").exists()
+    assert owned_path is not None
+    assert owned_path.read_bytes() == b"concurrent-owner"
+    assert parent_fsynced
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX publisher durability contract")
+def test_posix_report_publisher_fsyncs_parent_after_partial_temp_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    calls: list[int] = []
+    original_fsync = freeze_schema.os.fsync
+
+    def record_fsync(descriptor: int) -> None:
+        calls.append(descriptor)
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(freeze_schema.os, "fsync", record_fsync)
+
+    assert (
+        publish_confined_bytes_no_overwrite(
+            data_root,
+            "freeze_reports/approval.json",
+            b"complete-report",
+        )
+        == "created"
+    )
+    assert len(calls) >= 2
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows FILE_ID publisher contract")
+def test_windows_report_publisher_rejects_replaced_temp_path_and_preserves_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    report_parent = data_root / "freeze_reports"
+    attacker = data_root / "attacker.tmp"
+    attacker.write_bytes(b"complete-report")
+    original_file_id = freeze_schema._windows_file_id
+    replaced_path: Path | None = None
+    replacement_done = False
+
+    def replace_after_retaining_id(handle: int) -> tuple[int, bytes]:
+        nonlocal replaced_path, replacement_done
+        identity = original_file_id(handle)
+        if not replacement_done:
+            candidates = list(report_parent.glob(".approval.json.*.tmp"))
+            assert len(candidates) == 1
+            replaced_path = candidates[0]
+            _native_replace_windows(attacker, replaced_path)
+            replacement_done = True
+        return identity
+
+    monkeypatch.setattr(freeze_schema, "_windows_file_id", replace_after_retaining_id)
+
+    with pytest.raises(ValueError, match="freeze manifest is invalid"):
+        publish_confined_bytes_no_overwrite(
+            data_root,
+            "freeze_reports/approval.json",
+            b"complete-report",
+        )
+
+    assert replacement_done
+    assert replaced_path is not None
+    assert replaced_path.read_bytes() == b"complete-report"
+    assert not (report_parent / "approval.json").exists()
 
 
 def test_v2_loader_rechecks_every_bound_artifact_after_validation(
@@ -453,62 +866,15 @@ def test_posix_bound_artifacts_own_ancestor_descriptors_until_closed(
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows FILE_ID_INFO")
 def test_windows_file_id_rejects_native_replacement_of_current_path(tmp_path: Path) -> None:
-    import ctypes
-
-    class FileRenameInfoEx(ctypes.Structure):
-        _fields_ = [
-            ("flags", ctypes.c_uint32),
-            ("root_directory", ctypes.c_void_p),
-            ("file_name_length", ctypes.c_uint32),
-            ("file_name", ctypes.c_wchar * 1),
-        ]
-
     data_root = tmp_path / "data"
     data_root.mkdir()
     manifest = data_root / "manifest.json"
     manifest.write_bytes(b"current")
     replacement = data_root / "replacement.tmp"
     replacement.write_bytes(b"replacement")
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype = ctypes.c_void_p
-    handle = kernel32.CreateFileW(
-        str(replacement),
-        0x00010000,
-        0x00000001 | 0x00000002 | 0x00000004,
-        None,
-        3,
-        0,
-        None,
-    )
-    invalid = ctypes.c_void_p(-1).value
-    if handle == invalid:
-        pytest.fail(f"CreateFileW failed: {ctypes.get_last_error()}")
-    target_bytes = (str(manifest) + "\0").encode("utf-16-le")
-    buffer = ctypes.create_string_buffer(
-        ctypes.sizeof(FileRenameInfoEx) - ctypes.sizeof(ctypes.c_wchar) + len(target_bytes)
-    )
-    request = FileRenameInfoEx.from_buffer(buffer)
-    request.flags = 0x00000001 | 0x00000002
-    request.root_directory = None
-    request.file_name_length = len(target_bytes) - 2
-    ctypes.memmove(
-        ctypes.addressof(buffer) + FileRenameInfoEx.file_name.offset,
-        target_bytes,
-        len(target_bytes),
-    )
-    try:
-        with open_confined_artifact(
-            data_root, "manifest.json", replaceable_manifest=True
-        ) as artifact:
-            result = kernel32.SetFileInformationByHandle(
-                ctypes.c_void_p(handle), 22, ctypes.byref(request), len(buffer)
-            )
-            if not result:
-                error = ctypes.get_last_error()
-                if error in {1, 50, 87, 120}:
-                    pytest.skip(f"FileRenameInfoEx unavailable: WinError {error}")
-                pytest.fail(f"FileRenameInfoEx failed: WinError {error}")
-            with pytest.raises(ValueError, match="freeze manifest is invalid"):
-                artifact.verify_path_identity()
-    finally:
-        kernel32.CloseHandle(ctypes.c_void_p(handle))
+    with open_confined_artifact(
+        data_root, "manifest.json", replaceable_manifest=True
+    ) as artifact:
+        _native_replace_windows(replacement, manifest)
+        with pytest.raises(ValueError, match="freeze manifest is invalid"):
+            artifact.verify_path_identity()

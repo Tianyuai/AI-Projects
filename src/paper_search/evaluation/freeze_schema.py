@@ -431,6 +431,67 @@ def _windows_file_id(handle: int) -> tuple[int, bytes]:
     return result.volume_serial_number, bytes(result.file_id.identifier)
 
 
+def _delete_windows_path_if_file_id(
+    path: Path,
+    expected_file_id: tuple[int, bytes],
+) -> None:
+    """Best-effort deletion of only the pathname entry owned by one FILE_ID."""
+    import ctypes
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("file_attributes", ctypes.c_uint32), ("reparse_tag", ctypes.c_uint32)]
+
+    class FileDispositionInfo(ctypes.Structure):
+        _fields_ = [("delete_file", ctypes.c_ubyte)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.restype = ctypes.c_void_p
+    get_handle_info = kernel32.GetFileInformationByHandleEx
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    set_handle_info = kernel32.SetFileInformationByHandle
+    invalid = ctypes.c_void_p(-1).value
+    handle = create_file(
+        str(path),
+        0x80000000 | 0x00010000,
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,
+        0x00200000,
+        None,
+    )
+    if handle == invalid:
+        return
+    try:
+        attributes = FileAttributeTagInfo()
+        buffer = ctypes.create_unicode_buffer(32768)
+        if (
+            not get_handle_info(
+                ctypes.c_void_p(handle),
+                9,
+                ctypes.byref(attributes),
+                ctypes.sizeof(attributes),
+            )
+            or attributes.file_attributes & 0x00000400
+            or not get_final_path(ctypes.c_void_p(handle), buffer, len(buffer), 0)
+            or _normalized_windows_path(buffer.value)
+            != _normalized_windows_path(str(path))
+            or _windows_file_id(int(handle)) != expected_file_id
+        ):
+            return
+        disposition = FileDispositionInfo(1)
+        set_handle_info(
+            ctypes.c_void_p(handle),
+            4,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        )
+    except OSError:
+        return
+    finally:
+        kernel32.CloseHandle(ctypes.c_void_p(handle))
+
+
 def _open_windows_confined(
     data_root: Path,
     relative_path: SafeRelativePath,
@@ -698,6 +759,7 @@ def publish_confined_bytes_no_overwrite(
         root_final = _normalized_windows_path(buffer.value)
         handles = [int(root_handle)]
         temporary_path: Path | None = None
+        retained_temp_id: tuple[int, bytes] | None = None
         try:
             parent = root
             for part in normalized.split("/")[:-1]:
@@ -749,9 +811,30 @@ def publish_confined_bytes_no_overwrite(
                     int(handle), os.O_WRONLY | getattr(os, "O_BINARY", 0)
                 )
                 handle = invalid
+                retained_temp_id = _windows_file_id(
+                    msvcrt.get_osfhandle(descriptor)
+                )
                 _write_descriptor(descriptor, content)
-                if _windows_file_id(msvcrt.get_osfhandle(descriptor)) is None:
-                    raise ValueError("freeze manifest is invalid")
+                temporary_relative = temporary_path.relative_to(root).as_posix()
+                (
+                    current_temp_descriptor,
+                    current_temp_ancestors,
+                    _,
+                    current_temp_id,
+                ) = _open_windows_confined(
+                    root,
+                    temporary_relative,
+                    allow_target_delete_share=True,
+                    allow_target_write_share=True,
+                )
+                try:
+                    if (
+                        current_temp_ancestors
+                        or current_temp_id != retained_temp_id
+                    ):
+                        raise ValueError("freeze manifest is invalid")
+                finally:
+                    os.close(current_temp_descriptor)
                 create_hard_link = kernel32.CreateHardLinkW
                 if not create_hard_link(str(target), str(temporary_path), None):
                     try:
@@ -764,7 +847,10 @@ def publish_confined_bytes_no_overwrite(
                 with open_confined_artifact(
                     root, normalized, allow_target_write_share=True
                 ) as artifact:
-                    if artifact.content != content:
+                    if (
+                        artifact.content != content
+                        or artifact.windows_file_id != retained_temp_id
+                    ):
                         raise ValueError("freeze manifest is invalid")
                 return "created"
             finally:
@@ -774,8 +860,11 @@ def publish_confined_bytes_no_overwrite(
                     kernel32.CloseHandle(ctypes.c_void_p(handle))
         finally:
             try:
-                if temporary_path is not None:
-                    temporary_path.unlink(missing_ok=True)
+                if temporary_path is not None and retained_temp_id is not None:
+                    _delete_windows_path_if_file_id(
+                        temporary_path,
+                        retained_temp_id,
+                    )
             finally:
                 for open_handle in reversed(handles):
                     kernel32.CloseHandle(ctypes.c_void_p(open_handle))
@@ -790,56 +879,67 @@ def publish_confined_bytes_no_overwrite(
             descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent_descriptor)
         except FileExistsError:  # pragma: no cover - a random retry is impractical to force
             raise RuntimeError("freeze manifest is invalid") from None
-        temporary_identity = os.fstat(descriptor)
-        status: Literal["created", "matched"]
+        temporary_identity: os.stat_result | None = None
         try:
-            _write_descriptor(descriptor, content)
-            observed = os.stat(
-                temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
-            )
-            if (observed.st_dev, observed.st_ino) != (
-                temporary_identity.st_dev,
-                temporary_identity.st_ino,
-            ):
-                raise ValueError("freeze manifest is invalid")
+            temporary_identity = os.fstat(descriptor)
+            status: Literal["created", "matched"]
             try:
-                os.link(
-                    temporary_name,
-                    filename,
-                    src_dir_fd=parent_descriptor,
-                    dst_dir_fd=parent_descriptor,
-                    follow_symlinks=False,
+                _write_descriptor(descriptor, content)
+                observed = os.stat(
+                    temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
                 )
-            except FileExistsError:
-                with open_confined_artifact(data_root, normalized) as artifact:
-                    if artifact.content == content:
-                        status = "matched"
-                    else:
-                        raise FileExistsError("refusing to overwrite frozen file")
-            else:
-                final_identity = os.stat(
-                    filename, dir_fd=parent_descriptor, follow_symlinks=False
-                )
-                if (final_identity.st_dev, final_identity.st_ino) != (
+                if (observed.st_dev, observed.st_ino) != (
                     temporary_identity.st_dev,
                     temporary_identity.st_ino,
                 ):
                     raise ValueError("freeze manifest is invalid")
-                status = "created"
+                try:
+                    os.link(
+                        temporary_name,
+                        filename,
+                        src_dir_fd=parent_descriptor,
+                        dst_dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                except FileExistsError:
+                    with open_confined_artifact(data_root, normalized) as artifact:
+                        if artifact.content == content:
+                            status = "matched"
+                        else:
+                            raise FileExistsError("refusing to overwrite frozen file")
+                else:
+                    final_identity = os.stat(
+                        filename, dir_fd=parent_descriptor, follow_symlinks=False
+                    )
+                    if (final_identity.st_dev, final_identity.st_ino) != (
+                        temporary_identity.st_dev,
+                        temporary_identity.st_ino,
+                    ):
+                        raise ValueError("freeze manifest is invalid")
+                    status = "created"
+            finally:
+                try:
+                    os.close(descriptor)
+                finally:
+                    try:
+                        observed = os.stat(
+                            temporary_name,
+                            dir_fd=parent_descriptor,
+                            follow_symlinks=False,
+                        )
+                        if (observed.st_dev, observed.st_ino) == (
+                            temporary_identity.st_dev,
+                            temporary_identity.st_ino,
+                        ):
+                            os.unlink(temporary_name, dir_fd=parent_descriptor)
+                    except FileNotFoundError:
+                        pass
         finally:
-            os.close(descriptor)
             try:
-                observed = os.stat(
-                    temporary_name, dir_fd=parent_descriptor, follow_symlinks=False
-                )
-                if (observed.st_dev, observed.st_ino) == (
-                    temporary_identity.st_dev,
-                    temporary_identity.st_ino,
-                ):
-                    os.unlink(temporary_name, dir_fd=parent_descriptor)
-            except FileNotFoundError:
-                pass
-        os.fsync(parent_descriptor)
+                if temporary_identity is None:
+                    os.close(descriptor)
+            finally:
+                os.fsync(parent_descriptor)
         return status
     finally:
         os.close(parent_descriptor)

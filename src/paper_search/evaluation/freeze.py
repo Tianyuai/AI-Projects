@@ -948,66 +948,6 @@ def _manifest_recovery_matches(
     return content == expected_bytes and _sha256_bytes(content) == expected_sha256
 
 
-def _restore_manifest_without_overwrite(
-    backup_path: Path,
-    manifest_path: Path,
-    *,
-    expected_identity: _FileIdentity,
-    expected_bytes: bytes,
-    expected_sha256: str,
-    retained_manifest: BoundArtifact | None,
-) -> bool:
-    if not _manifest_recovery_matches(
-        backup_path,
-        expected_identity=expected_identity,
-        expected_bytes=expected_bytes,
-        expected_sha256=expected_sha256,
-        retained_manifest=retained_manifest,
-    ):
-        return False
-    if manifest_path.exists():
-        try:
-            restored = manifest_path.samefile(backup_path)
-        except OSError:
-            return False
-    else:
-        try:
-            os.link(backup_path, manifest_path)
-        except OSError:
-            try:
-                restored = manifest_path.samefile(backup_path)
-            except OSError:
-                return False
-        else:
-            restored = True
-    if not restored:
-        return False
-    try:
-        manifest_content = manifest_path.read_bytes()
-        manifest_matches = (
-            manifest_path.samefile(backup_path)
-            and _state_matches_owned_file(
-                _probe_file_state(manifest_path),
-                expected_identity,
-            )
-            and manifest_content == expected_bytes
-            and _sha256_bytes(manifest_content) == expected_sha256
-            and _manifest_recovery_matches(
-                backup_path,
-                expected_identity=expected_identity,
-                expected_bytes=expected_bytes,
-                expected_sha256=expected_sha256,
-                retained_manifest=retained_manifest,
-            )
-        )
-    except OSError:
-        manifest_matches = False
-    if manifest_matches:
-        return True
-    _move_manifest_to_quarantine_no_overwrite(manifest_path)
-    return False
-
-
 def _rename_no_overwrite(
     source: Path,
     target: Path,
@@ -1334,7 +1274,6 @@ def _replace_manifest_guarded(
     backup_identity: _FileIdentity | None = None
     source_manifest_state: _FileState | None = None
     manifest_taken = False
-    published = False
     committed = False
     try:
         temporary_state = _file_state(os.fstat(descriptor))
@@ -1410,13 +1349,7 @@ def _replace_manifest_guarded(
                 try:
                     os.link(temporary_path, manifest_path)
                 except OSError:
-                    try:
-                        published = manifest_path.samefile(temporary_path)
-                    except OSError:
-                        published = False
                     raise
-                else:
-                    published = True
             except OSError:
                 raise RuntimeError("freeze approval failed") from None
         if not manifest_path.samefile(temporary_path) or manifest_path.read_bytes() != frozen_bytes:
@@ -1436,17 +1369,7 @@ def _replace_manifest_guarded(
             backup_identity = source_manifest_state.identity
             manifest_taken = True
         if not committed and manifest_taken:
-            if published:
-                _quarantine_published_manifest(manifest_path, temporary_path)
-            if backup_path is not None and backup_identity is not None:
-                _restore_manifest_without_overwrite(
-                    backup_path,
-                    manifest_path,
-                    expected_identity=backup_identity,
-                    expected_bytes=prepared_bytes,
-                    expected_sha256=prepared_sha256,
-                    retained_manifest=bound_manifest,
-                )
+            _quarantine_published_manifest(manifest_path, temporary_path)
         raise
     finally:
         if temporary_file is not None:

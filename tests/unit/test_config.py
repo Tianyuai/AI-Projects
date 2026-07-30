@@ -4,11 +4,13 @@ import pytest
 from pydantic import ValidationError
 
 import paper_search.config as config_module
+from paper_search.config import RuntimeConfig
 
 
-def load_runtime_config(*args: object, **kwargs: object) -> object:
-    assert hasattr(config_module, "load_runtime_config"), "load_runtime_config must be implemented"
-    return config_module.load_runtime_config(*args, **kwargs)
+def load_runtime_config(
+    path: str | Path, *, env_file: str | Path | None = ".env"
+) -> RuntimeConfig:
+    return config_module.load_runtime_config(path, env_file=env_file)
 
 
 def write_runtime_files(directory: Path, *, extra_base: str = "", budget: str = "") -> Path:
@@ -77,6 +79,23 @@ def test_config_hash_is_stable_and_excludes_secrets(tmp_path: Path) -> None:
 
     assert first_hash.startswith("sha256:")
     assert changed_secret.config_hash() == first_hash
+
+
+def test_config_hash_excludes_operational_artifact_root_but_not_runtime_behavior(
+    tmp_path: Path,
+) -> None:
+    config = load_runtime_config(write_runtime_files(tmp_path), env_file=None)
+    relocated = config.model_copy(
+        update={"runtime": config.runtime.model_copy(update={"artifact_root": Path("elsewhere")})}
+    )
+    changed_runtime_behavior = config.model_copy(
+        update={
+            "runtime": config.runtime.model_copy(update={"allow_live": True})
+        }
+    )
+
+    assert relocated.config_hash() == config.config_hash()
+    assert changed_runtime_behavior.config_hash() != config.config_hash()
 
 
 def test_embedding_config_defaults_off_and_is_hashed(tmp_path: Path) -> None:

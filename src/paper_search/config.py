@@ -129,9 +129,10 @@ class RuntimeConfig(BaseModel):
         public_config = self.model_dump(
             mode="json",
             exclude={
-                "openalex_api_key",
-                "semantic_scholar_api_key",
-                "llm_api_key",
+                "openalex_api_key": True,
+                "semantic_scholar_api_key": True,
+                "llm_api_key": True,
+                "runtime": {"artifact_root"},
             },
         )
         return canonical_config_hash(public_config)

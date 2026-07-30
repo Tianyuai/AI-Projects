@@ -4,22 +4,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime
+from pathlib import PurePosixPath
 from pathlib import Path
 from typing import Annotated, Literal
 
 import yaml
-from pydantic import Field, PositiveInt, TypeAdapter, model_validator
+from pydantic import ConfigDict, Field, PositiveInt, TypeAdapter, model_validator
 
 from paper_search.domain.models import DomainModel, NonEmptyStr, SafeRelativePath, Sha256
 
 
-class ArtifactBinding(DomainModel):
+class _LockModel(DomainModel):
+    """Strict model base for serialized lock identities only."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class ArtifactBinding(_LockModel):
     path: SafeRelativePath
     sha256: Sha256
 
 
-class FrozenDataBinding(DomainModel):
+class FrozenDataBinding(_LockModel):
     manifest: ArtifactBinding
     identifier_map: ArtifactBinding
     split: Literal["smoke", "dev", "validation"]
@@ -27,26 +35,35 @@ class FrozenDataBinding(DomainModel):
     partition_sha256: Sha256
 
 
-class CapturePolicyBinding(DomainModel):
+class CapturePolicyBinding(_LockModel):
     snapshot_schema: Literal["dependency-snapshot-v2"]
     capture_policy_sha256: Sha256
 
 
-class TimeoutBinding(DomainModel):
+class TimeoutBinding(_LockModel):
     connect_seconds: Literal[5]
     read_seconds: Literal[20]
     write_seconds: Literal[20]
     pool_seconds: Literal[5]
 
 
-class RetryBinding(DomainModel):
+class RetryBinding(_LockModel):
     max_attempts: Literal[3]
     retryable_statuses: tuple[Literal[429], Literal["5xx"]]
     retry_timeouts: Literal[True]
     backoff_rule: Literal["min(8,2^retry_index)+jitter[0,1)"]
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_yaml_sequence(cls, value: object) -> object:
+        """Accept YAML's sequence representation without coercing scalar values."""
 
-class PlannerBinding(DomainModel):
+        if isinstance(value, dict) and isinstance(value.get("retryable_statuses"), list):
+            return {**value, "retryable_statuses": tuple(value["retryable_statuses"])}
+        return value
+
+
+class PlannerBinding(_LockModel):
     prompt_config: ArtifactBinding
     normal_subqueries_min: Literal[3]
     normal_subqueries_max: Literal[5]
@@ -55,7 +72,7 @@ class PlannerBinding(DomainModel):
     rules_fallback_enabled: Literal[True]
 
 
-class RetrievalBinding(DomainModel):
+class RetrievalBinding(_LockModel):
     openalex_endpoint: Literal["/works"]
     semantic_scholar_endpoint: Literal["/graph/v1/paper/search"]
     openalex_calls_min: Literal[3]
@@ -67,7 +84,7 @@ class RetrievalBinding(DomainModel):
     max_output_papers: Literal[50]
 
 
-class BaselineOptionalModules(DomainModel):
+class BaselineOptionalModules(_LockModel):
     embedding: Literal[False]
     citation_expansion: Literal[False]
     constraint_reranking: Literal[False]
@@ -75,7 +92,7 @@ class BaselineOptionalModules(DomainModel):
     adaptive_evolution: Literal[False]
 
 
-class BaselineBinding(DomainModel):
+class BaselineBinding(_LockModel):
     primary_model: Literal["qwen3.7-plus"]
     fallback_model: Literal["qwen3.6-flash"]
     prompt_version: Literal["query-analyze-v1"]
@@ -87,7 +104,7 @@ class BaselineBinding(DomainModel):
     optional_modules: BaselineOptionalModules
 
 
-class _LiveInputLockBase(DomainModel):
+class _LiveInputLockBase(_LockModel):
     schema_version: Literal["integrated-lock-v1"]
     created_at: datetime
     source_git_sha: NonEmptyStr
@@ -124,7 +141,7 @@ class ValidationLock(_LiveInputLockBase):
         return self
 
 
-class ReplayLock(DomainModel):
+class ReplayLock(_LockModel):
     schema_version: Literal["integrated-lock-v1"]
     lock_kind: Literal["replay"]
     created_at: datetime
@@ -162,7 +179,9 @@ def _artifact_bindings(lock: InputLock) -> tuple[ArtifactBinding, ...]:
     )
 
 
-def _confined_artifact_path(artifact_root: Path, relative_path: SafeRelativePath) -> Path:
+def _preflight_artifact_root(artifact_root: Path, relative_path: SafeRelativePath) -> Path:
+    """Reject immediately-invalid paths without treating this check as approval."""
+
     root = artifact_root.resolve(strict=True)
     try:
         candidate = (root / relative_path).resolve(strict=True)
@@ -170,17 +189,149 @@ def _confined_artifact_path(artifact_root: Path, relative_path: SafeRelativePath
         raise ValueError(f"lock artifact does not exist: {relative_path}") from error
     if not candidate.is_relative_to(root):
         raise ValueError(f"lock artifact escapes artifact root: {relative_path}")
-    return candidate
+    return root
+
+
+def _read_all(file_descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while chunk := os.read(file_descriptor, 64 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _read_confined_bytes_posix(root: Path, relative_path: SafeRelativePath) -> bytes:
+    parts = PurePosixPath(relative_path).parts
+    if not parts:
+        raise ValueError(f"lock artifact does not exist: {relative_path}")
+    directory_flag = getattr(os, "O_DIRECTORY", None)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", None)
+    if directory_flag is None or nofollow_flag is None:
+        raise OSError("safe descriptor traversal is unavailable on this platform")
+    directory_flags = os.O_RDONLY | directory_flag | nofollow_flag
+    root_descriptor = os.open(root, directory_flags)
+    directory_descriptor = root_descriptor
+    directory_descriptors = [root_descriptor]
+    file_descriptor: int | None = None
+    try:
+        for part in parts[:-1]:
+            next_descriptor = os.open(part, directory_flags, dir_fd=directory_descriptor)
+            directory_descriptor = next_descriptor
+            directory_descriptors.append(directory_descriptor)
+        file_descriptor = os.open(
+            parts[-1], os.O_RDONLY | nofollow_flag, dir_fd=directory_descriptor
+        )
+        return _read_all(file_descriptor)
+    finally:
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        for descriptor in reversed(directory_descriptors):
+            os.close(descriptor)
+
+
+def _windows_open_handle(path: Path, *, directory: bool) -> int:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    flags = 0x00000080 | (0x02000000 if directory else 0)
+    handle = create_file(str(path), 0x80000000, 0x00000001, None, 3, flags, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise OSError(ctypes.get_last_error(), f"could not open lock artifact: {path}")
+    return int(handle)
+
+
+def _windows_close_handle(handle: int) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.CloseHandle(wintypes.HANDLE(handle)):
+        raise OSError(ctypes.get_last_error(), "could not close lock artifact handle")
+
+
+def _windows_final_path(handle: int) -> str:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    final_path = kernel32.GetFinalPathNameByHandleW
+    final_path.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    final_path.restype = wintypes.DWORD
+    size = 260
+    while True:
+        buffer = ctypes.create_unicode_buffer(size)
+        result = final_path(wintypes.HANDLE(handle), buffer, size, 0)
+        if result == 0:
+            raise OSError(ctypes.get_last_error(), "could not resolve lock artifact handle")
+        if result < size:
+            return buffer.value
+        size = result + 1
+
+
+def _windows_path_is_beneath(root: str, target: str) -> bool:
+    import ntpath
+
+    normalized_root = ntpath.normcase(ntpath.normpath(root))
+    normalized_target = ntpath.normcase(ntpath.normpath(target))
+    try:
+        return ntpath.commonpath([normalized_root, normalized_target]) == normalized_root
+    except ValueError:
+        return False
+
+
+def _read_confined_bytes_windows(root: Path, relative_path: SafeRelativePath) -> bytes:
+    import msvcrt
+
+    root_handle = _windows_open_handle(root, directory=True)
+    file_handle: int | None = None
+    try:
+        root_path = _windows_final_path(root_handle)
+        file_handle = _windows_open_handle(root / relative_path, directory=False)
+        target_path = _windows_final_path(file_handle)
+        if not _windows_path_is_beneath(root_path, target_path):
+            raise ValueError(f"lock artifact escapes artifact root: {relative_path}")
+        file_descriptor = msvcrt.open_osfhandle(file_handle, os.O_RDONLY | os.O_BINARY)
+        file_handle = None
+        try:
+            return _read_all(file_descriptor)
+        finally:
+            os.close(file_descriptor)
+    finally:
+        if file_handle is not None:
+            _windows_close_handle(file_handle)
+        _windows_close_handle(root_handle)
+
+
+def _read_confined_bytes(artifact_root: Path, relative_path: SafeRelativePath) -> bytes:
+    """Read one artifact once after handle-bound confinement verification."""
+
+    root = _preflight_artifact_root(artifact_root, relative_path)
+    try:
+        if os.name == "nt":
+            return _read_confined_bytes_windows(root, relative_path)
+        return _read_confined_bytes_posix(root, relative_path)
+    except OSError as error:
+        raise ValueError(f"could not safely read lock artifact: {relative_path}") from error
 
 
 def _verify_artifact_bindings(lock: InputLock, artifact_root: Path) -> None:
-    bytes_by_path: dict[Path, bytes] = {}
+    bytes_by_path: dict[SafeRelativePath, bytes] = {}
     for binding in _artifact_bindings(lock):
-        path = _confined_artifact_path(artifact_root, binding.path)
-        payload = bytes_by_path.get(path)
+        payload = bytes_by_path.get(binding.path)
         if payload is None:
-            payload = path.read_bytes()
-            bytes_by_path[path] = payload
+            payload = _read_confined_bytes(artifact_root, binding.path)
+            bytes_by_path[binding.path] = payload
         actual_sha256 = f"sha256:{hashlib.sha256(payload).hexdigest()}"
         if actual_sha256 != binding.sha256:
             raise ValueError(f"lock artifact hash mismatch: {binding.path}")

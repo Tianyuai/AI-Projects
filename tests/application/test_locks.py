@@ -9,6 +9,7 @@ import pytest
 import yaml
 from pydantic import TypeAdapter, ValidationError
 
+import paper_search.application.locks as locks_module
 from paper_search.application.locks import (
     CandidateLock,
     InputLock,
@@ -151,7 +152,7 @@ def test_loader_discriminates_lock_kind_and_hashes_canonical_bytes(
 
 
 def test_candidate_and_validation_reject_snapshot_fields() -> None:
-    adapter = TypeAdapter(InputLock)
+    adapter: TypeAdapter[CandidateLock | ValidationLock | ReplayLock] = TypeAdapter(InputLock)
     for fixture_name in ("candidate.lock.yaml", "validation.lock.yaml"):
         raw = fixture_data(fixture_name)
         raw["snapshot_set_id"] = "forbidden"
@@ -162,7 +163,7 @@ def test_candidate_and_validation_reject_snapshot_fields() -> None:
 
 
 def test_replay_requires_snapshot_manifest_fields() -> None:
-    adapter = TypeAdapter(InputLock)
+    adapter: TypeAdapter[CandidateLock | ValidationLock | ReplayLock] = TypeAdapter(InputLock)
     raw = fixture_data("replay.lock.yaml")
     raw.pop("snapshot_set_id")
     raw.pop("snapshot_manifest_sha256")
@@ -227,25 +228,81 @@ def test_loader_rejects_symlink_escape_when_supported(tmp_path: Path) -> None:
         load_input_lock(lock_path, artifact_root=root)
 
 
+def test_loader_rejects_swap_after_preflight_before_artifact_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "artifacts"
+    lock_path, raw = write_lock(tmp_path, "candidate.lock.yaml")
+    target = root / "configs" / "budget_balanced.yaml"
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("outside\n", encoding="utf-8")
+    raw["budget_config"]["sha256"] = sha256(outside.read_bytes())
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+    original_resolve = Path.resolve
+    swapped = False
+
+    def swap_after_preflight(path: Path, strict: bool = False) -> Path:
+        nonlocal swapped
+        resolved = original_resolve(path, strict=strict)
+        if path == target and not swapped:
+            try:
+                target.unlink()
+                target.symlink_to(outside)
+            except OSError:
+                pytest.skip("symlink creation is unavailable on this platform")
+            swapped = True
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", swap_after_preflight)
+
+    with pytest.raises(ValueError, match="artifact root|symlink|escape"):
+        load_input_lock(lock_path, artifact_root=root)
+
+    assert swapped
+
+
 def test_loader_reads_a_referenced_artifact_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     lock_path, raw = write_lock(tmp_path, "candidate.lock.yaml")
     raw["pricing_policy"] = deepcopy(raw["budget_config"])
     lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    budget_path = (tmp_path / "artifacts" / "configs" / "budget_balanced.yaml").resolve()
-    original_read_bytes = Path.read_bytes
+    original_read = locks_module._read_confined_bytes
     reads = 0
 
-    def counted_read_bytes(path: Path) -> bytes:
+    def counted_read(root: Path, relative_path: str) -> bytes:
         nonlocal reads
-        if path.resolve() == budget_path:
+        if relative_path == "configs/budget_balanced.yaml":
             reads += 1
-        return original_read_bytes(path)
+        return original_read(root, relative_path)
 
-    monkeypatch.setattr(Path, "read_bytes", counted_read_bytes)
+    monkeypatch.setattr(locks_module, "_read_confined_bytes", counted_read)
 
     load_input_lock(lock_path, artifact_root=tmp_path / "artifacts")
 
     assert reads == 1
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("frozen_data", "query_count"), "2"),
+        (("runtime_allow_live",), "true"),
+        (("baseline", "timeout", "connect_seconds"), "5"),
+        (("baseline", "retry", "retry_timeouts"), "true"),
+    ],
+)
+def test_lock_models_reject_coercible_scalar_values(
+    path: tuple[str, ...], value: object
+) -> None:
+    raw = fixture_data("candidate.lock.yaml")
+    target: dict[str, Any] = raw
+    for key in path[:-1]:
+        nested = target[key]
+        assert isinstance(nested, dict)
+        target = nested
+    target[path[-1]] = value
+
+    with pytest.raises(ValidationError):
+        TypeAdapter(InputLock).validate_python(raw)
 
 
 def test_lock_hash_changes_when_each_top_level_lock_field_changes(tmp_path: Path) -> None:

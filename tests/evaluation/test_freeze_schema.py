@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import paper_search.evaluation.freeze_schema as freeze_schema
 from paper_search.evaluation.freeze_schema import (
     FreezeManifestV1,
     FreezeManifestV2,
     FrozenPartitionV2,
     canonical_gold_set_sha256,
     load_freeze_manifest,
+    open_confined_artifact,
     publish_confined_bytes_no_overwrite,
 )
 
@@ -325,3 +328,92 @@ def test_confined_report_publication_never_overwrites_different_existing_bytes(
             data_root, "freeze_reports/approval.json", b"different"
         )
     assert (data_root / "freeze_reports" / "approval.json").read_bytes() == b"first"
+
+
+def test_confined_report_publication_leaves_no_final_file_on_write_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed report write cannot reserve a partially written authority file."""
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+
+    def fail_after_partial_write(descriptor: int, content: bytes) -> None:
+        os.write(descriptor, content[:1])
+        raise OSError("synthetic write failure")
+
+    monkeypatch.setattr(freeze_schema, "_write_descriptor", fail_after_partial_write)
+
+    with pytest.raises(OSError, match="synthetic write failure"):
+        publish_confined_bytes_no_overwrite(
+            data_root, "freeze_reports/approval.json", b"complete-report"
+        )
+
+    assert not (data_root / "freeze_reports" / "approval.json").exists()
+
+
+def test_v2_loader_rechecks_every_bound_artifact_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loader forms one held-descriptor snapshot before it authorizes V2."""
+    data_root, _ = _write_bound_v2_tree(tmp_path)
+    original = freeze_schema.BoundArtifact.verify_path_identity
+    checked: list[str] = []
+
+    def record_check(artifact: freeze_schema.BoundArtifact) -> None:
+        checked.append(str(artifact.relative_path))
+        original(artifact)
+
+    monkeypatch.setattr(freeze_schema.BoundArtifact, "verify_path_identity", record_check)
+
+    load_freeze_manifest(data_root / "manifest.json", data_root=data_root)
+
+    assert checked == [
+        "manifest.json",
+        "freeze_reports/approval.json",
+        "dev/gold.jsonl",
+        "validation/gold.jsonl",
+        "identifier-map.json",
+    ]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing contract")
+def test_only_current_manifest_may_opt_in_to_delete_sharing_for_guarded_replace(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    manifest = data_root / "manifest.json"
+    manifest.write_bytes(b"current")
+    backup = data_root / "backup.json"
+
+    with open_confined_artifact(
+        data_root, "manifest.json", replaceable_manifest=True
+    ) as artifact:
+        os.replace(manifest, backup)
+        assert artifact.content == b"current"
+
+    assert backup.read_bytes() == b"current"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing contract")
+def test_normal_evidence_cannot_be_replaced_while_bound(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    parent = data_root / "evidence"
+    parent.mkdir()
+    evidence = parent / "evidence.json"
+    evidence.write_bytes(b"current")
+    replacement = parent / "replacement.tmp"
+    replacement.write_bytes(b"different")
+
+    with open_confined_artifact(data_root, "evidence/evidence.json"):
+        with pytest.raises(PermissionError):
+            os.replace(replacement, evidence)
+        with pytest.raises(PermissionError):
+            os.replace(parent, data_root / "evidence-renamed")
+        with pytest.raises(PermissionError):
+            os.replace(data_root, tmp_path / "data-renamed")
+
+    assert evidence.read_bytes() == b"current"

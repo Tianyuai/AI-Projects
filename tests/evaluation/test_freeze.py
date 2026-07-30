@@ -31,6 +31,7 @@ from paper_search.evaluation.freeze_schema import (
     IdentifierMapBindingV2,
     FreezeManifestV2,
     load_freeze_manifest,
+    open_confined_artifact,
 )
 
 
@@ -267,6 +268,24 @@ def _approval_plan(fixture: PreparedFixture) -> FreezeApprovalPlan:
         audit,
         report_relative_path="freeze_reports/synthetic-freeze.json",
     )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing contract")
+def test_windows_lock_stabilizes_root_during_replaceable_manifest_transition(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    manifest = data_root / "manifest.json"
+    manifest.write_bytes(b"current")
+
+    with freeze_module._exclusive_freeze_lock(data_root):
+        with open_confined_artifact(
+            data_root, "manifest.json", replaceable_manifest=True
+        ):
+            os.replace(manifest, data_root / "manifest.backup.json")
+            with pytest.raises(PermissionError):
+                os.replace(data_root, tmp_path / "data-renamed")
 
 
 def test_migrate_approved_v1_freeze_to_v2_with_bound_evidence(tmp_path: Path) -> None:

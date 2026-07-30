@@ -8,6 +8,7 @@ from paper_search.api.contracts import (
     ReadyHealthResponse,
     SearchRequest,
 )
+from paper_search.domain.models import DependencyStatus
 
 
 def test_search_request_has_prd_defaults_and_strips_identity() -> None:
@@ -44,7 +45,18 @@ def test_health_contracts_are_strict() -> None:
         status="degraded",
         execution_mode="replay",
         snapshot_set_id="mock-snapshot-v1",
-        dependencies=[],
+        dependencies=[
+            DependencyStatus(dependency="llm", state="degraded", cache_hit=False, error_codes=[]),
+            DependencyStatus(
+                dependency="openalex", state="degraded", cache_hit=False, error_codes=[]
+            ),
+            DependencyStatus(
+                dependency="semantic_scholar",
+                state="degraded",
+                cache_hit=False,
+                error_codes=[],
+            ),
+        ],
         last_authorized_probe_at=None,
     )
 
@@ -52,7 +64,21 @@ def test_health_contracts_are_strict() -> None:
         "status": "degraded",
         "execution_mode": "replay",
         "snapshot_set_id": "mock-snapshot-v1",
-        "dependencies": [],
+        "dependencies": [
+            {"dependency": "llm", "state": "degraded", "cache_hit": False, "error_codes": []},
+            {
+                "dependency": "openalex",
+                "state": "degraded",
+                "cache_hit": False,
+                "error_codes": [],
+            },
+            {
+                "dependency": "semantic_scholar",
+                "state": "degraded",
+                "cache_hit": False,
+                "error_codes": [],
+            },
+        ],
         "last_authorized_probe_at": None,
     }
     with pytest.raises(ValidationError):

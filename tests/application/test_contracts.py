@@ -69,7 +69,7 @@ def _dependency_statuses() -> list[DependencyStatus]:
     ]
 
 
-def _response(**updates: object) -> StructuredSearchResponse:
+def _response_payload(**updates: object) -> dict[str, object]:
     values: dict[str, object] = {
         "run_id": "run-1",
         "query_id": "query-1",
@@ -94,6 +94,11 @@ def _response(**updates: object) -> StructuredSearchResponse:
         "git_sha": "abc1234",
     }
     values.update(updates)
+    return values
+
+
+def _response(**updates: object) -> StructuredSearchResponse:
+    values = _response_payload(**updates)
     return StructuredSearchResponse.model_validate(values)
 
 
@@ -194,6 +199,10 @@ def test_dependency_order_and_planner_invariants_are_enforced() -> None:
     with pytest.raises(ValidationError):
         _response(dependency_status=list(reversed(_dependency_statuses())))
     with pytest.raises(ValidationError):
+        _response(dependency_status=[])
+    with pytest.raises(ValidationError):
+        _response(dependency_status=_dependency_statuses()[:2])
+    with pytest.raises(ValidationError):
         _response(planner_status="primary", planner_fallback=True)
     with pytest.raises(ValidationError):
         _response(planner_status="rules_fallback", planner_fallback=False, is_partial=True)
@@ -201,6 +210,29 @@ def test_dependency_order_and_planner_invariants_are_enforced() -> None:
         _response(planner_status="rules_fallback", planner_fallback=True, is_partial=False)
     with pytest.raises(ValidationError):
         _response(planner_status="rules_fallback", planner_fallback=True, is_partial=True)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "run_id",
+        "execution_mode",
+        "snapshot_set_id",
+        "snapshot_captured_at",
+        "planner_fallback",
+        "planner_status",
+        "dependency_status",
+        "prompt_version",
+    ],
+)
+def test_structured_response_requires_all_normative_metadata(
+    field_name: str,
+) -> None:
+    payload = _response_payload()
+    payload.pop(field_name)
+
+    with pytest.raises(ValidationError):
+        StructuredSearchResponse.model_validate(payload)
 
 
 def test_ready_health_uses_canonical_dependency_order() -> None:
@@ -219,5 +251,21 @@ def test_ready_health_uses_canonical_dependency_order() -> None:
             execution_mode="replay",
             snapshot_set_id="snapshot-v1",
             dependencies=list(reversed(_dependency_statuses())),
+            last_authorized_probe_at=None,
+        )
+    with pytest.raises(ValidationError):
+        ReadyHealthResponse(
+            status="ready",
+            execution_mode="replay",
+            snapshot_set_id="snapshot-v1",
+            dependencies=[],
+            last_authorized_probe_at=None,
+        )
+    with pytest.raises(ValidationError):
+        ReadyHealthResponse(
+            status="ready",
+            execution_mode="replay",
+            snapshot_set_id="snapshot-v1",
+            dependencies=_dependency_statuses()[1:],
             last_authorized_probe_at=None,
         )

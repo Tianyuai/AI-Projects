@@ -262,9 +262,7 @@ _DEPENDENCY_ORDER = {"llm": 0, "openalex": 1, "semantic_scholar": 2}
 
 def validate_dependency_status_order(statuses: list[DependencyStatus]) -> None:
     dependencies = [status.dependency for status in statuses]
-    if len(set(dependencies)) != len(dependencies) or dependencies != sorted(
-        dependencies, key=_DEPENDENCY_ORDER.__getitem__
-    ):
+    if dependencies != list(_DEPENDENCY_ORDER):
         raise ValueError(
             "dependency status order must be llm, openalex, semantic_scholar"
         )
@@ -301,11 +299,11 @@ class QueryAnalysisResult(DomainModel):
 
 
 class StructuredSearchResponse(DomainModel):
-    run_id: NonEmptyStr = "legacy-run"
+    run_id: NonEmptyStr
     query_id: NonEmptyStr
-    execution_mode: SearchMode = "replay"
-    snapshot_set_id: NonEmptyStr = "legacy-snapshot"
-    snapshot_captured_at: datetime | None = None
+    execution_mode: SearchMode
+    snapshot_set_id: NonEmptyStr
+    snapshot_captured_at: datetime | None
     query_analysis: QueryAnalysisResult
     selected_paper_ids: list[NonEmptyStr]
     high_relevance: list[RankedPaper]
@@ -315,11 +313,11 @@ class StructuredSearchResponse(DomainModel):
     usage: UsageActual
     stop_reason: NonEmptyStr
     is_partial: bool
-    planner_fallback: bool = False
-    planner_status: PlannerStatus = "primary"
-    dependency_status: list[DependencyStatus] = Field(default_factory=list)
+    planner_fallback: bool
+    planner_status: PlannerStatus
+    dependency_status: list[DependencyStatus]
     warnings: list[NonEmptyStr]
-    prompt_version: NonEmptyStr = "legacy-prompt"
+    prompt_version: NonEmptyStr
     config_hash: Sha256
     git_sha: NonEmptyStr
 

@@ -9,6 +9,7 @@ import pytest
 
 from paper_search.api.contracts import SearchRequest
 from paper_search.domain.models import (
+    DependencyStatus,
     QueryAnalysisResult,
     QuerySpec,
     SearchPlan,
@@ -31,7 +32,11 @@ def _response(request: SearchRequest, paper_ids: list[str]) -> StructuredSearchR
         research_goal="synthetic baseline",
     )
     return StructuredSearchResponse(
+        run_id=f"synthetic-run-{request.query_id}",
         query_id=request.query_id,
+        execution_mode="replay",
+        snapshot_set_id="synthetic-snapshot-v1",
+        snapshot_captured_at=None,
         query_analysis=QueryAnalysisResult(
             query_spec=spec,
             search_plan=SearchPlan(
@@ -57,7 +62,22 @@ def _response(request: SearchRequest, paper_ids: list[str]) -> StructuredSearchR
         usage=UsageActual(),
         stop_reason="completed",
         is_partial=False,
+        planner_fallback=False,
+        planner_status="primary",
+        dependency_status=[
+            DependencyStatus(dependency="llm", state="replayed", cache_hit=True, error_codes=[]),
+            DependencyStatus(
+                dependency="openalex", state="replayed", cache_hit=True, error_codes=[]
+            ),
+            DependencyStatus(
+                dependency="semantic_scholar",
+                state="replayed",
+                cache_hit=True,
+                error_codes=[],
+            ),
+        ],
         warnings=[],
+        prompt_version="synthetic-baseline-v1",
         config_hash="sha256:" + "a" * 64,
         git_sha="synthetic-task8c",
     )

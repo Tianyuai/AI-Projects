@@ -234,7 +234,11 @@ def test_structured_response_resolves_forward_references() -> None:
     ranked = models.RankedPaper(paper=make_paper(models), evidence=make_evidence(models))
 
     response = models.StructuredSearchResponse(
+        run_id="unit-run-1",
         query_id="q-1",
+        execution_mode="replay",
+        snapshot_set_id="unit-snapshot-v1",
+        snapshot_captured_at=None,
         query_analysis=make_query_analysis(models),
         selected_paper_ids=["doi:10.1/example"],
         high_relevance=[ranked],
@@ -244,7 +248,24 @@ def test_structured_response_resolves_forward_references() -> None:
         usage=models.UsageActual(),
         stop_reason="completed",
         is_partial=False,
+        planner_fallback=False,
+        planner_status="primary",
+        dependency_status=[
+            models.DependencyStatus(
+                dependency="llm", state="replayed", cache_hit=True, error_codes=[]
+            ),
+            models.DependencyStatus(
+                dependency="openalex", state="replayed", cache_hit=True, error_codes=[]
+            ),
+            models.DependencyStatus(
+                dependency="semantic_scholar",
+                state="replayed",
+                cache_hit=True,
+                error_codes=[],
+            ),
+        ],
         warnings=[],
+        prompt_version="query-analyze-v1",
         config_hash="sha256:" + "a" * 64,
         git_sha="abc1234",
     )

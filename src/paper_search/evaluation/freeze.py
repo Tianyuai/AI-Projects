@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 
+import errno
 import hashlib
 import json
 import os
+import secrets
 import stat
 import sys
 import tempfile
@@ -909,18 +911,100 @@ def _restore_manifest_without_overwrite(
         os.link(backup_path, manifest_path)
         return manifest_path.samefile(backup_path)
     except OSError:
-        return manifest_path.exists()
+        try:
+            return manifest_path.samefile(backup_path)
+        except OSError:
+            return False
 
 
-def _remove_own_published_manifest(
+def _rename_no_overwrite(
+    source: Path,
+    target: Path,
+) -> Literal["moved", "collision", "failed"]:
+    if os.name == "nt":
+        try:
+            os.rename(source, target)
+        except FileExistsError:
+            return "collision"
+        except OSError:
+            return "failed"
+        return "moved"
+
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    target_bytes = os.fsencode(target)
+    if sys.platform == "darwin":
+        renamex_np = getattr(libc, "renamex_np", None)
+        if renamex_np is None:
+            return "failed"
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+        result = renamex_np(source_bytes, target_bytes, 0x00000004)
+    else:
+        renameat2 = getattr(libc, "renameat2", None)
+        if renameat2 is None:
+            return "failed"
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(
+            -100,
+            source_bytes,
+            -100,
+            target_bytes,
+            0x00000001,
+        )
+    if result == 0:
+        return "moved"
+    return "collision" if ctypes.get_errno() == errno.EEXIST else "failed"
+
+
+def _move_manifest_to_quarantine_no_overwrite(
+    manifest_path: Path,
+) -> Path | None:
+    for _ in range(8):
+        quarantine = manifest_path.with_name(
+            f".{manifest_path.name}.rollback.{secrets.token_hex(16)}.tmp"
+        )
+        outcome = _rename_no_overwrite(manifest_path, quarantine)
+        if outcome == "moved":
+            return quarantine
+        if outcome == "failed":
+            return None
+    return None
+
+
+def _quarantine_published_manifest(
     manifest_path: Path,
     temporary_path: Path,
-) -> None:
+) -> Path | None:
+    """Move the current owner aside before deciding whether it is ours."""
+    quarantine = _move_manifest_to_quarantine_no_overwrite(manifest_path)
+    if quarantine is None:
+        return None
     try:
-        if manifest_path.samefile(temporary_path):
-            manifest_path.unlink()
+        own_published_inode = quarantine.samefile(temporary_path)
     except OSError:
-        return
+        return quarantine
+    if own_published_inode:
+        return quarantine
+    try:
+        os.link(quarantine, manifest_path)
+    except OSError:
+        return quarantine
+    try:
+        if not manifest_path.samefile(quarantine):
+            return quarantine
+    except OSError:
+        return quarantine
+    return quarantine
 
 
 def _best_effort_unlink(path: Path) -> None:
@@ -1138,7 +1222,7 @@ def _replace_manifest_guarded(
     except BaseException:
         if not committed and manifest_taken:
             if published:
-                _remove_own_published_manifest(manifest_path, temporary_path)
+                _quarantine_published_manifest(manifest_path, temporary_path)
             preserve_backup = not _restore_manifest_without_overwrite(
                 backup_path,
                 manifest_path,

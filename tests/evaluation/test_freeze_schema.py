@@ -720,6 +720,52 @@ def test_posix_report_publisher_cleans_owned_temp_at_earliest_failure_boundary(
     assert parent_fsynced
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX initial fstat cleanup contract")
+def test_posix_initial_fstat_failure_may_retain_unowned_non_authoritative_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    report_parent = data_root / "freeze_reports"
+    original_open = freeze_schema.os.open
+    original_fstat = freeze_schema.os.fstat
+    temporary_descriptor: int | None = None
+
+    def capture_open(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal temporary_descriptor
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        if isinstance(path, str) and path.startswith(".approval.json."):
+            temporary_descriptor = descriptor
+        return descriptor
+
+    def fail_initial_fstat(descriptor: int) -> os.stat_result:
+        if descriptor == temporary_descriptor:
+            raise OSError("synthetic initial fstat failure")
+        return original_fstat(descriptor)
+
+    monkeypatch.setattr(freeze_schema.os, "open", capture_open)
+    monkeypatch.setattr(freeze_schema.os, "fstat", fail_initial_fstat)
+
+    with pytest.raises(OSError, match="synthetic initial fstat failure"):
+        publish_confined_bytes_no_overwrite(
+            data_root,
+            "freeze_reports/approval.json",
+            b"complete-report",
+        )
+
+    assert not (report_parent / "approval.json").exists()
+    retained = list(report_parent.glob(".approval.json.*.tmp"))
+    assert len(retained) == 1
+    assert retained[0].read_bytes() == b""
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX publisher durability contract")
 def test_posix_report_publisher_fsyncs_parent_after_partial_temp_cleanup(
     tmp_path: Path,

@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 import httpx
 
 from paper_search.domain.models import BudgetReservation, UsageEstimate
-from paper_search.llm.client import OpenAICompatibleLLMClient
+from paper_search.llm.client import LLMResponseDecoder, OpenAICompatibleLLMClient
 
 
 API_KEY = "unit-test-secret"
@@ -177,3 +177,25 @@ def test_timeout_is_bounded_and_structured() -> None:
     assert result.errors[0].retryable is True
     assert result.usage.llm_calls == 1
     assert API_KEY not in result.model_dump_json()
+
+
+def test_pure_decoder_does_not_require_transport_or_credentials() -> None:
+    raw = json.dumps(
+        {
+            "choices": [{"message": {"content": json.dumps({"ok": True})}}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        }
+    ).encode()
+
+    result = LLMResponseDecoder().decode(
+        raw,
+        model_id="fixture-model",
+        captured_at=datetime(2026, 8, 1, tzinfo=UTC),
+        cache_hit=True,
+        snapshot_ref=None,
+    )
+
+    assert result.data == {"ok": True}
+    assert result.cache_hit is True
+    assert result.usage.input_tokens == 2
+    assert result.usage.output_tokens == 1

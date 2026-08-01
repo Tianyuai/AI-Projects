@@ -9,12 +9,36 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from paper_search.domain.models import ProviderResult, QueryAnalysisResult, QuerySpec
+from paper_search.domain.models import (
+    PlannerStatus,
+    ProviderResult,
+    QueryAnalysisResult,
+    QuerySpec,
+)
 from paper_search.query.planner import QueryPlanner
 
 
 Repair = Callable[[str], Awaitable[ProviderResult[dict[str, Any]]]]
 _KNOWN_VENUES = ("NeurIPS", "ICLR", "ICML", "ACL", "EMNLP", "CVPR")
+_MALFORMED_CONTENT_CODES = {"invalid_response", "empty_response", "invalid_json"}
+
+
+class PlannerDependencyError(RuntimeError):
+    """A sanitized transport or authentication failure that forbids fallback."""
+
+
+class ClassifiedQueryAnalysis(QueryAnalysisResult):
+    planner_status: PlannerStatus
+
+
+def _require_content_failure(result: ProviderResult[dict[str, Any]]) -> None:
+    blocking = [
+        error.code
+        for error in result.errors
+        if error.code not in _MALFORMED_CONTENT_CODES
+    ]
+    if blocking:
+        raise PlannerDependencyError(f"planner dependency failure: {blocking[0]}")
 
 
 def rule_fallback(query: str) -> QuerySpec:
@@ -53,12 +77,19 @@ class QueryParser:
     def __init__(self, planner: QueryPlanner) -> None:
         self._planner = planner
 
-    def _validate(self, query: str, data: dict[str, Any]) -> QueryAnalysisResult:
+    def _validate(
+        self,
+        query: str,
+        data: dict[str, Any],
+        *,
+        status: PlannerStatus,
+    ) -> ClassifiedQueryAnalysis:
         analysis = QueryAnalysisResult.model_validate(data)
         spec = analysis.query_spec.model_copy(update={"original_query": " ".join(query.split())})
-        return QueryAnalysisResult(
+        return ClassifiedQueryAnalysis(
             query_spec=spec,
             search_plan=self._planner.finalize(spec, analysis.search_plan),
+            planner_status=status,
         )
 
     async def parse(
@@ -67,25 +98,36 @@ class QueryParser:
         initial: ProviderResult[dict[str, Any]],
         *,
         repair: Repair | None = None,
-    ) -> QueryAnalysisResult:
+    ) -> ClassifiedQueryAnalysis:
         normalized = " ".join(query.split())
         if not normalized:
             raise ValueError("query must not be empty")
+        _require_content_failure(initial)
         try:
-            return self._validate(normalized, initial.data)
+            return self._validate(normalized, initial.data, status="primary")
         except (ValidationError, ValueError):
             pass
 
         if repair is not None:
             repair_input = json.dumps(initial.data, ensure_ascii=False, sort_keys=True)
             repaired = await repair(repair_input)
+            _require_content_failure(repaired)
             try:
-                return self._validate(normalized, repaired.data)
+                return self._validate(normalized, repaired.data, status="repaired")
             except (ValidationError, ValueError):
                 pass
 
         spec = rule_fallback(normalized)
-        return QueryAnalysisResult(
+        return ClassifiedQueryAnalysis(
             query_spec=spec,
             search_plan=self._planner.finalize(spec, None),
+            planner_status="rules_fallback",
         )
+
+
+__all__ = [
+    "ClassifiedQueryAnalysis",
+    "PlannerDependencyError",
+    "QueryParser",
+    "rule_fallback",
+]

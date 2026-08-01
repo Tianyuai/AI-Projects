@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 
 import pytest
 
-from paper_search.domain.models import ProviderResult, UsageActual
-from paper_search.query.parser import QueryParser
+from paper_search.domain.models import ErrorDetail, ProviderResult, UsageActual
+from paper_search.query.parser import PlannerDependencyError, QueryParser
 from paper_search.query.planner import QueryPlanner
 
 
@@ -89,6 +89,7 @@ def test_valid_payload_uses_existing_domain_models() -> None:
     assert result.query_spec.year_from == 2021
     assert result.search_plan.inherited_hard_filters["venues"] == ["NeurIPS"]
     assert len(result.search_plan.subqueries) == 3
+    assert result.planner_status == "primary"
 
 
 def test_invalid_payload_is_repaired_once() -> None:
@@ -110,6 +111,7 @@ def test_invalid_payload_is_repaired_once() -> None:
 
     assert calls == 1
     assert result.query_spec.research_goal == "Find graph retrieval papers"
+    assert result.planner_status == "repaired"
 
 
 def test_failed_repair_uses_deterministic_rule_fallback() -> None:
@@ -132,6 +134,39 @@ def test_failed_repair_uses_deterministic_rule_fallback() -> None:
     assert first.query_spec.venues == ["NeurIPS"]
     assert first.query_spec.exclusions == ["surveys"]
     assert 3 <= len(first.search_plan.subqueries) <= 5
+    assert first.planner_status == "rules_fallback"
+
+
+@pytest.mark.parametrize("code", ["timeout", "network_error", "authentication_error"])
+def test_transport_or_authentication_failure_cannot_become_rules_fallback(
+    code: str,
+) -> None:
+    failed = _provider_result({}).model_copy(
+        update={
+            "errors": [
+                ErrorDetail(
+                    code=code,
+                    message="fixed safe message",
+                    retryable=code != "authentication_error",
+                    provider="llm",
+                )
+            ]
+        }
+    )
+    repairs = 0
+
+    async def repair(_: str) -> ProviderResult[dict]:
+        nonlocal repairs
+        repairs += 1
+        return _provider_result(_valid_payload("graph retrieval"))
+
+    with pytest.raises(PlannerDependencyError, match=code):
+        asyncio.run(
+            QueryParser(QueryPlanner()).parse(
+                "graph retrieval", failed, repair=repair
+            )
+        )
+    assert repairs == 0
 
 
 def test_repair_callable_is_never_invoked_for_valid_payload() -> None:

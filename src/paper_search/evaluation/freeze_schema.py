@@ -228,6 +228,28 @@ FreezeManifest: TypeAlias = Annotated[
     Field(discriminator="schema_version"),
 ]
 _FREEZE_MANIFEST_ADAPTER: TypeAdapter[FreezeManifest] = TypeAdapter(FreezeManifest)
+FreezeEvidenceReason: TypeAlias = Literal[
+    "manifest_invalid",
+    "approval_invalid",
+    "partition_hash_mismatch",
+    "partition_count_mismatch",
+    "identifier_map_missing",
+    "identifier_map_hash_mismatch",
+    "identifier_map_coverage_failed",
+]
+
+
+class FreezeEvidenceError(ValueError):
+    """One sanitized, structured failure from the shared freeze validation pass."""
+
+    def __init__(
+        self,
+        reason: FreezeEvidenceReason,
+        *additional_reasons: FreezeEvidenceReason,
+    ) -> None:
+        super().__init__("freeze manifest is invalid")
+        self.reasons = tuple(dict.fromkeys((reason, *additional_reasons)))
+        self.reason = self.reasons[0]
 
 
 def sha256_bytes(content: bytes) -> Sha256:
@@ -352,6 +374,65 @@ class BoundArtifact:
             else:
                 for descriptor in reversed(self.ancestor_descriptors):
                     os.close(descriptor)
+
+
+PartitionRows: TypeAlias = tuple[
+    tuple[Literal["dev", "validation"], tuple[dict[str, object], ...]], ...
+]
+
+
+@dataclass(frozen=True)
+class ValidatedFreezeEvidence:
+    """One validated freeze whose exact source artifacts remain descriptor-bound."""
+
+    manifest: FreezeManifest
+    manifest_artifact: BoundArtifact
+    approval_artifact: BoundArtifact | None = None
+    partition_artifacts: tuple[BoundArtifact, ...] = ()
+    identifier_map_artifact: BoundArtifact | None = None
+    partition_rows: PartitionRows = ()
+
+    @property
+    def artifacts(self) -> tuple[BoundArtifact, ...]:
+        optional = (
+            (self.approval_artifact,) if self.approval_artifact is not None else ()
+        )
+        identifier = (
+            (self.identifier_map_artifact,)
+            if self.identifier_map_artifact is not None
+            else ()
+        )
+        return (
+            self.manifest_artifact,
+            *optional,
+            *self.partition_artifacts,
+            *identifier,
+        )
+
+    @property
+    def artifact_identity_checks(
+        self,
+    ) -> tuple[tuple[BoundArtifact, FreezeEvidenceReason], ...]:
+        approval = (
+            ((self.approval_artifact, "approval_invalid"),)
+            if self.approval_artifact is not None
+            else ()
+        )
+        partitions = tuple(
+            (artifact, "partition_hash_mismatch")
+            for artifact in self.partition_artifacts
+        )
+        identifier = (
+            ((self.identifier_map_artifact, "identifier_map_hash_mismatch"),)
+            if self.identifier_map_artifact is not None
+            else ()
+        )
+        return (
+            (self.manifest_artifact, "manifest_invalid"),
+            *approval,
+            *partitions,
+            *identifier,
+        )
 
 
 def _read_descriptor(descriptor: int) -> bytes:
@@ -663,7 +744,7 @@ def open_confined_artifact(
             descriptor, ancestors, path_identities = _open_posix_confined(
                 data_root, normalized
             )
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         raise ValueError("freeze manifest is invalid") from None
     try:
         metadata = os.fstat(descriptor)
@@ -684,7 +765,7 @@ def open_confined_artifact(
             windows_file_id=windows_file_id,
             replaceable_manifest=replaceable_manifest,
         )
-    except (OSError, ValueError):
+    except (OSError, RuntimeError, ValueError):
         for ancestor in reversed(ancestors):
             if os.name == "nt":
                 import ctypes
@@ -751,7 +832,10 @@ def publish_confined_bytes_no_overwrite(
         class FileAttributeTagInfo(ctypes.Structure):
             _fields_ = [("file_attributes", ctypes.c_uint32), ("reparse_tag", ctypes.c_uint32)]
 
-        root = data_root.resolve()
+        try:
+            root = data_root.resolve()
+        except (OSError, RuntimeError):
+            raise ValueError("freeze manifest is invalid") from None
         target = root.joinpath(*normalized.split("/"))
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         create_file = kernel32.CreateFileW
@@ -887,7 +971,7 @@ def publish_confined_bytes_no_overwrite(
                     kernel32.CloseHandle(ctypes.c_void_p(open_handle))
     try:
         parent_descriptor, filename = _open_posix_report_parent(data_root, normalized)
-    except OSError:
+    except (OSError, RuntimeError):
         raise ValueError("freeze manifest is invalid") from None
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -1013,35 +1097,51 @@ def _validate_v2_bindings(
     manifest: FreezeManifestV2,
     *,
     stack: ExitStack,
-    artifacts: list[BoundArtifact],
-) -> None:
-    report_artifact = stack.enter_context(
-        open_confined_artifact(data_root, manifest.approval.report_path)
-    )
-    artifacts.append(report_artifact)
+    manifest_artifact: BoundArtifact,
+) -> ValidatedFreezeEvidence:
+    try:
+        report_artifact = stack.enter_context(
+            open_confined_artifact(data_root, manifest.approval.report_path)
+        )
+    except ValueError:
+        raise FreezeEvidenceError("approval_invalid") from None
     if report_artifact.sha256 != manifest.approval.report_sha256:
-        raise ValueError("freeze manifest is invalid")
-    report = _validated_report_bytes(report_artifact.content)
+        raise FreezeEvidenceError("approval_invalid")
+    try:
+        report = _validated_report_bytes(report_artifact.content)
+    except ValueError:
+        raise FreezeEvidenceError("approval_invalid") from None
     if (
         report.approved_at != manifest.approval.approved_at
         or report.approver_ref != manifest.approval.approver_ref
         or report.identifier_map_sha256 != manifest.identifier_map.sha256
     ):
-        raise ValueError("freeze manifest is invalid")
+        raise FreezeEvidenceError("approval_invalid")
     partition_hashes: dict[str, Sha256] = {}
+    partition_artifacts: list[BoundArtifact] = []
+    partition_rows: list[
+        tuple[Literal["dev", "validation"], tuple[dict[str, object], ...]]
+    ] = []
     for partition in manifest.partitions:
-        artifact = stack.enter_context(open_confined_artifact(data_root, partition.path))
-        artifacts.append(artifact)
+        try:
+            artifact = stack.enter_context(
+                open_confined_artifact(data_root, partition.path)
+            )
+        except ValueError:
+            raise FreezeEvidenceError("partition_hash_mismatch") from None
+        partition_artifacts.append(artifact)
         if artifact.sha256 != partition.sha256:
-            raise ValueError("freeze manifest is invalid")
+            raise FreezeEvidenceError("partition_hash_mismatch")
         try:
             lines = artifact.content.splitlines()
             if not lines or any(not line for line in lines):
-                raise ValueError("freeze manifest is invalid")
+                raise FreezeEvidenceError("partition_count_mismatch")
             rows = [_json_object(line) for line in lines]
             query_ids = [row.get("query_id") for row in rows]
+        except FreezeEvidenceError:
+            raise
         except ValueError:
-            raise ValueError("freeze manifest is invalid") from None
+            raise FreezeEvidenceError("partition_count_mismatch") from None
         if (
             len(rows) != partition.query_count
             or not all(
@@ -1049,15 +1149,21 @@ def _validate_v2_bindings(
             )
             or len(set(query_ids)) != len(query_ids)
         ):
-            raise ValueError("freeze manifest is invalid")
+            raise FreezeEvidenceError("partition_count_mismatch")
         partition_hashes[partition.name] = artifact.sha256
-    identifier_artifact = stack.enter_context(
-        open_confined_artifact(data_root, manifest.identifier_map.path)
-    )
-    artifacts.append(identifier_artifact)
+        partition_rows.append((partition.name, tuple(rows)))
+    try:
+        identifier_artifact = stack.enter_context(
+            open_confined_artifact(data_root, manifest.identifier_map.path)
+        )
+    except ValueError:
+        raise FreezeEvidenceError("identifier_map_missing") from None
     if identifier_artifact.sha256 != manifest.identifier_map.sha256:
-        raise ValueError("freeze manifest is invalid")
-    value = _json_object(identifier_artifact.content)
+        raise FreezeEvidenceError("identifier_map_hash_mismatch")
+    try:
+        value = _json_object(identifier_artifact.content)
+    except ValueError:
+        raise FreezeEvidenceError("identifier_map_coverage_failed") from None
     if (
         len(value) != manifest.identifier_map.entry_count
         or not value
@@ -1069,28 +1175,71 @@ def _validate_v2_bindings(
             for key, target in value.items()
         )
     ):
-        raise ValueError("freeze manifest is invalid")
-    if (
-        report.partition_hashes != partition_hashes
-        or manifest.gold_sha256
-        != canonical_gold_set_sha256(partition_hashes["dev"], partition_hashes["validation"])
+        raise FreezeEvidenceError("identifier_map_coverage_failed")
+    if report.partition_hashes != partition_hashes:
+        raise FreezeEvidenceError("approval_invalid")
+    if manifest.gold_sha256 != canonical_gold_set_sha256(
+        partition_hashes["dev"], partition_hashes["validation"]
     ):
-        raise ValueError("freeze manifest is invalid")
-    for artifact in artifacts:
-        artifact.verify_path_identity()
+        raise FreezeEvidenceError("manifest_invalid")
+    return ValidatedFreezeEvidence(
+        manifest=manifest,
+        manifest_artifact=manifest_artifact,
+        approval_artifact=report_artifact,
+        partition_artifacts=tuple(partition_artifacts),
+        identifier_map_artifact=identifier_artifact,
+        partition_rows=tuple(partition_rows),
+    )
+
+
+@contextmanager
+def open_validated_freeze_evidence(
+    path: Path,
+    *,
+    data_root: Path,
+) -> Iterator[ValidatedFreezeEvidence]:
+    """Validate one freeze and retain every exact evidence descriptor through exit."""
+    try:
+        root = data_root.resolve()
+        relative_path = path.absolute().relative_to(root).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        raise FreezeEvidenceError("manifest_invalid") from None
+    with ExitStack() as stack:
+        try:
+            artifact = stack.enter_context(
+                open_confined_artifact(root, relative_path)
+            )
+            manifest = parse_freeze_manifest_bytes(artifact.content)
+        except ValueError:
+            raise FreezeEvidenceError("manifest_invalid") from None
+        if isinstance(manifest, FreezeManifestV2):
+            evidence = _validate_v2_bindings(
+                root,
+                manifest,
+                stack=stack,
+                manifest_artifact=artifact,
+            )
+        else:
+            evidence = ValidatedFreezeEvidence(
+                manifest=manifest,
+                manifest_artifact=artifact,
+            )
+        try:
+            yield evidence
+        finally:
+            identity_failures: list[FreezeEvidenceReason] = []
+            for bound_artifact, reason in evidence.artifact_identity_checks:
+                try:
+                    bound_artifact.verify_path_identity()
+                except (OSError, RuntimeError, ValueError):
+                    identity_failures.append(reason)
+            if identity_failures:
+                raise FreezeEvidenceError(
+                    identity_failures[0],
+                    *identity_failures[1:],
+                ) from None
 
 
 def load_freeze_manifest(path: Path, *, data_root: Path) -> FreezeManifest:
-    root = data_root.resolve()
-    try:
-        relative_path = path.relative_to(root).as_posix()
-    except ValueError:
-        raise ValueError("freeze manifest is invalid") from None
-    with ExitStack() as stack:
-        artifact = stack.enter_context(open_confined_artifact(root, relative_path))
-        manifest = parse_freeze_manifest_bytes(artifact.content)
-        if isinstance(manifest, FreezeManifestV2):
-            _validate_v2_bindings(root, manifest, stack=stack, artifacts=[artifact])
-        else:
-            artifact.verify_path_identity()
-        return manifest
+    with open_validated_freeze_evidence(path, data_root=data_root) as evidence:
+        return evidence.manifest

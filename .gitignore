@@ -22,3 +22,8 @@ data/annotation_work/
 
 # Local provider smoke artifacts
 /experiments/smoke/
+
+# Private Gate 0 inputs and generated runtime evidence
+/runs/
+/validation-attempts/
+/private-gate0/

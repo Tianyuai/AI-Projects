@@ -49,6 +49,247 @@ def load_fixture_policy() -> Any:
     return load_pricing_policy(FIXTURE_PATH)
 
 
+def test_policy_bytes_parsers_validate_exact_snapshots() -> None:
+    module = pricing_module()
+
+    pricing = module.parse_pricing_policy_bytes(FIXTURE_PATH.read_bytes())
+    quality = module.parse_quality_gate_policy_bytes(QUALITY_POLICY_PATH.read_bytes())
+
+    assert pricing == module.load_pricing_policy(FIXTURE_PATH)
+    assert quality == module.load_quality_gate_policy(QUALITY_POLICY_PATH)
+
+
+@pytest.mark.parametrize(
+    ("loader_name", "parser_name", "path"),
+    [
+        ("load_pricing_policy", "parse_pricing_policy_bytes", FIXTURE_PATH),
+        ("load_quality_gate_policy", "parse_quality_gate_policy_bytes", QUALITY_POLICY_PATH),
+    ],
+)
+def test_policy_path_loaders_read_once_and_delegate_to_bytes_parser(
+    monkeypatch: pytest.MonkeyPatch,
+    loader_name: str,
+    parser_name: str,
+    path: Path,
+) -> None:
+    module = pricing_module()
+    parser = getattr(module, parser_name)
+    expected_bytes = path.read_bytes()
+    parser_calls: list[bytes] = []
+    read_calls: list[Path] = []
+    original_read_bytes = Path.read_bytes
+
+    def record_parser(content: bytes) -> Any:
+        parser_calls.append(content)
+        return parser(content)
+
+    def record_read_bytes(candidate: Path) -> bytes:
+        read_calls.append(candidate)
+        return original_read_bytes(candidate)
+
+    monkeypatch.setattr(module, parser_name, record_parser)
+    monkeypatch.setattr(Path, "read_bytes", record_read_bytes)
+
+    getattr(module, loader_name)(path)
+
+    assert parser_calls == [expected_bytes]
+    assert read_calls == [path]
+
+
+@pytest.mark.parametrize(
+    ("parser_name", "policy_name", "content"),
+    [
+        (
+            "parse_pricing_policy_bytes",
+            "pricing policy",
+            (
+                b"schema_version: pricing-policy-v1\n"
+                b"currency: CNY\n"
+                b"effective_at: '2026-07-01T00:00:00Z'\n"
+                b"source_identity: operator-verified-production-safe\n"
+                b"rounding_quantum_cny: '0.000001'\n"
+                b"rates: []\n"
+                b"SECRET_POLICY_INPUT: bearer-sentinel\n"
+            ),
+        ),
+        (
+            "parse_quality_gate_policy_bytes",
+            "quality gate policy",
+            (
+                b"schema_version: quality-gates-v1\n"
+                b"rules: []\n"
+                b"SECRET_POLICY_INPUT: bearer-sentinel\n"
+            ),
+        ),
+    ],
+)
+def test_policy_bytes_parser_errors_never_include_policy_input(
+    parser_name: str,
+    policy_name: str,
+    content: bytes,
+) -> None:
+    parser = getattr(pricing_module(), parser_name)
+
+    with pytest.raises(ValueError) as error:
+        parser(content)
+
+    assert str(error.value) == f"invalid {policy_name}"
+    assert "SECRET_POLICY_INPUT" not in str(error.value)
+    assert "bearer-sentinel" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("parser_name", "policy_name"),
+    [
+        ("parse_pricing_policy_bytes", "pricing policy"),
+        ("parse_quality_gate_policy_bytes", "quality gate policy"),
+    ],
+)
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_policy_bytes_parser_sanitizes_internal_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    parser_name: str,
+    policy_name: str,
+    error_type: type[Exception],
+) -> None:
+    module = pricing_module()
+
+    def fail_parse(_: bytes) -> object:
+        raise error_type("SECRET_POLICY_INPUT bearer-sentinel")
+
+    monkeypatch.setattr(module.yaml, "safe_load", fail_parse)
+
+    with pytest.raises(ValueError) as error:
+        getattr(module, parser_name)(b"SECRET_POLICY_INPUT: bearer-sentinel\n")
+
+    assert str(error.value) == f"invalid {policy_name}"
+    assert "SECRET_POLICY_INPUT" not in str(error.value)
+    assert "bearer-sentinel" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("loader_name", "policy_name", "content"),
+    [
+        (
+            "load_pricing_policy",
+            "pricing policy",
+            b"SECRET_POLICY_INPUT: bearer-sentinel\n",
+        ),
+        (
+            "load_quality_gate_policy",
+            "quality gate policy",
+            b"SECRET_POLICY_INPUT: bearer-sentinel\n",
+        ),
+    ],
+)
+def test_policy_path_loader_wraps_parser_failure_at_path_boundary(
+    tmp_path: Path,
+    loader_name: str,
+    policy_name: str,
+    content: bytes,
+) -> None:
+    path = tmp_path / f"{loader_name}.yaml"
+    path.write_bytes(content)
+
+    with pytest.raises(ValueError) as error:
+        getattr(pricing_module(), loader_name)(path)
+
+    assert str(error.value) == f"invalid {policy_name}: {path}"
+    assert "SECRET_POLICY_INPUT" not in str(error.value)
+    assert "bearer-sentinel" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("loader_name", "parser_name", "policy_name"),
+    [
+        (
+            "load_pricing_policy",
+            "parse_pricing_policy_bytes",
+            "pricing policy",
+        ),
+        (
+            "load_quality_gate_policy",
+            "parse_quality_gate_policy_bytes",
+            "quality gate policy",
+        ),
+    ],
+)
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_policy_path_loader_wraps_delegated_internal_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    loader_name: str,
+    parser_name: str,
+    policy_name: str,
+    error_type: type[Exception],
+) -> None:
+    module = pricing_module()
+    path = tmp_path / f"{loader_name}.yaml"
+    path.write_bytes(b"safe: fixture\n")
+
+    def fail_parse(_: bytes) -> object:
+        raise error_type("SECRET_POLICY_INPUT bearer-sentinel")
+
+    monkeypatch.setattr(module, parser_name, fail_parse)
+
+    with pytest.raises(ValueError) as error:
+        getattr(module, loader_name)(path)
+
+    assert str(error.value) == f"invalid {policy_name}: {path}"
+    assert "SECRET_POLICY_INPUT" not in str(error.value)
+    assert "bearer-sentinel" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("loader_name", "policy_name"),
+    [
+        ("load_pricing_policy", "pricing policy"),
+        ("load_quality_gate_policy", "quality gate policy"),
+    ],
+)
+def test_policy_path_loader_wraps_read_failure_at_path_boundary(
+    tmp_path: Path,
+    loader_name: str,
+    policy_name: str,
+) -> None:
+    path = tmp_path / "missing.yaml"
+
+    with pytest.raises(ValueError) as error:
+        getattr(pricing_module(), loader_name)(path)
+
+    assert str(error.value) == f"invalid {policy_name}: {path}"
+
+
+@pytest.mark.parametrize(
+    ("loader_name", "policy_name"),
+    [
+        ("load_pricing_policy", "pricing policy"),
+        ("load_quality_gate_policy", "quality gate policy"),
+    ],
+)
+@pytest.mark.parametrize("error_type", [ValueError, OSError, RuntimeError])
+def test_policy_path_loader_sanitizes_all_read_boundary_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    loader_name: str,
+    policy_name: str,
+    error_type: type[Exception],
+) -> None:
+    path = tmp_path / f"{loader_name}.yaml"
+
+    def fail_read(_: Path) -> bytes:
+        raise error_type("SECRET_POLICY_INPUT bearer-sentinel")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read)
+
+    with pytest.raises(ValueError) as error:
+        getattr(pricing_module(), loader_name)(path)
+
+    assert str(error.value) == f"invalid {policy_name}: {path}"
+    assert "SECRET_POLICY_INPUT" not in str(error.value)
+    assert "bearer-sentinel" not in str(error.value)
+
+
 def test_fixture_policy_values_llm_usage_with_exact_decimal_cost() -> None:
     actual_cost_pricer, _, _, _, _, _ = pricing_api()
     pricer = actual_cost_pricer(
@@ -170,7 +411,7 @@ def test_policy_models_are_strict_and_loader_rejects_naive_or_float_yaml(tmp_pat
     raw["effective_at"] = "2026-07-01T00:00:00"
     naive_path = tmp_path / "naive.yaml"
     naive_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="timezone"):
+    with pytest.raises(ValueError, match="invalid pricing policy"):
         module.load_pricing_policy(naive_path)
 
     raw = yaml.safe_load(FIXTURE_PATH.read_bytes())
@@ -180,7 +421,7 @@ def test_policy_models_are_strict_and_loader_rejects_naive_or_float_yaml(tmp_pat
     rates[0]["price_cny_per_unit"] = 0.000002
     float_path = tmp_path / "float-price.yaml"
     float_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="Decimal string"):
+    with pytest.raises(ValueError, match="invalid pricing policy"):
         module.load_pricing_policy(float_path)
 
 
@@ -228,6 +469,16 @@ def test_unknown_model_or_missing_priced_unit_fails_closed() -> None:
             model_or_adapter="qwen-test-v1",
             usage=UsageActual(llm_calls=1, output_tokens=1),
         )
+
+
+def test_pricing_policy_rejects_empty_rates() -> None:
+    module = pricing_module()
+    policy = load_fixture_policy()
+    payload = policy.model_dump(mode="python")
+    payload["rates"] = []
+
+    with pytest.raises(ValidationError, match="rates"):
+        module.PricingPolicy.model_validate(payload)
 
 
 def test_duplicate_rate_ineffective_policy_missing_usage_and_billed_mismatch_fail_closed() -> None:
@@ -320,7 +571,7 @@ def test_quality_policy_encodes_every_approved_rule_and_requires_resolution(tmp_
     invalid_path = tmp_path / "unresolved.yaml"
     invalid_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="resolution"):
+    with pytest.raises(ValueError, match="invalid quality gate policy"):
         load_quality_gate_policy(invalid_path)
 
 
@@ -352,7 +603,7 @@ def test_quality_policy_fails_closed_when_an_authoritative_catalog_row_is_delete
     missing_path = tmp_path / f"missing-{rule_id}.yaml"
     missing_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="missing authoritative quality rule"):
+    with pytest.raises(ValueError, match="invalid quality gate policy"):
         load_quality_gate_policy(missing_path)
 
 
@@ -363,7 +614,7 @@ def test_quality_policy_rejects_empty_rules_and_invalid_resolution(tmp_path: Pat
     raw["rules"] = []
     empty_path = tmp_path / "empty.yaml"
     empty_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="missing authoritative quality rule"):
+    with pytest.raises(ValueError, match="invalid quality gate policy"):
         load_quality_gate_policy(empty_path)
 
     raw = yaml.safe_load(QUALITY_POLICY_PATH.read_bytes())
@@ -373,7 +624,7 @@ def test_quality_policy_rejects_empty_rules_and_invalid_resolution(tmp_path: Pat
     rules[0]["resolution"] = "unclassified"
     invalid_path = tmp_path / "invalid-resolution.yaml"
     invalid_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
-    with pytest.raises(ValueError, match="resolution"):
+    with pytest.raises(ValueError, match="invalid quality gate policy"):
         load_quality_gate_policy(invalid_path)
 
 
@@ -387,5 +638,5 @@ def test_quality_policy_rejects_superseded_rule_with_missing_target(tmp_path: Pa
     missing_target_path = tmp_path / "missing-superseded-target.yaml"
     missing_target_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="superseded quality rule target is missing"):
+    with pytest.raises(ValueError, match="invalid quality gate policy"):
         load_quality_gate_policy(missing_target_path)

@@ -4,12 +4,15 @@ import hashlib
 import json
 import os
 import shutil
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 import paper_search.evaluation.freeze_schema as freeze_schema
+from paper_search.evaluation.gate0 import verify_gate0
 from paper_search.evaluation.freeze_schema import (
     FreezeManifestV1,
     FreezeManifestV2,
@@ -326,6 +329,35 @@ def test_loads_only_approved_legacy_manifest_with_in_memory_discriminator(
     assert manifest_path.read_bytes() == original
 
 
+@pytest.fixture
+def readable_v1_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    data_root = tmp_path / "readable-v1"
+    data_root.mkdir()
+    manifest_path = data_root / "manifest.json"
+    manifest_path.write_bytes(_canonical_document(_legacy_manifest()))
+    return data_root, manifest_path
+
+
+def test_readable_v1_fixture_loads_but_gate0_rejects(
+    readable_v1_fixture: tuple[Path, Path],
+) -> None:
+    data_root, manifest_path = readable_v1_fixture
+
+    manifest = load_freeze_manifest(manifest_path, data_root=data_root)
+    report = verify_gate0(
+        data_root=data_root,
+        manifest_path=manifest_path,
+        pricing_policy_path=data_root / "missing-pricing.yaml",
+        quality_gates_path=data_root / "missing-quality.yaml",
+        readiness_report_path=data_root / "missing-readiness.json",
+        clock=lambda: datetime(2026, 7, 30, tzinfo=UTC),
+    )
+
+    assert isinstance(manifest, FreezeManifestV1)
+    assert report.passed is False
+    assert "manifest_invalid" in report.blocking_reasons
+
+
 def test_rejects_unapproved_unversioned_legacy_manifest(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     data_root.mkdir()
@@ -438,6 +470,261 @@ def test_loads_fully_bound_synthetic_versioned_v2_fixture(tmp_path: Path) -> Non
 
     assert isinstance(manifest, FreezeManifestV2)
     assert manifest.partitions[0].name == "dev"
+
+
+def test_bound_evidence_context_retains_exact_v2_artifacts_and_partition_rows(
+    tmp_path: Path,
+) -> None:
+    data_root, _ = _write_bound_v2_tree(tmp_path)
+    manifest_bytes = (data_root / "manifest.json").read_bytes()
+
+    with freeze_schema.open_validated_freeze_evidence(
+        data_root / "manifest.json",
+        data_root=data_root,
+    ) as evidence:
+        assert isinstance(evidence.manifest, FreezeManifestV2)
+        assert evidence.manifest_artifact.content == manifest_bytes
+        assert evidence.approval_artifact is not None
+        assert evidence.approval_artifact.relative_path == "freeze_reports/approval.json"
+        assert [artifact.relative_path for artifact in evidence.partition_artifacts] == [
+            "dev/gold.jsonl",
+            "validation/gold.jsonl",
+        ]
+        assert evidence.identifier_map_artifact is not None
+        assert evidence.identifier_map_artifact.relative_path == "identifier-map.json"
+        assert evidence.partition_rows == (
+            (
+                "dev",
+                (
+                    {
+                        "query_id": "dev-1",
+                        "query": "synthetic",
+                        "relevant_paper_ids": ["p1"],
+                    },
+                ),
+            ),
+            (
+                "validation",
+                (
+                    {
+                        "query_id": "validation-1",
+                        "query": "synthetic",
+                        "relevant_paper_ids": [],
+                    },
+                ),
+            ),
+        )
+        for artifact in evidence.artifacts:
+            os.fstat(artifact.descriptor)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("approval_missing", "approval_invalid"),
+        ("partition_hash", "partition_hash_mismatch"),
+        ("partition_count", "partition_count_mismatch"),
+        ("identifier_missing", "identifier_map_missing"),
+        ("identifier_hash", "identifier_map_hash_mismatch"),
+    ],
+)
+def test_bound_evidence_reports_structured_validation_reason(
+    tmp_path: Path,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    data_root, manifest = _write_bound_v2_tree(tmp_path)
+    partitions = manifest["partitions"]
+    identifier_map = manifest["identifier_map"]
+    assert isinstance(partitions, list)
+    assert isinstance(identifier_map, dict)
+    dev = next(
+        item for item in partitions if isinstance(item, dict) and item["name"] == "dev"
+    )
+
+    if mutation == "approval_missing":
+        (data_root / "freeze_reports" / "approval.json").unlink()
+    elif mutation == "partition_hash":
+        dev["sha256"] = _sha256(b"different-partition")
+        _write_v2_manifest(data_root, manifest)
+    elif mutation == "partition_count":
+        dev["query_count"] = 2
+        _write_v2_manifest(data_root, manifest)
+    elif mutation == "identifier_missing":
+        (data_root / str(identifier_map["path"])).unlink()
+    else:
+        (data_root / str(identifier_map["path"])).write_bytes(
+            b'{"legacy:2":"canonical:2"}'
+        )
+
+    with pytest.raises(ValueError) as error:
+        with freeze_schema.open_validated_freeze_evidence(
+            data_root / "manifest.json",
+            data_root=data_root,
+        ):
+            pass
+
+    assert getattr(error.value, "reason", None) == expected_reason
+    assert str(error.value) == "freeze manifest is invalid"
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_reason"),
+    [
+        ("manifest.json", "manifest_invalid"),
+        ("freeze_reports/approval.json", "approval_invalid"),
+        ("dev/gold.jsonl", "partition_hash_mismatch"),
+        ("identifier-map.json", "identifier_map_hash_mismatch"),
+    ],
+)
+@pytest.mark.parametrize("error_type", [ValueError, OSError, RuntimeError])
+def test_bound_evidence_exit_identity_failures_preserve_artifact_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+    expected_reason: str,
+    error_type: type[Exception],
+) -> None:
+    data_root, _ = _write_bound_v2_tree(tmp_path)
+    original = freeze_schema.BoundArtifact.verify_path_identity
+
+    def fail_selected(artifact: freeze_schema.BoundArtifact) -> None:
+        if artifact.relative_path == relative_path:
+            raise error_type("PRIVATE_PATH_SENTINEL")
+        original(artifact)
+
+    monkeypatch.setattr(
+        freeze_schema.BoundArtifact,
+        "verify_path_identity",
+        fail_selected,
+    )
+
+    with pytest.raises(freeze_schema.FreezeEvidenceError) as error:
+        with freeze_schema.open_validated_freeze_evidence(
+            data_root / "manifest.json",
+            data_root=data_root,
+        ):
+            pass
+
+    assert error.value.reasons == (expected_reason,)
+    assert error.value.reason == expected_reason
+    assert str(error.value) == "freeze manifest is invalid"
+    assert "PRIVATE_PATH_SENTINEL" not in str(error.value)
+
+
+def test_bound_evidence_exit_collects_all_artifact_identity_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, _ = _write_bound_v2_tree(tmp_path)
+    original = freeze_schema.BoundArtifact.verify_path_identity
+
+    def fail_selected(artifact: freeze_schema.BoundArtifact) -> None:
+        if artifact.relative_path in {
+            "freeze_reports/approval.json",
+            "identifier-map.json",
+        }:
+            raise ValueError("PRIVATE_PATH_SENTINEL")
+        original(artifact)
+
+    monkeypatch.setattr(
+        freeze_schema.BoundArtifact,
+        "verify_path_identity",
+        fail_selected,
+    )
+
+    with pytest.raises(freeze_schema.FreezeEvidenceError) as error:
+        with freeze_schema.open_validated_freeze_evidence(
+            data_root / "manifest.json",
+            data_root=data_root,
+        ):
+            pass
+
+    assert error.value.reasons == (
+        "approval_invalid",
+        "identifier_map_hash_mismatch",
+    )
+
+
+def test_public_manifest_loader_delegates_to_bound_evidence_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root, _ = _write_bound_v2_tree(tmp_path)
+    original = freeze_schema.open_validated_freeze_evidence
+    entered = False
+    exited = False
+
+    @contextmanager
+    def record_delegation(
+        path: Path,
+        *,
+        data_root: Path,
+    ) -> object:
+        nonlocal entered, exited
+        with original(path, data_root=data_root) as evidence:
+            entered = True
+            yield evidence
+        exited = True
+
+    monkeypatch.setattr(
+        freeze_schema,
+        "open_validated_freeze_evidence",
+        record_delegation,
+    )
+
+    manifest = load_freeze_manifest(data_root / "manifest.json", data_root=data_root)
+
+    assert isinstance(manifest, FreezeManifestV2)
+    assert entered is True
+    assert exited is True
+
+
+def test_public_manifest_loader_accepts_cli_style_relative_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_bound_v2_tree(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    manifest = load_freeze_manifest(
+        Path("data/manifest.json"),
+        data_root=Path("data"),
+    )
+
+    assert isinstance(manifest, FreezeManifestV2)
+
+
+@pytest.mark.parametrize("method_name", ["resolve", "absolute"])
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_bound_evidence_wraps_path_normalization_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    error_type: type[Exception],
+) -> None:
+    data_root, _ = _write_bound_v2_tree(tmp_path)
+    manifest_path = data_root / "manifest.json"
+    target = data_root if method_name == "resolve" else manifest_path
+    original = getattr(Path, method_name)
+
+    def fail_target(candidate: Path, *args: object, **kwargs: object) -> Path:
+        if candidate == target:
+            raise error_type("PRIVATE_PATH_SENTINEL")
+        return original(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method_name, fail_target)
+
+    with pytest.raises(ValueError) as error:
+        with freeze_schema.open_validated_freeze_evidence(
+            manifest_path,
+            data_root=data_root,
+        ):
+            pass
+
+    assert getattr(error.value, "reason", None) == "manifest_invalid"
+    assert str(error.value) == "freeze manifest is invalid"
+    assert "PRIVATE_PATH_SENTINEL" not in str(error.value)
 
 
 @pytest.mark.parametrize(

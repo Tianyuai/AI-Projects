@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal, Self
 
 import yaml
-from pydantic import ConfigDict, ValidationError, model_validator
+from pydantic import ConfigDict, Field, ValidationError, model_validator
 
 from paper_search.domain.models import (
     DependencyName,
@@ -50,7 +50,7 @@ class PricingPolicy(_PolicyModel):
     effective_at: datetime
     source_identity: NonEmptyStr
     rounding_quantum_cny: Decimal
-    rates: list[PricingRate]
+    rates: list[PricingRate] = Field(min_length=1)
 
     @model_validator(mode="after")
     def validate_policy(self) -> Self:
@@ -240,13 +240,13 @@ class QualityGatePolicy(_PolicyModel):
         return self
 
 
-def _load_yaml_mapping(path: Path, *, policy_name: str) -> dict[str, object]:
+def _parse_yaml_mapping(content: bytes, *, policy_name: str) -> dict[str, object]:
     try:
-        raw = yaml.safe_load(path.read_bytes())
-    except (OSError, yaml.YAMLError) as error:
-        raise ValueError(f"invalid {policy_name}: {path}") from error
+        raw = yaml.safe_load(content)
+    except (UnicodeError, yaml.YAMLError) as error:
+        raise ValueError(f"invalid {policy_name}") from error
     if not isinstance(raw, dict):
-        raise ValueError(f"{policy_name} must contain a mapping: {path}")
+        raise ValueError(f"{policy_name} must contain a mapping")
     return raw
 
 
@@ -324,26 +324,50 @@ def _normalize_quality_gate_policy(raw: dict[str, object]) -> dict[str, object]:
     return normalized
 
 
+def parse_pricing_policy_bytes(content: bytes) -> PricingPolicy:
+    """Parse one exact pricing-policy byte snapshot without reopening a path."""
+    try:
+        raw = _normalize_pricing_policy(
+            _parse_yaml_mapping(content, policy_name="pricing policy")
+        )
+        return PricingPolicy.model_validate(raw)
+    except (OSError, RuntimeError, ValidationError, ValueError):
+        raise ValueError("invalid pricing policy") from None
+
+
+def parse_quality_gate_policy_bytes(content: bytes) -> QualityGatePolicy:
+    """Parse the complete authoritative Gate policy from one byte snapshot."""
+    try:
+        raw = _normalize_quality_gate_policy(
+            _parse_yaml_mapping(content, policy_name="quality gate policy")
+        )
+        return QualityGatePolicy.model_validate(raw)
+    except (OSError, RuntimeError, ValidationError, ValueError):
+        raise ValueError("invalid quality gate policy") from None
+
+
 def load_pricing_policy(path: Path) -> PricingPolicy:
     """Load one exact, versioned pricing policy without guessing production rates."""
-
-    raw = _normalize_pricing_policy(_load_yaml_mapping(path, policy_name="pricing policy"))
     try:
-        return PricingPolicy.model_validate(raw)
-    except ValidationError as error:
-        raise ValueError(f"invalid pricing policy: {path}") from error
+        content = path.read_bytes()
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(f"invalid pricing policy: {path}") from None
+    try:
+        return parse_pricing_policy_bytes(content)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(f"invalid pricing policy: {path}") from None
 
 
 def load_quality_gate_policy(path: Path) -> QualityGatePolicy:
     """Load the complete Gate policy, rejecting unresolved authoritative rows."""
-
-    raw = _normalize_quality_gate_policy(
-        _load_yaml_mapping(path, policy_name="quality gate policy")
-    )
     try:
-        return QualityGatePolicy.model_validate(raw)
-    except ValidationError as error:
-        raise ValueError(f"invalid quality gate policy: {error}") from error
+        content = path.read_bytes()
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(f"invalid quality gate policy: {path}") from None
+    try:
+        return parse_quality_gate_policy_bytes(content)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError(f"invalid quality gate policy: {path}") from None
 
 
 def canonical_pricing_policy_bytes(policy: PricingPolicy) -> bytes:

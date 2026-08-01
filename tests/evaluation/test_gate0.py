@@ -1,0 +1,862 @@
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+import os
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable
+
+import pytest
+import yaml
+
+import paper_search.evaluation.freeze_schema as freeze_schema
+from paper_search.evaluation.freeze_schema import canonical_gold_set_sha256
+
+
+QUALITY_POLICY_PATH = Path("configs/quality_gates_v1.yaml")
+TEST_PRICING_POLICY_PATH = Path(
+    "tests/fixtures/pricing/pricing-policy-test-v1.yaml"
+)
+FIXED_NOW = datetime(2026, 7, 30, 12, 0, tzinfo=UTC)
+PUBLIC_STATUS_PATHS = (
+    Path("data/manifest.json"),
+    Path("README.md"),
+    Path("data/README.md"),
+    Path("PRD.md"),
+)
+
+
+def _gate0() -> Any:
+    try:
+        return importlib.import_module("paper_search.evaluation.gate0")
+    except ModuleNotFoundError:
+        pytest.fail("paper_search.evaluation.gate0 must be implemented")
+
+
+def _sha256(content: bytes) -> str:
+    return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def _canonical_document(payload: object) -> bytes:
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _production_pricing_bytes() -> bytes:
+    raw = yaml.safe_load(TEST_PRICING_POLICY_PATH.read_bytes())
+    assert isinstance(raw, dict)
+    raw["source_identity"] = "operator-verified-production-2026-07-30"
+    rates = raw["rates"]
+    assert isinstance(rates, list)
+    for rate in rates:
+        assert isinstance(rate, dict)
+        if rate["dependency"] == "llm":
+            rate["model_or_adapter"] = "qwen-production-v1"
+    return yaml.safe_dump(raw, sort_keys=False).encode("utf-8")
+
+
+def _readiness_bytes() -> bytes:
+    return _canonical_document(
+        {
+            "schema_version": "gate0-readiness-v1",
+            "generated_at": "2026-07-30T11:59:00Z",
+            "capabilities": [
+                {
+                    "name": "llm",
+                    "state": "ready",
+                    "observed_at": "2026-07-30T11:58:00Z",
+                },
+                {
+                    "name": "openalex",
+                    "state": "ready",
+                    "observed_at": "2026-07-30T11:58:10Z",
+                },
+                {
+                    "name": "semantic_scholar",
+                    "state": "ready",
+                    "observed_at": "2026-07-30T11:58:20Z",
+                },
+            ],
+        }
+    )
+
+
+@dataclass
+class Gate0Fixture:
+    root: Path
+    data_root: Path
+    manifest_path: Path
+    pricing_path: Path
+    quality_path: Path
+    readiness_path: Path
+    report_path: Path
+    manifest: dict[str, object]
+    approval: dict[str, object]
+
+    def verify(self, *, clock: Callable[[], datetime] = lambda: FIXED_NOW) -> Any:
+        return _gate0().verify_gate0(
+            data_root=self.data_root,
+            manifest_path=self.manifest_path,
+            pricing_policy_path=self.pricing_path,
+            quality_gates_path=self.quality_path,
+            readiness_report_path=self.readiness_path,
+            clock=clock,
+        )
+
+    def write_manifest(self) -> None:
+        self.manifest_path.write_bytes(_canonical_document(self.manifest))
+
+    def bind_approval(self) -> None:
+        approval_bytes = _canonical_document(self.approval)
+        approval_binding = self.manifest["approval"]
+        assert isinstance(approval_binding, dict)
+        approval_path = self.data_root / str(approval_binding["report_path"])
+        approval_path.write_bytes(approval_bytes)
+        approval_binding["report_sha256"] = _sha256(approval_bytes)
+
+    def bind_identifier_map(self, content: bytes) -> None:
+        identifier_binding = self.manifest["identifier_map"]
+        assert isinstance(identifier_binding, dict)
+        payload = json.loads(content)
+        assert isinstance(payload, dict)
+        (self.data_root / str(identifier_binding["path"])).write_bytes(content)
+        identifier_binding["sha256"] = _sha256(content)
+        identifier_binding["entry_count"] = len(payload)
+        self.approval["identifier_map_sha256"] = _sha256(content)
+        self.bind_approval()
+        self.write_manifest()
+
+    def cli_args(self) -> list[str]:
+        return [
+            "--data-root",
+            str(self.data_root),
+            "--manifest",
+            str(self.manifest_path),
+            "--pricing-policy",
+            str(self.pricing_path),
+            "--quality-gates",
+            str(self.quality_path),
+            "--readiness",
+            str(self.readiness_path),
+            "--report",
+            str(self.report_path),
+        ]
+
+
+@pytest.fixture
+def passing_gate0(tmp_path: Path) -> Gate0Fixture:
+    root = tmp_path / "private gate0"
+    data_root = root / "frozen"
+    data_root.mkdir(parents=True)
+    dev_bytes = (
+        b'{"query_id":"dev-1","query":"synthetic dev",'
+        b'"relevant_paper_ids":["doi:10.1000/dev"]}\n'
+    )
+    validation_bytes = (
+        b'{"query_id":"validation-1","query":"synthetic validation",'
+        b'"relevant_paper_ids":["arxiv:2501.10120"]}\n'
+    )
+    identifier_map_bytes = _canonical_document(
+        {
+            "doi:10.1000/dev": "openalex:W100",
+            "arxiv:2501.10120": "openalex:W200",
+        }
+    )
+    artifact_bytes = {
+        "dev/gold.jsonl": dev_bytes,
+        "validation/gold.jsonl": validation_bytes,
+        "identifier-map.json": identifier_map_bytes,
+    }
+    for relative_path, content in artifact_bytes.items():
+        path = data_root / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    partition_hashes = {
+        "dev": _sha256(dev_bytes),
+        "validation": _sha256(validation_bytes),
+    }
+    approval: dict[str, object] = {
+        "schema_version": "freeze-approval-v2",
+        "approval_requested": True,
+        "approved_at": "2026-07-30T00:00:00Z",
+        "approver_ref": "operator-approval-2026-07-30",
+        "audit_sha256": _sha256(b"synthetic-safe-audit"),
+        "partition_hashes": partition_hashes,
+        "identifier_map_sha256": _sha256(identifier_map_bytes),
+    }
+    approval_bytes = _canonical_document(approval)
+    approval_path = data_root / "freeze_reports" / "approval.json"
+    approval_path.parent.mkdir()
+    approval_path.write_bytes(approval_bytes)
+    manifest: dict[str, object] = {
+        "schema_version": "paper-search-freeze-v2",
+        "dataset_revision": "synthetic-v2-revision",
+        "created_at": "2026-07-30T00:00:00Z",
+        "annotation_status": "frozen",
+        "freeze_status": "approved",
+        "partitions": [
+            {
+                "name": "dev",
+                "path": "dev/gold.jsonl",
+                "query_count": 1,
+                "sha256": partition_hashes["dev"],
+                "zero_answer_policy": "forbid",
+            },
+            {
+                "name": "validation",
+                "path": "validation/gold.jsonl",
+                "query_count": 1,
+                "sha256": partition_hashes["validation"],
+                "zero_answer_policy": "allow",
+            },
+        ],
+        "gold_sha256": canonical_gold_set_sha256(
+            partition_hashes["dev"],
+            partition_hashes["validation"],
+        ),
+        "identifier_map": {
+            "path": "identifier-map.json",
+            "sha256": _sha256(identifier_map_bytes),
+            "entry_count": 2,
+        },
+        "partition_immutability": "content_addressed",
+        "approval": {
+            "report_path": "freeze_reports/approval.json",
+            "report_sha256": _sha256(approval_bytes),
+            "approved_at": "2026-07-30T00:00:00Z",
+            "approver_ref": "operator-approval-2026-07-30",
+        },
+    }
+    manifest_path = data_root / "manifest.json"
+    manifest_path.write_bytes(_canonical_document(manifest))
+    pricing_path = root / "pricing-policy-v1.yaml"
+    pricing_path.write_bytes(_production_pricing_bytes())
+    quality_path = root / "quality-gates-v1.yaml"
+    quality_path.write_bytes(QUALITY_POLICY_PATH.read_bytes())
+    readiness_path = root / "provider-readiness.json"
+    readiness_path.write_bytes(_readiness_bytes())
+    return Gate0Fixture(
+        root=root,
+        data_root=data_root,
+        manifest_path=manifest_path,
+        pricing_path=pricing_path,
+        quality_path=quality_path,
+        readiness_path=readiness_path,
+        report_path=root / "gate0-report.json",
+        manifest=manifest,
+        approval=approval,
+    )
+
+
+def test_complete_synthetic_v2_evidence_passes_with_safe_deterministic_report(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    report = passing_gate0.verify()
+
+    assert report.schema_version == "gate0-report-v1"
+    assert report.generated_at == FIXED_NOW
+    assert report.passed is True
+    assert report.blocking_reasons == []
+    assert report.manifest is not None
+    assert report.manifest.identity == "paper-search-freeze-v2"
+    assert report.manifest.sha256 == _sha256(passing_gate0.manifest_path.read_bytes())
+    assert [(item.identity, item.count) for item in report.partitions] == [
+        ("dev", 1),
+        ("validation", 1),
+    ]
+    assert report.identifier_map is not None
+    assert report.identifier_map.identity == "identifier-map-v1"
+    assert report.identifier_map.count == 2
+    assert report.pricing_policy_sha256 == _sha256(
+        passing_gate0.pricing_path.read_bytes()
+    )
+    assert report.quality_gates_sha256 == _sha256(
+        passing_gate0.quality_path.read_bytes()
+    )
+    assert report.readiness_report_sha256 == _sha256(
+        passing_gate0.readiness_path.read_bytes()
+    )
+    serialized = report.model_dump_json()
+    assert str(passing_gate0.root) not in serialized
+    assert "synthetic dev" not in serialized
+    assert "doi:10.1000/dev" not in serialized
+
+
+def test_manifest_private_revision_text_never_enters_report(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    secrets = (
+        "sk-credential-shaped-sentinel",
+        "GATED_QUERY_SENTINEL",
+    )
+    passing_gate0.manifest["dataset_revision"] = "-".join(secrets)
+    passing_gate0.write_manifest()
+
+    report = passing_gate0.verify()
+    serialized = report.model_dump_json()
+
+    assert report.passed
+    assert report.manifest is not None
+    assert report.manifest.identity == "paper-search-freeze-v2"
+    assert all(secret not in serialized for secret in secrets)
+
+
+@pytest.mark.parametrize(
+    ("reason", "mutate"),
+    [
+        ("manifest_missing", lambda fixture: fixture.manifest_path.unlink()),
+        (
+            "manifest_invalid",
+            lambda fixture: fixture.manifest_path.write_bytes(b"{}"),
+        ),
+        (
+            "approval_invalid",
+            lambda fixture: (
+                fixture.data_root / "freeze_reports" / "approval.json"
+            ).write_bytes(b"{}"),
+        ),
+        (
+            "partition_hash_mismatch",
+            lambda fixture: (fixture.data_root / "dev" / "gold.jsonl").write_bytes(
+                b'{"query_id":"dev-2","query":"changed","relevant_paper_ids":[]}\n'
+            ),
+        ),
+        (
+            "partition_count_mismatch",
+            lambda fixture: _set_dev_query_count(fixture, 2),
+        ),
+        (
+            "identifier_map_missing",
+            lambda fixture: (fixture.data_root / "identifier-map.json").unlink(),
+        ),
+        (
+            "identifier_map_hash_mismatch",
+            lambda fixture: (fixture.data_root / "identifier-map.json").write_bytes(
+                b'{"doi:10.1000/changed":"openalex:W999"}\n'
+            ),
+        ),
+        (
+            "identifier_map_coverage_failed",
+            lambda fixture: fixture.bind_identifier_map(
+                _canonical_document(
+                    {"doi:10.1000/other": "openalex:W999"}
+                )
+            ),
+        ),
+        ("pricing_policy_missing", lambda fixture: fixture.pricing_path.unlink()),
+        (
+            "pricing_policy_invalid",
+            lambda fixture: fixture.pricing_path.write_bytes(
+                TEST_PRICING_POLICY_PATH.read_bytes()
+            ),
+        ),
+        (
+            "quality_policy_invalid",
+            lambda fixture: fixture.quality_path.write_bytes(
+                b"schema_version: quality-gates-v1\nrules: []\n"
+            ),
+        ),
+        (
+            "readiness_evidence_invalid",
+            lambda fixture: fixture.readiness_path.write_bytes(
+                b'{"schema_version":"gate0-readiness-v1","Authorization":'
+                b'"Bearer SECRET_SENTINEL"}'
+            ),
+        ),
+    ],
+)
+def test_each_gate0_reason_isolated(
+    passing_gate0: Gate0Fixture,
+    reason: str,
+    mutate: Callable[[Gate0Fixture], object],
+) -> None:
+    mutate(passing_gate0)
+
+    report = passing_gate0.verify()
+
+    assert report.passed is False
+    assert report.blocking_reasons == [reason]
+
+
+def _set_dev_query_count(fixture: Gate0Fixture, count: int) -> None:
+    partitions = fixture.manifest["partitions"]
+    assert isinstance(partitions, list)
+    dev = next(
+        item
+        for item in partitions
+        if isinstance(item, dict) and item.get("name") == "dev"
+    )
+    dev["query_count"] = count
+    fixture.write_manifest()
+
+
+def _rewrite_pricing_identity(
+    fixture: Gate0Fixture,
+    *,
+    source_identity: str | None = None,
+    adapter_identity: str | None = None,
+) -> None:
+    raw = yaml.safe_load(fixture.pricing_path.read_bytes())
+    assert isinstance(raw, dict)
+    if source_identity is not None:
+        raw["source_identity"] = source_identity
+    if adapter_identity is not None:
+        rates = raw["rates"]
+        assert isinstance(rates, list)
+        first = rates[0]
+        assert isinstance(first, dict)
+        first["model_or_adapter"] = adapter_identity
+    fixture.pricing_path.write_text(
+        yaml.safe_dump(raw, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "identity"),
+    [
+        ("source", "operator-verified-safe"),
+        ("source", "operator-verified-production-unknown"),
+        ("source", "operator-verified-production-mock"),
+        ("source", "operator-verified-production-synthetic"),
+        ("source", "operator-verified-production-test"),
+        ("source", "operator-verified-production-fixture"),
+        ("adapter", "unknown-adapter"),
+        ("adapter", "mock-adapter"),
+        ("adapter", "synthetic-adapter"),
+        ("adapter", "qwen-test-v1"),
+        ("adapter", "fixture-adapter"),
+    ],
+)
+def test_production_pricing_requires_positive_source_and_safe_adapters(
+    passing_gate0: Gate0Fixture,
+    field: str,
+    identity: str,
+) -> None:
+    _rewrite_pricing_identity(
+        passing_gate0,
+        source_identity=identity if field == "source" else None,
+        adapter_identity=identity if field == "adapter" else None,
+    )
+
+    report = passing_gate0.verify()
+
+    assert report.passed is False
+    assert report.blocking_reasons == ["pricing_policy_invalid"]
+
+
+def test_gate0_reads_each_bound_source_artifact_exactly_once(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = freeze_schema._read_descriptor
+    descriptors: list[int] = []
+
+    def record_read(descriptor: int) -> bytes:
+        descriptors.append(descriptor)
+        return original(descriptor)
+
+    monkeypatch.setattr(freeze_schema, "_read_descriptor", record_read)
+
+    report = passing_gate0.verify()
+
+    assert report.passed
+    assert len(descriptors) == 8
+    assert len(set(descriptors)) == 8
+
+
+def test_gate0_forms_provisional_decision_while_all_artifacts_are_open(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _gate0()
+    original_read = freeze_schema._read_descriptor
+    original_report = module.Gate0Report
+    descriptors: list[int] = []
+    decisions = 0
+
+    def record_read(descriptor: int) -> bytes:
+        descriptors.append(descriptor)
+        return original_read(descriptor)
+
+    def assert_open_report(**kwargs: object) -> object:
+        nonlocal decisions
+        decisions += 1
+        assert len(descriptors) == 8
+        for descriptor in descriptors:
+            os.fstat(descriptor)
+        return original_report(**kwargs)
+
+    monkeypatch.setattr(freeze_schema, "_read_descriptor", record_read)
+    monkeypatch.setattr(module, "Gate0Report", assert_open_report)
+
+    report = passing_gate0.verify()
+
+    assert report.passed
+    assert decisions == 1
+
+
+@pytest.mark.parametrize(
+    ("relative_path", "expected_reason"),
+    [
+        ("manifest.json", "manifest_invalid"),
+        ("freeze_reports/approval.json", "approval_invalid"),
+        ("dev/gold.jsonl", "partition_hash_mismatch"),
+        ("identifier-map.json", "identifier_map_hash_mismatch"),
+        ("pricing-policy-v1.yaml", "pricing_policy_invalid"),
+        ("quality-gates-v1.yaml", "quality_policy_invalid"),
+        ("provider-readiness.json", "readiness_evidence_invalid"),
+    ],
+)
+@pytest.mark.parametrize("error_type", [ValueError, OSError, RuntimeError])
+def test_gate0_exit_identity_failure_downgrades_with_artifact_reason(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    relative_path: str,
+    expected_reason: str,
+    error_type: type[Exception],
+) -> None:
+    original = freeze_schema.BoundArtifact.verify_path_identity
+
+    def fail_selected(artifact: freeze_schema.BoundArtifact) -> None:
+        if artifact.relative_path == relative_path:
+            raise error_type("PRIVATE_PATH_SENTINEL")
+        original(artifact)
+
+    monkeypatch.setattr(
+        freeze_schema.BoundArtifact,
+        "verify_path_identity",
+        fail_selected,
+    )
+
+    report = passing_gate0.verify()
+
+    assert report.passed is False
+    assert report.blocking_reasons == [expected_reason]
+    assert "PRIVATE_PATH_SENTINEL" not in report.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("path_field", "expected_reason"),
+    [
+        ("pricing_path", "pricing_policy_invalid"),
+        ("quality_path", "quality_policy_invalid"),
+        ("readiness_path", "readiness_evidence_invalid"),
+    ],
+)
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_external_path_resolution_failures_are_isolated_and_sanitized(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    path_field: str,
+    expected_reason: str,
+    error_type: type[Exception],
+) -> None:
+    source = getattr(passing_gate0, path_field)
+    isolated_parent = passing_gate0.root / f"isolated-{path_field}"
+    isolated_parent.mkdir()
+    isolated_path = isolated_parent / source.name
+    isolated_path.write_bytes(source.read_bytes())
+    setattr(passing_gate0, path_field, isolated_path)
+    original_resolve = Path.resolve
+
+    def fail_target(
+        candidate: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> Path:
+        if candidate == isolated_parent:
+            raise error_type("PRIVATE_PATH_SENTINEL")
+        return original_resolve(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_target)
+
+    report = passing_gate0.verify()
+
+    assert report.passed is False
+    assert report.blocking_reasons == [expected_reason]
+    assert "PRIVATE_PATH_SENTINEL" not in report.model_dump_json()
+
+
+def test_cli_sanitizes_report_parent_symlink_loop(
+    passing_gate0: Gate0Fixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    report_parent = tmp_path / "isolated-report-parent"
+    report_parent.mkdir()
+    passing_gate0.report_path = report_parent / "gate0-report.json"
+    original_resolve = Path.resolve
+
+    def fail_report_parent(
+        candidate: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> Path:
+        if candidate == report_parent:
+            raise RuntimeError("PRIVATE_PATH_SENTINEL")
+        return original_resolve(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_report_parent)
+
+    result = _gate0().main(passing_gate0.cli_args())
+
+    assert result == 2
+    assert capsys.readouterr().out == (
+        "gate0 status=error reasons=report_write_failed\n"
+    )
+    assert not passing_gate0.report_path.exists()
+
+
+@pytest.mark.parametrize("error_type", [ValueError, OSError, RuntimeError])
+def test_cli_sanitizes_unexpected_verification_failure(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error_type: type[Exception],
+) -> None:
+    def fail_verification(**_: object) -> object:
+        raise error_type("PRIVATE_PATH_SENTINEL")
+
+    monkeypatch.setattr(_gate0(), "verify_gate0", fail_verification)
+
+    result = _gate0().main(passing_gate0.cli_args())
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert captured.out == "gate0 status=error reasons=verification_failed\n"
+    assert captured.err == ""
+    assert "PRIVATE_PATH_SENTINEL" not in captured.out
+    assert not passing_gate0.report_path.exists()
+
+
+def test_report_writer_sanitizes_parent_resolution_failure(
+    passing_gate0: Gate0Fixture,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_parent = tmp_path / "isolated-writer-parent"
+    report_parent.mkdir()
+    report_path = report_parent / "gate0-report.json"
+    original_resolve = Path.resolve
+
+    def fail_report_parent(
+        candidate: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> Path:
+        if candidate == report_parent:
+            raise RuntimeError("PRIVATE_PATH_SENTINEL")
+        return original_resolve(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_report_parent)
+
+    with pytest.raises(ValueError) as error:
+        _gate0().write_gate0_report(report_path, passing_gate0.verify())
+
+    assert str(error.value) == "gate0 report is invalid"
+    assert "PRIVATE_PATH_SENTINEL" not in str(error.value)
+    assert not report_path.exists()
+
+
+def test_invalid_evidence_never_mutates_sources_or_public_status(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    sources = [
+        path
+        for path in passing_gate0.root.rglob("*")
+        if path.is_file()
+    ]
+    before_sources = {path: path.read_bytes() for path in sources}
+    before_public = {path: path.read_bytes() for path in PUBLIC_STATUS_PATHS}
+    passing_gate0.pricing_path.unlink()
+    expected_sources = {
+        path: content
+        for path, content in before_sources.items()
+        if path != passing_gate0.pricing_path
+    }
+
+    report = passing_gate0.verify()
+
+    assert report.blocking_reasons == ["pricing_policy_missing"]
+    assert {
+        path: path.read_bytes()
+        for path in expected_sources
+    } == expected_sources
+    assert {path: path.read_bytes() for path in PUBLIC_STATUS_PATHS} == before_public
+
+
+def test_report_writer_is_atomic_exact_match_and_no_overwrite(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    module = _gate0()
+    report = passing_gate0.verify()
+
+    module.write_gate0_report(passing_gate0.report_path, report)
+    first = passing_gate0.report_path.read_bytes()
+    module.write_gate0_report(passing_gate0.report_path, report)
+
+    later = passing_gate0.verify(clock=lambda: FIXED_NOW + timedelta(seconds=1))
+    with pytest.raises(FileExistsError):
+        module.write_gate0_report(passing_gate0.report_path, later)
+
+    assert passing_gate0.report_path.read_bytes() == first
+    assert first.endswith(b"\n")
+    assert json.loads(first)["passed"] is True
+    assert list(passing_gate0.root.glob(".gate0-report.json.*.tmp")) == []
+
+
+def test_report_model_rejects_pass_with_blocking_reasons() -> None:
+    module = _gate0()
+
+    with pytest.raises(ValueError):
+        module.Gate0Report(
+            schema_version="gate0-report-v1",
+            generated_at=FIXED_NOW,
+            passed=True,
+            blocking_reasons=["manifest_invalid"],
+            manifest=None,
+            partitions=[],
+            identifier_map=None,
+            pricing_policy_sha256=None,
+            quality_gates_sha256=None,
+            readiness_report_sha256=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("manifest", None),
+        ("partitions", []),
+        ("identifier_map", None),
+        ("pricing_policy_sha256", None),
+        ("quality_gates_sha256", None),
+        ("readiness_report_sha256", None),
+    ],
+)
+def test_report_model_rejects_incomplete_passing_evidence(
+    passing_gate0: Gate0Fixture,
+    field: str,
+    value: object,
+) -> None:
+    module = _gate0()
+    payload = passing_gate0.verify().model_dump(mode="python")
+    payload[field] = value
+
+    with pytest.raises(ValueError):
+        module.Gate0Report.model_validate(payload, strict=True)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "D:\\private\\freeze\\manifest.json",
+        "/private/freeze/manifest.json",
+        "synthetic-v2-revision",
+    ],
+)
+def test_artifact_evidence_accepts_only_fixed_public_identities(identity: str) -> None:
+    module = _gate0()
+
+    with pytest.raises(ValueError):
+        module.Gate0ArtifactEvidence(
+            identity=identity,
+            sha256=_sha256(b"evidence"),
+            count=None,
+        )
+
+
+def test_report_writer_revalidates_constructed_report_before_serializing(
+    tmp_path: Path,
+) -> None:
+    module = _gate0()
+    unsafe_artifact = module.Gate0ArtifactEvidence.model_construct(
+        identity="D:\\private\\freeze\\manifest.json",
+        sha256=_sha256(b"manifest"),
+        count=None,
+    )
+    fake_pass = module.Gate0Report.model_construct(
+        schema_version="gate0-report-v1",
+        generated_at=FIXED_NOW,
+        passed=True,
+        blocking_reasons=[],
+        manifest=unsafe_artifact,
+        partitions=[],
+        identifier_map=None,
+        pricing_policy_sha256=None,
+        quality_gates_sha256=None,
+        readiness_report_sha256=None,
+    )
+    path = tmp_path / "gate0-report.json"
+
+    with pytest.raises(ValueError, match="gate0 report is invalid"):
+        module.write_gate0_report(path, fake_pass)
+
+    assert not path.exists()
+
+
+def test_cli_prints_only_sanitized_deterministic_summary(
+    passing_gate0: Gate0Fixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    unsafe = (
+        '{"schema_version":"gate0-readiness-v1",'
+        '"Authorization":"Bearer AUTH_SECRET_SENTINEL",'
+        '"api_key":"sk-credential-shaped-sentinel",'
+        '"query":"GATED_QUERY_SENTINEL",'
+        '"path":"D:\\\\private\\\\freeze\\\\labels.json"}'
+    ).encode()
+    passing_gate0.readiness_path.write_bytes(unsafe)
+
+    result = _gate0().main(passing_gate0.cli_args())
+
+    assert result == 1
+    assert capsys.readouterr().out == (
+        "gate0 status=blocked reasons=readiness_evidence_invalid\n"
+    )
+    serialized = passing_gate0.report_path.read_text(encoding="utf-8")
+    for secret in (
+        "Authorization",
+        "Bearer",
+        "AUTH_SECRET_SENTINEL",
+        "api_key",
+        "sk-credential-shaped-sentinel",
+        "GATED_QUERY_SENTINEL",
+        "D:\\private",
+        str(passing_gate0.root),
+    ):
+        assert secret not in serialized
+
+
+def test_cli_returns_zero_only_for_passing_report(
+    passing_gate0: Gate0Fixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    result = _gate0().main(passing_gate0.cli_args())
+
+    assert result == 0
+    assert capsys.readouterr().out == "gate0 status=passed reasons=none\n"
+    assert json.loads(passing_gate0.report_path.read_bytes())["passed"] is True
+
+
+def test_private_gate0_and_runtime_roots_are_ignored() -> None:
+    entries = {
+        line.strip()
+        for line in Path(".gitignore").read_text(encoding="utf-8").splitlines()
+    }
+
+    assert {"/runs/", "/validation-attempts/", "/private-gate0/"} <= entries

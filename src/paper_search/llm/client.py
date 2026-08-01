@@ -23,6 +23,7 @@ from paper_search.domain.models import (
 
 Clock = Callable[[], datetime]
 _SAFE_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+_SAFE_PROMPT_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
 _SECRET_SHAPE = re.compile(
     r"(?:\bsk-[A-Za-z0-9]|\bgh[pousr]_[A-Za-z0-9]|\bgithub_pat_"
     r"|\bxox[baprs]-|\bsecret\b|\bbearer\b)",
@@ -56,6 +57,16 @@ def validate_model_id(value: str) -> str:
         or _SECRET_SHAPE.search(normalized) is not None
     ):
         raise ValueError("LLM model identifier is not safe")
+    return normalized
+
+
+def validate_prompt_version(value: str) -> str:
+    normalized = value.strip()
+    if (
+        _SAFE_PROMPT_VERSION.fullmatch(normalized) is None
+        or _SECRET_SHAPE.search(normalized) is not None
+    ):
+        raise ValueError("LLM prompt version is not safe")
     return normalized
 
 
@@ -95,7 +106,7 @@ class LLMResponseDecoder:
     """Decode one exact OpenAI-compatible response without transport or credentials."""
 
     def __init__(self, *, prompt_version: str = "query-analyze-v1") -> None:
-        self._prompt_version = prompt_version
+        self._prompt_version = validate_prompt_version(prompt_version)
 
     def decode(
         self,
@@ -106,6 +117,7 @@ class LLMResponseDecoder:
         cache_hit: bool,
         snapshot_ref: SnapshotRef | None,
     ) -> ProviderResult[dict[str, Any]]:
+        safe_model_id = validate_model_id(model_id)
         data: dict[str, Any] = {}
         errors: list[ErrorDetail] = []
         try:
@@ -155,7 +167,7 @@ class LLMResponseDecoder:
                     data = decoded
 
         provenance = _base_provenance(
-            model_id=model_id,
+            model_id=safe_model_id,
             captured_at=captured_at,
             response_bytes=response_bytes,
         )
@@ -238,7 +250,7 @@ class OpenAICompatibleLLMClient:
         self._transport_endpoint = f"{normalized_url}/chat/completions"
         self._model = validate_model_id(model)
         self._api_key = api_key
-        self._prompt_version = prompt_version
+        self._prompt_version = validate_prompt_version(prompt_version)
         self._clock = clock
         self._decoder = LLMResponseDecoder(prompt_version=prompt_version)
 

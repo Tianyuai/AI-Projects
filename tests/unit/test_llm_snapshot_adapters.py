@@ -162,7 +162,7 @@ def test_real_budget_controller_success_settles_once(tmp_path: Path) -> None:
     assert controller.committed_usage == result.usage
     assert settlement.committed_usage == result.usage
     assert controller.reserved_usage.llm_calls == 0
-    with pytest.raises(ReservationError, match="already finalized"):
+    with pytest.raises(ReservationError, match="reservation is unknown"):
         settlement.settle(reservation, result.usage)
 
 
@@ -209,7 +209,7 @@ def test_real_budget_controller_terminal_failure_records_usage_and_hard_stops(
     assert controller.stop_status() == "hard_stop"
     assert controller.reserved_usage.llm_calls == 0
     assert settlement.committed_usage.llm_calls == 1
-    with pytest.raises(ReservationError, match="already finalized"):
+    with pytest.raises(ReservationError, match="reservation is unknown"):
         settlement.fail_closed(reservation, UsageActual(llm_calls=1))
 
 
@@ -451,6 +451,135 @@ def test_three_timeouts_return_fixed_error_and_settle_once(tmp_path: Path) -> No
     assert controller.settled[0][1].llm_calls == 3
 
 
+def test_staging_failure_commits_all_valued_attempts_to_real_controller(
+    tmp_path: Path,
+) -> None:
+    class BrokenCaptureStore:
+        def stage_success(self, *_: object, **__: object) -> object:
+            raise OSError("sensitive staging failure")
+
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                content=b'{"usage":{"prompt_tokens":1,"completion_tokens":0}}',
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=_response_bytes({"ok": True}, input_tokens=5, output_tokens=3),
+            request=request,
+        )
+
+    controller = _budget_controller()
+    settlement = HardBudgetSettlementAdapter(controller)
+    reservation = _controller_reservation(controller)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://llm.example.test/v1",
+                    model="qwen-test-v1",
+                    api_key="unit-test-secret",
+                ),
+                capture_store=BrokenCaptureStore(),  # type: ignore[arg-type]
+                pricer=_pricer(),
+                controller=settlement,
+            )
+            with pytest.raises(LLMAdapterError, match="live capture failed") as error:
+                await analyzer.generate_json(
+                    prompt_name="query_analyze",
+                    payload={"query": "x"},
+                    reservation=reservation,
+                )
+            assert "sensitive" not in str(error.value)
+
+    asyncio.run(run())
+
+    assert attempts == 2
+    assert controller.stop_status() == "hard_stop"
+    assert controller.reserved_usage == UsageEstimate()
+    assert controller.committed_usage.llm_calls == 2
+    assert controller.committed_usage.input_tokens == 6
+    assert controller.committed_usage.output_tokens == 3
+    assert controller.committed_usage.cost_cny == Decimal("0.000221")
+
+
+def test_pricing_failure_preserves_prior_valued_attempts_in_real_controller(
+    tmp_path: Path,
+) -> None:
+    delegate = _pricer()
+
+    class SecondAttemptPricingFailure:
+        attempts = 0
+
+        def value_actual(self, **kwargs: object) -> UsageActual:
+            self.attempts += 1
+            if self.attempts == 2:
+                raise ValueError("sensitive pricing failure")
+            return delegate.value_actual(**kwargs)  # type: ignore[arg-type]
+
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(
+                429,
+                content=b'{"usage":{"prompt_tokens":1,"completion_tokens":0}}',
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=_response_bytes({"ok": True}, input_tokens=5, output_tokens=3),
+            request=request,
+        )
+
+    controller = _budget_controller()
+    reservation = _controller_reservation(controller)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://llm.example.test/v1",
+                    model="qwen-test-v1",
+                    api_key="unit-test-secret",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "partial-pricing"),
+                pricer=SecondAttemptPricingFailure(),  # type: ignore[arg-type]
+                controller=HardBudgetSettlementAdapter(controller),
+            )
+            with pytest.raises(LLMAdapterError, match="live capture failed"):
+                await analyzer.generate_json(
+                    prompt_name="query_analyze",
+                    payload={"query": "x"},
+                    reservation=reservation,
+                )
+
+    asyncio.run(run())
+
+    assert attempts == 2
+    assert controller.committed_usage.llm_calls == 2
+    assert controller.committed_usage.input_tokens == 6
+    assert controller.committed_usage.output_tokens == 3
+    assert controller.committed_usage.cost_cny is None
+    assert controller.known_committed_cost_cny == Decimal("0.000102")
+    assert controller.unknown_cost_actions == ["query.analyze"]
+
+
 def test_terminal_internal_failure_records_accumulated_usage_fail_closed(
     tmp_path: Path,
 ) -> None:
@@ -492,3 +621,103 @@ def test_terminal_internal_failure_records_accumulated_usage_fail_closed(
     assert controller.settled == []
     assert len(controller.failed) == 1
     assert controller.failed[0][1].llm_calls == 1
+
+
+@pytest.mark.parametrize("settlement_error", [ReservationError, TypeError])
+def test_terminal_settlement_failure_is_fixed_no_chain_adapter_error(
+    tmp_path: Path,
+    settlement_error: type[Exception],
+) -> None:
+    class BrokenPricer:
+        def value_actual(self, **_: object) -> UsageActual:
+            raise ValueError("sensitive pricing failure")
+
+    class FailingSettlementController:
+        def settle(self, *_: object) -> None:
+            raise AssertionError("settle must not be called")
+
+        def fail_closed(self, *_: object) -> None:
+            raise settlement_error("sensitive settlement failure")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=_response_bytes({"ok": True}), request=request
+                )
+            )
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://llm.example.test/v1",
+                    model="qwen-test-v1",
+                    api_key="unit-test-secret",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "terminal-mask"),
+                pricer=BrokenPricer(),  # type: ignore[arg-type]
+                controller=FailingSettlementController(),  # type: ignore[arg-type]
+            )
+            with pytest.raises(LLMAdapterError) as error:
+                await analyzer.generate_json(
+                    prompt_name="query_analyze",
+                    payload={"query": "x"},
+                    reservation=_reservation(),
+                )
+            assert str(error.value) == "LLM live capture failed"
+            assert error.value.__cause__ is None
+            assert "sensitive" not in repr(error.value)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("settlement_error", [ReservationError, TypeError])
+def test_cancellation_preserves_cancelled_error_when_terminal_settlement_fails(
+    tmp_path: Path,
+    settlement_error: type[Exception],
+) -> None:
+    class FailingSettlementController:
+        def settle(self, *_: object) -> None:
+            raise AssertionError("settle must not be called")
+
+        def fail_closed(self, *_: object) -> None:
+            raise settlement_error("sensitive settlement failure")
+
+    async def run() -> None:
+        dispatched = asyncio.Event()
+        never_complete = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            dispatched.set()
+            await never_complete.wait()
+            return httpx.Response(200, content=_response_bytes({}), request=request)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://llm.example.test/v1",
+                    model="qwen-test-v1",
+                    api_key="unit-test-secret",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "cancel-mask"),
+                pricer=_pricer(),
+                controller=FailingSettlementController(),  # type: ignore[arg-type]
+            )
+            task = asyncio.create_task(
+                analyzer.generate_json(
+                    prompt_name="query_analyze",
+                    payload={"query": "x"},
+                    reservation=_reservation(),
+                )
+            )
+            await dispatched.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as error:
+                await task
+            assert error.value.__cause__ is None
+            assert "sensitive" not in repr(error.value)
+
+    asyncio.run(run())

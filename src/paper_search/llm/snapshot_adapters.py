@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -13,12 +12,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from paper_search.control.budget import HardBudgetController
 from paper_search.control.pricing import ActualCostPricer
-from paper_search.control.budget import (
-    BudgetExceededError,
-    HardBudgetController,
-    ReservationError,
-)
 from paper_search.domain.models import (
     BudgetReservation,
     ErrorDetail,
@@ -63,45 +58,32 @@ class LLMAdapterError(RuntimeError):
 
 
 class HardBudgetSettlementAdapter:
-    """Add exact-once terminal usage accounting to a request budget controller."""
+    """Expose the analyzer settlement contract over one authoritative controller."""
 
     def __init__(self, controller: HardBudgetController) -> None:
         self._controller = controller
-        self._lock = threading.RLock()
-        self._finalized: set[str] = set()
-        self._recorded: list[UsageActual] = []
 
     @property
     def committed_usage(self) -> UsageActual:
-        with self._lock:
-            return _aggregate(self._recorded)
+        return self._controller.committed_usage
 
     def stop_status(self) -> str:
         return self._controller.stop_status()
 
-    def _require_active(self, reservation: BudgetReservation) -> None:
-        if reservation.reservation_id in self._finalized:
-            raise ReservationError("reservation is already finalized")
-
     def settle(self, reservation: BudgetReservation, actual: UsageActual) -> None:
-        with self._lock:
-            self._require_active(reservation)
-            self._controller.settle(reservation, actual)
-            self._recorded.append(actual)
-            self._finalized.add(reservation.reservation_id)
+        self._controller.settle(reservation, actual)
 
     def fail_closed(
         self, reservation: BudgetReservation, actual: UsageActual
     ) -> None:
-        with self._lock:
-            self._require_active(reservation)
-            self._controller.fail_closed(reservation)
-            try:
-                self._controller.settle(reservation, actual)
-            except (BudgetExceededError, ReservationError):
-                self._controller.release(reservation)
-            self._recorded.append(actual)
-            self._finalized.add(reservation.reservation_id)
+        self._controller.fail_closed(reservation, actual)
+
+    def fail_closed_attempts(
+        self,
+        reservation: BudgetReservation,
+        actuals: list[UsageActual],
+    ) -> None:
+        self._controller.fail_closed_attempts(reservation, actuals)
 
 
 def _identity(
@@ -158,6 +140,26 @@ def _aggregate(usages: list[UsageActual]) -> UsageActual:
         cost_cny=cost,
         elapsed_ms=sum(item.elapsed_ms for item in usages),
     )
+
+
+def _terminal_attempts(
+    measured_attempts: list[UsageActual], valued_attempts: list[UsageActual]
+) -> list[UsageActual]:
+    return [*valued_attempts, *measured_attempts[len(valued_attempts) :]]
+
+
+def _fail_closed_terminal(
+    controller: RequestSettlementController,
+    reservation: BudgetReservation,
+    measured_attempts: list[UsageActual],
+    valued_attempts: list[UsageActual],
+) -> None:
+    attempts = _terminal_attempts(measured_attempts, valued_attempts)
+    batch_settlement = getattr(controller, "fail_closed_attempts", None)
+    if callable(batch_settlement):
+        batch_settlement(reservation, attempts)
+        return
+    controller.fail_closed(reservation, _aggregate(attempts))
 
 
 def _error_result(
@@ -355,7 +357,7 @@ class LiveCaptureLLMAnalyzer:
                 raise RuntimeError("missing terminal LLM result")
             self._controller.settle(reservation, terminal.usage)
             return terminal
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             if in_flight_started is not None:
                 measured_attempts.append(
                     UsageActual(
@@ -368,16 +370,26 @@ class LiveCaptureLLMAnalyzer:
                         ),
                     )
                 )
-            self._controller.fail_closed(reservation, _aggregate(measured_attempts))
-            raise
-        except Exception:
-            measured_total = _aggregate(measured_attempts)
             try:
-                self._controller.fail_closed(reservation, measured_total)
-            except TypeError:
-                raise
+                _fail_closed_terminal(
+                    self._controller,
+                    reservation,
+                    measured_attempts,
+                    valued_attempts,
+                )
             except Exception:
-                raise LLMAdapterError("LLM live capture failed") from None
+                pass
+            raise cancellation from None
+        except Exception:
+            try:
+                _fail_closed_terminal(
+                    self._controller,
+                    reservation,
+                    measured_attempts,
+                    valued_attempts,
+                )
+            except Exception:
+                pass
             raise LLMAdapterError("LLM live capture failed") from None
 
 

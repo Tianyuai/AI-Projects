@@ -184,13 +184,59 @@ class HardBudgetController:
         with self._lock:
             return self._expire_locked()
 
-    def fail_closed(self, reservation: BudgetReservation) -> None:
-        """Block all future calls after a provider reports unaccountable usage."""
+    def fail_closed(
+        self,
+        reservation: BudgetReservation,
+        actual: UsageActual | None = None,
+    ) -> None:
+        """Atomically hard-stop and optionally commit terminal measured usage.
+
+        The one-argument form retains the original behavior for callers that do not
+        possess terminal usage. The two-argument form is the authoritative terminal
+        transition: dispatched usage is committed even when its cost is unknown or it
+        exceeds the reservation, because the controller is hard-stopped at the same time.
+        """
         with self._lock:
             active = self._reservations.get(reservation.reservation_id)
             if active != reservation:
                 raise ReservationError("reservation is unknown or does not match the active reservation")
             self._fail_closed = True
+            if actual is None:
+                return
+            self._commit_terminal_locked(active, [actual])
+
+    def fail_closed_attempts(
+        self,
+        reservation: BudgetReservation,
+        actuals: Iterable[UsageActual],
+    ) -> None:
+        """Atomically hard-stop and retain priced and unpriced terminal attempts."""
+
+        committed = [
+            UsageActual.model_validate(actual.model_dump(mode="python"))
+            for actual in actuals
+        ]
+        if not committed:
+            raise ReservationError("terminal settlement requires actual usage")
+        with self._lock:
+            active = self._reservations.get(reservation.reservation_id)
+            if active != reservation:
+                raise ReservationError("reservation is unknown or does not match the active reservation")
+            self._fail_closed = True
+            self._commit_terminal_locked(active, committed)
+
+    def _commit_terminal_locked(
+        self,
+        reservation: BudgetReservation,
+        actuals: Iterable[UsageActual],
+    ) -> None:
+        committed = [
+            UsageActual.model_validate(actual.model_dump(mode="python"))
+            for actual in actuals
+        ]
+        del self._reservations[reservation.reservation_id]
+        self._committed.extend(committed)
+        self._committed_actions.extend(reservation.action for _ in committed)
 
     def stop_status(self) -> str:
         """Return deterministic continue, soft-stop, or hard-stop state."""

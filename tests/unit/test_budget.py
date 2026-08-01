@@ -373,6 +373,106 @@ def test_failed_settlement_can_force_a_fail_closed_hard_stop() -> None:
         controller.reserve("provider.retry", UsageEstimate(search_api_calls=1))
 
 
+def test_terminal_fail_closed_atomically_commits_unknown_actual() -> None:
+    controller_type, _, reservation_error = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+    reservation = controller.reserve(
+        "llm.terminal",
+        UsageEstimate(llm_calls=1, input_tokens=10, cost_cny=0.5),
+    )
+
+    controller.fail_closed(
+        reservation,
+        UsageActual(llm_calls=1, input_tokens=7, cost_cny=None),
+    )
+
+    assert controller.stop_status() == "hard_stop"
+    assert controller.reserved_usage == UsageEstimate()
+    assert controller.committed_usage.llm_calls == 1
+    assert controller.committed_usage.input_tokens == 7
+    assert controller.committed_usage.cost_cny is None
+    assert controller.known_committed_cost_cny == Decimal("0")
+    assert controller.unknown_cost_actions == ["llm.terminal"]
+    with pytest.raises(reservation_error, match="reservation is unknown"):
+        controller.fail_closed(reservation, UsageActual(llm_calls=1))
+
+
+def test_terminal_fail_closed_commits_over_reservation_actual() -> None:
+    controller_type, _, _ = budget_api()
+    controller = controller_type(
+        make_budget(max_llm_calls=5, target_llm_calls=1, max_cost_cny=2.0),
+        formal_live=True,
+    )
+    reservation = controller.reserve(
+        "llm.overrun",
+        UsageEstimate(llm_calls=1, input_tokens=1, cost_cny=0.1),
+    )
+    actual = UsageActual(llm_calls=3, input_tokens=20, cost_cny=0.8)
+
+    controller.fail_closed(reservation, actual)
+
+    assert controller.committed_usage == actual
+    assert controller.known_committed_cost_cny == Decimal("0.8")
+    assert controller.stop_status() == "hard_stop"
+
+
+def test_terminal_fail_closed_records_dispatched_usage_after_ttl() -> None:
+    controller_type, _, _ = budget_api()
+    current = datetime(2026, 8, 2, tzinfo=UTC)
+    controller = controller_type(
+        make_budget(),
+        formal_live=True,
+        clock=lambda: current,
+        reservation_ttl_seconds=1,
+    )
+    reservation = controller.reserve(
+        "llm.late-terminal",
+        UsageEstimate(llm_calls=1, cost_cny=0.5),
+    )
+    current += timedelta(seconds=2)
+
+    controller.fail_closed(
+        reservation,
+        UsageActual(llm_calls=1, cost_cny=0.4),
+    )
+
+    assert controller.committed_usage.llm_calls == 1
+    assert controller.reserved_usage == UsageEstimate()
+
+
+def test_terminal_fail_closed_is_concurrent_exact_once() -> None:
+    controller_type, _, reservation_error = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+    reservation = controller.reserve(
+        "llm.concurrent-terminal",
+        UsageEstimate(llm_calls=1, cost_cny=0.5),
+    )
+    barrier = threading.Barrier(3)
+    outcomes: list[str] = []
+
+    def finalize() -> None:
+        barrier.wait()
+        try:
+            controller.fail_closed(
+                reservation,
+                UsageActual(llm_calls=1, cost_cny=0.4),
+            )
+        except reservation_error:
+            outcomes.append("rejected")
+        else:
+            outcomes.append("committed")
+
+    threads = [threading.Thread(target=finalize), threading.Thread(target=finalize)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["committed", "rejected"]
+    assert controller.committed_usage.llm_calls == 1
+
+
 def test_recovery_rejects_duplicate_reservation_ids() -> None:
     controller_type, _, _ = budget_api()
     controller = controller_type(make_budget())

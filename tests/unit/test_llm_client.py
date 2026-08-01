@@ -203,6 +203,30 @@ def test_pure_decoder_does_not_require_transport_or_credentials() -> None:
     assert result.usage.output_tokens == 1
 
 
+def test_pure_decoder_rejects_secret_shaped_model_identifier_without_echo() -> None:
+    secret_model = "sk-live-model-secret"
+
+    with pytest.raises(ValueError, match="model identifier is not safe") as error:
+        LLMResponseDecoder().decode(
+            b"{}",
+            model_id=secret_model,
+            captured_at=datetime(2026, 8, 1, tzinfo=UTC),
+            cache_hit=True,
+            snapshot_ref=None,
+        )
+
+    assert secret_model not in str(error.value)
+
+
+def test_pure_decoder_rejects_secret_shaped_prompt_version_without_echo() -> None:
+    secret_prompt_version = "query-sk-live-prompt-secret"
+
+    with pytest.raises(ValueError, match="prompt version is not safe") as error:
+        LLMResponseDecoder(prompt_version=secret_prompt_version)
+
+    assert secret_prompt_version not in str(error.value)
+
+
 def test_secret_shaped_model_identifier_is_rejected_without_echo() -> None:
     async def run() -> None:
         async with httpx.AsyncClient(

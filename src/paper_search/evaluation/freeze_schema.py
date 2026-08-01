@@ -316,6 +316,32 @@ def parse_json_object_bytes(content: bytes) -> dict[str, object]:
     return _json_object(content)
 
 
+def _validated_lexical_root(path: Path) -> Path:
+    """Return one absolute root only when no lexical component redirects."""
+    try:
+        absolute = path.absolute()
+        current = Path(absolute.anchor)
+        for part in absolute.parts[1:]:
+            current /= part
+            try:
+                metadata = os.lstat(current)
+            except FileNotFoundError:
+                break
+            attributes = getattr(metadata, "st_file_attributes", 0)
+            if stat.S_ISLNK(metadata.st_mode) or attributes & getattr(
+                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x00000400
+            ):
+                raise ValueError("freeze manifest is invalid")
+        resolved = path.resolve()
+        if os.path.normcase(os.path.normpath(str(resolved))) != os.path.normcase(
+            os.path.normpath(str(absolute))
+        ):
+            raise ValueError("freeze manifest is invalid")
+        return absolute
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("freeze manifest is invalid") from None
+
+
 @dataclass
 class BoundArtifact:
     """Exact bytes and identity read through one still-open trusted descriptor."""
@@ -335,9 +361,20 @@ class BoundArtifact:
     _closed: bool = field(default=False, init=False, repr=False)
 
     def verify_path_identity(self) -> None:
-        """Reject if a serialized path no longer names the opened evidence object."""
+        """Rehash the descriptor, then reject any lexical/path identity change."""
         if self._closed:
             raise ValueError("freeze manifest is invalid")
+        try:
+            metadata = os.fstat(self.descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino) != (self.device, self.inode)
+                or sha256_bytes(_read_descriptor(self.descriptor)) != self.sha256
+                or _validated_lexical_root(self.data_root) != self.data_root
+            ):
+                raise ValueError("freeze manifest is invalid")
+        except (OSError, RuntimeError, ValueError):
+            raise ValueError("freeze manifest is invalid") from None
         if os.name == "nt":
             _verify_windows_artifact_identity(self)
             return
@@ -450,7 +487,7 @@ def _read_descriptor(descriptor: int) -> bytes:
 def _open_posix_confined(
     data_root: Path, relative_path: SafeRelativePath
 ) -> tuple[int, list[int], tuple[tuple[int, int], ...]]:
-    root = data_root.resolve()
+    root = data_root
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptors: list[int] = []
     try:
@@ -616,7 +653,7 @@ def _open_windows_confined(
     handles: list[int] = []
     try:
         root_handle = create_file(
-            str(data_root.resolve()),
+            str(data_root),
             0x80000000,
             0x00000001 | 0x00000002,
             None,
@@ -632,7 +669,7 @@ def _open_windows_confined(
             raise OSError
         root_final = _normalized_windows_path(buffer.value)
         final_paths = [root_final]
-        candidate = data_root.resolve()
+        candidate = data_root
         for index, part in enumerate(relative_path.split("/")):
             candidate = candidate / part
             final = index == len(relative_path.split("/")) - 1
@@ -728,6 +765,7 @@ def open_confined_artifact(
     """Open each path component safely and keep the evidence descriptor alive."""
     try:
         normalized = validate_safe_relative_path(relative_path)
+        root = _validated_lexical_root(data_root)
         if replaceable_manifest and normalized != "manifest.json":
             raise ValueError("freeze manifest is invalid")
         path_identities: tuple[tuple[int, int], ...] = ()
@@ -735,14 +773,14 @@ def open_confined_artifact(
         windows_file_id: tuple[int, bytes] | None = None
         if os.name == "nt":
             descriptor, ancestors, windows_final_paths, windows_file_id = _open_windows_confined(
-                data_root,
+                root,
                 normalized,
                 allow_target_delete_share=replaceable_manifest,
                 allow_target_write_share=allow_target_write_share,
             )
         else:
             descriptor, ancestors, path_identities = _open_posix_confined(
-                data_root, normalized
+                root, normalized
             )
     except (OSError, RuntimeError, ValueError):
         raise ValueError("freeze manifest is invalid") from None
@@ -752,7 +790,7 @@ def open_confined_artifact(
             raise ValueError("freeze manifest is invalid")
         content = _read_descriptor(descriptor)
         artifact = BoundArtifact(
-            data_root=data_root.resolve(),
+            data_root=root,
             relative_path=normalized,
             descriptor=descriptor,
             content=content,
@@ -790,7 +828,7 @@ def read_confined_bytes(data_root: Path, relative_path: SafeRelativePath) -> byt
 
 def _open_posix_report_parent(data_root: Path, relative_path: SafeRelativePath) -> tuple[int, str]:
     parts = relative_path.split("/")
-    root = data_root.resolve()
+    root = data_root
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(root, flags)
     try:
@@ -823,6 +861,7 @@ def publish_confined_bytes_no_overwrite(
     """Atomically create a confined report or accept only its exact bytes."""
     try:
         normalized = validate_safe_relative_path(relative_path)
+        root = _validated_lexical_root(data_root)
     except ValueError:
         raise ValueError("freeze manifest is invalid") from None
     if os.name == "nt":
@@ -832,10 +871,6 @@ def publish_confined_bytes_no_overwrite(
         class FileAttributeTagInfo(ctypes.Structure):
             _fields_ = [("file_attributes", ctypes.c_uint32), ("reparse_tag", ctypes.c_uint32)]
 
-        try:
-            root = data_root.resolve()
-        except (OSError, RuntimeError):
-            raise ValueError("freeze manifest is invalid") from None
         target = root.joinpath(*normalized.split("/"))
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         create_file = kernel32.CreateFileW
@@ -970,7 +1005,7 @@ def publish_confined_bytes_no_overwrite(
                 for open_handle in reversed(handles):
                     kernel32.CloseHandle(ctypes.c_void_p(open_handle))
     try:
-        parent_descriptor, filename = _open_posix_report_parent(data_root, normalized)
+        parent_descriptor, filename = _open_posix_report_parent(root, normalized)
     except (OSError, RuntimeError):
         raise ValueError("freeze manifest is invalid") from None
     try:
@@ -1003,7 +1038,7 @@ def publish_confined_bytes_no_overwrite(
                         follow_symlinks=False,
                     )
                 except FileExistsError:
-                    with open_confined_artifact(data_root, normalized) as artifact:
+                    with open_confined_artifact(root, normalized) as artifact:
                         if artifact.content == content:
                             status = "matched"
                         else:
@@ -1200,7 +1235,7 @@ def open_validated_freeze_evidence(
 ) -> Iterator[ValidatedFreezeEvidence]:
     """Validate one freeze and retain every exact evidence descriptor through exit."""
     try:
-        root = data_root.resolve()
+        root = _validated_lexical_root(data_root)
         relative_path = path.absolute().relative_to(root).as_posix()
     except (OSError, RuntimeError, ValueError):
         raise FreezeEvidenceError("manifest_invalid") from None

@@ -4,6 +4,10 @@ import hashlib
 import importlib
 import json
 import os
+import subprocess
+import sys
+from collections import Counter
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -90,6 +94,31 @@ def _readiness_bytes() -> bytes:
             ],
         }
     )
+
+
+@contextmanager
+def _directory_redirect(link: Path, target: Path) -> object:
+    if os.name == "nt":
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError:
+            result = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                pytest.skip("Windows directory reparse creation is unavailable")
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    try:
+        yield
+    finally:
+        if link.is_symlink():
+            link.unlink()
+        elif os.name == "nt" and link.exists():
+            link.rmdir()
 
 
 @dataclass
@@ -313,6 +342,44 @@ def test_manifest_private_revision_text_never_enters_report(
     assert all(secret not in serialized for secret in secrets)
 
 
+def test_identifier_coverage_uses_relevant_paper_ids_never_query_id(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    dev_path = passing_gate0.data_root / "dev" / "gold.jsonl"
+    dev_bytes = (
+        b'{"query_id":"doi:10.9999/query-id-is-not-a-paper",'
+        b'"query":"synthetic dev",'
+        b'"relevant_paper_ids":["doi:10.1000/dev"]}\n'
+    )
+    dev_path.write_bytes(dev_bytes)
+    partitions = passing_gate0.manifest["partitions"]
+    assert isinstance(partitions, list)
+    dev = next(
+        item
+        for item in partitions
+        if isinstance(item, dict) and item.get("name") == "dev"
+    )
+    dev["sha256"] = _sha256(dev_bytes)
+    approval_hashes = passing_gate0.approval["partition_hashes"]
+    assert isinstance(approval_hashes, dict)
+    approval_hashes["dev"] = _sha256(dev_bytes)
+    validation = next(
+        item
+        for item in partitions
+        if isinstance(item, dict) and item.get("name") == "validation"
+    )
+    passing_gate0.manifest["gold_sha256"] = canonical_gold_set_sha256(
+        str(dev["sha256"]), str(validation["sha256"])
+    )
+    passing_gate0.bind_approval()
+    passing_gate0.write_manifest()
+
+    report = passing_gate0.verify()
+
+    assert report.passed is True
+    assert report.blocking_reasons == []
+
+
 @pytest.mark.parametrize(
     ("reason", "mutate"),
     [
@@ -457,7 +524,7 @@ def test_production_pricing_requires_positive_source_and_safe_adapters(
     assert report.blocking_reasons == ["pricing_policy_invalid"]
 
 
-def test_gate0_reads_each_bound_source_artifact_exactly_once(
+def test_gate0_reads_then_rehashes_each_bound_source_on_the_same_descriptor(
     passing_gate0: Gate0Fixture,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -473,8 +540,8 @@ def test_gate0_reads_each_bound_source_artifact_exactly_once(
     report = passing_gate0.verify()
 
     assert report.passed
-    assert len(descriptors) == 8
-    assert len(set(descriptors)) == 8
+    assert len(descriptors) == 16
+    assert set(Counter(descriptors).values()) == {2}
 
 
 def test_gate0_forms_provisional_decision_while_all_artifacts_are_open(
@@ -506,6 +573,127 @@ def test_gate0_forms_provisional_decision_while_all_artifacts_are_open(
 
     assert report.passed
     assert decisions == 1
+
+
+@pytest.mark.parametrize("failure_stage", ["clock", "report"])
+def test_gate0_closes_every_bound_descriptor_when_decision_construction_fails(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    module = _gate0()
+    original_stack = module.ExitStack
+    original_read = freeze_schema._read_descriptor
+    retained_stacks: list[Any] = []
+    descriptors: set[int] = set()
+
+    def retain_stack() -> Any:
+        stack = original_stack()
+        retained_stacks.append(stack)
+        return stack
+
+    def record_read(descriptor: int) -> bytes:
+        descriptors.add(descriptor)
+        return original_read(descriptor)
+
+    def fail_clock() -> datetime:
+        raise LookupError("PRIVATE_CLOCK_SENTINEL")
+
+    def fail_report(**_: object) -> object:
+        raise LookupError("PRIVATE_REPORT_SENTINEL")
+
+    monkeypatch.setattr(module, "ExitStack", retain_stack)
+    monkeypatch.setattr(freeze_schema, "_read_descriptor", record_read)
+    if failure_stage == "report":
+        monkeypatch.setattr(module, "Gate0Report", fail_report)
+
+    with pytest.raises(LookupError):
+        passing_gate0.verify(
+            clock=fail_clock if failure_stage == "clock" else lambda: FIXED_NOW
+        )
+
+    assert len(descriptors) == 8
+    still_open: list[int] = []
+    for descriptor in descriptors:
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            continue
+        still_open.append(descriptor)
+    for stack in retained_stacks:
+        stack.close()
+    retained_stacks.clear()
+    assert still_open == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX same-inode mutation contract")
+@pytest.mark.parametrize(
+    ("relative_path", "expected_reason"),
+    [
+        ("manifest.json", "manifest_invalid"),
+        ("freeze_reports/approval.json", "approval_invalid"),
+        ("dev/gold.jsonl", "partition_hash_mismatch"),
+        ("identifier-map.json", "identifier_map_hash_mismatch"),
+        ("pricing-policy-v1.yaml", "pricing_policy_invalid"),
+        ("quality-gates-v1.yaml", "quality_policy_invalid"),
+        ("provider-readiness.json", "readiness_evidence_invalid"),
+    ],
+)
+def test_gate0_detects_same_inode_truncate_write_with_per_artifact_reason(
+    passing_gate0: Gate0Fixture,
+    relative_path: str,
+    expected_reason: str,
+) -> None:
+    path = (
+        passing_gate0.data_root / relative_path
+        if relative_path
+        in {
+            "manifest.json",
+            "freeze_reports/approval.json",
+            "dev/gold.jsonl",
+            "identifier-map.json",
+        }
+        else passing_gate0.root / relative_path
+    )
+    original_identity = (path.stat().st_dev, path.stat().st_ino)
+
+    def mutate_after_all_evidence_is_open() -> datetime:
+        path.write_bytes(b"same inode, different exact bytes")
+        assert (path.stat().st_dev, path.stat().st_ino) == original_identity
+        return FIXED_NOW
+
+    report = passing_gate0.verify(clock=mutate_after_all_evidence_is_open)
+
+    assert report.passed is False
+    assert report.blocking_reasons == [expected_reason]
+
+
+@pytest.mark.parametrize(
+    ("path_field", "expected_reason"),
+    [
+        ("pricing_path", "pricing_policy_invalid"),
+        ("quality_path", "quality_policy_invalid"),
+        ("readiness_path", "readiness_evidence_invalid"),
+    ],
+)
+def test_external_lexical_parent_redirect_is_rejected_with_artifact_reason(
+    passing_gate0: Gate0Fixture,
+    tmp_path: Path,
+    path_field: str,
+    expected_reason: str,
+) -> None:
+    source = getattr(passing_gate0, path_field)
+    redirected_parent = tmp_path / f"redirected-{path_field}"
+    redirected_parent.mkdir()
+    (redirected_parent / source.name).write_bytes(source.read_bytes())
+    lexical_parent = passing_gate0.root / f"lexical-{path_field}"
+
+    with _directory_redirect(lexical_parent, redirected_parent):
+        setattr(passing_gate0, path_field, lexical_parent / source.name)
+        report = passing_gate0.verify()
+
+    assert report.passed is False
+    assert report.blocking_reasons == [expected_reason]
 
 
 @pytest.mark.parametrize(
@@ -546,6 +734,17 @@ def test_gate0_exit_identity_failure_downgrades_with_artifact_reason(
     assert report.passed is False
     assert report.blocking_reasons == [expected_reason]
     assert "PRIVATE_PATH_SENTINEL" not in report.model_dump_json()
+    invalidated_fields: dict[str, tuple[str, object]] = {
+        "manifest_invalid": ("manifest", None),
+        "partition_hash_mismatch": ("partitions", []),
+        "identifier_map_hash_mismatch": ("identifier_map", None),
+        "pricing_policy_invalid": ("pricing_policy_sha256", None),
+        "quality_policy_invalid": ("quality_gates_sha256", None),
+        "readiness_evidence_invalid": ("readiness_report_sha256", None),
+    }
+    if expected_reason in invalidated_fields:
+        field, empty_value = invalidated_fields[expected_reason]
+        assert getattr(report, field) == empty_value
 
 
 @pytest.mark.parametrize(
@@ -621,7 +820,29 @@ def test_cli_sanitizes_report_parent_symlink_loop(
     assert not passing_gate0.report_path.exists()
 
 
-@pytest.mark.parametrize("error_type", [ValueError, OSError, RuntimeError])
+def test_cli_rejects_real_report_parent_redirect_without_writing_target(
+    passing_gate0: Gate0Fixture,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    redirected_parent = tmp_path / "redirected-report-parent"
+    redirected_parent.mkdir()
+    lexical_parent = passing_gate0.root / "lexical-report-parent"
+
+    with _directory_redirect(lexical_parent, redirected_parent):
+        passing_gate0.report_path = lexical_parent / "gate0-report.json"
+        result = _gate0().main(passing_gate0.cli_args())
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert captured.out == "gate0 status=error reasons=report_write_failed\n"
+    assert captured.err == ""
+    assert not (redirected_parent / "gate0-report.json").exists()
+
+
+@pytest.mark.parametrize(
+    "error_type", [ValueError, OSError, RuntimeError, LookupError]
+)
 def test_cli_sanitizes_unexpected_verification_failure(
     passing_gate0: Gate0Fixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -641,6 +862,51 @@ def test_cli_sanitizes_unexpected_verification_failure(
     assert captured.err == ""
     assert "PRIVATE_PATH_SENTINEL" not in captured.out
     assert not passing_gate0.report_path.exists()
+
+
+def test_cli_sanitizes_unexpected_report_write_failure(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def fail_write(*_: object, **__: object) -> None:
+        raise LookupError("PRIVATE_REPORT_WRITE_SENTINEL")
+
+    monkeypatch.setattr(_gate0(), "write_gate0_report", fail_write)
+
+    result = _gate0().main(passing_gate0.cli_args())
+
+    captured = capsys.readouterr()
+    assert result == 2
+    assert captured.out == "gate0 status=error reasons=report_write_failed\n"
+    assert captured.err == ""
+    assert "PRIVATE_REPORT_WRITE_SENTINEL" not in captured.out
+
+
+def test_invalid_cli_arguments_are_sanitized_at_process_boundary() -> None:
+    sentinel = r"D:\private\GATED_QUERY_AUTH_SECRET_SENTINEL"
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path("src").resolve())
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "paper_search.evaluation.gate0",
+            "--unknown-private-argument",
+            sentinel,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=invalid_arguments\n"
+    assert completed.stderr == ""
+    assert sentinel not in completed.stdout
+    assert sentinel not in completed.stderr
 
 
 def test_report_writer_sanitizes_parent_resolution_failure(

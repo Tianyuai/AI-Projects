@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +37,31 @@ def _canonical_document(payload: object) -> bytes:
         json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2, allow_nan=False)
         + "\n"
     ).encode()
+
+
+@contextmanager
+def _directory_redirect(link: Path, target: Path) -> object:
+    if os.name == "nt":
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError:
+            result = subprocess.run(
+                ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                pytest.skip("Windows directory reparse creation is unavailable")
+    else:
+        link.symlink_to(target, target_is_directory=True)
+    try:
+        yield
+    finally:
+        if link.is_symlink():
+            link.unlink()
+        elif os.name == "nt" and link.exists():
+            link.rmdir()
 
 
 def _write_bound_v2_tree(tmp_path: Path) -> tuple[Path, dict[str, object]]:
@@ -695,6 +721,26 @@ def test_public_manifest_loader_accepts_cli_style_relative_paths(
     assert isinstance(manifest, FreezeManifestV2)
 
 
+def test_bound_evidence_rejects_lexical_data_root_parent_redirect(
+    tmp_path: Path,
+) -> None:
+    actual_parent = tmp_path / "actual-parent"
+    actual_parent.mkdir()
+    actual_root, _ = _write_bound_v2_tree(actual_parent)
+    lexical_root = tmp_path / "lexical-data"
+
+    with _directory_redirect(lexical_root, actual_root):
+        with pytest.raises(freeze_schema.FreezeEvidenceError) as error:
+            with freeze_schema.open_validated_freeze_evidence(
+                lexical_root / "manifest.json",
+                data_root=lexical_root,
+            ):
+                pass
+
+    assert error.value.reasons == ("manifest_invalid",)
+    assert str(error.value) == "freeze manifest is invalid"
+
+
 @pytest.mark.parametrize("method_name", ["resolve", "absolute"])
 @pytest.mark.parametrize("error_type", [OSError, RuntimeError])
 def test_bound_evidence_wraps_path_normalization_failures(
@@ -1255,6 +1301,32 @@ def test_posix_bound_artifacts_own_ancestor_descriptors_until_closed(
         os.fstat(reused)
     finally:
         os.close(reused)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX same-inode mutation contract")
+def test_posix_bound_evidence_rehashes_same_descriptor_after_truncate_write(
+    tmp_path: Path,
+) -> None:
+    data_root, _ = _write_bound_v2_tree(tmp_path)
+    partition_path = data_root / "dev" / "gold.jsonl"
+    original_identity = (
+        partition_path.stat().st_dev,
+        partition_path.stat().st_ino,
+    )
+
+    with pytest.raises(freeze_schema.FreezeEvidenceError) as error:
+        with freeze_schema.open_validated_freeze_evidence(
+            data_root / "manifest.json",
+            data_root=data_root,
+        ):
+            partition_path.write_bytes(b"same inode, different exact bytes\n")
+            assert (
+                partition_path.stat().st_dev,
+                partition_path.stat().st_ino,
+            ) == original_identity
+
+    assert error.value.reasons == ("partition_hash_mismatch",)
+    assert str(error.value) == "freeze manifest is invalid"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows FILE_ID_INFO")

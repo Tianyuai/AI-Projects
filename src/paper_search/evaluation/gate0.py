@@ -7,7 +7,7 @@ import re
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Callable, Literal, Sequence, TypeAlias
+from typing import Callable, Literal, NoReturn, Sequence, TypeAlias
 
 from pydantic import ConfigDict, ValidationError, field_validator, model_validator
 
@@ -204,8 +204,7 @@ def _enter_external_artifact(
     stack: ExitStack,
     path: Path,
 ) -> BoundArtifact:
-    parent = path.parent.resolve()
-    return stack.enter_context(open_confined_artifact(parent, path.name))
+    return stack.enter_context(open_confined_artifact(path.parent, path.name))
 
 
 def _is_production_pricing_policy(policy: PricingPolicy) -> bool:
@@ -304,74 +303,84 @@ def verify_gate0(
     readiness_sha256: Sha256 | None = None
     external_artifacts: list[tuple[BoundArtifact, ExternalReason]] = []
     stack = ExitStack()
+    provisional: Gate0Report
+    decision_constructed = False
+    close_error: Exception | None = None
 
-    if _path_missing(manifest_path):
-        reasons.add("manifest_missing")
-    else:
-        try:
-            freeze_evidence = stack.enter_context(
-                open_validated_freeze_evidence(
-                    manifest_path,
-                    data_root=data_root,
+    try:
+        if _path_missing(manifest_path):
+            reasons.add("manifest_missing")
+        else:
+            try:
+                freeze_evidence = stack.enter_context(
+                    open_validated_freeze_evidence(
+                        manifest_path,
+                        data_root=data_root,
+                    )
                 )
-            )
-        except FreezeEvidenceError as error:
-            reasons.update(error.reasons)
-        else:
-            (
-                manifest_report,
-                partition_reports,
-                identifier_report,
-            ) = _freeze_report_evidence(freeze_evidence, reasons)
+            except FreezeEvidenceError as error:
+                reasons.update(error.reasons)
+            else:
+                (
+                    manifest_report,
+                    partition_reports,
+                    identifier_report,
+                ) = _freeze_report_evidence(freeze_evidence, reasons)
 
-    if _path_missing(pricing_policy_path):
-        reasons.add("pricing_policy_missing")
-    else:
+        if _path_missing(pricing_policy_path):
+            reasons.add("pricing_policy_missing")
+        else:
+            try:
+                pricing_artifact = _enter_external_artifact(
+                    stack, pricing_policy_path
+                )
+                external_artifacts.append(
+                    (pricing_artifact, "pricing_policy_invalid")
+                )
+                pricing_policy = parse_pricing_policy_bytes(pricing_artifact.content)
+                if not _is_production_pricing_policy(pricing_policy):
+                    raise ValueError("pricing policy is not production evidence")
+            except (OSError, RuntimeError, ValueError):
+                reasons.add("pricing_policy_invalid")
+            else:
+                pricing_sha256 = pricing_artifact.sha256
+
         try:
-            pricing_artifact = _enter_external_artifact(stack, pricing_policy_path)
-            external_artifacts.append((pricing_artifact, "pricing_policy_invalid"))
-            pricing_policy = parse_pricing_policy_bytes(pricing_artifact.content)
-            if not _is_production_pricing_policy(pricing_policy):
-                raise ValueError("pricing policy is not production evidence")
+            quality_artifact = _enter_external_artifact(stack, quality_gates_path)
+            external_artifacts.append((quality_artifact, "quality_policy_invalid"))
+            parse_quality_gate_policy_bytes(quality_artifact.content)
         except (OSError, RuntimeError, ValueError):
-            reasons.add("pricing_policy_invalid")
+            reasons.add("quality_policy_invalid")
         else:
-            pricing_sha256 = pricing_artifact.sha256
+            quality_sha256 = quality_artifact.sha256
 
-    try:
-        quality_artifact = _enter_external_artifact(stack, quality_gates_path)
-        external_artifacts.append((quality_artifact, "quality_policy_invalid"))
-        parse_quality_gate_policy_bytes(quality_artifact.content)
-    except (OSError, RuntimeError, ValueError):
-        reasons.add("quality_policy_invalid")
-    else:
-        quality_sha256 = quality_artifact.sha256
+        try:
+            readiness_artifact = _enter_external_artifact(
+                stack, readiness_report_path
+            )
+            external_artifacts.append(
+                (readiness_artifact, "readiness_evidence_invalid")
+            )
+            _parse_readiness_bytes(readiness_artifact.content)
+        except (OSError, RuntimeError, ValueError):
+            reasons.add("readiness_evidence_invalid")
+        else:
+            readiness_sha256 = readiness_artifact.sha256
 
-    try:
-        readiness_artifact = _enter_external_artifact(stack, readiness_report_path)
-        external_artifacts.append(
-            (readiness_artifact, "readiness_evidence_invalid")
+        provisional = Gate0Report(
+            schema_version="gate0-report-v1",
+            generated_at=clock(),
+            passed=not reasons,
+            blocking_reasons=sorted(reasons),
+            manifest=manifest_report,
+            partitions=partition_reports,
+            identifier_map=identifier_report,
+            pricing_policy_sha256=pricing_sha256,
+            quality_gates_sha256=quality_sha256,
+            readiness_report_sha256=readiness_sha256,
         )
-        _parse_readiness_bytes(readiness_artifact.content)
-    except (OSError, RuntimeError, ValueError):
-        reasons.add("readiness_evidence_invalid")
-    else:
-        readiness_sha256 = readiness_artifact.sha256
+        decision_constructed = True
 
-    provisional = Gate0Report(
-        schema_version="gate0-report-v1",
-        generated_at=clock(),
-        passed=not reasons,
-        blocking_reasons=sorted(reasons),
-        manifest=manifest_report,
-        partitions=partition_reports,
-        identifier_map=identifier_report,
-        pricing_policy_sha256=pricing_sha256,
-        quality_gates_sha256=quality_sha256,
-        readiness_report_sha256=readiness_sha256,
-    )
-
-    try:
         for artifact, reason in external_artifacts:
             try:
                 artifact.verify_path_identity()
@@ -381,7 +390,14 @@ def verify_gate0(
         try:
             stack.close()
         except FreezeEvidenceError as error:
-            reasons.update(error.reasons)
+            if decision_constructed:
+                reasons.update(error.reasons)
+        except Exception as error:
+            if decision_constructed:
+                close_error = error
+
+    if close_error is not None:
+        raise ValueError("gate0 verification failed") from None
 
     if reasons == set(provisional.blocking_reasons):
         return provisional
@@ -390,12 +406,34 @@ def verify_gate0(
         generated_at=provisional.generated_at,
         passed=not reasons,
         blocking_reasons=sorted(reasons),
-        manifest=provisional.manifest,
-        partitions=provisional.partitions,
-        identifier_map=provisional.identifier_map,
-        pricing_policy_sha256=provisional.pricing_policy_sha256,
-        quality_gates_sha256=provisional.quality_gates_sha256,
-        readiness_report_sha256=provisional.readiness_report_sha256,
+        manifest=(
+            None if "manifest_invalid" in reasons else provisional.manifest
+        ),
+        partitions=(
+            []
+            if "partition_hash_mismatch" in reasons
+            else provisional.partitions
+        ),
+        identifier_map=(
+            None
+            if "identifier_map_hash_mismatch" in reasons
+            else provisional.identifier_map
+        ),
+        pricing_policy_sha256=(
+            None
+            if "pricing_policy_invalid" in reasons
+            else provisional.pricing_policy_sha256
+        ),
+        quality_gates_sha256=(
+            None
+            if "quality_policy_invalid" in reasons
+            else provisional.quality_gates_sha256
+        ),
+        readiness_report_sha256=(
+            None
+            if "readiness_evidence_invalid" in reasons
+            else provisional.readiness_report_sha256
+        ),
     )
 
 
@@ -414,7 +452,7 @@ def write_gate0_report(path: Path, report: Gate0Report) -> None:
     """Atomically create a report, accepting only a byte-identical rerun."""
     try:
         publish_confined_bytes_no_overwrite(
-            path.parent.resolve(),
+            path.parent,
             path.name,
             _report_bytes(report),
         )
@@ -424,8 +462,18 @@ def write_gate0_report(path: Path, report: Gate0Report) -> None:
         raise ValueError("gate0 report is invalid") from None
 
 
+class _InvalidArguments(ValueError):
+    pass
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        del message
+        raise _InvalidArguments("invalid arguments")
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Verify private Gate 0 evidence")
+    parser = _SafeArgumentParser(description="Verify private Gate 0 evidence")
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--pricing-policy", type=Path, required=True)
@@ -436,7 +484,11 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    try:
+        args = _parser().parse_args(argv)
+    except _InvalidArguments:
+        print("gate0 status=error reasons=invalid_arguments")
+        return 2
     try:
         report = verify_gate0(
             data_root=args.data_root,
@@ -446,12 +498,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             readiness_report_path=args.readiness,
             clock=lambda: datetime.now(UTC),
         )
-    except (OSError, RuntimeError, ValueError):
+    except Exception:
         print("gate0 status=error reasons=verification_failed")
         return 2
     try:
         write_gate0_report(args.report, report)
-    except (OSError, RuntimeError, ValueError):
+    except Exception:
         print("gate0 status=error reasons=report_write_failed")
         return 2
     reasons = ",".join(report.blocking_reasons) if report.blocking_reasons else "none"

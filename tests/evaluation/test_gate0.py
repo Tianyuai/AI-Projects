@@ -31,6 +31,7 @@ PUBLIC_STATUS_PATHS = (
     Path("data/README.md"),
     Path("PRD.md"),
 )
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _gate0() -> Any:
@@ -117,8 +118,30 @@ def _directory_redirect(link: Path, target: Path) -> object:
     finally:
         if link.is_symlink():
             link.unlink()
-        elif os.name == "nt" and link.exists():
-            link.rmdir()
+        elif os.name == "nt":
+            try:
+                os.lstat(link)
+            except FileNotFoundError:
+                pass
+            else:
+                link.rmdir()
+
+
+def _run_gate0_process(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+    return subprocess.run(
+        [sys.executable, "-m", "paper_search.evaluation.gate0", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=environment,
+        cwd=cwd,
+    )
 
 
 @dataclass
@@ -575,6 +598,67 @@ def test_gate0_forms_provisional_decision_while_all_artifacts_are_open(
     assert decisions == 1
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("approval", "approval_invalid"),
+        ("partition", "partition_count_mismatch"),
+        ("identifier_map", "identifier_map_coverage_failed"),
+    ],
+)
+def test_invalid_freeze_evidence_stays_open_through_decision_and_is_rehashed(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    if mutation == "approval":
+        (passing_gate0.data_root / "freeze_reports" / "approval.json").write_bytes(
+            b"{}"
+        )
+    elif mutation == "partition":
+        _set_dev_query_count(passing_gate0, 2)
+    else:
+        passing_gate0.bind_identifier_map(
+            _canonical_document({"": "openalex:W999"})
+        )
+
+    module = _gate0()
+    original_read = freeze_schema._read_descriptor
+    original_report = module.Gate0Report
+    read_counts: Counter[tuple[int, int]] = Counter()
+    descriptor_by_identity: dict[tuple[int, int], int] = {}
+    decisions = 0
+
+    def record_read(descriptor: int) -> bytes:
+        metadata = os.fstat(descriptor)
+        identity = (metadata.st_dev, metadata.st_ino)
+        read_counts[identity] += 1
+        descriptor_by_identity.setdefault(identity, descriptor)
+        return original_read(descriptor)
+
+    def assert_invalid_evidence_open(**kwargs: object) -> object:
+        nonlocal decisions
+        decisions += 1
+        assert len(descriptor_by_identity) == 8
+        assert set(read_counts.values()) == {1}
+        for identity, descriptor in descriptor_by_identity.items():
+            metadata = os.fstat(descriptor)
+            assert (metadata.st_dev, metadata.st_ino) == identity
+        return original_report(**kwargs)
+
+    monkeypatch.setattr(freeze_schema, "_read_descriptor", record_read)
+    monkeypatch.setattr(module, "Gate0Report", assert_invalid_evidence_open)
+
+    report = passing_gate0.verify()
+
+    assert report.passed is False
+    assert report.blocking_reasons == [expected_reason]
+    assert decisions == 1
+    assert len(read_counts) == 8
+    assert set(read_counts.values()) == {2}
+
+
 @pytest.mark.parametrize("failure_stage", ["clock", "report"])
 def test_gate0_closes_every_bound_descriptor_when_decision_construction_fails(
     passing_gate0: Gate0Fixture,
@@ -690,6 +774,32 @@ def test_external_lexical_parent_redirect_is_rejected_with_artifact_reason(
 
     with _directory_redirect(lexical_parent, redirected_parent):
         setattr(passing_gate0, path_field, lexical_parent / source.name)
+        report = passing_gate0.verify()
+
+    assert report.passed is False
+    assert report.blocking_reasons == [expected_reason]
+
+
+@pytest.mark.parametrize(
+    ("path_field", "expected_reason"),
+    [
+        ("manifest_path", "manifest_invalid"),
+        ("pricing_path", "pricing_policy_invalid"),
+        ("quality_path", "quality_policy_invalid"),
+        ("readiness_path", "readiness_evidence_invalid"),
+    ],
+)
+def test_missing_file_below_dangling_lexical_parent_is_not_classified_missing(
+    passing_gate0: Gate0Fixture,
+    tmp_path: Path,
+    path_field: str,
+    expected_reason: str,
+) -> None:
+    missing_target = tmp_path / f"missing-target-{path_field}"
+    lexical_parent = passing_gate0.root / f"dangling-{path_field}"
+
+    with _directory_redirect(lexical_parent, missing_target):
+        setattr(passing_gate0, path_field, lexical_parent / "missing-evidence")
         report = passing_gate0.verify()
 
     assert report.passed is False
@@ -885,21 +995,8 @@ def test_cli_sanitizes_unexpected_report_write_failure(
 
 def test_invalid_cli_arguments_are_sanitized_at_process_boundary() -> None:
     sentinel = r"D:\private\GATED_QUERY_AUTH_SECRET_SENTINEL"
-    environment = os.environ.copy()
-    environment["PYTHONPATH"] = str(Path("src").resolve())
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "paper_search.evaluation.gate0",
-            "--unknown-private-argument",
-            sentinel,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-        env=environment,
+    completed = _run_gate0_process(
+        ["--unknown-private-argument", sentinel]
     )
 
     assert completed.returncode == 2
@@ -907,6 +1004,91 @@ def test_invalid_cli_arguments_are_sanitized_at_process_boundary() -> None:
     assert completed.stderr == ""
     assert sentinel not in completed.stdout
     assert sentinel not in completed.stderr
+
+
+@pytest.mark.parametrize("missing_input", ["manifest_path", "pricing_path"])
+def test_cli_rejects_missing_input_report_alias_before_creating_it(
+    passing_gate0: Gate0Fixture,
+    missing_input: str,
+) -> None:
+    alias = passing_gate0.root / f"missing-{missing_input}.json"
+    setattr(passing_gate0, missing_input, alias)
+    passing_gate0.report_path = alias
+
+    completed = _run_gate0_process(passing_gate0.cli_args())
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=path_alias\n"
+    assert completed.stderr == ""
+    assert not alias.exists()
+
+
+def test_cli_rejects_equivalent_relative_input_and_absolute_report_path(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    args = passing_gate0.cli_args()
+    args[args.index("--data-root") + 1] = "."
+    args[args.index("--manifest") + 1] = "manifest.json"
+    args[args.index("--report") + 1] = str(passing_gate0.manifest_path)
+    before = passing_gate0.manifest_path.read_bytes()
+
+    completed = _run_gate0_process(args, cwd=passing_gate0.data_root)
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=path_alias\n"
+    assert completed.stderr == ""
+    assert passing_gate0.manifest_path.read_bytes() == before
+
+
+def test_cli_rejects_existing_report_hardlink_to_input_object(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    report_alias = passing_gate0.root / "pricing-report-hardlink.yaml"
+    os.link(passing_gate0.pricing_path, report_alias)
+    passing_gate0.report_path = report_alias
+    before = passing_gate0.pricing_path.read_bytes()
+
+    completed = _run_gate0_process(passing_gate0.cli_args())
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=path_alias\n"
+    assert completed.stderr == ""
+    assert passing_gate0.pricing_path.read_bytes() == before
+    assert report_alias.read_bytes() == before
+
+
+@pytest.mark.parametrize("protected_path", PUBLIC_STATUS_PATHS)
+def test_cli_rejects_every_protected_public_report_path(
+    passing_gate0: Gate0Fixture,
+    protected_path: Path,
+) -> None:
+    before = protected_path.read_bytes()
+    passing_gate0.report_path = protected_path.resolve()
+
+    completed = _run_gate0_process(passing_gate0.cli_args(), cwd=PROJECT_ROOT)
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=path_alias\n"
+    assert completed.stderr == ""
+    assert protected_path.read_bytes() == before
+
+
+def test_cli_protects_public_report_path_from_different_working_directory(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    protected_path = PROJECT_ROOT / "README.md"
+    before = protected_path.read_bytes()
+    passing_gate0.report_path = protected_path
+
+    completed = _run_gate0_process(
+        passing_gate0.cli_args(),
+        cwd=passing_gate0.root,
+    )
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=path_alias\n"
+    assert completed.stderr == ""
+    assert protected_path.read_bytes() == before
 
 
 def test_report_writer_sanitizes_parent_resolution_failure(

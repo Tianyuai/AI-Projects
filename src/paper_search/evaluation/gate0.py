@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 from contextlib import ExitStack
 from datetime import UTC, datetime
@@ -32,6 +33,7 @@ from paper_search.evaluation.freeze_schema import (
     open_validated_freeze_evidence,
     parse_json_object_bytes,
     publish_confined_bytes_no_overwrite,
+    validate_lexical_parent,
 )
 
 
@@ -191,6 +193,13 @@ _NON_PRODUCTION_MARKER = re.compile(
     r"(?:^|[-_:/.])(unknown|mock|synthetic|test|fixture)(?:$|[-_:/.])",
     re.IGNORECASE,
 )
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_PROTECTED_PUBLIC_PATHS = (
+    _PROJECT_ROOT / "data/manifest.json",
+    _PROJECT_ROOT / "README.md",
+    _PROJECT_ROOT / "data/README.md",
+    _PROJECT_ROOT / "PRD.md",
+)
 
 
 def _path_missing(path: Path) -> bool:
@@ -198,6 +207,37 @@ def _path_missing(path: Path) -> bool:
         return not path.exists() and not path.is_symlink()
     except (OSError, RuntimeError):
         return False
+
+
+def _lexical_path_identity(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path.absolute())))
+
+
+def _paths_alias(left: Path, right: Path) -> bool:
+    if _lexical_path_identity(left) == _lexical_path_identity(right):
+        return True
+    try:
+        return left.samefile(right)
+    except FileNotFoundError:
+        return False
+
+
+def _report_aliases_input_or_public(
+    report_path: Path,
+    *,
+    manifest_path: Path,
+    pricing_path: Path,
+    quality_path: Path,
+    readiness_path: Path,
+) -> bool:
+    guarded_paths = (
+        manifest_path,
+        pricing_path,
+        quality_path,
+        readiness_path,
+        *_PROTECTED_PUBLIC_PATHS,
+    )
+    return any(_paths_alias(report_path, path) for path in guarded_paths)
 
 
 def _enter_external_artifact(
@@ -233,38 +273,60 @@ def _freeze_report_evidence(
     list[Gate0ArtifactEvidence],
     Gate0ArtifactEvidence | None,
 ]:
+    reasons.update(evidence.reasons)
     manifest = evidence.manifest
     if not isinstance(manifest, FreezeManifestV2):
         reasons.add("manifest_invalid")
         return None, [], None
 
-    manifest_report = Gate0ArtifactEvidence(
-        identity="paper-search-freeze-v2",
-        sha256=evidence.manifest_artifact.sha256,
-        count=None,
-    )
-    partitions = [
-        Gate0ArtifactEvidence(
-            identity=partition.name,
-            sha256=artifact.sha256,
-            count=partition.query_count,
+    manifest_report = (
+        None
+        if "manifest_invalid" in evidence.reasons
+        else Gate0ArtifactEvidence(
+            identity="paper-search-freeze-v2",
+            sha256=evidence.manifest_artifact.sha256,
+            count=None,
         )
-        for partition, artifact in zip(
-            manifest.partitions,
+    )
+    partition_reasons = {
+        "partition_hash_mismatch",
+        "partition_count_mismatch",
+    }
+    artifacts_by_name = dict(
+        zip(
+            evidence.partition_artifact_names,
             evidence.partition_artifacts,
             strict=True,
         )
-    ]
+    )
+    partitions = (
+        []
+        if reasons.intersection(partition_reasons)
+        else [
+            Gate0ArtifactEvidence(
+                identity=partition.name,
+                sha256=artifacts_by_name[partition.name].sha256,
+                count=partition.query_count,
+            )
+            for partition in manifest.partitions
+        ]
+    )
+    identifier_artifact = evidence.identifier_map_artifact
+    identifier_binding_reasons = {
+        "identifier_map_missing",
+        "identifier_map_hash_mismatch",
+        "identifier_map_coverage_failed",
+    }
+    if identifier_artifact is None or reasons.intersection(
+        identifier_binding_reasons
+    ):
+        return manifest_report, partitions, None
+
     identifier_report = Gate0ArtifactEvidence(
         identity="identifier-map-v1",
         sha256=manifest.identifier_map.sha256,
         count=manifest.identifier_map.entry_count,
     )
-    identifier_artifact = evidence.identifier_map_artifact
-    if identifier_artifact is None:
-        reasons.add("identifier_map_missing")
-        return manifest_report, partitions, None
-
     try:
         identifier_map = IdentifierMap.from_bytes(
             identifier_artifact.content,
@@ -307,65 +369,87 @@ def verify_gate0(
     decision_constructed = False
     close_error: Exception | None = None
 
-    try:
-        if _path_missing(manifest_path):
-            reasons.add("manifest_missing")
-        else:
-            try:
-                freeze_evidence = stack.enter_context(
-                    open_validated_freeze_evidence(
-                        manifest_path,
-                        data_root=data_root,
-                    )
-                )
-            except FreezeEvidenceError as error:
-                reasons.update(error.reasons)
-            else:
-                (
-                    manifest_report,
-                    partition_reports,
-                    identifier_report,
-                ) = _freeze_report_evidence(freeze_evidence, reasons)
+    lexical_failures: set[Gate0ReasonCode] = set()
+    lexical_path_checks: tuple[tuple[Path, Gate0ReasonCode], ...] = (
+        (manifest_path, "manifest_invalid"),
+        (pricing_policy_path, "pricing_policy_invalid"),
+        (quality_gates_path, "quality_policy_invalid"),
+        (readiness_report_path, "readiness_evidence_invalid"),
+    )
+    for path, reason in lexical_path_checks:
+        try:
+            validate_lexical_parent(path)
+        except (OSError, RuntimeError, ValueError):
+            lexical_failures.add(reason)
+            reasons.add(reason)
 
-        if _path_missing(pricing_policy_path):
-            reasons.add("pricing_policy_missing")
-        else:
+    try:
+        if "manifest_invalid" not in lexical_failures:
+            if _path_missing(manifest_path):
+                reasons.add("manifest_missing")
+            else:
+                try:
+                    freeze_evidence = stack.enter_context(
+                        open_validated_freeze_evidence(
+                            manifest_path,
+                            data_root=data_root,
+                        )
+                    )
+                except FreezeEvidenceError as error:
+                    reasons.update(error.reasons)
+                else:
+                    (
+                        manifest_report,
+                        partition_reports,
+                        identifier_report,
+                    ) = _freeze_report_evidence(freeze_evidence, reasons)
+
+        if "pricing_policy_invalid" not in lexical_failures:
+            if _path_missing(pricing_policy_path):
+                reasons.add("pricing_policy_missing")
+            else:
+                try:
+                    pricing_artifact = _enter_external_artifact(
+                        stack, pricing_policy_path
+                    )
+                    external_artifacts.append(
+                        (pricing_artifact, "pricing_policy_invalid")
+                    )
+                    pricing_policy = parse_pricing_policy_bytes(
+                        pricing_artifact.content
+                    )
+                    if not _is_production_pricing_policy(pricing_policy):
+                        raise ValueError("pricing policy is not production evidence")
+                except (OSError, RuntimeError, ValueError):
+                    reasons.add("pricing_policy_invalid")
+                else:
+                    pricing_sha256 = pricing_artifact.sha256
+
+        if "quality_policy_invalid" not in lexical_failures:
             try:
-                pricing_artifact = _enter_external_artifact(
-                    stack, pricing_policy_path
+                quality_artifact = _enter_external_artifact(stack, quality_gates_path)
+                external_artifacts.append(
+                    (quality_artifact, "quality_policy_invalid")
+                )
+                parse_quality_gate_policy_bytes(quality_artifact.content)
+            except (OSError, RuntimeError, ValueError):
+                reasons.add("quality_policy_invalid")
+            else:
+                quality_sha256 = quality_artifact.sha256
+
+        if "readiness_evidence_invalid" not in lexical_failures:
+            try:
+                readiness_artifact = _enter_external_artifact(
+                    stack, readiness_report_path
                 )
                 external_artifacts.append(
-                    (pricing_artifact, "pricing_policy_invalid")
+                    (readiness_artifact, "readiness_evidence_invalid")
                 )
-                pricing_policy = parse_pricing_policy_bytes(pricing_artifact.content)
-                if not _is_production_pricing_policy(pricing_policy):
-                    raise ValueError("pricing policy is not production evidence")
+                _parse_readiness_bytes(readiness_artifact.content)
             except (OSError, RuntimeError, ValueError):
-                reasons.add("pricing_policy_invalid")
+                reasons.add("readiness_evidence_invalid")
             else:
-                pricing_sha256 = pricing_artifact.sha256
-
-        try:
-            quality_artifact = _enter_external_artifact(stack, quality_gates_path)
-            external_artifacts.append((quality_artifact, "quality_policy_invalid"))
-            parse_quality_gate_policy_bytes(quality_artifact.content)
-        except (OSError, RuntimeError, ValueError):
-            reasons.add("quality_policy_invalid")
-        else:
-            quality_sha256 = quality_artifact.sha256
-
-        try:
-            readiness_artifact = _enter_external_artifact(
-                stack, readiness_report_path
-            )
-            external_artifacts.append(
-                (readiness_artifact, "readiness_evidence_invalid")
-            )
-            _parse_readiness_bytes(readiness_artifact.content)
-        except (OSError, RuntimeError, ValueError):
-            reasons.add("readiness_evidence_invalid")
-        else:
-            readiness_sha256 = readiness_artifact.sha256
+                readiness_sha256 = readiness_artifact.sha256
 
         provisional = Gate0Report(
             schema_version="gate0-report-v1",
@@ -488,6 +572,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = _parser().parse_args(argv)
     except _InvalidArguments:
         print("gate0 status=error reasons=invalid_arguments")
+        return 2
+    try:
+        aliases_protected_path = _report_aliases_input_or_public(
+            args.report,
+            manifest_path=args.manifest,
+            pricing_path=args.pricing_policy,
+            quality_path=args.quality_gates,
+            readiness_path=args.readiness,
+        )
+    except Exception:
+        aliases_protected_path = True
+    if aliases_protected_path:
+        print("gate0 status=error reasons=path_alias")
         return 2
     try:
         report = verify_gate0(

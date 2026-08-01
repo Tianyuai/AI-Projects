@@ -1,5 +1,14 @@
 # Week 1–4 Integrated Baseline and Demo Master Implementation Plan
 
+> **Execution update (2026-08-01):** Use
+> `docs/superpowers/plans/2026-08-01-week1-4-streamlined-engineering.md`
+> for the remaining offline engineering packages and
+> `docs/superpowers/plans/2026-08-01-week1-4-deferred-evidence.md` for real
+> Gate evidence. The four 2026-07-30 phase plans remain the exact requirement
+> and interface catalog, but their per-original-task worker/review cadence is
+> superseded by the approved package-level cadence. No feature or Gate has
+> been removed.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Turn the separately completed Week 1–4 components into one reproducible formal baseline and one interactive demo that share the same application service.

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import json
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -13,6 +14,11 @@ from typing import Any, Protocol
 import httpx
 
 from paper_search.control.pricing import ActualCostPricer
+from paper_search.control.budget import (
+    BudgetExceededError,
+    HardBudgetController,
+    ReservationError,
+)
 from paper_search.domain.models import (
     BudgetReservation,
     ErrorDetail,
@@ -24,6 +30,7 @@ from paper_search.llm.client import (
     OpenAICompatibleLLMClient,
     sanitize_request_id,
     usage_from_response_bytes,
+    validate_model_id,
 )
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
@@ -55,6 +62,48 @@ class LLMAdapterError(RuntimeError):
     """A fixed, credential-safe terminal adapter failure."""
 
 
+class HardBudgetSettlementAdapter:
+    """Add exact-once terminal usage accounting to a request budget controller."""
+
+    def __init__(self, controller: HardBudgetController) -> None:
+        self._controller = controller
+        self._lock = threading.RLock()
+        self._finalized: set[str] = set()
+        self._recorded: list[UsageActual] = []
+
+    @property
+    def committed_usage(self) -> UsageActual:
+        with self._lock:
+            return _aggregate(self._recorded)
+
+    def stop_status(self) -> str:
+        return self._controller.stop_status()
+
+    def _require_active(self, reservation: BudgetReservation) -> None:
+        if reservation.reservation_id in self._finalized:
+            raise ReservationError("reservation is already finalized")
+
+    def settle(self, reservation: BudgetReservation, actual: UsageActual) -> None:
+        with self._lock:
+            self._require_active(reservation)
+            self._controller.settle(reservation, actual)
+            self._recorded.append(actual)
+            self._finalized.add(reservation.reservation_id)
+
+    def fail_closed(
+        self, reservation: BudgetReservation, actual: UsageActual
+    ) -> None:
+        with self._lock:
+            self._require_active(reservation)
+            self._controller.fail_closed(reservation)
+            try:
+                self._controller.settle(reservation, actual)
+            except (BudgetExceededError, ReservationError):
+                self._controller.release(reservation)
+            self._recorded.append(actual)
+            self._finalized.add(reservation.reservation_id)
+
+
 def _identity(
     client: OpenAICompatibleLLMClient,
     *,
@@ -67,7 +116,7 @@ def _identity(
         method="POST",
         endpoint=client.endpoint,
         model_or_adapter=client.model_id,
-        canonical_request=client.canonical_request(
+        canonical_request=client.canonical_identity_request(
             prompt_name=prompt_name,
             payload=payload,
         ),
@@ -75,22 +124,16 @@ def _identity(
 
 
 def _replay_identity(
-    *, model_id: str, prompt_name: str, payload: dict[str, object]
+    *,
+    model_id: str,
+    prompt_name: str,
+    payload: dict[str, object],
+    prompt_version: str,
 ) -> DependencyRequestIdentity:
     canonical_request = {
-        "model": model_id,
-        "messages": [
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {"prompt_name": prompt_name, "payload": payload},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-            }
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": 0,
+        "prompt_name": prompt_name,
+        "payload": payload,
+        "prompt_version": prompt_version,
     }
     return DependencyRequestIdentity.from_canonical_request(
         dependency="llm",
@@ -201,11 +244,13 @@ class LiveCaptureLLMAnalyzer:
         measured_attempts: list[UsageActual] = []
         valued_attempts: list[UsageActual] = []
         terminal: ProviderResult[dict[str, Any]] | None = None
+        in_flight_started: float | None = None
 
         try:
             for attempt in range(3):
                 started = time.perf_counter()
                 response: httpx.Response | None = None
+                in_flight_started = started
                 try:
                     response = await self._client.request_response(
                         prompt_name=prompt_name,
@@ -233,6 +278,7 @@ class LiveCaptureLLMAnalyzer:
                         response.headers.get("x-request-id")
                     )
                     code, message, retryable = _status_error(response.status_code)
+                in_flight_started = None
 
                 elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
                 measured = usage_from_response_bytes(response_bytes).model_copy(
@@ -309,12 +355,29 @@ class LiveCaptureLLMAnalyzer:
                 raise RuntimeError("missing terminal LLM result")
             self._controller.settle(reservation, terminal.usage)
             return terminal
+        except asyncio.CancelledError:
+            if in_flight_started is not None:
+                measured_attempts.append(
+                    UsageActual(
+                        llm_calls=1,
+                        elapsed_ms=max(
+                            0,
+                            round(
+                                (time.perf_counter() - in_flight_started) * 1000
+                            ),
+                        ),
+                    )
+                )
+            self._controller.fail_closed(reservation, _aggregate(measured_attempts))
+            raise
         except Exception:
             measured_total = _aggregate(measured_attempts)
             try:
                 self._controller.fail_closed(reservation, measured_total)
+            except TypeError:
+                raise
             except Exception:
-                pass
+                raise LLMAdapterError("LLM live capture failed") from None
             raise LLMAdapterError("LLM live capture failed") from None
 
 
@@ -331,7 +394,7 @@ class ReplayLLMAnalyzer:
         clock: Clock = _utc_now,
     ) -> None:
         self._reader = reader
-        self._model_id = model_id
+        self._model_id = validate_model_id(model_id)
         self._prompt_version = prompt_version
         self._decoder = decoder or LLMResponseDecoder(prompt_version=prompt_version)
         self._clock = clock
@@ -348,6 +411,7 @@ class ReplayLLMAnalyzer:
             model_id=self._model_id,
             prompt_name=prompt_name,
             payload=payload,
+            prompt_version=self._prompt_version,
         )
         try:
             snapshot = self._reader.read(identity)
@@ -379,6 +443,7 @@ class ReplayLLMAnalyzer:
 __all__ = [
     "LLMAdapterError",
     "LLMResponseDecoder",
+    "HardBudgetSettlementAdapter",
     "LiveCaptureLLMAnalyzer",
     "ReplayLLMAnalyzer",
 ]

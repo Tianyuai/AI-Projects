@@ -24,13 +24,30 @@ def _sha256(value: bytes) -> str:
 
 
 def _identity(dependency: str = "openalex") -> DependencyRequestIdentity:
+    if dependency == "llm":
+        canonical_request: dict[str, object] = {
+            "prompt_name": "query_analyze",
+            "payload": {"query": "retrieval augmented generation", "limit": 2},
+            "prompt_version": "query-analyze-v1",
+        }
+    else:
+        canonical_request = {
+            "query": "retrieval augmented generation",
+            "limit": 2,
+        }
     return DependencyRequestIdentity.from_canonical_request(
         dependency=dependency,
-        operation="search",
+        operation="generate_json" if dependency == "llm" else "search",
         method="POST" if dependency == "llm" else "GET",
-        endpoint="chat/completions" if dependency == "llm" else "/works",
+        endpoint=(
+            "/chat/completions"
+            if dependency == "llm"
+            else "/paper/search"
+            if dependency == "semantic_scholar"
+            else "/works"
+        ),
         model_or_adapter="model-v1" if dependency == "llm" else "adapter-v1",
-        canonical_request={"query": "retrieval augmented generation", "limit": 2},
+        canonical_request=canonical_request,
     )
 
 
@@ -177,6 +194,70 @@ def test_manifest_is_read_once_but_payload_is_verified_on_every_read(
         reader.read(identity)
 
 
+def _rewrite_self_consistent_manifest(
+    manifest_path: Path, payload: dict[str, object]
+) -> str:
+    entries = payload["entries"]
+    payload["snapshot_set_id"] = _sha256(
+        json.dumps(
+            entries,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
+    content = (
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode()
+        + b"\n"
+    )
+    manifest_path.write_bytes(content)
+    return _sha256(content)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("order", "canonical order"),
+        ("cache_key", "cache key"),
+        ("response_path", "response path"),
+    ],
+)
+def test_reader_rejects_self_consistent_semantic_manifest_tampering(
+    tmp_path: Path, mutation: str, message: str
+) -> None:
+    store = DependencyCaptureStore(tmp_path, clock=lambda: CAPTURED_AT)
+    store.stage_success(
+        _identity("llm"), response_bytes=b'{"kind":"llm"}', safe_headers={}, captured_at=CAPTURED_AT
+    )
+    store.stage_success(
+        _identity("openalex"),
+        response_bytes=b'{"kind":"openalex"}',
+        safe_headers={},
+        captured_at=CAPTURED_AT,
+    )
+    store.seal()
+    payload = json.loads(store.manifest_path.read_bytes())
+    entries = payload["entries"]
+    assert isinstance(entries, list)
+    if mutation == "order":
+        entries.reverse()
+    elif mutation == "cache_key":
+        entries[0]["cache_key"] = _sha256(b"wrong request")
+    else:
+        entries[0]["response_path"] = (
+            f"responses/{entries[0]['request']['dependency']}/"
+            f"{_sha256(b'wrong path').removeprefix('sha256:')}.bin"
+        )
+    locked_hash = _rewrite_self_consistent_manifest(store.manifest_path, payload)
+
+    with pytest.raises(ValueError, match=message):
+        DependencySnapshotReader(
+            store.manifest_path,
+            snapshot_manifest_sha256=locked_hash,
+            snapshot_set_id=payload["snapshot_set_id"],
+        )
+
+
 @pytest.mark.parametrize("response_path", ["C:/outside.bin", "../outside.bin"])
 def test_manifest_rejects_absolute_or_escaping_paths(
     tmp_path: Path, response_path: str
@@ -237,6 +318,55 @@ def test_secret_shaped_safe_headers_are_rejected(
     store = DependencyCaptureStore(tmp_path)
     with pytest.raises(ValueError, match="safe header"):
         store.stage_success(
+            _identity(),
+            response_bytes=b"{}",
+            safe_headers={name: value},
+            captured_at=CAPTURED_AT,
+        )
+
+
+def test_canonical_request_rejects_fields_outside_operation_allowlist() -> None:
+    with pytest.raises(ValueError, match="canonical request field"):
+        DependencyRequestIdentity.from_canonical_request(
+            dependency="openalex",
+            operation="search",
+            method="GET",
+            endpoint="/works",
+            model_or_adapter="adapter-v1",
+            canonical_request={
+                "search": "rag",
+                "per_page": 2,
+                "unapproved_debug": "raw-body-fragment",
+            },
+        )
+
+
+def test_dependency_identity_rejects_secret_shaped_adapter_identifier() -> None:
+    with pytest.raises(ValueError, match="model or adapter identifier"):
+        DependencyRequestIdentity.from_canonical_request(
+            dependency="openalex",
+            operation="search",
+            method="GET",
+            endpoint="/works",
+            model_or_adapter="ghp_provider_secret",
+            canonical_request={"search": "rag", "per_page": 2},
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("x-debug", "not-approved"),
+        ("x-auth-token", "ghp_abcdefghijklmnopqrstuvwxyz123456"),
+        ("x-request-id", "eyJhbGciOiJIUzI1NiJ9.payload.signature"),
+        ("x-request-id", "xoxb-123456789-secret"),
+    ],
+)
+def test_safe_headers_require_name_allowlist_and_reject_token_shapes(
+    tmp_path: Path, name: str, value: str
+) -> None:
+    with pytest.raises(ValueError, match="safe header"):
+        DependencyCaptureStore(tmp_path).stage_success(
             _identity(),
             response_bytes=b"{}",
             safe_headers={name: value},

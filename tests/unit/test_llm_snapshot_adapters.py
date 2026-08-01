@@ -10,9 +10,16 @@ import httpx
 import pytest
 
 from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
-from paper_search.domain.models import BudgetReservation, UsageActual, UsageEstimate
+from paper_search.control.budget import HardBudgetController, ReservationError
+from paper_search.domain.models import (
+    BudgetReservation,
+    SearchBudget,
+    UsageActual,
+    UsageEstimate,
+)
 from paper_search.llm.client import OpenAICompatibleLLMClient
 from paper_search.llm.snapshot_adapters import (
+    HardBudgetSettlementAdapter,
     LLMAdapterError,
     LiveCaptureLLMAnalyzer,
     ReplayLLMAnalyzer,
@@ -79,7 +86,8 @@ def _pricer() -> ActualCostPricer:
 async def _live(
     tmp_path: Path,
     transport: httpx.MockTransport,
-    controller: SettlementRecorder,
+    controller: object,
+    reservation: BudgetReservation | None = None,
 ) -> tuple[object, DependencyCaptureStore]:
     store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
     async with httpx.AsyncClient(transport=transport) as http_client:
@@ -94,15 +102,164 @@ async def _live(
             client=client,
             capture_store=store,
             pricer=_pricer(),
-            controller=controller,
+            controller=controller,  # type: ignore[arg-type]
             clock=lambda: CAPTURED_AT,
         )
         result = await analyzer.generate_json(
             prompt_name="query_analyze",
             payload={"query": "graph retrieval"},
-            reservation=_reservation(),
+            reservation=reservation or _reservation(),
         )
     return result, store
+
+
+def _budget_controller(*, formal_live: bool = True) -> HardBudgetController:
+    return HardBudgetController(
+        SearchBudget(
+            max_llm_calls=10,
+            target_llm_calls=3,
+            max_total_tokens=1_000,
+            max_cost_cny=1.0,
+            max_elapsed_seconds=120,
+            soft_deadline_seconds=110,
+        ),
+        formal_live=formal_live,
+        clock=lambda: CAPTURED_AT,
+    )
+
+
+def _controller_reservation(controller: HardBudgetController) -> BudgetReservation:
+    return controller.reserve(
+        "query.analyze",
+        UsageEstimate(
+            llm_calls=3,
+            input_tokens=100,
+            output_tokens=100,
+            cost_cny=Decimal("0.30"),
+            elapsed_ms=10_000,
+        ),
+    )
+
+
+def test_real_budget_controller_success_settles_once(tmp_path: Path) -> None:
+    controller = _budget_controller()
+    settlement = HardBudgetSettlementAdapter(controller)
+    reservation = _controller_reservation(controller)
+
+    result, _ = asyncio.run(
+        _live(
+            tmp_path,
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=_response_bytes({"ok": True}), request=request
+                )
+            ),
+            settlement,
+            reservation,
+        )
+    )
+
+    assert controller.committed_usage == result.usage
+    assert settlement.committed_usage == result.usage
+    assert controller.reserved_usage.llm_calls == 0
+    with pytest.raises(ReservationError, match="already finalized"):
+        settlement.settle(reservation, result.usage)
+
+
+def test_real_budget_controller_terminal_failure_records_usage_and_hard_stops(
+    tmp_path: Path,
+) -> None:
+    class BrokenPricer:
+        def value_actual(self, **_: object) -> UsageActual:
+            raise ValueError("sensitive pricing failure")
+
+    controller = _budget_controller()
+    settlement = HardBudgetSettlementAdapter(controller)
+    reservation = _controller_reservation(controller)
+    store = DependencyCaptureStore(tmp_path / "snapshot")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=_response_bytes({"ok": True}), request=request
+                )
+            )
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://llm.example.test/v1",
+                    model="qwen-test-v1",
+                    api_key="unit-test-secret",
+                ),
+                capture_store=store,
+                pricer=BrokenPricer(),  # type: ignore[arg-type]
+                controller=settlement,
+            )
+            with pytest.raises(LLMAdapterError, match="live capture failed"):
+                await analyzer.generate_json(
+                    prompt_name="query_analyze",
+                    payload={"query": "x"},
+                    reservation=reservation,
+                )
+
+    asyncio.run(run())
+
+    assert controller.stop_status() == "hard_stop"
+    assert controller.reserved_usage.llm_calls == 0
+    assert settlement.committed_usage.llm_calls == 1
+    with pytest.raises(ReservationError, match="already finalized"):
+        settlement.fail_closed(reservation, UsageActual(llm_calls=1))
+
+
+def test_cancellation_after_dispatch_fail_closes_then_reraises_cancelled_error(
+    tmp_path: Path,
+) -> None:
+    controller = _budget_controller()
+    settlement = HardBudgetSettlementAdapter(controller)
+    reservation = _controller_reservation(controller)
+
+    async def run() -> None:
+        dispatched = asyncio.Event()
+        never_complete = asyncio.Event()
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            dispatched.set()
+            await never_complete.wait()
+            return httpx.Response(200, content=_response_bytes({}), request=request)
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://llm.example.test/v1",
+                    model="qwen-test-v1",
+                    api_key="unit-test-secret",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "cancelled"),
+                pricer=_pricer(),
+                controller=settlement,
+            )
+            task = asyncio.create_task(
+                analyzer.generate_json(
+                    prompt_name="query_analyze",
+                    payload={"query": "x"},
+                    reservation=reservation,
+                )
+            )
+            await dispatched.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+
+    assert controller.stop_status() == "hard_stop"
+    assert controller.reserved_usage.llm_calls == 0
+    assert settlement.committed_usage.llm_calls == 1
 
 
 def test_live_capture_builds_safe_identity_and_stages_exact_success_bytes(
@@ -198,6 +355,18 @@ def test_replay_miss_is_snapshot_unavailable_without_network_fallback(
     assert result.usage == UsageActual()
 
 
+def test_replay_rejects_secret_shaped_model_identifier(tmp_path: Path) -> None:
+    store = DependencyCaptureStore(tmp_path / "empty-model-check")
+    store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+    )
+
+    with pytest.raises(ValueError, match="model identifier is not safe"):
+        ReplayLLMAnalyzer(reader=reader, model_id="sk-live-replay-secret")
+
+
 @pytest.mark.parametrize(
     ("status_code", "expected_code", "expected_calls"),
     [(401, "authentication_error", 1), (400, "invalid_request", 1)],
@@ -216,7 +385,7 @@ def test_nonretryable_http_errors_are_sanitized_and_not_captured(
         return httpx.Response(
             status_code,
             content=b'{"error":"Bearer top-secret"}',
-            headers={"x-request-id": "Bearer request-secret"},
+            headers={"x-request-id": "sk-live-request-secret"},
             request=request,
         )
 
@@ -228,7 +397,7 @@ def test_nonretryable_http_errors_are_sanitized_and_not_captured(
     assert calls == expected_calls
     assert result.errors[0].code == expected_code
     assert "top-secret" not in result.model_dump_json()
-    assert "request-secret" not in result.model_dump_json()
+    assert "sk-live-request-secret" not in result.model_dump_json()
     assert not (store.root / "responses").exists()
     assert len(controller.settled) == 1
 

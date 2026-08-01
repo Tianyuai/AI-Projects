@@ -9,9 +9,9 @@ import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import ValidationError
+from pydantic import ValidationError, model_validator
 
 from paper_search.application.contracts import SnapshotRef
 from paper_search.domain.models import (
@@ -21,13 +21,59 @@ from paper_search.domain.models import (
     SafeRelativePath,
     Sha256,
 )
+from paper_search.storage.cache import make_cache_key
 
 
 Clock = Callable[[], datetime]
-_SECRET_HEADER_NAME = re.compile(
-    r"(?:authorization|api[-_]?key|access[-_]?token|cookie|secret)", re.IGNORECASE
+_SECRET_FIELD_NAME = re.compile(
+    r"(?:authorization|api[-_]?key|auth[-_]?token|access[-_]?token|cookie|secret)",
+    re.IGNORECASE,
 )
-_SECRET_HEADER_VALUE = re.compile(r"(?:\bbearer\s+|\bsk-[A-Za-z0-9])", re.IGNORECASE)
+_SECRET_HEADER_VALUE = re.compile(
+    r"(?:\bbearer\s+|\bsk-[A-Za-z0-9]|\bgh[pousr]_[A-Za-z0-9]"
+    r"|\bgithub_pat_[A-Za-z0-9]|\bxox[baprs]-|\bsecret\b"
+    r"|\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)",
+    re.IGNORECASE,
+)
+_SAFE_HEADER_NAMES = frozenset(
+    {
+        "content-type",
+        "x-request-id",
+        "x-ratelimit-limit",
+        "x-ratelimit-remaining",
+        "x-ratelimit-credits-used",
+        "x-ratelimit-reset",
+    }
+)
+_SAFE_MODEL_OR_ADAPTER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+_CANONICAL_REQUEST_FIELDS: dict[tuple[str, str], frozenset[str]] = {
+    ("llm", "generate_json"): frozenset(
+        {"payload", "prompt_name", "prompt_version"}
+    ),
+    ("openalex", "search"): frozenset(
+        {
+            "cursor",
+            "filter",
+            "filters",
+            "limit",
+            "mailto",
+            "per_page",
+            "query",
+            "search",
+            "select",
+        }
+    ),
+    ("semantic_scholar", "search"): frozenset(
+        {"fields", "filters", "limit", "offset", "query", "venue", "year"}
+    ),
+    ("semantic_scholar", "batch"): frozenset({"fields", "ids"}),
+    ("semantic_scholar", "citations"): frozenset(
+        {"fields", "limit", "offset", "paper_id"}
+    ),
+    ("semantic_scholar", "references"): frozenset(
+        {"fields", "limit", "offset", "paper_id"}
+    ),
+}
 
 
 def _utc_now() -> datetime:
@@ -50,7 +96,7 @@ def _sha256(value: bytes) -> str:
 def _reject_secret_keys(value: object) -> None:
     if isinstance(value, Mapping):
         for key, nested in value.items():
-            if _SECRET_HEADER_NAME.search(str(key)):
+            if _SECRET_FIELD_NAME.search(str(key)):
                 raise ValueError("canonical request contains a secret-shaped field")
             _reject_secret_keys(nested)
     elif isinstance(value, (list, tuple)):
@@ -67,6 +113,44 @@ class DependencyRequestIdentity(DomainModel):
     model_or_adapter: NonEmptyStr
     canonical_request_sha256: Sha256
 
+    @model_validator(mode="after")
+    def validate_safe_binding(self) -> Self:
+        if (
+            _SAFE_MODEL_OR_ADAPTER.fullmatch(self.model_or_adapter) is None
+            or _SECRET_HEADER_VALUE.search(self.model_or_adapter) is not None
+        ):
+            raise ValueError("model or adapter identifier is not safe")
+        valid_binding = False
+        if self.dependency == "llm":
+            valid_binding = (
+                self.operation == "generate_json"
+                and self.method == "POST"
+                and self.endpoint == "/chat/completions"
+            )
+        elif self.dependency == "openalex":
+            valid_binding = (
+                self.operation == "search"
+                and self.method == "GET"
+                and self.endpoint == "/works"
+            )
+        elif self.dependency == "semantic_scholar":
+            valid_binding = (
+                self.operation == "search"
+                and self.method == "GET"
+                and self.endpoint == "/paper/search"
+            ) or (
+                self.operation == "batch"
+                and self.method == "POST"
+                and self.endpoint == "/paper/batch"
+            )
+            if self.operation in {"citations", "references"}:
+                valid_binding = self.method == "GET" and re.fullmatch(
+                    rf"/paper/[^/]+/{self.operation}", self.endpoint
+                ) is not None
+        if not valid_binding:
+            raise ValueError("dependency request binding is not allowlisted")
+        return self
+
     @classmethod
     def from_canonical_request(
         cls,
@@ -79,6 +163,14 @@ class DependencyRequestIdentity(DomainModel):
         canonical_request: Mapping[str, object],
     ) -> DependencyRequestIdentity:
         """Build an identity from an explicitly safe, canonical request object."""
+        allowed_fields = _CANONICAL_REQUEST_FIELDS.get((dependency, operation))
+        if allowed_fields is None:
+            raise ValueError("canonical request operation is not allowlisted")
+        unknown_fields = set(canonical_request).difference(allowed_fields)
+        if unknown_fields:
+            raise ValueError(
+                f"canonical request field is not allowlisted: {sorted(unknown_fields)}"
+            )
         _reject_secret_keys(canonical_request)
         return cls(
             dependency=dependency,
@@ -116,6 +208,14 @@ def _identity_cache_key(identity: DependencyRequestIdentity) -> str:
     return _sha256(_canonical_json_bytes(identity.model_dump(mode="json")))
 
 
+def _response_path(identity: DependencyRequestIdentity, cache_key: str) -> str:
+    return (
+        Path("responses")
+        / identity.dependency
+        / f"{cache_key.removeprefix('sha256:')}.bin"
+    ).as_posix()
+
+
 def _entry_metadata_bytes(entries: list[SnapshotEntryV2]) -> bytes:
     return _canonical_json_bytes(
         [entry.model_dump(mode="json") for entry in entries]
@@ -138,7 +238,9 @@ def _sanitize_headers(headers: Mapping[str, str]) -> dict[str, str]:
     sanitized: dict[str, str] = {}
     for name, value in headers.items():
         normalized = name.casefold()
-        if _SECRET_HEADER_NAME.search(normalized) or _SECRET_HEADER_VALUE.search(value):
+        if normalized not in _SAFE_HEADER_NAMES:
+            raise ValueError("safe header name is not allowlisted")
+        if _SECRET_FIELD_NAME.search(normalized) or _SECRET_HEADER_VALUE.search(value):
             raise ValueError("safe header contains secret-shaped data")
         sanitized[normalized] = value
     return sanitized
@@ -206,11 +308,7 @@ class DependencyCaptureStore:
                 {"cache_key": cache_key, "response_sha256": response_sha256}
             )
         )
-        response_path = (
-            Path("responses")
-            / identity.dependency
-            / f"{cache_key.removeprefix('sha256:')}.bin"
-        ).as_posix()
+        response_path = _response_path(identity, cache_key)
         entry = SnapshotEntryV2(
             entry_id=entry_id,
             request=identity,
@@ -273,6 +371,21 @@ class DependencySnapshotReader:
         entries = manifest.entries
         if len({entry.cache_key for entry in entries}) != len(entries):
             raise ValueError("duplicate cache key")
+        ordered_entries = sorted(
+            entries,
+            key=lambda entry: (
+                entry.request.dependency,
+                entry.cache_key,
+                entry.entry_id,
+            ),
+        )
+        if entries != ordered_entries:
+            raise ValueError("snapshot entries are not in canonical order")
+        for entry in entries:
+            if entry.cache_key != _identity_cache_key(entry.request):
+                raise ValueError("snapshot cache key does not match request")
+            if entry.response_path != _response_path(entry.request, entry.cache_key):
+                raise ValueError("snapshot response path is not canonical")
         if manifest.snapshot_set_id != _sha256(_entry_metadata_bytes(entries)):
             raise ValueError("snapshot set identity mismatch")
         if snapshot_set_id is not None and manifest.snapshot_set_id != snapshot_set_id:
@@ -337,12 +450,18 @@ def migrate_v1_to_v2(
             provider = raw_entry["provider"]
             if provider not in ("openalex", "semantic_scholar"):
                 raise ValueError
-            operation = raw_entry["operation"]
-            method = raw_entry["method"]
             endpoint = raw_entry["endpoint"]
             adapter = raw_entry["cache_version"]
             params = raw_entry["params"]
-            if method not in ("GET", "POST") or not isinstance(params, dict):
+            if not isinstance(endpoint, str) or not isinstance(params, dict):
+                raise ValueError
+            operation, method = _infer_v1_operation(provider, endpoint)
+            if raw_entry["cache_key"] != make_cache_key(
+                provider, endpoint, params, adapter
+            ):
+                raise ValueError
+            response_hash = raw_entry["response_hash"]
+            if raw_entry["snapshot_sha256"] != response_hash:
                 raise ValueError
             identity = DependencyRequestIdentity.from_canonical_request(
                 dependency=provider,
@@ -356,7 +475,7 @@ def migrate_v1_to_v2(
                 entry_id="v1-validation",
                 dependency=provider,
                 cache_key=_sha256(b"v1-validation"),
-                response_sha256=raw_entry["response_hash"],
+                response_sha256=response_hash,
                 captured_at=raw_entry["requested_at"],
                 snapshot_path=raw_entry["snapshot_path"],
             ).snapshot_path
@@ -366,7 +485,7 @@ def migrate_v1_to_v2(
             if source_root not in resolved.parents or response_path.is_symlink():
                 raise ValueError
             response_bytes = response_path.read_bytes()
-            if _sha256(response_bytes) != raw_entry["response_hash"]:
+            if _sha256(response_bytes) != response_hash:
                 raise ValueError
             safe_headers = raw_entry.get("safe_headers", {})
             if not isinstance(safe_headers, dict) or not all(
@@ -390,6 +509,22 @@ def migrate_v1_to_v2(
             captured_at=captured_at,
         )
     return store.seal()
+
+
+def _infer_v1_operation(
+    provider: object, endpoint: str
+) -> tuple[str, Literal["GET", "POST"]]:
+    if provider == "openalex" and endpoint == "/works":
+        return "search", "GET"
+    if provider == "semantic_scholar":
+        if endpoint == "/paper/search":
+            return "search", "GET"
+        if endpoint == "/paper/batch":
+            return "batch", "POST"
+        match = re.fullmatch(r"/paper/[^/]+/(citations|references)", endpoint)
+        if match is not None:
+            return match.group(1), "GET"
+    raise ValueError("ambiguous V1 provider endpoint")
 
 
 __all__ = [

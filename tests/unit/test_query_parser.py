@@ -160,13 +160,35 @@ def test_transport_or_authentication_failure_cannot_become_rules_fallback(
         repairs += 1
         return _provider_result(_valid_payload("graph retrieval"))
 
-    with pytest.raises(PlannerDependencyError, match=code):
+    with pytest.raises(PlannerDependencyError, match="planner dependency failure"):
         asyncio.run(
             QueryParser(QueryPlanner()).parse(
                 "graph retrieval", failed, repair=repair
             )
         )
     assert repairs == 0
+
+
+def test_provider_controlled_error_code_is_not_echoed() -> None:
+    malicious_code = "sk-live-provider-secret"
+    failed = _provider_result({}).model_copy(
+        update={
+            "errors": [
+                ErrorDetail(
+                    code=malicious_code,
+                    message="fixed safe message",
+                    retryable=False,
+                    provider="llm",
+                )
+            ]
+        }
+    )
+
+    with pytest.raises(PlannerDependencyError) as error:
+        asyncio.run(QueryParser(QueryPlanner()).parse("graph retrieval", failed))
+
+    assert str(error.value) == "planner dependency failure"
+    assert malicious_code not in str(error.value)
 
 
 def test_repair_callable_is_never_invoked_for_valid_payload() -> None:

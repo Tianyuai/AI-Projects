@@ -250,7 +250,7 @@ def test_v1_provider_snapshot_migration_requires_complete_identity(
     source = tmp_path / "v1"
     source.mkdir()
     (source / "response.json").write_bytes(b"{}")
-    complete_entry = {
+    synthetic_entry = {
         "provider": "openalex",
         "operation": "search",
         "method": "GET",
@@ -266,27 +266,63 @@ def test_v1_provider_snapshot_migration_requires_complete_identity(
     manifest = source / "snapshot_manifest.json"
     manifest.write_text(
         json.dumps(
-            {"contract_version": "provider-snapshot-v1", "entries": [complete_entry]}
+            {"contract_version": "provider-snapshot-v1", "entries": [synthetic_entry]}
         ),
         encoding="utf-8",
     )
 
-    migrated = migrate_v1_to_v2(
-        manifest, tmp_path / "v2", sealed_at=datetime(2026, 8, 1, tzinfo=UTC)
-    )
-    assert migrated.entries[0].request.dependency == "openalex"
-    assert migrated.entries[0].request.endpoint == "/works"
-
-    del complete_entry["operation"]
-    manifest.write_text(
-        json.dumps(
-            {"contract_version": "provider-snapshot-v1", "entries": [complete_entry]}
-        ),
-        encoding="utf-8",
-    )
     with pytest.raises(ValueError, match="ambiguous V1 snapshot entry"):
         migrate_v1_to_v2(
             manifest,
-            tmp_path / "ambiguous-v2",
+            tmp_path / "v2",
             sealed_at=datetime(2026, 8, 1, tzinfo=UTC),
         )
+
+
+def test_v1_migration_accepts_real_sqlite_cache_snapshot(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 1, tzinfo=UTC)
+    params = {"search": "rag", "per_page": 2}
+    key = make_cache_key("openalex", "/works", params, "v1")
+    cache = SQLiteResponseCache(tmp_path / "cache.sqlite3", clock=lambda: now)
+    cache.put_response(
+        key=key,
+        provider="openalex",
+        endpoint="/works",
+        cache_version="v1",
+        params=params,
+        raw_response=b'{"results":[]}',
+        requested_at=now,
+        ttl=timedelta(days=7),
+        safe_headers={"x-request-id": "request-1"},
+    )
+    manifest_path = cache.export_snapshot([key], tmp_path / "v1-real")
+
+    migrated = migrate_v1_to_v2(
+        manifest_path,
+        tmp_path / "v2-real",
+        sealed_at=now,
+    )
+
+    request = migrated.entries[0].request
+    assert request.dependency == "openalex"
+    assert request.operation == "search"
+    assert request.method == "GET"
+    assert request.endpoint == "/works"
+
+    original = json.loads(manifest_path.read_bytes())
+    for index, (field, value) in enumerate(
+        [
+            ("cache_key", "sha256:" + "0" * 64),
+            ("snapshot_sha256", "sha256:" + "1" * 64),
+            ("endpoint", "/ambiguous"),
+        ]
+    ):
+        tampered = json.loads(json.dumps(original))
+        tampered["entries"][0][field] = value
+        manifest_path.write_text(json.dumps(tampered), encoding="utf-8")
+        with pytest.raises(ValueError, match="ambiguous V1 snapshot entry"):
+            migrate_v1_to_v2(
+                manifest_path,
+                tmp_path / f"v2-rejected-{index}",
+                sealed_at=now,
+            )

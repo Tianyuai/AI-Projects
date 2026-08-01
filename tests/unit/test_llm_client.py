@@ -5,6 +5,7 @@ import json
 from datetime import UTC, datetime, timedelta
 
 import httpx
+import pytest
 
 from paper_search.domain.models import BudgetReservation, UsageEstimate
 from paper_search.llm.client import LLMResponseDecoder, OpenAICompatibleLLMClient
@@ -82,7 +83,8 @@ def test_generate_json_returns_data_usage_and_safe_provenance() -> None:
     assert result.usage.cost_cny is None
     assert result.provenance["model_id"] == "fixture-model"
     assert result.provenance["prompt_version"] == "query-analyze-v1"
-    assert result.provenance["request_id"] == "request-1"
+    assert result.provenance["request_id"].startswith("sha256:")
+    assert "request-1" not in result.provenance["request_id"]
     assert result.provenance["response_hash"].startswith("sha256:")
     assert seen[0].url == httpx.URL("https://llm.example.test/v1/chat/completions")
     assert seen[0].headers["authorization"] == f"Bearer {API_KEY}"
@@ -199,3 +201,22 @@ def test_pure_decoder_does_not_require_transport_or_credentials() -> None:
     assert result.cache_hit is True
     assert result.usage.input_tokens == 2
     assert result.usage.output_tokens == 1
+
+
+def test_secret_shaped_model_identifier_is_rejected_without_echo() -> None:
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={}, request=request)
+            )
+        ) as client:
+            with pytest.raises(ValueError, match="model identifier is not safe") as error:
+                OpenAICompatibleLLMClient(
+                    client=client,
+                    base_url="https://llm.example.test/v1",
+                    model="sk-live-model-secret",
+                    api_key=API_KEY,
+                )
+            assert "sk-live-model-secret" not in str(error.value)
+
+    asyncio.run(run())

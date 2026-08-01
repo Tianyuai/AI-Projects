@@ -38,7 +38,7 @@ def _require_content_failure(result: ProviderResult[dict[str, Any]]) -> None:
         if error.code not in _MALFORMED_CONTENT_CODES
     ]
     if blocking:
-        raise PlannerDependencyError(f"planner dependency failure: {blocking[0]}")
+        raise PlannerDependencyError("planner dependency failure")
 
 
 def rule_fallback(query: str) -> QuerySpec:

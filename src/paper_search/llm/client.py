@@ -22,6 +22,12 @@ from paper_search.domain.models import (
 
 
 Clock = Callable[[], datetime]
+_SAFE_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
+_SECRET_SHAPE = re.compile(
+    r"(?:\bsk-[A-Za-z0-9]|\bgh[pousr]_[A-Za-z0-9]|\bgithub_pat_"
+    r"|\bxox[baprs]-|\bsecret\b|\bbearer\b)",
+    re.IGNORECASE,
+)
 
 
 def _utc_now() -> datetime:
@@ -37,10 +43,20 @@ def _nonnegative_int(value: object) -> int:
 
 
 def sanitize_request_id(value: str | None) -> str | None:
-    """Allow only compact opaque request identifiers into safe provenance."""
-    if value is None or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", value) is None:
+    """Retain only an irreversible identity for a provider-controlled request ID."""
+    if value is None or not value or len(value) > 1024:
         return None
-    return value
+    return _hash(value.encode("utf-8"))
+
+
+def validate_model_id(value: str) -> str:
+    normalized = value.strip()
+    if (
+        _SAFE_MODEL_ID.fullmatch(normalized) is None
+        or _SECRET_SHAPE.search(normalized) is not None
+    ):
+        raise ValueError("LLM model identifier is not safe")
+    return normalized
 
 
 def usage_from_response_bytes(response_bytes: bytes) -> UsageActual:
@@ -220,7 +236,7 @@ class OpenAICompatibleLLMClient:
             raise ValueError("LLM model and API key must not be empty")
         self._client = client
         self._transport_endpoint = f"{normalized_url}/chat/completions"
-        self._model = model.strip()
+        self._model = validate_model_id(model)
         self._api_key = api_key
         self._prompt_version = prompt_version
         self._clock = clock
@@ -255,6 +271,16 @@ class OpenAICompatibleLLMClient:
             ],
             "response_format": {"type": "json_object"},
             "temperature": 0,
+        }
+
+    def canonical_identity_request(
+        self, *, prompt_name: str, payload: dict[str, object]
+    ) -> dict[str, object]:
+        """Return only approved identity fields, excluding transport metadata."""
+        return {
+            "prompt_name": prompt_name,
+            "payload": payload,
+            "prompt_version": self._prompt_version,
         }
 
     async def request_response(

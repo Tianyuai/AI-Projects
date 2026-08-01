@@ -316,6 +316,62 @@ def parse_json_object_bytes(content: bytes) -> dict[str, object]:
     return _json_object(content)
 
 
+_WINDOWS_RESERVED_BASENAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{number}" for number in range(1, 10)),
+        *(f"lpt{number}" for number in range(1, 10)),
+        "com¹",
+        "com²",
+        "com³",
+        "lpt¹",
+        "lpt²",
+        "lpt³",
+    }
+)
+_WINDOWS_NAMESPACE_PREFIXES = ("\\\\?\\", "\\\\.\\", "\\??\\", "\\\\??\\")
+
+
+def _validate_stable_windows_component(component: str) -> None:
+    if component.endswith((".", " ")):
+        raise ValueError("freeze manifest is invalid")
+    basename = component.split(".", 1)[0].rstrip(" .").casefold()
+    if basename in _WINDOWS_RESERVED_BASENAMES:
+        raise ValueError("freeze manifest is invalid")
+
+
+def validate_stable_path(path: Path) -> None:
+    """Reject Windows spellings whose ordinary namespace identity is unstable."""
+    if os.name != "nt":
+        return
+    try:
+        raw = str(path)
+        namespace_spelling = raw.replace("/", "\\").casefold()
+        if namespace_spelling.startswith(_WINDOWS_NAMESPACE_PREFIXES):
+            raise ValueError("freeze manifest is invalid")
+        colon_positions = [index for index, value in enumerate(raw) if value == ":"]
+        if colon_positions and not (
+            colon_positions == [1]
+            and len(raw) >= 3
+            and raw[0].isalpha()
+            and raw[2] in {"/", "\\"}
+        ):
+            raise ValueError("freeze manifest is invalid")
+        components: tuple[str, ...] = path.parts[1:] if path.anchor else path.parts
+        if namespace_spelling.startswith("\\\\"):
+            authority = raw.replace("/", "\\")[2:].split("\\")[:2]
+            if len(authority) != 2 or not all(authority):
+                raise ValueError("freeze manifest is invalid")
+            components = (*authority, *components)
+        for component in components:
+            _validate_stable_windows_component(component)
+    except (OSError, RuntimeError, ValueError):
+        raise ValueError("freeze manifest is invalid") from None
+
+
 def _validated_lexical_root(path: Path) -> Path:
     """Return one absolute root only when no lexical component redirects."""
     try:
@@ -772,6 +828,7 @@ def open_confined_artifact(
     """Open each path component safely and keep the evidence descriptor alive."""
     try:
         normalized = validate_safe_relative_path(relative_path)
+        validate_stable_path(data_root.joinpath(*normalized.split("/")))
         root = _validated_lexical_root(data_root)
         if replaceable_manifest and normalized != "manifest.json":
             raise ValueError("freeze manifest is invalid")
@@ -868,6 +925,7 @@ def publish_confined_bytes_no_overwrite(
     """Atomically create a confined report or accept only its exact bytes."""
     try:
         normalized = validate_safe_relative_path(relative_path)
+        validate_stable_path(data_root.joinpath(*normalized.split("/")))
         root = _validated_lexical_root(data_root)
     except ValueError:
         raise ValueError("freeze manifest is invalid") from None

@@ -470,6 +470,92 @@ def test_canonical_gold_identity_uses_fixed_partition_order() -> None:
     assert canonical_gold_set_sha256(dev, validation) == expected
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows stable-path contract")
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        Path(r"C:\gate0\report.json"),
+        Path(r"\\server\share\gate0\report.json"),
+        Path(r"relative\ leading-space.json"),
+    ],
+)
+def test_windows_stable_path_validator_allows_drive_unc_and_leading_space(
+    spelling: Path,
+) -> None:
+    freeze_schema.validate_stable_path(spelling)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows stable-path contract")
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        Path("report.json."),
+        Path("report.json "),
+        Path("folder/CON"),
+        Path("folder/prn.txt"),
+        Path("folder/AUX.log"),
+        Path("folder/NUL.json"),
+        Path("folder/COM1.log"),
+        Path("folder/COM¹.log"),
+        Path("folder/LPT9.log"),
+        Path("folder/LPT².log"),
+        Path("folder/report.json:stream"),
+        Path(r"\\?\C:\gate0\report.json"),
+        Path(r"\\.\C:\gate0\report.json"),
+        Path(r"\??\C:\gate0\report.json"),
+        Path(r"\\server\share.\gate0\report.json"),
+        Path(r"\\server \share\gate0\report.json"),
+    ],
+)
+def test_windows_stable_path_validator_rejects_unstable_namespace_spellings(
+    spelling: Path,
+) -> None:
+    with pytest.raises(ValueError, match="freeze manifest is invalid"):
+        freeze_schema.validate_stable_path(spelling)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX stable-path no-op contract")
+@pytest.mark.parametrize(
+    "spelling",
+    [Path("report.json."), Path("report.json "), Path("CON.txt"), Path("x:y")],
+)
+def test_posix_stable_path_validator_preserves_valid_posix_names(
+    spelling: Path,
+) -> None:
+    freeze_schema.validate_stable_path(spelling)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows stable-path contract")
+@pytest.mark.parametrize("relative_path", ["report.json.", "report.json "])
+def test_windows_confined_publisher_rejects_unstable_final_component(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    data_root = tmp_path / "publish-root"
+    data_root.mkdir()
+
+    with pytest.raises(ValueError, match="freeze manifest is invalid"):
+        publish_confined_bytes_no_overwrite(data_root, relative_path, b"blocked")
+
+    assert list(data_root.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows stable-path contract")
+def test_windows_confined_open_rejects_unstable_existing_file_spelling(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "open-root"
+    data_root.mkdir()
+    actual = data_root / "evidence.json"
+    actual.write_bytes(b"stable evidence")
+
+    with pytest.raises(ValueError, match="freeze manifest is invalid"):
+        with open_confined_artifact(data_root, "evidence.json."):
+            pass
+
+    assert actual.read_bytes() == b"stable evidence"
+
+
 def test_v2_loader_rejects_missing_bound_approval_report(tmp_path: Path) -> None:
     data_root, _ = _write_bound_v2_tree(tmp_path)
     (data_root / "freeze_reports" / "approval.json").unlink()

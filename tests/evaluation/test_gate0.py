@@ -1133,6 +1133,106 @@ def test_cli_rejects_missing_targets_below_aliased_directory_object(
     assert not report_path.exists()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows namespace behavior")
+@pytest.mark.parametrize("suffix", [".", " "])
+def test_cli_rejects_missing_input_alias_via_windows_terminal_stripping(
+    passing_gate0: Gate0Fixture,
+    suffix: str,
+) -> None:
+    missing_input = passing_gate0.root / "missing-manifest.json"
+    supplied_report = Path(f"{missing_input}{suffix}")
+    passing_gate0.manifest_path = missing_input
+    passing_gate0.report_path = supplied_report
+
+    completed = _run_gate0_process(passing_gate0.cli_args())
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=path_alias\n"
+    assert completed.stderr == ""
+    assert not missing_input.exists()
+    assert not supplied_report.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows namespace behavior")
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--data-root",
+        "--manifest",
+        "--pricing-policy",
+        "--quality-gates",
+        "--readiness",
+        "--report",
+    ],
+)
+def test_cli_preflight_rejects_unstable_component_on_every_operator_path(
+    passing_gate0: Gate0Fixture,
+    flag: str,
+) -> None:
+    args = passing_gate0.cli_args()
+    value_index = args.index(flag) + 1
+    args[value_index] = f"{args[value_index]}."
+
+    completed = _run_gate0_process(args)
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=path_alias\n"
+    assert completed.stderr == ""
+    assert not passing_gate0.report_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows namespace behavior")
+@pytest.mark.parametrize("case", ["reserved", "extended_namespace", "ads"])
+def test_cli_rejects_windows_device_namespace_without_leaking_spelling(
+    passing_gate0: Gate0Fixture,
+    case: str,
+) -> None:
+    sentinel = "GATED_WINDOWS_NAMESPACE_SENTINEL"
+    actual_target = passing_gate0.root / f"{sentinel}.json"
+    if case == "reserved":
+        supplied_report = passing_gate0.root / f"CON.{sentinel}"
+    elif case == "extended_namespace":
+        supplied_report = Path("\\\\?\\" + str(actual_target.resolve()))
+    else:
+        supplied_report = Path(f"{actual_target}:{sentinel}")
+    passing_gate0.report_path = supplied_report
+    before_entries = {path.name for path in passing_gate0.root.iterdir()}
+
+    completed = _run_gate0_process(passing_gate0.cli_args())
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=path_alias\n"
+    assert completed.stderr == ""
+    assert sentinel not in completed.stdout
+    assert sentinel not in completed.stderr
+    assert {path.name for path in passing_gate0.root.iterdir()} == before_entries
+    assert not actual_target.exists()
+
+
+def test_cli_allows_same_missing_basename_below_unrelated_real_parents(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    input_parent = passing_gate0.root / "unrelated-input-parent"
+    report_parent = passing_gate0.root / "unrelated-report-parent"
+    input_parent.mkdir()
+    report_parent.mkdir()
+    missing_name = "missing-manifest.json"
+    input_path = input_parent / missing_name
+    report_path = report_parent / missing_name
+    passing_gate0.manifest_path = input_path
+    passing_gate0.report_path = report_path
+
+    completed = _run_gate0_process(passing_gate0.cli_args())
+
+    assert completed.returncode == 1
+    assert completed.stdout == "gate0 status=blocked reasons=manifest_missing\n"
+    assert completed.stderr == ""
+    assert not input_path.exists()
+    payload = json.loads(report_path.read_bytes())
+    assert payload["passed"] is False
+    assert payload["blocking_reasons"] == ["manifest_missing"]
+
+
 def test_cli_rejects_equivalent_relative_input_and_absolute_report_path(
     passing_gate0: Gate0Fixture,
 ) -> None:
@@ -1228,6 +1328,22 @@ def test_report_writer_sanitizes_parent_resolution_failure(
     assert str(error.value) == "gate0 report is invalid"
     assert "PRIVATE_PATH_SENTINEL" not in str(error.value)
     assert not report_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows namespace behavior")
+@pytest.mark.parametrize("suffix", [".", " "])
+def test_report_writer_rejects_windows_unstable_final_name(
+    passing_gate0: Gate0Fixture,
+    suffix: str,
+) -> None:
+    actual_report = passing_gate0.report_path
+    supplied_report = Path(f"{actual_report}{suffix}")
+
+    with pytest.raises(ValueError, match="gate0 report is invalid"):
+        _gate0().write_gate0_report(supplied_report, passing_gate0.verify())
+
+    assert not actual_report.exists()
+    assert not supplied_report.exists()
 
 
 def test_invalid_evidence_never_mutates_sources_or_public_status(

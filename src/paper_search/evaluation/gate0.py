@@ -35,6 +35,7 @@ from paper_search.evaluation.freeze_schema import (
     parse_json_object_bytes,
     publish_confined_bytes_no_overwrite,
     validate_lexical_parent,
+    validate_stable_path,
 )
 
 
@@ -397,6 +398,14 @@ def verify_gate0(
     clock: Callable[[], datetime],
 ) -> Gate0Report:
     """Reconcile exact evidence without mutating any source or public status."""
+    for operator_path in (
+        data_root,
+        manifest_path,
+        pricing_policy_path,
+        quality_gates_path,
+        readiness_report_path,
+    ):
+        validate_stable_path(operator_path)
     reasons: set[Gate0ReasonCode] = set()
     manifest_report: Gate0ArtifactEvidence | None = None
     partition_reports: list[Gate0ArtifactEvidence] = []
@@ -615,6 +624,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("gate0 status=error reasons=invalid_arguments")
         return 2
     try:
+        for operator_path in (
+            args.data_root,
+            args.manifest,
+            args.pricing_policy,
+            args.quality_gates,
+            args.readiness,
+            args.report,
+        ):
+            validate_stable_path(operator_path)
         aliases_protected_path = _report_aliases_input_or_public(
             args.report,
             manifest_path=args.manifest,

@@ -112,7 +112,10 @@ def _directory_redirect(link: Path, target: Path) -> object:
             if result.returncode != 0:
                 pytest.skip("Windows directory reparse creation is unavailable")
     else:
-        link.symlink_to(target, target_is_directory=True)
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"POSIX directory symlink creation is unavailable: {error}")
     try:
         yield
     finally:
@@ -492,6 +495,16 @@ def _set_dev_query_count(fixture: Gate0Fixture, count: int) -> None:
     fixture.write_manifest()
 
 
+def _bind_model_invalid_approval(fixture: Gate0Fixture) -> None:
+    invalid_approval = _canonical_document({})
+    approval_binding = fixture.manifest["approval"]
+    assert isinstance(approval_binding, dict)
+    approval_path = fixture.data_root / str(approval_binding["report_path"])
+    approval_path.write_bytes(invalid_approval)
+    approval_binding["report_sha256"] = _sha256(invalid_approval)
+    fixture.write_manifest()
+
+
 def _rewrite_pricing_identity(
     fixture: Gate0Fixture,
     *,
@@ -601,7 +614,7 @@ def test_gate0_forms_provisional_decision_while_all_artifacts_are_open(
 @pytest.mark.parametrize(
     ("mutation", "expected_reason"),
     [
-        ("approval", "approval_invalid"),
+        ("approval_model_invalid", "approval_invalid"),
         ("partition", "partition_count_mismatch"),
         ("identifier_map", "identifier_map_coverage_failed"),
     ],
@@ -612,10 +625,8 @@ def test_invalid_freeze_evidence_stays_open_through_decision_and_is_rehashed(
     mutation: str,
     expected_reason: str,
 ) -> None:
-    if mutation == "approval":
-        (passing_gate0.data_root / "freeze_reports" / "approval.json").write_bytes(
-            b"{}"
-        )
+    if mutation == "approval_model_invalid":
+        _bind_model_invalid_approval(passing_gate0)
     elif mutation == "partition":
         _set_dev_query_count(passing_gate0, 2)
     else:
@@ -657,6 +668,77 @@ def test_invalid_freeze_evidence_stays_open_through_decision_and_is_rehashed(
     assert decisions == 1
     assert len(read_counts) == 8
     assert set(read_counts.values()) == {2}
+
+
+def test_parse_invalid_manifest_stays_open_until_decision_rehash_then_closes(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    passing_gate0.manifest_path.write_bytes(b'{"schema_version":')
+    manifest_metadata = passing_gate0.manifest_path.stat()
+    manifest_identity = (manifest_metadata.st_dev, manifest_metadata.st_ino)
+    module = _gate0()
+    original_read = freeze_schema._read_descriptor
+    original_report = module.Gate0Report
+    manifest_reads: list[int] = []
+    decisions = 0
+
+    def record_manifest_read(descriptor: int) -> bytes:
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) == manifest_identity:
+            manifest_reads.append(descriptor)
+        return original_read(descriptor)
+
+    def assert_manifest_open_at_decision(**kwargs: object) -> object:
+        nonlocal decisions
+        decisions += 1
+        assert len(manifest_reads) == 1
+        metadata = os.fstat(manifest_reads[0])
+        assert (metadata.st_dev, metadata.st_ino) == manifest_identity
+        return original_report(**kwargs)
+
+    monkeypatch.setattr(freeze_schema, "_read_descriptor", record_manifest_read)
+    monkeypatch.setattr(module, "Gate0Report", assert_manifest_open_at_decision)
+
+    report = passing_gate0.verify()
+
+    assert report.passed is False
+    assert report.blocking_reasons == ["manifest_invalid"]
+    assert decisions == 1
+    assert len(manifest_reads) == 2
+    assert len(set(manifest_reads)) == 1
+    with pytest.raises(OSError):
+        os.fstat(manifest_reads[0])
+
+
+def test_parse_invalid_manifest_rehashes_and_closes_when_clock_fails(
+    passing_gate0: Gate0Fixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    passing_gate0.manifest_path.write_bytes(b'{"schema_version":')
+    manifest_metadata = passing_gate0.manifest_path.stat()
+    manifest_identity = (manifest_metadata.st_dev, manifest_metadata.st_ino)
+    original_read = freeze_schema._read_descriptor
+    manifest_reads: list[int] = []
+
+    def record_manifest_read(descriptor: int) -> bytes:
+        metadata = os.fstat(descriptor)
+        if (metadata.st_dev, metadata.st_ino) == manifest_identity:
+            manifest_reads.append(descriptor)
+        return original_read(descriptor)
+
+    def fail_clock() -> datetime:
+        raise LookupError("PRIVATE_CLOCK_SENTINEL")
+
+    monkeypatch.setattr(freeze_schema, "_read_descriptor", record_manifest_read)
+
+    with pytest.raises(LookupError, match="PRIVATE_CLOCK_SENTINEL"):
+        passing_gate0.verify(clock=fail_clock)
+
+    assert len(manifest_reads) == 2
+    assert len(set(manifest_reads)) == 1
+    with pytest.raises(OSError):
+        os.fstat(manifest_reads[0])
 
 
 @pytest.mark.parametrize("failure_stage", ["clock", "report"])
@@ -1021,6 +1103,34 @@ def test_cli_rejects_missing_input_report_alias_before_creating_it(
     assert completed.stdout == "gate0 status=error reasons=path_alias\n"
     assert completed.stderr == ""
     assert not alias.exists()
+
+
+def test_cli_rejects_missing_targets_below_aliased_directory_object(
+    passing_gate0: Gate0Fixture,
+) -> None:
+    input_parent = passing_gate0.root / "real-input-parent"
+    input_parent.mkdir()
+    report_parent = passing_gate0.root / "aliased-report-parent"
+    missing_name = "missing-manifest.json"
+    input_path = input_parent / missing_name
+    report_path = report_parent / missing_name
+    args = passing_gate0.cli_args()
+    args[args.index("--manifest") + 1] = str(
+        Path(input_parent.name) / missing_name
+    )
+    args[args.index("--report") + 1] = str(
+        Path(report_parent.name) / missing_name
+    )
+
+    with _directory_redirect(report_parent, input_parent):
+        assert input_parent.samefile(report_parent)
+        completed = _run_gate0_process(args, cwd=passing_gate0.root)
+
+    assert completed.returncode == 2
+    assert completed.stdout == "gate0 status=error reasons=path_alias\n"
+    assert completed.stderr == ""
+    assert not input_path.exists()
+    assert not report_path.exists()
 
 
 def test_cli_rejects_equivalent_relative_input_and_absolute_report_path(

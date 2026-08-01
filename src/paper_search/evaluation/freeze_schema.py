@@ -427,7 +427,7 @@ PartitionRows: TypeAlias = tuple[
 class ValidatedFreezeEvidence:
     """One validated freeze whose exact source artifacts remain descriptor-bound."""
 
-    manifest: FreezeManifest
+    manifest: FreezeManifest | None
     manifest_artifact: BoundArtifact
     approval_artifact: BoundArtifact | None = None
     partition_artifacts: tuple[BoundArtifact, ...] = ()
@@ -1275,21 +1275,29 @@ def open_validated_freeze_evidence(
             artifact = stack.enter_context(
                 open_confined_artifact(root, relative_path)
             )
-            manifest = parse_freeze_manifest_bytes(artifact.content)
         except ValueError:
             raise FreezeEvidenceError("manifest_invalid") from None
-        if isinstance(manifest, FreezeManifestV2):
-            evidence = _validate_v2_bindings(
-                root,
-                manifest,
-                stack=stack,
+        try:
+            manifest = parse_freeze_manifest_bytes(artifact.content)
+        except ValueError:
+            evidence = ValidatedFreezeEvidence(
+                manifest=None,
                 manifest_artifact=artifact,
+                reasons=("manifest_invalid",),
             )
         else:
-            evidence = ValidatedFreezeEvidence(
-                manifest=manifest,
-                manifest_artifact=artifact,
-            )
+            if isinstance(manifest, FreezeManifestV2):
+                evidence = _validate_v2_bindings(
+                    root,
+                    manifest,
+                    stack=stack,
+                    manifest_artifact=artifact,
+                )
+            else:
+                evidence = ValidatedFreezeEvidence(
+                    manifest=manifest,
+                    manifest_artifact=artifact,
+                )
         try:
             yield evidence
         finally:
@@ -1308,9 +1316,8 @@ def open_validated_freeze_evidence(
 
 def load_freeze_manifest(path: Path, *, data_root: Path) -> FreezeManifest:
     with open_validated_freeze_evidence(path, data_root=data_root) as evidence:
-        if evidence.reasons:
+        if evidence.reasons or evidence.manifest is None:
             raise FreezeEvidenceError(
-                evidence.reasons[0],
-                *evidence.reasons[1:],
+                *(evidence.reasons or ("manifest_invalid",)),
             )
         return evidence.manifest

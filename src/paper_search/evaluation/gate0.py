@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import stat
 from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
@@ -213,13 +214,53 @@ def _lexical_path_identity(path: Path) -> str:
     return os.path.normcase(os.path.normpath(str(path.absolute())))
 
 
+def _normalized_path_component(component: str) -> str:
+    return os.path.normcase(os.path.normpath(component))
+
+
+def _nearest_existing_parent(path: Path) -> tuple[Path, tuple[str, ...]]:
+    current = path.absolute().parent
+    missing_components: list[str] = []
+    while True:
+        try:
+            metadata = os.stat(current)
+        except FileNotFoundError:
+            try:
+                os.lstat(current)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError("gate0 path lookup is invalid") from None
+            parent = current.parent
+            if parent == current:
+                raise ValueError("gate0 path lookup is invalid") from None
+            missing_components.append(_normalized_path_component(current.name))
+            current = parent
+            continue
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError("gate0 path lookup is invalid")
+        return current, tuple(reversed(missing_components))
+
+
+def _missing_targets_alias(left: Path, right: Path) -> bool:
+    if _normalized_path_component(left.name) != _normalized_path_component(
+        right.name
+    ):
+        return False
+    left_parent, left_missing = _nearest_existing_parent(left)
+    right_parent, right_missing = _nearest_existing_parent(right)
+    if left_missing != right_missing:
+        return False
+    return left_parent.samefile(right_parent)
+
+
 def _paths_alias(left: Path, right: Path) -> bool:
     if _lexical_path_identity(left) == _lexical_path_identity(right):
         return True
     try:
         return left.samefile(right)
     except FileNotFoundError:
-        return False
+        return _missing_targets_alias(left, right)
 
 
 def _report_aliases_input_or_public(

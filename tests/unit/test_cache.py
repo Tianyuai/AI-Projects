@@ -13,6 +13,7 @@ from paper_search.storage.cache import (
     make_cache_key,
     validate_snapshot_manifest,
 )
+from paper_search.storage.dependency_snapshot import migrate_v1_to_v2
 
 
 class MutableClock:
@@ -241,3 +242,51 @@ def test_prepared_snapshot_write_rejects_paths_outside_run_directory(
 
     with pytest.raises(ValueError, match="snapshot path"):
         cache.write_snapshot(malicious, tmp_path / "run")
+
+
+def test_v1_provider_snapshot_migration_requires_complete_identity(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "v1"
+    source.mkdir()
+    (source / "response.json").write_bytes(b"{}")
+    complete_entry = {
+        "provider": "openalex",
+        "operation": "search",
+        "method": "GET",
+        "endpoint": "/works",
+        "cache_version": "adapter-v1",
+        "params": {"search": "rag", "per_page": "2"},
+        "requested_at": "2026-08-01T12:00:00Z",
+        "response_hash": (
+            "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+        ),
+        "snapshot_path": "response.json",
+    }
+    manifest = source / "snapshot_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {"contract_version": "provider-snapshot-v1", "entries": [complete_entry]}
+        ),
+        encoding="utf-8",
+    )
+
+    migrated = migrate_v1_to_v2(
+        manifest, tmp_path / "v2", sealed_at=datetime(2026, 8, 1, tzinfo=UTC)
+    )
+    assert migrated.entries[0].request.dependency == "openalex"
+    assert migrated.entries[0].request.endpoint == "/works"
+
+    del complete_entry["operation"]
+    manifest.write_text(
+        json.dumps(
+            {"contract_version": "provider-snapshot-v1", "entries": [complete_entry]}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="ambiguous V1 snapshot entry"):
+        migrate_v1_to_v2(
+            manifest,
+            tmp_path / "ambiguous-v2",
+            sealed_at=datetime(2026, 8, 1, tzinfo=UTC),
+        )

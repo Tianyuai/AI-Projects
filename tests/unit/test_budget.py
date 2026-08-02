@@ -2,11 +2,13 @@ import importlib
 import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
 from paper_search.domain.models import SearchBudget, UsageActual, UsageEstimate
+from paper_search.config import load_budget
 
 
 def budget_api() -> tuple[type, type[Exception], type[Exception]]:
@@ -39,6 +41,12 @@ def make_budget(**updates: object) -> SearchBudget:
     }
     values.update(updates)
     return SearchBudget.model_validate(values)
+
+
+def test_balanced_request_budget_is_bound_to_thirty_fen() -> None:
+    budget = load_budget(Path("configs/budget_balanced.yaml"))
+
+    assert Decimal(str(budget.max_cost_cny)) == Decimal("0.30")
 
 
 def test_reserve_rejects_usage_above_hard_limit_without_changing_state() -> None:

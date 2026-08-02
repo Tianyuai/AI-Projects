@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -27,7 +28,13 @@ class ReservationError(RuntimeError):
 
 Clock = Callable[[], datetime]
 TerminalMode = Literal["settled", "failed"]
-TerminalRecord = tuple[BudgetReservation, TerminalMode, UsageActual]
+TerminalRecord = tuple[
+    BudgetReservation,
+    TerminalMode,
+    UsageActual,
+    tuple[UsageActual, ...],
+]
+CommittedProvenance = tuple[BudgetReservation, TerminalMode, int] | None
 
 
 def _aggregate(usages: Iterable[UsageEstimate]) -> UsageEstimate:
@@ -49,6 +56,25 @@ def _known_cost(usages: Iterable[UsageEstimate]) -> Decimal:
     return sum(
         (item.cost_cny for item in usages if item.cost_cny is not None),
         Decimal("0"),
+    )
+
+
+def _committed_component_key(
+    action: str,
+    usage: UsageActual,
+    provenance: CommittedProvenance,
+) -> tuple[str, str, str, TerminalMode, int]:
+    """Return the exact immutable identity of one receipted commitment."""
+
+    if provenance is None:
+        raise ValueError("unreceipted usage has no terminal component key")
+    reservation, mode, component_index = provenance
+    return (
+        action,
+        usage.model_dump_json(),
+        reservation.model_dump_json(),
+        mode,
+        component_index,
     )
 
 
@@ -80,8 +106,8 @@ class HardBudgetController:
         self._dispatched_reservations: set[str] = set()
         self._committed: list[UsageActual] = []
         self._committed_actions: list[str] = []
+        self._committed_provenance: list[CommittedProvenance] = []
         self._terminal_outcomes: dict[str, TerminalRecord] = {}
-        self._terminal_outcomes_complete = True
         self._fail_closed = False
 
     @property
@@ -178,10 +204,12 @@ class HardBudgetController:
             self._dispatched_reservations.discard(reservation.reservation_id)
             self._committed.append(actual)
             self._committed_actions.append(active.action)
+            self._committed_provenance.append((active, "settled", 0))
             self._terminal_outcomes[reservation.reservation_id] = (
                 active,
                 "settled",
                 actual,
+                (actual,),
             )
 
     def terminal_outcome(
@@ -194,7 +222,7 @@ class HardBudgetController:
             record = self._terminal_outcomes.get(reservation.reservation_id)
             if record is None:
                 return None
-            stored, mode, actual = record
+            stored, mode, actual, _ = record
             if stored != reservation:
                 raise ReservationError(
                     "reservation does not match the terminal reservation"
@@ -299,11 +327,15 @@ class HardBudgetController:
         self._dispatched_reservations.discard(reservation.reservation_id)
         self._committed.extend(committed)
         self._committed_actions.extend(reservation.action for _ in committed)
+        self._committed_provenance.extend(
+            (reservation, "failed", index) for index in range(len(committed))
+        )
         aggregate = UsageActual.model_validate(_aggregate(committed).model_dump())
         self._terminal_outcomes[reservation.reservation_id] = (
             reservation,
             "failed",
             aggregate,
+            tuple(committed),
         )
 
     def stop_status(self) -> str:
@@ -345,18 +377,43 @@ class HardBudgetController:
                     self._dispatched_reservations
                 ),
                 "committed": [
-                    {"action": action, "usage": usage.model_dump(mode="json")}
-                    for action, usage in zip(self._committed_actions, self._committed, strict=True)
+                    {
+                        "action": action,
+                        "usage": usage.model_dump(mode="json"),
+                        "reservation": (
+                            provenance[0].model_dump(mode="json")
+                            if provenance is not None
+                            else None
+                        ),
+                        "mode": provenance[1] if provenance is not None else None,
+                        "component_index": (
+                            provenance[2] if provenance is not None else None
+                        ),
+                    }
+                    for action, usage, provenance in zip(
+                        self._committed_actions,
+                        self._committed,
+                        self._committed_provenance,
+                        strict=True,
+                    )
                 ],
                 "terminal_outcomes": [
                     {
                         "reservation": reservation.model_dump(mode="json"),
+                        "action": reservation.action,
                         "mode": mode,
                         "actual": actual.model_dump(mode="json"),
+                        "components": [
+                            component.model_dump(mode="json")
+                            for component in components
+                        ],
                     }
-                    for reservation, mode, actual in self._terminal_outcomes.values()
+                    for reservation, mode, actual, components in self._terminal_outcomes.values()
                 ],
-                "terminal_outcomes_complete": self._terminal_outcomes_complete,
+                "terminal_outcomes_complete": all(
+                    provenance is not None
+                    for provenance in self._committed_provenance
+                ),
             }
 
     @classmethod
@@ -402,11 +459,7 @@ class HardBudgetController:
         )
         committed = state.get("committed")
         terminal_outcomes = state.get("terminal_outcomes") if version == 4 else []
-        terminal_outcomes_complete = (
-            state.get("terminal_outcomes_complete")
-            if version == 4
-            else not committed
-        )
+        terminal_outcomes_complete = state.get("terminal_outcomes_complete", False)
         if (
             not isinstance(reservations, list)
             or not isinstance(expired_reservations, list)
@@ -467,13 +520,44 @@ class HardBudgetController:
             controller._dispatched_reservations = restored_dispatched
             controller._committed = []
             controller._committed_actions = []
+            controller._committed_provenance = []
             for raw in committed:
                 if not isinstance(raw, Mapping) or not isinstance(raw.get("action"), str):
                     raise ValueError("invalid committed usage state")
-                controller._committed_actions.append(raw["action"])
-                controller._committed.append(UsageActual.model_validate(raw.get("usage")))
+                action = raw["action"]
+                usage = UsageActual.model_validate(raw.get("usage"))
+                provenance: CommittedProvenance = None
+                if version == 4:
+                    raw_reservation = raw.get("reservation")
+                    raw_mode = raw.get("mode")
+                    component_index = raw.get("component_index")
+                    if (
+                        raw_reservation is None
+                        and raw_mode is None
+                        and component_index is None
+                    ):
+                        provenance = None
+                    else:
+                        if (
+                            raw_mode not in {"settled", "failed"}
+                            or type(component_index) is not int
+                            or component_index < 0
+                        ):
+                            raise ValueError("invalid committed usage provenance")
+                        provenance_reservation = BudgetReservation.model_validate(
+                            raw_reservation
+                        )
+                        if provenance_reservation.action != action:
+                            raise ValueError("invalid committed usage provenance")
+                        provenance = (
+                            provenance_reservation,
+                            raw_mode,
+                            component_index,
+                        )
+                controller._committed_actions.append(action)
+                controller._committed.append(usage)
+                controller._committed_provenance.append(provenance)
             controller._terminal_outcomes = {}
-            controller._terminal_outcomes_complete = terminal_outcomes_complete
             for raw in terminal_outcomes:
                 if not isinstance(raw, Mapping):
                     raise ValueError("invalid terminal outcome")
@@ -483,7 +567,25 @@ class HardBudgetController:
                 mode = raw.get("mode")
                 if mode not in {"settled", "failed"}:
                     raise ValueError("invalid terminal outcome")
+                if raw.get("action") != terminal_reservation.action:
+                    raise ValueError("invalid terminal outcome")
                 terminal_actual = UsageActual.model_validate(raw.get("actual"))
+                raw_components = raw.get("components")
+                if not isinstance(raw_components, list) or not raw_components:
+                    raise ValueError("invalid terminal outcome")
+                components = tuple(
+                    UsageActual.model_validate(component)
+                    for component in raw_components
+                )
+                aggregate = UsageActual.model_validate(
+                    _aggregate(components).model_dump()
+                )
+                if aggregate != terminal_actual:
+                    raise ValueError("invalid terminal outcome")
+                if mode == "settled" and len(components) != 1:
+                    raise ValueError("invalid terminal outcome")
+                if mode == "failed" and not fail_closed:
+                    raise ValueError("invalid terminal outcome")
                 reservation_id = terminal_reservation.reservation_id
                 if (
                     reservation_id in controller._terminal_outcomes
@@ -494,13 +596,35 @@ class HardBudgetController:
                     terminal_reservation,
                     mode,
                     terminal_actual,
+                    components,
                 )
-            if version == 4 and terminal_outcomes_complete:
-                terminal_usage = _aggregate(
-                    record[2] for record in controller._terminal_outcomes.values()
+            if version == 4:
+                committed_components = Counter(
+                    _committed_component_key(action, usage, provenance)
+                    for action, usage, provenance in zip(
+                        controller._committed_actions,
+                        controller._committed,
+                        controller._committed_provenance,
+                        strict=True,
+                    )
+                    if provenance is not None
                 )
-                committed_usage = _aggregate(controller._committed)
-                if terminal_usage != committed_usage:
+                receipt_components = Counter(
+                    _committed_component_key(
+                        reservation.action,
+                        component,
+                        (reservation, mode, index),
+                    )
+                    for reservation, mode, _, components in controller._terminal_outcomes.values()
+                    for index, component in enumerate(components)
+                )
+                if committed_components != receipt_components:
+                    raise ValueError("invalid terminal outcome")
+                has_unreceipted = any(
+                    provenance is None
+                    for provenance in controller._committed_provenance
+                )
+                if terminal_outcomes_complete == has_unreceipted:
                     raise ValueError("invalid terminal outcome")
             if (
                 formal_live

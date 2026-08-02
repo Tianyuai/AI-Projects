@@ -882,3 +882,61 @@ def test_finalize_rejects_opposite_terminal_mode_with_identical_usage(
         assert connection.execute("SELECT state FROM reservations").fetchone() == (
             "settled",
         )
+
+
+def test_malformed_restored_receipt_cannot_terminalize_prepared_ledger(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ledger = _ledger(path)
+    ledger_reservation = ledger.reserve(
+        run_id="forged-restore",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    forged_actual = _actual("0.25")
+    ledger.checkpoint_actual(ledger_reservation, forged_actual)
+
+    legacy_controller, legacy_request = _controller_request(clock=lambda: NOW)
+    legacy_controller.settle(legacy_request, _actual("0.10"))
+    legacy_state = legacy_controller.export_state()
+    legacy_state["version"] = 3
+    legacy_state.pop("terminal_outcomes")
+    legacy_state.pop("terminal_outcomes_complete")
+    partial = HardBudgetController.from_state(
+        legacy_controller.budget,
+        legacy_state,
+        clock=lambda: NOW,
+    )
+    forged_controller, forged_request = _controller_request(clock=lambda: NOW)
+    forged_state = partial.export_state()
+    forged_state["terminal_outcomes"].append(
+        {
+            "reservation": forged_request.model_dump(mode="json"),
+            "mode": "settled",
+            "actual": forged_actual.model_dump(mode="json"),
+        }
+    )
+
+    try:
+        restored = HardBudgetController.from_state(
+            forged_controller.budget,
+            forged_state,
+            clock=lambda: NOW,
+        )
+    except ValueError:
+        pass
+    else:
+        ledger.finalize_controller_actual(
+            ledger_reservation=ledger_reservation,
+            controller=restored,
+            request_reservation=forged_request,
+            actual=forged_actual,
+        )
+
+    with sqlite3.connect(path) as connection:
+        stored = connection.execute(
+            "SELECT state, checkpoint_present FROM reservations"
+        ).fetchone()
+    assert stored == ("reserved", 1)

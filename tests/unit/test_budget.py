@@ -1,3 +1,4 @@
+import copy
 import importlib
 import threading
 from datetime import UTC, datetime, timedelta
@@ -1004,6 +1005,12 @@ def test_legacy_v3_committed_usage_round_trips_with_partial_v4_receipts() -> Non
     legacy_state.pop("terminal_outcomes")
 
     restored = controller_type.from_state(make_budget(), legacy_state)
+    restored_legacy_state = restored.export_state()
+    legacy_commitment = restored_legacy_state["committed"][0]
+    assert legacy_commitment["reservation"] is None
+    assert legacy_commitment["mode"] is None
+    assert legacy_commitment["component_index"] is None
+    assert restored_legacy_state["terminal_outcomes_complete"] is False
     new_reservation = restored.reserve(
         "provider.new",
         UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
@@ -1021,3 +1028,168 @@ def test_legacy_v3_committed_usage_round_trips_with_partial_v4_receipts() -> Non
         "settled",
         new_actual,
     )
+
+
+def test_failed_attempt_components_are_ordered_and_bound_on_restore() -> None:
+    controller_type, _, _ = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+    reservation = controller.reserve(
+        "provider.retry",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    controller.mark_dispatched(reservation)
+    attempts = [
+        UsageActual(search_api_calls=1, cost_cny=Decimal("0.10")),
+        UsageActual(search_api_calls=1, cost_cny=None),
+    ]
+    controller.fail_closed_attempts(reservation, attempts)
+
+    state = controller.export_state()
+    receipt = state["terminal_outcomes"][0]
+    assert receipt["components"] == [
+        attempt.model_dump(mode="json") for attempt in attempts
+    ]
+    assert [item["component_index"] for item in state["committed"]] == [0, 1]
+    restored = controller_type.from_state(make_budget(), state)
+    assert restored.terminal_outcome(reservation) == (
+        "failed",
+        UsageActual(search_api_calls=2, cost_cny=None),
+    )
+
+    tampered = copy.deepcopy(state)
+    tampered["terminal_outcomes"][0]["components"].reverse()
+    with pytest.raises(ValueError, match="invalid budget controller state"):
+        controller_type.from_state(make_budget(), tampered)
+
+
+def _settled_v4_state(
+    *,
+    action: str = "provider.search",
+    cost: str = "0.10",
+) -> tuple[type, SearchBudget, object, dict[str, object]]:
+    controller_type, _, _ = budget_api()
+    budget = make_budget()
+    controller = controller_type(budget, formal_live=True)
+    reservation = controller.reserve(
+        action,
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    controller.settle(
+        reservation,
+        UsageActual(search_api_calls=1, cost_cny=Decimal(cost)),
+    )
+    return controller_type, budget, reservation, controller.export_state()
+
+
+def _partial_v4_state_with_legacy_commitment() -> tuple[type, SearchBudget, dict[str, object]]:
+    controller_type, budget, _, state = _settled_v4_state()
+    state["version"] = 3
+    state.pop("terminal_outcomes")
+    state.pop("terminal_outcomes_complete")
+    restored = controller_type.from_state(budget, state)
+    return controller_type, budget, restored.export_state()
+
+
+def test_restore_rejects_forged_receipt_in_partial_v4_state() -> None:
+    controller_type, budget, state = _partial_v4_state_with_legacy_commitment()
+    forged = controller_type(budget).reserve(
+        "provider.forged",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    state["terminal_outcomes"].append(
+        {
+            "reservation": forged.model_dump(mode="json"),
+            "mode": "settled",
+            "actual": UsageActual(
+                search_api_calls=1,
+                cost_cny=Decimal("0.25"),
+            ).model_dump(mode="json"),
+        }
+    )
+
+    with pytest.raises(ValueError, match="invalid budget controller state"):
+        controller_type.from_state(budget, state)
+
+
+def test_restore_rejects_complete_v4_receipt_mode_flip() -> None:
+    controller_type, budget, _, state = _settled_v4_state()
+    state["terminal_outcomes"][0]["mode"] = "failed"
+
+    with pytest.raises(ValueError, match="invalid budget controller state"):
+        controller_type.from_state(budget, state)
+
+
+@pytest.mark.parametrize("mutation", ["action", "reservation"])
+def test_restore_rejects_receipt_identity_mutation(mutation: str) -> None:
+    controller_type, budget, _, state = _settled_v4_state()
+    receipt = state["terminal_outcomes"][0]
+    if mutation == "action":
+        receipt["reservation"]["action"] = "provider.mutated"
+    else:
+        receipt["reservation"]["reserved"]["cost_cny"] = "0.29"
+
+    with pytest.raises(ValueError, match="invalid budget controller state"):
+        controller_type.from_state(budget, state)
+
+
+def test_restore_rejects_per_receipt_usage_swap_with_same_aggregate() -> None:
+    controller_type, _, _ = budget_api()
+    budget = make_budget()
+    controller = controller_type(budget, formal_live=True)
+    reservations = [
+        controller.reserve(
+            f"provider.{index}",
+            UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+        )
+        for index in range(2)
+    ]
+    controller.settle(
+        reservations[0],
+        UsageActual(search_api_calls=1, cost_cny=Decimal("0.10")),
+    )
+    controller.settle(
+        reservations[1],
+        UsageActual(search_api_calls=1, cost_cny=Decimal("0.20")),
+    )
+    state = controller.export_state()
+    receipts = state["terminal_outcomes"]
+    receipts[0]["actual"], receipts[1]["actual"] = (
+        copy.deepcopy(receipts[1]["actual"]),
+        copy.deepcopy(receipts[0]["actual"]),
+    )
+
+    with pytest.raises(ValueError, match="invalid budget controller state"):
+        controller_type.from_state(budget, state)
+
+
+def test_restore_rejects_unknown_cost_aggregate_masking() -> None:
+    controller_type, _, _ = budget_api()
+    budget = make_budget()
+    controller = controller_type(budget, formal_live=True)
+    settled = controller.reserve(
+        "provider.known",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    failed = controller.reserve(
+        "provider.unknown",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    controller.mark_dispatched(failed)
+    controller.settle(
+        settled,
+        UsageActual(search_api_calls=1, cost_cny=Decimal("0.10")),
+    )
+    controller.fail_closed(
+        failed,
+        UsageActual(search_api_calls=1, cost_cny=None),
+    )
+    state = controller.export_state()
+    known_receipt = next(
+        item
+        for item in state["terminal_outcomes"]
+        if item["mode"] == "settled"
+    )
+    known_receipt["actual"]["cost_cny"] = "0.90"
+
+    with pytest.raises(ValueError, match="invalid budget controller state"):
+        controller_type.from_state(budget, state)

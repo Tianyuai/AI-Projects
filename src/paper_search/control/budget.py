@@ -378,6 +378,10 @@ class HardBudgetController:
                 all_reservations
             ):
                 raise ValueError("duplicate reservation IDs")
+            for item in all_reservations:
+                if item.reserved.llm_calls > 0 and item.reserved.cost_cny is None:
+                    raise ValueError("invalid restored LLM reservation")
+                controller._check_hard_limits([item.reserved])
             controller._reservations = {
                 item.reservation_id: item for item in restored_reservations
             }
@@ -417,6 +421,12 @@ class HardBudgetController:
                     raise ValueError("invalid committed usage state")
                 controller._committed_actions.append(raw["action"])
                 controller._committed.append(UsageActual.model_validate(raw.get("usage")))
+            if (
+                formal_live
+                and not fail_closed
+                and any(usage.cost_cny is None for usage in controller._committed)
+            ):
+                raise ValueError("invalid formal-live committed usage")
             active_usage = [
                 item.reserved for item in controller._reservations.values()
             ]
@@ -427,8 +437,8 @@ class HardBudgetController:
                     [*controller._committed, *active_usage]
                 )
             controller._fail_closed = fail_closed
-        except (TypeError, ValueError) as error:
-            raise ValueError("invalid budget controller state") from error
+        except (BudgetExceededError, TypeError, ValueError):
+            raise ValueError("invalid budget controller state") from None
         controller._expire_locked()
         return controller
 

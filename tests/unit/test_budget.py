@@ -720,7 +720,7 @@ def test_fail_closed_over_hard_limit_state_round_trips(
 
 
 def test_fail_closed_restore_rejects_tampered_over_limit_active_reservation() -> None:
-    controller_type, exceeded_error, _ = budget_api()
+    controller_type, _, _ = budget_api()
     controller = controller_type(make_budget(), formal_live=True)
     state = controller.export_state()
     state["fail_closed"] = True
@@ -738,12 +738,12 @@ def test_fail_closed_restore_rejects_tampered_over_limit_active_reservation() ->
         }
     ]
 
-    with pytest.raises(exceeded_error, match="hard limit"):
+    with pytest.raises(ValueError, match="^invalid budget controller state$"):
         controller_type.from_state(make_budget(), state)
 
 
 def test_non_fail_closed_restore_rejects_over_limit_committed_usage() -> None:
-    controller_type, exceeded_error, _ = budget_api()
+    controller_type, _, _ = budget_api()
     controller = controller_type(make_budget())
     state = controller.export_state()
     state["committed"] = [
@@ -755,7 +755,7 @@ def test_non_fail_closed_restore_rejects_over_limit_committed_usage() -> None:
         }
     ]
 
-    with pytest.raises(exceeded_error, match="hard limit"):
+    with pytest.raises(ValueError, match="^invalid budget controller state$"):
         controller_type.from_state(make_budget(), state)
 
 
@@ -813,6 +813,89 @@ def legacy_v1_state(**updates: object) -> dict[str, object]:
     }
     state.update(updates)
     return state
+
+
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_restore_rejects_active_llm_reservation_with_unknown_cost(
+    version: int,
+) -> None:
+    controller_type, _, _ = budget_api()
+    secret_action = "sk-live-restored-action-secret"
+    reservation = {
+        "reservation_id": "restored-unknown-cost",
+        "action": secret_action,
+        "reserved": UsageEstimate(llm_calls=1, cost_cny=None).model_dump(
+            mode="json"
+        ),
+        "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+    }
+    if version == 3:
+        state = controller_type(make_budget()).export_state()
+        state["reservations"] = [reservation]
+    else:
+        state = legacy_v1_state(version=version, reservations=[reservation])
+        if version == 2:
+            state["formal_live"] = False
+
+    with pytest.raises(ValueError, match="^invalid budget controller state$") as error:
+        controller_type.from_state(make_budget(), state)
+
+    assert secret_action not in str(error.value)
+    assert error.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    [
+        UsageEstimate(llm_calls=1, cost_cny=None),
+        UsageEstimate(llm_calls=2, cost_cny=0.5),
+        UsageEstimate(input_tokens=101),
+        UsageEstimate(elapsed_ms=2_001),
+        UsageEstimate(cost_cny=1.1),
+    ],
+)
+def test_restore_rejects_invalid_dispatched_tombstone_estimate(
+    reserved: UsageEstimate,
+) -> None:
+    controller_type, _, _ = budget_api()
+    secret_action = "sk-live-tombstone-secret"
+    reservation_id = "invalid-expired-tombstone"
+    state = controller_type(make_budget()).export_state()
+    state["expired_reservations"] = [
+        {
+            "reservation_id": reservation_id,
+            "action": secret_action,
+            "reserved": reserved.model_dump(mode="json"),
+            "expires_at": (datetime.now(UTC) - timedelta(minutes=5)).isoformat(),
+        }
+    ]
+    state["dispatched_reservation_ids"] = [reservation_id]
+
+    with pytest.raises(ValueError, match="^invalid budget controller state$") as error:
+        controller_type.from_state(make_budget(), state)
+
+    assert secret_action not in str(error.value)
+    assert error.value.__cause__ is None
+
+
+def test_formal_live_non_fail_closed_restore_rejects_unknown_committed_cost() -> None:
+    controller_type, _, _ = budget_api()
+    secret_action = "sk-live-committed-secret"
+    state = controller_type(make_budget(), formal_live=True).export_state()
+    state["committed"] = [
+        {
+            "action": secret_action,
+            "usage": UsageActual(llm_calls=1, cost_cny=None).model_dump(
+                mode="json"
+            ),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="^invalid budget controller state$") as error:
+        controller_type.from_state(make_budget(), state)
+
+    assert secret_action not in str(error.value)
+    assert error.value.__cause__ is None
 
 
 def test_recovery_migrates_true_legacy_v1_state_without_formal_live_flag() -> None:

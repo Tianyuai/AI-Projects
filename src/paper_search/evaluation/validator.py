@@ -547,6 +547,7 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
                 ),
                 snapshot_manifest=snapshot,
                 snapshot_reader=reader,
+                prompt_version=lock.baseline.prompt_version,
             ),
             policy=gate_policy,
             split=manifest.split,

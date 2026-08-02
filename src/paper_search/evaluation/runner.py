@@ -1394,6 +1394,7 @@ async def _run_formal_evaluation(
                 ),
                 snapshot_manifest=snapshot_manifest,
                 snapshot_reader=snapshot_reader,
+                prompt_version=inputs.lock.baseline.prompt_version,
             ),
             policy=inputs.gate_policy,
             split=request.split,

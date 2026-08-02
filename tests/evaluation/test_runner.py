@@ -31,6 +31,7 @@ from paper_search.domain.models import (
     ErrorDetail,
     Paper,
     ProviderResult,
+    QueryAnalysisResult,
     QuerySpec,
     ResolvedCitationEdge,
     UsageActual,
@@ -65,6 +66,7 @@ from paper_search.storage.dependency_snapshot import (
     DependencyRequestIdentity,
     DependencySnapshotReader,
 )
+from paper_search.query.planner import QueryPlanner
 
 
 CONFIG = Path(__file__).parents[2] / "configs" / "base.yaml"
@@ -2849,7 +2851,7 @@ def test_retrieval_response_without_snapshot_refs_is_not_parseable() -> None:
         numerator=0, denominator=1, value=0
     )
     assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
-        numerator=0, denominator=0, value=None
+        numerator=0, denominator=2, value=0
     )
     assert "cached_repeat_latency_p50_ms" not in measures
 
@@ -2958,6 +2960,7 @@ def test_retrieval_response_requires_bound_decodable_configured_snapshot(
         configured_endpoints={"openalex": configured_endpoint},
         snapshot_manifest=manifest,
         snapshot_reader=reader,
+        prompt_version="query-analyze-v1",
     )
 
     assert measures["parseable_configured_retrieval_response_rate"] == MeasureValue(
@@ -2965,7 +2968,10 @@ def test_retrieval_response_requires_bound_decodable_configured_snapshot(
     )
 
 
-@pytest.mark.parametrize("published_post_filter_ids", [[], ["openalex:W1"]])
+@pytest.mark.parametrize(
+    "published_post_filter_ids",
+    [[], ["openalex:W1", "openalex:W2"]],
+)
 def test_hard_filter_loss_is_derived_from_decoded_candidates(
     tmp_path: Path,
     published_post_filter_ids: list[str],
@@ -2983,7 +2989,7 @@ def test_hard_filter_loss_is_derived_from_decoded_candidates(
         identity,
         response_bytes=(
             b'{"results":[{"id":"W1","title":"One",'
-            b'"is_retracted":true}]}'
+            b'"is_retracted":true},{"id":"W2","title":"Two"}]}'
         ),
         safe_headers={"content-type": "application/json"},
         captured_at=datetime(2026, 8, 2, tzinfo=UTC),
@@ -3012,7 +3018,7 @@ def test_hard_filter_loss_is_derived_from_decoded_candidates(
                 errors=[],
             )
         ],
-        retrieved_paper_ids=["openalex:W1"],
+        retrieved_paper_ids=["openalex:W1", "openalex:W2"],
         post_filter_paper_ids=published_post_filter_ids,
         is_partial=False,
         planner_status="primary",
@@ -3024,7 +3030,7 @@ def test_hard_filter_loss_is_derived_from_decoded_candidates(
             EvaluationQuery(
                 query_id="q1",
                 query="one",
-                relevant_paper_ids=["openalex:W1"],
+                relevant_paper_ids=[f"openalex:W{index}" for index in range(1, 101)],
                 metadata={"split": "dev"},
             )
         ],
@@ -3044,10 +3050,171 @@ def test_hard_filter_loss_is_derived_from_decoded_candidates(
         configured_endpoints={"openalex": "/works"},
         snapshot_manifest=manifest,
         snapshot_reader=reader,
+        prompt_version="query-analyze-v1",
     )
 
     assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
-        numerator=1, denominator=1, value=1
+        numerator=1, denominator=100, value=Decimal("0.01")
+    )
+
+
+@pytest.mark.parametrize("bind_llm_snapshot", [False, True])
+def test_business_query_analysis_requires_bound_llm_snapshot(
+    tmp_path: Path,
+    bind_llm_snapshot: bool,
+) -> None:
+    store = DependencyCaptureStore(tmp_path / "snapshots")
+    identity = DependencyRequestIdentity.from_canonical_request(
+        dependency="openalex",
+        operation="search",
+        method="GET",
+        endpoint="/works",
+        model_or_adapter="openalex-v1",
+        canonical_request={"query": "one"},
+    )
+    retrieval_ref = store.stage_success(
+        identity,
+        response_bytes=b'{"results":[{"id":"W1","title":"One"}]}',
+        safe_headers={"content-type": "application/json"},
+        captured_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    mutated_spec = QuerySpec(
+        original_query="one",
+        research_goal="one",
+        exclusions=["One"],
+    )
+    analysis = QueryAnalysisResult(
+            query_spec=mutated_spec,
+            search_plan=QueryPlanner().finalize(mutated_spec, None),
+        )
+    llm_refs = []
+    if bind_llm_snapshot:
+        llm_identity = DependencyRequestIdentity.from_canonical_request(
+            dependency="llm",
+            operation="generate_json",
+            method="POST",
+            endpoint="/chat/completions",
+            model_or_adapter="qwen3.7-plus",
+            canonical_request={
+                "payload": "sha256:" + "c" * 64,
+                "prompt_name": "query-analyze",
+                "prompt_version": "query-analyze-v1",
+            },
+        )
+        llm_refs.append(
+            store.stage_success(
+                llm_identity,
+                response_bytes=json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        analysis.model_dump(mode="json"),
+                                        separators=(",", ":"),
+                                    )
+                                }
+                            }
+                        ]
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+                safe_headers={"content-type": "application/json"},
+                captured_at=datetime(2026, 8, 2, tzinfo=UTC),
+            )
+        )
+    manifest = store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+    business = BusinessResultRecord(
+        query_id="q1",
+        query_analysis=analysis,
+        selected_paper_ids=[],
+        high_relevance=[],
+        partial_relevance=[],
+        citation_edges=[],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        warnings=[],
+        stop_reason="completed",
+        hard_failure_code=None,
+    )
+    execution = EvaluationExecutionRecord(
+        query_id="q1",
+        run_id="formal-1",
+        outcome_kind="success",
+        business_result_sha256="sha256:" + "a" * 64,
+        usage=UsageActual(cost_cny=Decimal("0")),
+        diagnostics=[
+            DependencyDiagnostic(
+                dependency="openalex",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=1,
+                cache_hit=False,
+                snapshot_refs=[retrieval_ref],
+                errors=[],
+            ),
+            DependencyDiagnostic(
+                dependency="llm",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=1,
+                cache_hit=False,
+                snapshot_refs=llm_refs,
+                errors=[],
+            ),
+        ],
+        retrieved_paper_ids=["openalex:W1"],
+        post_filter_paper_ids=[],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        stop_reason="completed",
+    )
+    measures = runner_module.formal_audit_measures(
+        frozen_queries=[
+            EvaluationQuery(
+                query_id="q1",
+                query="one",
+                relevant_paper_ids=["openalex:W1"],
+                metadata={"split": "dev"},
+            )
+        ],
+        executions=[execution],
+        business_results=[business],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("3"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+        configured_endpoints={"openalex": "/works"},
+        snapshot_manifest=manifest,
+        snapshot_reader=reader,
+        prompt_version="query-analyze-v1",
+    )
+
+    assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
+        numerator=1 if bind_llm_snapshot else 0,
+        denominator=1,
+        value=1 if bind_llm_snapshot else 0,
+    )
+    assert measures["provenance_failures"] == MeasureValue(
+        numerator=0 if bind_llm_snapshot else 1,
+        denominator=1,
+        value=0 if bind_llm_snapshot else 1,
     )
 
 

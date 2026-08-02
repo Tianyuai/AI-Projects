@@ -10,7 +10,13 @@ from urllib.parse import unquote
 
 from paper_search.control.ledger import LedgerReport
 from paper_search.control.pricing import QualityGatePolicy
-from paper_search.domain.models import CitationEdge, Paper, ProviderPaperId, QuerySpec
+from paper_search.domain.models import (
+    CitationEdge,
+    Paper,
+    ProviderPaperId,
+    QueryAnalysisResult,
+    QuerySpec,
+)
 from paper_search.evaluation.business_results import BusinessResultRecord
 from paper_search.evaluation.dataset import (
     EvaluationQuery,
@@ -24,7 +30,9 @@ from paper_search.evaluation.execution_adapter import (
 )
 from paper_search.evaluation.gates import MeasureValue
 from paper_search.evaluation.metrics import EvaluationResult, evaluate
+from paper_search.llm.client import LLMResponseDecoder
 from paper_search.processing import apply_hard_filters
+from paper_search.query.parser import rule_fallback
 from paper_search.retrieval.openalex import decode_openalex_page
 from paper_search.retrieval.semantic_scholar import (
     decode_semantic_scholar_batch,
@@ -244,6 +252,108 @@ def _snapshot_retrieval_evidence(
     )
 
 
+def _frozen_query_spec(query: EvaluationQuery) -> QuerySpec:
+    payload = query.metadata.get("query_spec")
+    if payload is None:
+        return rule_fallback(query.query)
+    if not isinstance(payload, Mapping):
+        raise ValueError("frozen query_spec metadata must be an object")
+    return QuerySpec.model_validate(
+        {
+            **payload,
+            "original_query": query.query,
+            "research_goal": payload.get("research_goal", query.query),
+        }
+    )
+
+
+def _bound_llm_query_specs(
+    execution: EvaluationExecutionRecord,
+    *,
+    query: EvaluationQuery,
+    prompt_version: str | None,
+    snapshot_manifest: DependencySnapshotManifestV2 | None,
+    snapshot_reader: DependencySnapshotReader | None,
+) -> tuple[QuerySpec, ...]:
+    if (
+        prompt_version is None
+        or snapshot_manifest is None
+        or snapshot_reader is None
+    ):
+        return ()
+    entries = {
+        (entry.request.dependency, entry.cache_key): entry
+        for entry in snapshot_manifest.entries
+    }
+    decoder = LLMResponseDecoder(prompt_version=prompt_version)
+    specs: list[QuerySpec] = []
+    for diagnostic in execution.diagnostics:
+        if diagnostic.dependency != "llm" or diagnostic.errors:
+            continue
+        for ref in diagnostic.snapshot_refs:
+            entry = entries.get((ref.dependency, ref.cache_key))
+            if (
+                entry is None
+                or entry.request.dependency != "llm"
+                or entry.request.operation != "generate_json"
+            ):
+                continue
+            try:
+                snapshot = snapshot_reader.read(entry.request)
+            except (KeyError, OSError, ValueError):
+                continue
+            if snapshot.ref != ref:
+                continue
+            decoded = decoder.decode(
+                snapshot.response_bytes,
+                model_id=entry.request.model_or_adapter,
+                captured_at=entry.captured_at,
+                cache_hit=diagnostic.cache_hit,
+                snapshot_ref=snapshot.ref,
+            )
+            if decoded.errors:
+                continue
+            try:
+                analysis = QueryAnalysisResult.model_validate(decoded.data)
+            except ValueError:
+                continue
+            specs.append(
+                analysis.query_spec.model_copy(
+                    update={"original_query": " ".join(query.query.split())}
+                )
+            )
+    return tuple(specs)
+
+
+def _filter_query_spec(
+    query: EvaluationQuery,
+    *,
+    record: BusinessResultRecord | None,
+    execution: EvaluationExecutionRecord,
+    prompt_version: str | None,
+    snapshot_manifest: DependencySnapshotManifestV2 | None,
+    snapshot_reader: DependencySnapshotReader | None,
+) -> tuple[QuerySpec, bool]:
+    frozen_spec = _frozen_query_spec(query)
+    if record is None or record.query_analysis is None:
+        return frozen_spec, False
+    published_spec = record.query_analysis.query_spec
+    bound_specs = _bound_llm_query_specs(
+        execution,
+        query=query,
+        prompt_version=prompt_version,
+        snapshot_manifest=snapshot_manifest,
+        snapshot_reader=snapshot_reader,
+    )
+    if published_spec in bound_specs:
+        return published_spec, False
+    if "query_spec" in query.metadata and published_spec == frozen_spec:
+        return frozen_spec, False
+    if record.planner_fallback and published_spec == frozen_spec:
+        return frozen_spec, False
+    return frozen_spec, True
+
+
 def formal_audit_measures(
     *,
     frozen_queries: Sequence[EvaluationQuery],
@@ -256,6 +366,7 @@ def formal_audit_measures(
     configured_endpoints: Mapping[str, str] | None = None,
     snapshot_manifest: DependencySnapshotManifestV2 | None = None,
     snapshot_reader: DependencySnapshotReader | None = None,
+    prompt_version: str | None = None,
 ) -> dict[str, MeasureValue]:
     """Derive all applicable enforced and core reporting measures."""
     count = len(frozen_queries)
@@ -265,15 +376,18 @@ def formal_audit_measures(
     resolve = identifier_map.resolve if identifier_map is not None else lambda value: value
     execution_by_query = {execution.query_id: execution for execution in executions}
     structured_by_query = {record.query_id: record for record in business_results}
+    relevant_count = 0
     retrieved_relevant_count = 0
     post_filter_relevant_count = 0
     parseable_retrieval_query_count = 0
     response_ids_by_query: dict[str, set[str]] = {}
     bound_edges_by_query: dict[str, frozenset[tuple[str, str, str]]] = {}
     openalex_ids_by_query: dict[str, frozenset[str]] = {}
+    query_spec_binding_failures = 0
     configured = configured_endpoints or {}
     for query in frozen_queries:
         relevant = {resolve(identifier) for identifier in query.relevant_paper_ids}
+        relevant_count += len(relevant)
         execution = execution_by_query.get(query.query_id)
         if execution is None:
             continue
@@ -294,11 +408,15 @@ def formal_audit_measures(
             resolve(paper.canonical_id) for paper in evidence.candidate_papers
         }
         record = structured_by_query.get(query.query_id)
-        query_spec = (
-            record.query_analysis.query_spec
-            if record is not None and record.query_analysis is not None
-            else QuerySpec(original_query=query.query, research_goal=query.query)
+        query_spec, binding_failed = _filter_query_spec(
+            query,
+            record=record,
+            execution=execution,
+            prompt_version=prompt_version,
+            snapshot_manifest=snapshot_manifest,
+            snapshot_reader=snapshot_reader,
         )
+        query_spec_binding_failures += binding_failed
         filtered = apply_hard_filters(evidence.candidate_papers, query_spec)
         post_filter = {
             resolve(item.paper.canonical_id) for item in filtered.accepted
@@ -405,7 +523,11 @@ def formal_audit_measures(
             1,
         ),
         "provenance_failures": _measure(
-            sum(code in {"integrity_failure", "snapshot_unavailable"} for code in error_codes),
+            sum(
+                code in {"integrity_failure", "snapshot_unavailable"}
+                for code in error_codes
+            )
+            + query_spec_binding_failures,
             1,
         ),
         "sanitization_failures": _measure(len(diagnostics) - clean_diagnostics, 1),
@@ -423,7 +545,7 @@ def formal_audit_measures(
         ),
         "hard_filter_absolute_recall_loss": _measure(
             retrieved_relevant_count - post_filter_relevant_count,
-            retrieved_relevant_count,
+            relevant_count,
         ),
         "hard_failure_rate": _measure(hard_failure_count, count),
         "partial_result_rate": _measure(

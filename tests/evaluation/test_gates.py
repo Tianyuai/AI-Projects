@@ -193,6 +193,7 @@ def test_prediction_order_and_cardinality_are_formal_inputs() -> None:
 
 def test_hard_failure_requires_exactly_one_supplemental_record_per_query() -> None:
     one_expected = _audits(hard_failure_rate=_measure("1", "1"))
+    one_expected["hard_failed_query:q1"] = _measure("1", "1")
     missing = _evaluate(failures=[], audits=one_expected)
     single = _evaluate(failures=[_failure()], audits=one_expected)
     duplicate = _evaluate(failures=[_failure(), _failure()], audits=one_expected)
@@ -204,6 +205,43 @@ def test_hard_failure_requires_exactly_one_supplemental_record_per_query() -> No
     assert _check(unknown, "hard-failure-cardinality").passed is False
 
 
+def test_two_expected_hard_failures_require_exact_linked_frozen_order() -> None:
+    frozen = [
+        EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"}),
+        EvaluationQuery(query_id="q2", query="two", metadata={"split": "dev"}),
+    ]
+    audits = _audits(hard_failure_rate=_measure("1", "2"))
+    audits["hard_failed_query:q1"] = _measure("1", "1")
+    audits["hard_failed_query:q2"] = _measure("1", "1")
+
+    ordered = _evaluate(
+        frozen=frozen,
+        failures=[_failure("q1"), _failure("q2")],
+        audits=audits,
+    )
+    invalid_sets = (
+        [_failure("q2"), _failure("q1")],
+        [_failure("q1")],
+        [_failure("q1"), _failure("q1")],
+        [_failure("q1"), _failure("q2"), _failure("unknown")],
+    )
+
+    assert _check(ordered, "hard-failure-cardinality").passed is True
+    for failures in invalid_sets:
+        evaluation = _evaluate(frozen=frozen, failures=failures, audits=audits)
+        assert _check(evaluation, "hard-failure-cardinality").passed is False
+        assert evaluation.formal_valid is False
+
+
+def test_nonzero_hard_failure_rate_requires_identity_bearing_audit_markers() -> None:
+    missing_identity = _evaluate(
+        failures=[_failure()],
+        audits=_audits(hard_failure_rate=_measure("1", "1")),
+    )
+
+    assert _check(missing_identity, "hard-failure-cardinality").passed is False
+
+
 def test_hard_failure_cardinality_rejects_inconsistent_authoritative_rate() -> None:
     invalid = _evaluate(
         failures=[],
@@ -212,6 +250,16 @@ def test_hard_failure_cardinality_rejects_inconsistent_authoritative_rate() -> N
 
     assert _check(invalid, "hard-failure-cardinality").passed is False
     assert invalid.formal_valid is False
+
+
+def test_zero_expected_hard_failures_rejects_an_extra_failure_record() -> None:
+    evaluation = _evaluate(failures=[_failure()])
+
+    check = _check(evaluation, "hard-failure-cardinality")
+    assert check.measure.value is None
+    assert check.passed is False
+    assert evaluation.formal_valid is False
+    assert evaluation.gate_result == "failed"
 
 
 def test_ledger_over_cap_is_formal_failure() -> None:

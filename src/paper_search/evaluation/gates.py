@@ -16,6 +16,9 @@ from paper_search.evaluation.execution_adapter import EvaluationFailureRecord
 from paper_search.evaluation.metrics import EvaluationResult, MetricMeasure
 
 
+_HARD_FAILED_QUERY_PREFIX = "hard_failed_query:"
+
+
 class MeasureValue(DomainModel):
     numerator: Decimal
     denominator: Decimal = Field(ge=0)
@@ -81,8 +84,9 @@ def _failure_cardinality(
     frozen_queries: Sequence[EvaluationQuery],
     failures: Sequence[EvaluationFailureRecord],
     expected_hard_failures: MeasureValue | None,
+    audit_measures: Mapping[str, MeasureValue],
 ) -> MeasureValue:
-    frozen_ids = {query.query_id for query in frozen_queries}
+    frozen_ids = [query.query_id for query in frozen_queries]
     failure_ids = [failure.query_id for failure in failures]
     if expected_hard_failures is None:
         return _measure(0, 0, None)
@@ -102,12 +106,25 @@ def _failure_cardinality(
     ):
         return _measure(0, 0, None)
     denominator = int(expected_count)
+    marked_ids = {
+        name.removeprefix(_HARD_FAILED_QUERY_PREFIX): measure
+        for name, measure in audit_measures.items()
+        if name.startswith(_HARD_FAILED_QUERY_PREFIX)
+    }
+    markers_valid = (
+        len(marked_ids) == denominator
+        and set(marked_ids) <= set(frozen_ids)
+        and all(
+            measure == _measure(1, 1, 1) for measure in marked_ids.values()
+        )
+    )
     if denominator == 0:
         return _measure(0, 0, None)
+    expected_ids = [query_id for query_id in frozen_ids if query_id in marked_ids]
     valid = (
-        len(failure_ids) == denominator
-        and len(failure_ids) == len(set(failure_ids))
-        and set(failure_ids) <= frozen_ids
+        markers_valid
+        and failure_ids == expected_ids
+        and len(failure_ids) == denominator
     )
     return _measure(denominator if valid else 0, denominator, 1 if valid else 0)
 
@@ -158,6 +175,7 @@ def evaluate_gates(
             frozen_queries,
             failures,
             audit_measures.get("hard_failure_rate"),
+            audit_measures,
         )
     )
     available["budget_ledgers_over_hard_cap"] = _measure(
@@ -179,6 +197,11 @@ def evaluate_gates(
                 and hard_failure_rate.numerator == 0
                 and hard_failure_rate.denominator == Decimal(len(frozen_queries))
                 and hard_failure_rate.value == 0
+                and not failures
+                and not any(
+                    name.startswith(_HARD_FAILED_QUERY_PREFIX)
+                    for name in audit_measures
+                )
             )
             if no_hard_failures:
                 passed = True

@@ -1,0 +1,45 @@
+{
+  "config_hash": "sha256:84094f9e47639334a6a8495509766764f9fb17b6c75f870d984213f0e1ed15ad",
+  "ended_at": "2026-08-02T00:00:00Z",
+  "execution_mode": "live",
+  "experiment_name": "main-baseline",
+  "failure_count": 0,
+  "frozen_manifest_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "gate_result": "passed",
+  "identifier_map_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "input_lock_sha256": "sha256:5a30d4e1865421b3467f8fac0164af86191e21b3e7998a9d715f8a031466e8a3",
+  "optional_modules": {
+    "embedding": false
+  },
+  "partition_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "prompt_version": "query-analyze-v1",
+  "readiness_summary": [
+    {
+      "cache_hit": false,
+      "dependency": "llm",
+      "error_codes": [],
+      "state": "ready"
+    },
+    {
+      "cache_hit": false,
+      "dependency": "openalex",
+      "error_codes": [],
+      "state": "ready"
+    },
+    {
+      "cache_hit": false,
+      "dependency": "semantic_scholar",
+      "error_codes": [],
+      "state": "ready"
+    }
+  ],
+  "run_id": "capture",
+  "schema_version": "formal-run-v1",
+  "snapshot_manifest_sha256": "sha256:cb8989cfb9c9eedaea483e5a316a2848a2bf72ccf189832a2c60b144c5db5982",
+  "snapshot_set_id": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "source_git_sha": "task2-fixture-commit",
+  "split": "dev",
+  "started_at": "2026-08-02T00:00:00Z",
+  "status": "complete",
+  "tracked_source_dirty": false
+}

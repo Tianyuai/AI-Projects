@@ -16,6 +16,15 @@ from paper_search.application.contracts import (
     SearchFailure,
     SearchRequest,
 )
+from paper_search.evaluation.runner import (
+    EvaluationRunRequest,
+    EvaluationRunResult,
+    run_evaluation,
+)
+from paper_search.evaluation.validator import (
+    compare_replay_command,
+    verify_run_command,
+)
 
 
 _SMOKE_QUERY = "resource-aware scholarly paper search"
@@ -43,6 +52,18 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--mode", choices=("replay", "live"), default="replay")
     smoke.add_argument("--snapshot-manifest", type=Path)
     smoke.add_argument("--allow-network", action="store_true")
+    evaluate = commands.add_parser("evaluate", help="run one formal evaluation")
+    evaluate.add_argument("--lock", type=Path, required=True)
+    evaluate.add_argument("--split", choices=("dev", "validation"), required=True)
+    evaluate.add_argument("--mode", choices=("replay", "live"), default="replay")
+    evaluate.add_argument("--output-root", type=Path, required=True)
+    evaluate.add_argument("--snapshot-manifest", type=Path)
+    evaluate.add_argument("--allow-network", action="store_true")
+    verify = commands.add_parser("verify-run", help="verify a formal run")
+    verify.add_argument("run_directory", type=Path)
+    compare = commands.add_parser("compare-replay", help="compare capture and replay")
+    compare.add_argument("capture_run", type=Path)
+    compare.add_argument("replay_run", type=Path)
     return parser
 
 
@@ -127,6 +148,44 @@ async def _run_smoke(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "verify-run":
+        return verify_run_command(args.run_directory)
+    if args.command == "compare-replay":
+        return compare_replay_command(args.capture_run, args.replay_run)
+    if args.command == "evaluate":
+        try:
+            result = asyncio.run(
+                run_evaluation(
+                    EvaluationRunRequest(
+                        split=args.split,
+                        mode=args.mode,
+                        lock_path=args.lock,
+                        output_root=args.output_root,
+                        snapshot_manifest_path=args.snapshot_manifest,
+                        network_authorized=bool(args.allow_network),
+                    )
+                )
+            )
+            if not isinstance(result, EvaluationRunResult):
+                raise TypeError("formal runner returned a legacy result")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            return 130
+        except (OSError, TypeError, ValueError):
+            print("evaluation failed: invalid input", file=sys.stderr)
+            return 2
+        print(
+            json.dumps(
+                {
+                    "gate_result": result.gate_result,
+                    "path": str(result.run_path),
+                    "run_id": result.run_id,
+                    "status": result.status,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 5 if result.gate_result == "failed" else 0
     try:
         exit_code, summary = asyncio.run(_run_smoke(args))
     except _SmokeFailure as error:

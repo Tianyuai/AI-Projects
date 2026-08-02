@@ -1,0 +1,45 @@
+{
+  "config_hash": "sha256:f639995adf2f73f2ac1b19dea0b36c69f146eda2f4129e646334f0317fe183eb",
+  "ended_at": "2026-08-02T00:00:00Z",
+  "execution_mode": "replay",
+  "experiment_name": "main-baseline",
+  "failure_count": 0,
+  "frozen_manifest_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "gate_result": "passed",
+  "identifier_map_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "input_lock_sha256": "sha256:b7a1d8d187d4b8109617e54008915950eb1f0b4ac83efa7d6fc6f8380b2e2cd9",
+  "optional_modules": {
+    "embedding": false
+  },
+  "partition_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "prompt_version": "query-analyze-v1",
+  "readiness_summary": [
+    {
+      "cache_hit": true,
+      "dependency": "llm",
+      "error_codes": [],
+      "state": "replayed"
+    },
+    {
+      "cache_hit": true,
+      "dependency": "openalex",
+      "error_codes": [],
+      "state": "replayed"
+    },
+    {
+      "cache_hit": true,
+      "dependency": "semantic_scholar",
+      "error_codes": [],
+      "state": "replayed"
+    }
+  ],
+  "run_id": "replay",
+  "schema_version": "formal-run-v1",
+  "snapshot_manifest_sha256": "sha256:cb8989cfb9c9eedaea483e5a316a2848a2bf72ccf189832a2c60b144c5db5982",
+  "snapshot_set_id": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "source_git_sha": "task2-fixture-commit",
+  "split": "dev",
+  "started_at": "2026-08-02T00:00:00Z",
+  "status": "complete",
+  "tracked_source_dirty": false
+}

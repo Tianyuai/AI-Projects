@@ -1,0 +1,24 @@
+{
+  "actual": {
+    "cost_cny": "0",
+    "elapsed_ms": 0,
+    "input_tokens": 0,
+    "llm_calls": 0,
+    "output_tokens": 0,
+    "search_api_calls": 0
+  },
+  "project_actual_cny": "0",
+  "project_hard_cap_cny": "200",
+  "project_soft_stop_cny": "160",
+  "reserved": {
+    "cost_cny": "0",
+    "elapsed_ms": 0,
+    "input_tokens": 0,
+    "llm_calls": 0,
+    "output_tokens": 0,
+    "search_api_calls": 0
+  },
+  "run_cap_cny": "18",
+  "run_id": "replay",
+  "within_caps": true
+}

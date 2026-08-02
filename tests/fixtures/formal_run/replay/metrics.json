@@ -1,0 +1,102 @@
+{
+  "measures": {
+    "macro_f1": {
+      "denominator": "2",
+      "numerator": "2.0",
+      "value": "1.0"
+    },
+    "macro_identifier_map_recall": {
+      "denominator": "2",
+      "numerator": "2.0",
+      "value": "1.0"
+    },
+    "macro_precision": {
+      "denominator": "2",
+      "numerator": "2.0",
+      "value": "1.0"
+    },
+    "macro_recall": {
+      "denominator": "2",
+      "numerator": "2.0",
+      "value": "1.0"
+    },
+    "micro_f1": {
+      "denominator": "0",
+      "numerator": "0",
+      "value": "1.0"
+    },
+    "micro_identifier_map_recall": {
+      "denominator": "0",
+      "numerator": "0",
+      "value": "1.0"
+    },
+    "micro_precision": {
+      "denominator": "0",
+      "numerator": "0",
+      "value": "1.0"
+    },
+    "micro_recall": {
+      "denominator": "0",
+      "numerator": "0",
+      "value": "1.0"
+    },
+    "recall_at_10": {
+      "denominator": "2",
+      "numerator": "2.0",
+      "value": "1.0"
+    },
+    "recall_at_20": {
+      "denominator": "2",
+      "numerator": "2.0",
+      "value": "1.0"
+    },
+    "recall_at_5": {
+      "denominator": "2",
+      "numerator": "2.0",
+      "value": "1.0"
+    }
+  },
+  "per_query": {
+    "q1": {
+      "f1": 1.0,
+      "false_negative_count": 0,
+      "false_positive_count": 0,
+      "gold_ids": [],
+      "hit_ids": [],
+      "precision": 1.0,
+      "predicted_ids": [],
+      "recall": 1.0,
+      "recall_at_10": 1.0,
+      "recall_at_20": 1.0,
+      "recall_at_5": 1.0,
+      "true_positive_count": 0
+    },
+    "q2": {
+      "f1": 1.0,
+      "false_negative_count": 0,
+      "false_positive_count": 0,
+      "gold_ids": [],
+      "hit_ids": [],
+      "precision": 1.0,
+      "predicted_ids": [],
+      "recall": 1.0,
+      "recall_at_10": 1.0,
+      "recall_at_20": 1.0,
+      "recall_at_5": 1.0,
+      "true_positive_count": 0
+    }
+  },
+  "summary": {
+    "macro_f1": 1.0,
+    "macro_precision": 1.0,
+    "macro_recall": 1.0,
+    "macro_recall_at_10": 1.0,
+    "macro_recall_at_20": 1.0,
+    "macro_recall_at_5": 1.0,
+    "micro_f1": 1.0,
+    "micro_precision": 1.0,
+    "micro_recall": 1.0,
+    "missing_prediction_count": 0,
+    "query_count": 2
+  }
+}

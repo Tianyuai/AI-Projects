@@ -149,11 +149,7 @@ def test_to_structured_response_preserves_fusion_and_optional_evidence() -> None
     assert response.fused_papers == result.fused_papers
     assert response.high_relevance[0].evidence.fusion_score == 0.25
     assert response.high_relevance[0].evidence.source_ranks == {"openalex": 1}
-    assert response.partial_relevance[0].paper.canonical_id == "s2:S1"
-    assert response.partial_relevance[0].evidence.fusion_score == 0.20
-    assert response.partial_relevance[0].evidence.source_ranks == {
-        "semantic_scholar": 1
-    }
+    assert response.partial_relevance == []
     assert response.query_analysis == result.query_analysis
     assert response.search_trace == result.trace
     assert response.usage == result.usage
@@ -169,9 +165,11 @@ def test_to_structured_response_preserves_fusion_and_optional_evidence() -> None
     assert [item.paper for item in response.high_relevance] == [
         item.paper for item in result.high_relevance
     ]
-    assert [item.paper.canonical_id for item in response.partial_relevance] == [
-        "s2:S1"
-    ]
+    ranked_ids = {
+        item.paper.canonical_id
+        for item in [*response.high_relevance, *response.partial_relevance]
+    }
+    assert "s2:S1" not in ranked_ids
     assert response.citation_edges == result.citation_edges
     assert response.prompt_version == result.prompt_version
     assert response.warnings == result.warnings

@@ -340,6 +340,36 @@ def test_service_maps_provider_snapshot_miss_to_snapshot_unavailable() -> None:
     assert execution.outcome.error.code == "snapshot_unavailable"
 
 
+@pytest.mark.parametrize(
+    "code",
+    ["snapshot_unavailable", "integrity_failure"],
+)
+def test_service_replay_evidence_failure_is_hard_with_sibling_papers(
+    code: str,
+) -> None:
+    error = ErrorDetail(
+        code=code,
+        message="untrusted replay evidence",
+        retryable=False,
+        provider="openalex",
+    )
+    result = _result(
+        diagnostics=[
+            _diagnostic("llm"),
+            _diagnostic("openalex", errors=[error]),
+            _diagnostic("semantic_scholar"),
+        ],
+        warnings=["openalex: provider returned errors"],
+    )
+
+    execution = asyncio.run(_service(result).execute(_request()))
+
+    assert isinstance(execution.outcome, SearchFailure)
+    assert execution.outcome.error.code == code
+    assert execution.outcome.usage == result.usage
+    assert execution.diagnostics == result.diagnostics
+
+
 def test_business_hash_includes_fusion_scores_and_source_ranks() -> None:
     original = _result()
     changed = original.model_copy(

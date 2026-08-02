@@ -156,9 +156,9 @@ class SearchApplicationService:
             if diagnostic.dependency in {"openalex", "semantic_scholar"}
             for error in diagnostic.errors
         }
-        if not result.papers and "integrity_failure" in provider_error_codes:
+        if "integrity_failure" in provider_error_codes:
             return "integrity_failure"
-        if not result.papers and "snapshot_unavailable" in provider_error_codes:
+        if "snapshot_unavailable" in provider_error_codes:
             return "snapshot_unavailable"
 
         provider_failures = {

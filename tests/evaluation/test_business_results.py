@@ -6,7 +6,12 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from paper_search.domain.models import StructuredSearchResponse
+from paper_search.domain.models import (
+    CandidateEvidence,
+    Paper,
+    RankedPaper,
+    StructuredSearchResponse,
+)
 from paper_search.evaluation.business_results import (
     BusinessResultRecord,
     business_result_from_response,
@@ -61,6 +66,28 @@ def test_business_hash_changes_for_semantic_fields() -> None:
         _record(stop_reason="soft_stop"),
     ):
         assert business_result_sha256(changed) != business_result_sha256(original)
+
+
+def test_canonical_business_result_rejects_nonfinite_nested_evidence() -> None:
+    evidence = CandidateEvidence(
+        paper_id="openalex:W1",
+        lexical_score=float("nan"),
+        embedding_score=0.0,
+        constraint_coverage=0.0,
+        source_agreement=0.0,
+        authority_score=0.0,
+        recency_score=0.0,
+        final_score=0.0,
+        scoring_version="v1",
+        relevance_level="high",
+    )
+    ranked = RankedPaper(
+        paper=Paper(canonical_id="openalex:W1", title="One"),
+        evidence=evidence,
+    )
+
+    with pytest.raises(ValueError, match="Out of range float values"):
+        canonical_business_result_bytes(_record(high_relevance=[ranked]))
 
 
 def test_transport_fields_cannot_enter_business_record_or_hash() -> None:

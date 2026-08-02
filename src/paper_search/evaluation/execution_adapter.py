@@ -15,6 +15,7 @@ from paper_search.application.contracts import (
 from paper_search.domain.models import (
     DependencyErrorCode,
     DomainModel,
+    ErrorDetail,
     NonEmptyStr,
     PlannerStatus,
     Sha256,
@@ -47,6 +48,10 @@ _DEPENDENCY_ERROR_CODES = frozenset(
         "provider_error",
     }
 )
+_SAFE_DIAGNOSTIC_ERROR_CODES = _DEPENDENCY_ERROR_CODES | {
+    "integrity_failure",
+    "snapshot_unavailable",
+}
 
 
 class EvaluationFailureRecord(DomainModel):
@@ -96,6 +101,37 @@ def _diagnostics_sha256(diagnostics: list[DependencyDiagnostic]) -> Sha256:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _sanitized_diagnostics(
+    diagnostics: list[DependencyDiagnostic],
+) -> list[DependencyDiagnostic]:
+    """Retain audit facts while removing provider-controlled text and request IDs."""
+    sanitized: list[DependencyDiagnostic] = []
+    for diagnostic in diagnostics:
+        errors = [
+            ErrorDetail(
+                code=(
+                    error.code
+                    if error.code in _SAFE_DIAGNOSTIC_ERROR_CODES
+                    else "provider_error"
+                ),
+                message="Dependency execution reported an error",
+                retryable=error.retryable,
+                provider=diagnostic.dependency,
+                request_id=None,
+            )
+            for error in diagnostic.errors
+        ]
+        sanitized.append(
+            diagnostic.model_copy(
+                update={
+                    "endpoint": "dependency",
+                    "errors": errors,
+                }
+            )
+        )
+    return sanitized
+
+
 def _validated_business_hash(
     result: SearchExecutionResult,
     record: BusinessResultRecord,
@@ -116,6 +152,7 @@ def adapt_execution(
 ) -> AdaptedExecution:
     """Convert exactly one application outcome without weakening prediction records."""
     outcome = result.outcome
+    diagnostics = _sanitized_diagnostics(result.diagnostics)
     if isinstance(outcome, SearchFailure):
         if outcome.query_id != expected_query_id:
             raise ValueError(
@@ -129,7 +166,7 @@ def adapt_execution(
         digest = _validated_business_hash(result, business)
         dependency_codes = [
             cast(DependencyErrorCode, error.code)
-            for diagnostic in result.diagnostics
+            for diagnostic in diagnostics
             for error in diagnostic.errors
             if error.code in _DEPENDENCY_ERROR_CODES
         ]
@@ -141,8 +178,8 @@ def adapt_execution(
             stop_reason=outcome.stop_reason,
             usage=outcome.usage,
             dependency_error_codes=dependency_codes,
-            diagnostics=result.diagnostics,
-            diagnostics_sha256=_diagnostics_sha256(result.diagnostics),
+            diagnostics=diagnostics,
+            diagnostics_sha256=_diagnostics_sha256(diagnostics),
         )
         return AdaptedExecution(
             prediction=InternalPredictionRecord(
@@ -155,7 +192,7 @@ def adapt_execution(
                 outcome_kind="failure",
                 business_result_sha256=digest,
                 usage=outcome.usage,
-                diagnostics=result.diagnostics,
+                diagnostics=diagnostics,
                 is_partial=False,
                 planner_status=None,
                 planner_fallback=False,
@@ -180,7 +217,7 @@ def adapt_execution(
             outcome_kind="success",
             business_result_sha256=digest,
             usage=response.usage,
-            diagnostics=result.diagnostics,
+            diagnostics=diagnostics,
             is_partial=response.is_partial,
             planner_status=response.planner_status,
             planner_fallback=response.planner_fallback,

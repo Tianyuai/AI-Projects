@@ -46,6 +46,7 @@ def _inputs() -> tuple[list[EvaluationQuery], list[PredictionRecord]]:
                 query_id="q1",
                 query="one",
                 relevant_paper_ids=["openalex:W1"],
+                metadata={"split": "dev"},
             )
         ],
         [PredictionRecord(query_id="q1", predicted_paper_ids=["openalex:W1"])],
@@ -75,6 +76,7 @@ def _audits(**changes: MeasureValue) -> dict[str, MeasureValue]:
         "valid_model_produced_query_analysis_rate": _measure("0.99"),
         "parseable_configured_retrieval_response_rate": _measure("0.95"),
         "hard_filter_absolute_recall_loss": _measure("0.02"),
+        "hard_failure_rate": _measure("0", "1"),
     }
     values.update(changes)
     return values
@@ -87,17 +89,19 @@ def _evaluate(
     failures: list[EvaluationFailureRecord] | None = None,
     audits: dict[str, MeasureValue] | None = None,
     within_caps: bool = True,
-    split: str = "dev",
 ):
     default_frozen, default_predictions = _inputs()
     selected_frozen = default_frozen if frozen is None else frozen
     selected_predictions = default_predictions if predictions is None else predictions
+    try:
+        metric_result = evaluate(selected_frozen, selected_predictions)
+    except ValueError:
+        metric_result = evaluate(selected_frozen, [])
     return evaluate_gates(
-        split=split,
         frozen_queries=selected_frozen,
         predictions=selected_predictions,
         failures=[] if failures is None else failures,
-        metrics=evaluate(selected_frozen, selected_predictions),
+        metrics=metric_result,
         audit_measures=_audits() if audits is None else audits,
         ledger_report=_ledger(within_caps=within_caps),
         policy=POLICY,
@@ -139,7 +143,6 @@ def test_strict_positive_recall_boundaries() -> None:
         [PredictionRecord(query_id="q1", predicted_paper_ids=[])],
     )
     zero = evaluate_gates(
-        split="dev",
         frozen_queries=frozen,
         predictions=predictions,
         failures=[],
@@ -167,11 +170,21 @@ def test_each_formal_audit_failure_invalidates_run(measure: str) -> None:
 
 
 def test_prediction_order_and_cardinality_are_formal_inputs() -> None:
-    frozen = [EvaluationQuery(query_id="q1", query="one"), EvaluationQuery(query_id="q2", query="two")]
+    frozen = [
+        EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"}),
+        EvaluationQuery(query_id="q2", query="two", metadata={"split": "dev"}),
+    ]
     missing = [PredictionRecord(query_id="q1")]
     reordered = [PredictionRecord(query_id="q2"), PredictionRecord(query_id="q1")]
 
-    for predictions in (missing, reordered):
+    extra = [
+        PredictionRecord(query_id="q1"),
+        PredictionRecord(query_id="q2"),
+        PredictionRecord(query_id="extra"),
+    ]
+    duplicate = [PredictionRecord(query_id="q1"), PredictionRecord(query_id="q1")]
+
+    for predictions in (missing, reordered, extra, duplicate):
         evaluation = _evaluate(frozen=frozen, predictions=predictions)
         check = _check(evaluation, "prediction-cardinality")
         assert check.passed is False
@@ -179,13 +192,26 @@ def test_prediction_order_and_cardinality_are_formal_inputs() -> None:
 
 
 def test_hard_failure_requires_exactly_one_supplemental_record_per_query() -> None:
-    single = _evaluate(failures=[_failure()])
-    duplicate = _evaluate(failures=[_failure(), _failure()])
-    unknown = _evaluate(failures=[_failure("unknown")])
+    one_expected = _audits(hard_failure_rate=_measure("1", "1"))
+    missing = _evaluate(failures=[], audits=one_expected)
+    single = _evaluate(failures=[_failure()], audits=one_expected)
+    duplicate = _evaluate(failures=[_failure(), _failure()], audits=one_expected)
+    unknown = _evaluate(failures=[_failure("unknown")], audits=one_expected)
 
+    assert _check(missing, "hard-failure-cardinality").passed is False
     assert _check(single, "hard-failure-cardinality").passed is True
     assert _check(duplicate, "hard-failure-cardinality").passed is False
     assert _check(unknown, "hard-failure-cardinality").passed is False
+
+
+def test_hard_failure_cardinality_rejects_inconsistent_authoritative_rate() -> None:
+    invalid = _evaluate(
+        failures=[],
+        audits=_audits(hard_failure_rate=_measure("0", "0")),
+    )
+
+    assert _check(invalid, "hard-failure-cardinality").passed is False
+    assert invalid.formal_valid is False
 
 
 def test_ledger_over_cap_is_formal_failure() -> None:

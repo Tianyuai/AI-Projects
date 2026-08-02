@@ -37,7 +37,11 @@ from paper_search.evaluation.execution_adapter import (
 NOW = datetime(2026, 8, 2, tzinfo=UTC)
 
 
-def _diagnostic(*, request_id: str = "safe-request") -> DependencyDiagnostic:
+def _diagnostic(
+    *,
+    request_id: str = "safe-request",
+    message: str = "safe provider failure",
+) -> DependencyDiagnostic:
     return DependencyDiagnostic(
         dependency="openalex",
         endpoint="/works",
@@ -58,7 +62,7 @@ def _diagnostic(*, request_id: str = "safe-request") -> DependencyDiagnostic:
         errors=[
             ErrorDetail(
                 code="server_error",
-                message="safe provider failure",
+                message=message,
                 retryable=True,
                 provider="openalex",
                 request_id=request_id,
@@ -139,6 +143,8 @@ def test_adapt_execution_success_partial_and_empty_retrieval(
     assert adapted.prediction.selected_paper_ids == selected
     assert adapted.execution.outcome_kind == "success"
     assert adapted.execution.is_partial is partial
+    assert "safe provider failure" not in adapted.execution.model_dump_json()
+    assert "safe-request" not in adapted.execution.model_dump_json()
     assert adapted.failure is None
     assert adapted.business_result.selected_paper_ids == selected
 
@@ -170,7 +176,12 @@ def test_adapt_execution_hard_failure_emits_one_safe_failure_record() -> None:
     assert adapted.business_result.hard_failure_code == "dependency_failure"
     assert adapted.failure is not None
     assert adapted.failure.dependency_error_codes == ["server_error"]
-    assert adapted.failure.diagnostics == [diagnostic]
+    assert adapted.failure.diagnostics[0].snapshot_refs == diagnostic.snapshot_refs
+    assert adapted.failure.diagnostics[0].usage == diagnostic.usage
+    assert adapted.failure.diagnostics[0].latency_ms == diagnostic.latency_ms
+    persisted = adapted.failure.model_dump_json()
+    assert "safe provider failure" not in persisted
+    assert "safe-request" not in persisted
 
 
 def test_adapt_execution_rejects_mismatched_query_id() -> None:
@@ -178,7 +189,7 @@ def test_adapt_execution_rejects_mismatched_query_id() -> None:
         adapt_execution(expected_query_id="different", result=_success())
 
 
-def test_failure_diagnostic_hash_is_canonical_and_sensitive() -> None:
+def test_failure_diagnostic_hash_uses_sanitized_canonical_diagnostics() -> None:
     base = SearchExecutionResult(
         outcome=SearchFailure(
             query_id="q1",
@@ -190,13 +201,32 @@ def test_failure_diagnostic_hash_is_canonical_and_sensitive() -> None:
         diagnostics=[_diagnostic(request_id="one")],
         business_result_sha256=None,
     )
-    changed = base.model_copy(update={"diagnostics": [_diagnostic(request_id="two")]})
+    changed = base.model_copy(
+        update={
+            "diagnostics": [
+                _diagnostic(request_id="two", message="private=/provider/detail")
+            ]
+        }
+    )
 
     first = adapt_execution(expected_query_id="q1", result=base).failure
     second = adapt_execution(expected_query_id="q1", result=changed).failure
 
     assert first is not None and second is not None
-    assert first.diagnostics_sha256 != second.diagnostics_sha256
+    assert first.diagnostics_sha256 == second.diagnostics_sha256
+    assert "private=/provider/detail" not in second.model_dump_json()
+    assert '"request_id":null' in second.model_dump_json()
+
+    latency_changed = base.model_copy(
+        update={
+            "diagnostics": [
+                base.diagnostics[0].model_copy(update={"latency_ms": 13})
+            ]
+        }
+    )
+    third = adapt_execution(expected_query_id="q1", result=latency_changed).failure
+    assert third is not None
+    assert third.diagnostics_sha256 != first.diagnostics_sha256
 
 
 def test_execution_models_reject_extra_fields() -> None:

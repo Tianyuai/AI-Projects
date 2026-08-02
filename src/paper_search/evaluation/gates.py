@@ -71,21 +71,56 @@ def _prediction_cardinality(
     )
     valid = len(actual_ids) == denominator and matching == denominator
     return _measure(
-        denominator if valid else matching,
+        denominator if valid else 0,
         denominator,
-        1 if valid else (Decimal(matching) / denominator if denominator else 0),
+        1 if valid else 0,
     )
 
 
 def _failure_cardinality(
     frozen_queries: Sequence[EvaluationQuery],
     failures: Sequence[EvaluationFailureRecord],
+    expected_hard_failures: MeasureValue | None,
 ) -> MeasureValue:
     frozen_ids = {query.query_id for query in frozen_queries}
     failure_ids = [failure.query_id for failure in failures]
-    valid = len(failure_ids) == len(set(failure_ids)) and set(failure_ids) <= frozen_ids
-    denominator = len(failure_ids)
+    if expected_hard_failures is None:
+        return _measure(0, 0, None)
+    expected_count = expected_hard_failures.numerator
+    expected_denominator = Decimal(len(frozen_queries))
+    expected_value = (
+        expected_count / expected_denominator if expected_denominator else None
+    )
+    if (
+        not expected_count.is_finite()
+        or not expected_hard_failures.denominator.is_finite()
+        or expected_count != expected_count.to_integral_value()
+        or expected_count < 0
+        or expected_count > expected_denominator
+        or expected_hard_failures.denominator != expected_denominator
+        or expected_hard_failures.value != expected_value
+    ):
+        return _measure(0, 0, None)
+    denominator = int(expected_count)
+    if denominator == 0:
+        return _measure(0, 0, None)
+    valid = (
+        len(failure_ids) == denominator
+        and len(failure_ids) == len(set(failure_ids))
+        and set(failure_ids) <= frozen_ids
+    )
     return _measure(denominator if valid else 0, denominator, 1 if valid else 0)
+
+
+def _split_from_frozen_queries(
+    frozen_queries: Sequence[EvaluationQuery],
+) -> Literal["dev", "validation"]:
+    splits = {query.metadata.get("split") for query in frozen_queries}
+    if splits == {"dev"}:
+        return "dev"
+    if splits == {"validation"}:
+        return "validation"
+    raise ValueError("frozen queries must declare one consistent dev or validation split")
 
 
 def _compare(rule: QualityGateRule, value: Decimal) -> bool:
@@ -100,6 +135,7 @@ def _compare(rule: QualityGateRule, value: Decimal) -> bool:
 
 
 def evaluate_gates(
+    *,
     frozen_queries: Sequence[EvaluationQuery],
     predictions: Sequence[PredictionRecord],
     failures: Sequence[EvaluationFailureRecord],
@@ -107,10 +143,9 @@ def evaluate_gates(
     audit_measures: Mapping[str, MeasureValue],
     ledger_report: LedgerReport,
     policy: QualityGatePolicy,
-    *,
-    split: Literal["dev", "validation"],
 ) -> GateEvaluation:
     """Evaluate every policy row while only enforcing applicable formal/baseline rows."""
+    split = _split_from_frozen_queries(frozen_queries)
     available: dict[str, MeasureValue] = {
         name: _from_metric(measure) for name, measure in metrics.measures.items()
     }
@@ -119,7 +154,11 @@ def evaluate_gates(
         frozen_queries, predictions
     )
     available["supplemental_failure_records_per_hard_failed_query"] = (
-        _failure_cardinality(frozen_queries, failures)
+        _failure_cardinality(
+            frozen_queries,
+            failures,
+            audit_measures.get("hard_failure_rate"),
+        )
     )
     available["budget_ledgers_over_hard_cap"] = _measure(
         0 if ledger_report.within_caps else 1,
@@ -133,7 +172,17 @@ def evaluate_gates(
         measure = available.get(rule.measure, _measure(0, 0, None))
         passed: bool | None = None
         if applies:
-            if measure.value is None or (
+            no_hard_failures = (
+                rule.measure == "supplemental_failure_records_per_hard_failed_query"
+                and (hard_failure_rate := audit_measures.get("hard_failure_rate"))
+                is not None
+                and hard_failure_rate.numerator == 0
+                and hard_failure_rate.denominator == Decimal(len(frozen_queries))
+                and hard_failure_rate.value == 0
+            )
+            if no_hard_failures:
+                passed = True
+            elif measure.value is None or (
                 measure.denominator == 0
                 and rule.measure
                 not in {"supplemental_failure_records_per_hard_failed_query"}

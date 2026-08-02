@@ -89,6 +89,7 @@ def canonical_business_result_bytes(record: BusinessResultRecord) -> bytes:
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
+            allow_nan=False,
         ).encode("utf-8")
         + b"\n"
     )

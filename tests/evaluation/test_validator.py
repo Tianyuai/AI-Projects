@@ -5,6 +5,12 @@ from pathlib import Path
 import pytest
 import yaml
 
+import paper_search.evaluation.runner as runner_module
+import paper_search.evaluation.validator as validator_module
+from paper_search.evaluation.business_results import (
+    BusinessResultRecord,
+    business_result_sha256,
+)
 from paper_search.evaluation.validator import (
     RunValidationResult,
     ValidationIssue,
@@ -119,3 +125,173 @@ def test_replay_rejects_absolute_capture_run_id(tmp_path: Path) -> None:
 
     assert not result.valid
     assert "artifact_invalid" in {issue.code for issue in result.issues}
+
+
+def test_validator_rejects_forged_cost_and_open_reservations(tmp_path: Path) -> None:
+    run = tmp_path / "capture"
+    shutil.copytree(FIXTURE_ROOT / "capture", run)
+    payload = json.loads((run / "usage.json").read_bytes())
+    payload["actual"]["cost_cny"] = "999"
+    payload["reserved"]["search_api_calls"] = 1
+    payload["reserved"]["cost_cny"] = "1"
+    payload["project_actual_cny"] = "0"
+    payload["within_caps"] = True
+    (run / "usage.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    result = validate_run_directory(run)
+
+    assert not result.valid
+    assert "ledger_invalid" in {issue.code for issue in result.issues}
+
+
+def test_capture_replay_lock_must_inherit_live_config(tmp_path: Path) -> None:
+    run = tmp_path / "capture"
+    shutil.copytree(FIXTURE_ROOT / "capture", run)
+    replay_lock_path = run / "replay.lock.yaml"
+    payload = yaml.safe_load(replay_lock_path.read_bytes())
+    payload["budget_config"]["path"] = "configs/unrelated_budget.yaml"
+    replay_lock_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    result = validate_run_directory(run)
+
+    assert not result.valid
+    assert "replay_binding_invalid" in {issue.code for issue in result.issues}
+
+
+def test_validator_rejects_private_platform_path(tmp_path: Path) -> None:
+    run = tmp_path / "capture"
+    shutil.copytree(FIXTURE_ROOT / "capture", run)
+    payload = json.loads((run / "run.json").read_bytes())
+    payload["experiment_name"] = "C:\\Users\\alice\\secret\\trace.log"
+    (run / "run.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    result = validate_run_directory(run)
+
+    assert not result.valid
+    assert "sanitization_invalid" in {issue.code for issue in result.issues}
+
+
+def test_failure_diagnostics_digest_is_recomputed(tmp_path: Path) -> None:
+    run = tmp_path / "capture"
+    shutil.copytree(FIXTURE_ROOT / "capture", run)
+    business_lines = (run / "business-results.jsonl").read_text(encoding="utf-8").splitlines()
+    business_payload = json.loads(business_lines[0])
+    business_payload.update(
+        {
+            "hard_failure_code": "dependency_failure",
+            "stop_reason": "dependency_failure",
+        }
+    )
+    business_record = BusinessResultRecord.model_validate(business_payload)
+    business_lines[0] = business_record.model_dump_json()
+    (run / "business-results.jsonl").write_text(
+        "\n".join(business_lines) + "\n", encoding="utf-8"
+    )
+    execution_lines = (run / "executions.jsonl").read_text(encoding="utf-8").splitlines()
+    execution = json.loads(execution_lines[0])
+    execution.update(
+        {
+            "outcome_kind": "failure",
+            "stop_reason": "dependency_failure",
+            "business_result_sha256": business_result_sha256(business_record),
+        }
+    )
+    execution_lines[0] = json.dumps(execution)
+    (run / "executions.jsonl").write_text(
+        "\n".join(execution_lines) + "\n", encoding="utf-8"
+    )
+    failure = {
+        "schema_version": "evaluation-failure-v1",
+        "query_id": "q1",
+        "run_id": "capture",
+        "error_code": "dependency_failure",
+        "retryable": True,
+        "stop_reason": "dependency_failure",
+        "usage": execution["usage"],
+        "dependency_error_codes": [],
+        "diagnostics": [],
+        "diagnostics_sha256": "sha256:" + "a" * 64,
+    }
+    (run / "failures.jsonl").write_text(json.dumps(failure) + "\n", encoding="utf-8")
+    manifest = json.loads((run / "run.json").read_bytes())
+    manifest["failure_count"] = 1
+    (run / "run.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = validate_run_directory(run)
+
+    assert not result.valid
+    assert "diagnostic_hash_invalid" in {issue.code for issue in result.issues}
+
+
+def test_standalone_replay_validates_complete_source_capture(tmp_path: Path) -> None:
+    fixture = tmp_path / "formal_run"
+    shutil.copytree(FIXTURE_ROOT, fixture)
+    source_manifest_path = fixture / "capture" / "run.json"
+    source_manifest = json.loads(source_manifest_path.read_bytes())
+    source_manifest["status"] = "failed"
+    source_manifest_path.write_text(json.dumps(source_manifest), encoding="utf-8")
+
+    result = validate_run_directory(fixture / "replay")
+
+    assert not result.valid
+    assert "source_capture_invalid" in {issue.code for issue in result.issues}
+
+
+def test_frozen_evidence_requires_v2_schema_and_identifier_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    quality_bytes = Path("configs/quality_gates_v1.yaml").read_bytes()
+    partition_bytes = b'{"query_id":"q1","query":"one","metadata":{"split":"dev"}}\n'
+    identifier_bytes = b"{}\n"
+    manifest_bytes = json.dumps(
+        {
+            "schema_version": "not-v2",
+            "partitions": [
+                {
+                    "name": "dev",
+                    "path": "dev.jsonl",
+                    "query_count": 1,
+                    "sha256": runner_module._sha256_bytes(partition_bytes),
+                }
+            ],
+            "identifier_map": {
+                "path": "identifier-map.json",
+                "sha256": "sha256:" + "f" * 64,
+            },
+        }
+    ).encode()
+    inputs = tmp_path / "inputs"
+    inputs.mkdir()
+    (inputs / "manifest.json").write_bytes(manifest_bytes)
+    (inputs / "dev.jsonl").write_bytes(partition_bytes)
+    (inputs / "identifier-map.json").write_bytes(identifier_bytes)
+    (tmp_path / "quality.yaml").write_bytes(quality_bytes)
+    lock_payload = yaml.safe_load(
+        Path("tests/fixtures/application/candidate.lock.yaml").read_bytes()
+    )
+    lock_payload["frozen_data"] = {
+        "manifest": {
+            "path": "inputs/manifest.json",
+            "sha256": runner_module._sha256_bytes(manifest_bytes),
+        },
+        "identifier_map": {
+            "path": "inputs/identifier-map.json",
+            "sha256": runner_module._sha256_bytes(identifier_bytes),
+        },
+        "split": "dev",
+        "query_count": 1,
+        "partition_sha256": runner_module._sha256_bytes(partition_bytes),
+    }
+    lock_payload["quality_gates"] = {
+        "path": "quality.yaml",
+        "sha256": runner_module._sha256_bytes(quality_bytes),
+    }
+    lock = runner_module.CandidateLock.model_validate(lock_payload)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ValueError):
+        validator_module._frozen_evidence(lock)

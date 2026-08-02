@@ -7,9 +7,56 @@
     "output_tokens": 0,
     "search_api_calls": 0
   },
+  "policy_version": "budget-ledger-policy-v1",
   "project_actual_cny": "0",
   "project_hard_cap_cny": "200",
   "project_soft_stop_cny": "160",
+  "receipts": [
+    {
+      "actual": {
+        "cost_cny": "0",
+        "elapsed_ms": 0,
+        "input_tokens": 0,
+        "llm_calls": 0,
+        "output_tokens": 0,
+        "search_api_calls": 0
+      },
+      "estimate": {
+        "cost_cny": "0",
+        "elapsed_ms": 0,
+        "input_tokens": 0,
+        "llm_calls": 0,
+        "output_tokens": 0,
+        "search_api_calls": 0
+      },
+      "query_id": "q1",
+      "reservation_id": "capture-q1",
+      "run_id": "capture",
+      "state": "settled"
+    },
+    {
+      "actual": {
+        "cost_cny": "0",
+        "elapsed_ms": 0,
+        "input_tokens": 0,
+        "llm_calls": 0,
+        "output_tokens": 0,
+        "search_api_calls": 0
+      },
+      "estimate": {
+        "cost_cny": "0",
+        "elapsed_ms": 0,
+        "input_tokens": 0,
+        "llm_calls": 0,
+        "output_tokens": 0,
+        "search_api_calls": 0
+      },
+      "query_id": "q2",
+      "reservation_id": "capture-q2",
+      "run_id": "capture",
+      "state": "settled"
+    }
+  ],
   "reserved": {
     "cost_cny": "0",
     "elapsed_ms": 0,

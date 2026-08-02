@@ -40,13 +40,19 @@ from paper_search.application.locks import (
     load_verified_input_lock_bytes,
     lock_sha256,
 )
-from paper_search.control.ledger import LedgerReservation, SQLiteBudgetLedger
+from paper_search.control.ledger import (
+    DEV_RUN_CAP_CNY,
+    VALIDATION_RUN_CAP_CNY,
+    LedgerReservation,
+    SQLiteBudgetLedger,
+)
 from paper_search.control.pricing import (
     QualityGatePolicy,
     parse_quality_gate_policy_bytes,
 )
 from paper_search.evaluation.freeze_schema import FreezeManifestV2
-from paper_search.evaluation.gates import MeasureValue, evaluate_gates
+from paper_search.evaluation.formal_evidence import formal_audit_measures
+from paper_search.evaluation.gates import evaluate_gates
 from paper_search.evaluation.official_adapter import adapt_prediction_record
 from paper_search.control import HardBudgetController
 from paper_search.domain.models import (
@@ -94,6 +100,9 @@ from paper_search.retrieval import OpenAlexProvider
 from paper_search.storage import SQLiteResponseCache, validate_snapshot_manifest
 from paper_search.storage.cache import PreparedSnapshot
 from paper_search.storage.dependency_snapshot import DependencySnapshotManifestV2
+
+
+_formal_audit_measures = formal_audit_measures
 
 
 class PipelineResult(DomainModel):
@@ -1025,7 +1034,13 @@ def _close_outstanding_reservations(
             if index == current_index
             else UsageEstimate(cost_cny=Decimal("0"))
         )
-        ledger.fail(reservation, UsageActual.model_validate(estimate.model_dump()))
+        try:
+            ledger.fail(
+                reservation,
+                UsageActual.model_validate(estimate.model_dump()),
+            )
+        except Exception:  # noqa: BLE001
+            continue
 
 
 def _reject_or_recover_existing_attempt(
@@ -1101,7 +1116,11 @@ async def _run_formal_evaluation(
         network_authorized=request.network_authorized,
         lock_bytes=inputs.lock_bytes,
     )
-    readiness = bundle.readiness_probe()
+    try:
+        readiness = bundle.readiness_probe()
+    except BaseException:
+        await bundle.aclose()
+        raise
     if request.mode == "live" and readiness.status != "ready":
         await bundle.aclose()
         raise ValueError("authorized live readiness is not current")
@@ -1165,7 +1184,15 @@ async def _run_formal_evaluation(
     per_query_cost = (
         Decimal("0")
         if request.mode == "replay"
-        else min(Decimal("8"), Decimal("18") / Decimal(len(inputs.gold)))
+        else min(
+            Decimal("0.30"),
+            (
+                DEV_RUN_CAP_CNY
+                if request.split == "dev"
+                else VALIDATION_RUN_CAP_CNY
+            )
+            / Decimal(len(inputs.gold)),
+        )
     )
     estimates = [
         UsageEstimate(
@@ -1181,15 +1208,7 @@ async def _run_formal_evaluation(
         )
         for _ in inputs.gold
     ]
-    reservations = [
-        ledger.reserve(
-            run_id=run_id,
-            query_id=query.query_id,
-            estimate=estimate,
-            run_cap_cny=Decimal("18"),
-        )
-        for query, estimate in zip(inputs.gold, estimates, strict=True)
-    ]
+    reservations: list[LedgerReservation] = []
     settled: set[int] = set()
     current_index: int | None = None
     claim_created = False
@@ -1205,6 +1224,17 @@ async def _run_formal_evaluation(
         def on_start(index: int) -> None:
             nonlocal current_index
             current_index = index
+            reservation = ledger.reserve(
+                run_id=run_id,
+                query_id=inputs.gold[index].query_id,
+                estimate=estimates[index],
+                run_cap_cny=(
+                    DEV_RUN_CAP_CNY
+                    if request.split == "dev"
+                    else VALIDATION_RUN_CAP_CNY
+                ),
+            )
+            reservations.append(reservation)
 
         def settle_and_append(index: int, record: AdaptedExecution) -> None:
             ledger.settle(reservations[index], record.execution.usage)
@@ -1227,21 +1257,14 @@ async def _run_formal_evaluation(
         metrics = evaluate(inputs.gold, predictions, id_map=inputs.identifier_map)
         report = ledger.report(run_id)
         failures = [record.failure for record in adapted if record.failure is not None]
-        failure_count = len(failures)
-        denominator = len(inputs.gold)
-        audit_measures = {
-            "hard_failure_rate": MeasureValue(
-                numerator=Decimal(failure_count),
-                denominator=Decimal(denominator),
-                value=Decimal(failure_count) / Decimal(denominator),
-            ),
-            **{
-                f"hard_failed_query:{failure.query_id}": MeasureValue(
-                    numerator=Decimal(1), denominator=Decimal(1), value=Decimal(1)
-                )
-                for failure in failures
-            },
-        }
+        business_results = [record.business_result for record in adapted]
+        audit_measures = formal_audit_measures(
+            frozen_queries=inputs.gold,
+            executions=[record.execution for record in adapted],
+            business_results=business_results,
+            failures=failures,
+            ledger_report=report,
+        )
         gate = evaluate_gates(
             frozen_queries=inputs.gold,
             predictions=predictions,
@@ -1282,11 +1305,14 @@ async def _run_formal_evaluation(
             snapshot_manifest=snapshot_manifest,
         )
         if claim_created and attempt_store is not None and attempt_hash is not None:
-            attempt_store.transition(
-                validation_lock_sha256=attempt_hash,
-                target="complete",
-                completed_at=clock(),
-            )
+            try:
+                attempt_store.transition(
+                    validation_lock_sha256=attempt_hash,
+                    target="complete",
+                    completed_at=clock(),
+                )
+            except Exception:  # noqa: BLE001
+                pass
         return EvaluationRunResult(
             run_id=run_id,
             run_path=run_path,

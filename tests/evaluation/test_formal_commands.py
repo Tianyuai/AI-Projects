@@ -109,3 +109,35 @@ def test_evaluate_runtime_failure_maps_to_stable_invalid_input(
 
     assert exit_code == 2
     assert capsys.readouterr().err == "evaluation failed: invalid input\n"
+
+
+def test_evaluate_unexpected_exception_maps_to_safe_internal_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fail(request: object) -> EvaluationRunResult:
+        del request
+        raise LookupError("C:/Users/alice/private/provider-detail")
+
+    monkeypatch.setattr(cli_module, "run_evaluation", fail)
+
+    exit_code = cli_module.main(
+        [
+            "evaluate",
+            "--lock",
+            "replay.lock.yaml",
+            "--split",
+            "dev",
+            "--output-root",
+            str(tmp_path / "runs"),
+            "--snapshot-manifest",
+            "snapshot-manifest.json",
+        ]
+    )
+
+    assert exit_code == 6
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "evaluation failed: internal error\n"
+    assert "alice" not in captured.err

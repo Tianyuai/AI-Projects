@@ -18,6 +18,7 @@ import pytest
 import yaml
 
 import paper_search.evaluation.runner as runner_module
+from paper_search.control.ledger import LedgerReport
 from paper_search.application.contracts import (
     SearchErrorResponse,
     SearchExecutionResult,
@@ -2252,3 +2253,327 @@ def test_existing_claim_recovers_complete_published_run_then_rejects_reuse(
         )
 
     assert store.read(validation_hash).state == "complete"
+
+
+def test_formal_runner_closes_bundle_when_readiness_probe_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_bytes = (Path("tests/fixtures/formal_run/capture/config.lock.yaml")).read_bytes()
+    lock = runner_module.CandidateLock.model_validate(yaml.safe_load(lock_bytes))
+    closed = False
+
+    class BrokenBundle:
+        def readiness_probe(self) -> object:
+            raise LookupError("private readiness failure")
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    class FakeRoot:
+        @staticmethod
+        def compose(**kwargs: object) -> BrokenBundle:
+            del kwargs
+            return BrokenBundle()
+
+    monkeypatch.setattr(
+        runner_module,
+        "_load_formal_inputs",
+        lambda request: runner_module._FormalInputs(
+            lock=lock,
+            lock_bytes=lock_bytes,
+            gold=[EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"})],
+            identifier_map=runner_module.IdentifierMap.from_bytes(b"{}\n"),
+            gate_policy=runner_module.parse_quality_gate_policy_bytes(
+                Path("configs/quality_gates_v1.yaml").read_bytes()
+            ),
+            snapshot_manifest=None,
+            snapshot_root=None,
+        ),
+    )
+
+    with pytest.raises(LookupError, match="readiness"):
+        asyncio.run(
+            runner_module._run_formal_evaluation(
+                EvaluationRunRequest(
+                    split="dev",
+                    mode="live",
+                    lock_path=tmp_path / "candidate.lock.yaml",
+                    output_root=tmp_path / "runs",
+                    snapshot_manifest_path=None,
+                    network_authorized=True,
+                ),
+                composition_root=FakeRoot,
+                attempt_store_factory=runner_module.ValidationAttemptStore,
+                clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+            )
+        )
+
+    assert closed
+
+
+def test_formal_audit_builder_covers_every_enforced_measure() -> None:
+    builder = getattr(runner_module, "_formal_audit_measures", None)
+
+    assert builder is not None
+    measures = builder(
+        frozen_queries=[
+            EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"})
+        ],
+        executions=[],
+        business_results=[],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("18"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+    )
+    assert {
+        "integrity_failures",
+        "provenance_failures",
+        "sanitization_failures",
+        "unaccounted_usage_failures",
+        "valid_model_produced_query_analysis_rate",
+        "parseable_configured_retrieval_response_rate",
+        "hard_filter_absolute_recall_loss",
+        "hard_failure_rate",
+    } <= set(measures)
+
+
+def test_partial_second_reservation_failure_closes_bundle_and_first_query(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_bytes = Path("tests/fixtures/formal_run/capture/config.lock.yaml").read_bytes()
+    lock = runner_module.CandidateLock.model_validate(yaml.safe_load(lock_bytes))
+    events: list[str] = []
+
+    class FakeLedger:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            del args, kwargs
+            self.count = 0
+
+        def reserve(self, **kwargs: object) -> runner_module.LedgerReservation:
+            self.count += 1
+            query_id = str(kwargs["query_id"])
+            events.append(f"reserve:{query_id}")
+            if self.count == 2:
+                raise LookupError("second reservation failed")
+            return runner_module.LedgerReservation(
+                reservation_id=f"reservation-{query_id}",
+                run_id=str(kwargs["run_id"]),
+                query_id=query_id,
+                estimate=kwargs["estimate"],
+                state="reserved",
+            )
+
+        def settle(self, reservation: object, actual: object) -> None:
+            del actual
+            events.append(f"settle:{getattr(reservation, 'query_id')}")
+
+        def fail(self, reservation: object, actual: object) -> None:
+            del actual
+            events.append(f"fail:{getattr(reservation, 'query_id')}")
+
+    class FakeService:
+        async def execute(self, request: object, *, run_id: str | None = None):
+            query_id = getattr(request, "query_id")
+            return SearchExecutionResult(
+                outcome=SearchFailure(
+                    query_id=query_id,
+                    run_id=run_id or "formal",
+                    error=SearchErrorResponse(
+                        code="dependency_failure",
+                        detail="safe",
+                        retryable=True,
+                        run_id=run_id,
+                    ),
+                    usage=UsageActual(cost_cny=Decimal("0")),
+                    stop_reason="dependency_failure",
+                ),
+                diagnostics=[],
+                business_result_sha256=None,
+            )
+
+    class ArtifactFactory:
+        def __init__(self) -> None:
+            self._sessions: dict[str, object] = {}
+
+    class FakeBundle:
+        def __init__(self) -> None:
+            self.service = FakeService()
+            self.artifact_factory = ArtifactFactory()
+
+        def readiness_probe(self) -> object:
+            return SimpleNamespace(status="ready", dependencies=[])
+
+        async def aclose(self) -> None:
+            events.append("bundle:closed")
+
+    bundle = FakeBundle()
+
+    class FakeRoot:
+        @staticmethod
+        def compose(**kwargs: object) -> FakeBundle:
+            del kwargs
+            return bundle
+
+    monkeypatch.setattr(runner_module, "SQLiteBudgetLedger", FakeLedger)
+    monkeypatch.setattr(
+        runner_module,
+        "_load_formal_inputs",
+        lambda request: runner_module._FormalInputs(
+            lock=lock,
+            lock_bytes=lock_bytes,
+            gold=[
+                EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"}),
+                EvaluationQuery(query_id="q2", query="two", metadata={"split": "dev"}),
+            ],
+            identifier_map=runner_module.IdentifierMap.from_bytes(b"{}\n"),
+            gate_policy=runner_module.parse_quality_gate_policy_bytes(
+                Path("configs/quality_gates_v1.yaml").read_bytes()
+            ),
+            snapshot_manifest=None,
+            snapshot_root=None,
+        ),
+    )
+
+    with pytest.raises(LookupError, match="second reservation"):
+        asyncio.run(
+            runner_module._run_formal_evaluation(
+                EvaluationRunRequest(
+                    split="dev",
+                    mode="live",
+                    lock_path=tmp_path / "candidate.lock.yaml",
+                    output_root=tmp_path / "runs",
+                    snapshot_manifest_path=None,
+                    network_authorized=True,
+                ),
+                composition_root=FakeRoot,
+                attempt_store_factory=runner_module.ValidationAttemptStore,
+                clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+            )
+        )
+
+    assert events == ["reserve:q1", "settle:q1", "reserve:q2", "bundle:closed"]
+    assert not list((tmp_path / "runs").glob(".incomplete-*"))
+
+
+def test_post_publication_attempt_transition_error_does_not_mark_run_failed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_payload = yaml.safe_load(
+        Path("tests/fixtures/application/validation.lock.yaml").read_bytes()
+    )
+    lock_payload["frozen_data"]["query_count"] = 1
+    lock = runner_module.ValidationLock.model_validate(lock_payload)
+    lock_bytes = yaml.safe_dump(
+        lock.model_dump(mode="python"), sort_keys=False
+    ).encode()
+    targets: list[str] = []
+
+    class FakeService:
+        async def execute(self, request: object, *, run_id: str | None = None):
+            query_id = getattr(request, "query_id")
+            return SearchExecutionResult(
+                outcome=SearchFailure(
+                    query_id=query_id,
+                    run_id=run_id or "formal",
+                    error=SearchErrorResponse(
+                        code="dependency_failure",
+                        detail="safe",
+                        retryable=True,
+                        run_id=run_id,
+                    ),
+                    usage=UsageActual(cost_cny=Decimal("0")),
+                    stop_reason="dependency_failure",
+                ),
+                diagnostics=[],
+                business_result_sha256=None,
+            )
+
+    class ArtifactFactory:
+        def __init__(self) -> None:
+            self._sessions: dict[str, object] = {}
+
+    class FakeBundle:
+        def __init__(self) -> None:
+            self.service = FakeService()
+            self.artifact_factory = ArtifactFactory()
+
+        def readiness_probe(self) -> object:
+            return SimpleNamespace(status="ready", dependencies=[])
+
+        async def aclose(self) -> None:
+            return None
+
+    class FakeRoot:
+        @staticmethod
+        def compose(**kwargs: object) -> FakeBundle:
+            del kwargs
+            return FakeBundle()
+
+    class FakeAttemptStore:
+        def claim(self, **kwargs: object) -> None:
+            del kwargs
+
+        def transition(self, **kwargs: object) -> None:
+            target = str(kwargs["target"])
+            targets.append(target)
+            if target == "complete":
+                raise LookupError("terminal write failed")
+
+    monkeypatch.setattr(
+        runner_module,
+        "_load_formal_inputs",
+        lambda request: runner_module._FormalInputs(
+            lock=lock,
+            lock_bytes=lock_bytes,
+            gold=[
+                EvaluationQuery(
+                    query_id="q1",
+                    query="one",
+                    metadata={"split": "validation"},
+                )
+            ],
+            identifier_map=runner_module.IdentifierMap.from_bytes(b"{}\n"),
+            gate_policy=runner_module.parse_quality_gate_policy_bytes(
+                Path("configs/quality_gates_v1.yaml").read_bytes()
+            ),
+            snapshot_manifest=None,
+            snapshot_root=None,
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "_reject_or_recover_existing_attempt",
+        lambda **kwargs: None,
+    )
+
+    result = asyncio.run(
+        runner_module._run_formal_evaluation(
+            EvaluationRunRequest(
+                split="validation",
+                mode="live",
+                lock_path=tmp_path / "validation.lock.yaml",
+                output_root=tmp_path / "runs",
+                snapshot_manifest_path=None,
+                network_authorized=True,
+            ),
+            composition_root=FakeRoot,
+            attempt_store_factory=lambda path: FakeAttemptStore(),
+            clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+        )
+    )
+
+    assert result.status == "complete"
+    assert result.run_path.is_dir()
+    assert targets == ["complete"]

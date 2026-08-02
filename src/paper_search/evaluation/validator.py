@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from decimal import Decimal
 from pathlib import Path
 
@@ -12,8 +13,21 @@ import yaml
 from pydantic import TypeAdapter
 
 from paper_search.application.artifacts import RunManifest
-from paper_search.application.locks import InputLock, ReplayLock, lock_sha256
-from paper_search.control.ledger import LedgerReport
+from paper_search.application.locks import (
+    CandidateLock,
+    InputLock,
+    ReplayLock,
+    ValidationLock,
+    lock_sha256,
+)
+from paper_search.control.ledger import (
+    DEV_RUN_CAP_CNY,
+    PROJECT_HARD_CAP_CNY,
+    PROJECT_SOFT_STOP_CNY,
+    REQUEST_HARD_CAP_CNY,
+    VALIDATION_RUN_CAP_CNY,
+    LedgerReport,
+)
 from paper_search.control.pricing import QualityGatePolicy, parse_quality_gate_policy_bytes
 from paper_search.domain.models import DomainModel, NonEmptyStr, SafeRelativePath
 from paper_search.evaluation.business_results import (
@@ -24,8 +38,10 @@ from paper_search.evaluation.execution_adapter import (
     EvaluationExecutionRecord,
     EvaluationFailureRecord,
 )
+from paper_search.evaluation.freeze_schema import FreezeManifestV2
+from paper_search.evaluation.formal_evidence import formal_audit_measures
 from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap
-from paper_search.evaluation.gates import MeasureValue, evaluate_gates
+from paper_search.evaluation.gates import evaluate_gates
 from paper_search.evaluation.metrics import EvaluationResult, evaluate
 from paper_search.evaluation.official_adapter import (
     InternalPredictionRecord,
@@ -58,8 +74,14 @@ _SECRET_MARKERS = (
     b"api-key",
     b"credential",
     b"bearer ",
+    b"password",
+    b"private_key",
+    b"access_token",
 )
 _RUN_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")
+_PRIVATE_PATH = re.compile(
+    rb"(?i)(?:[a-z]:(?:\\+|/)(?:users|documents and settings)(?:\\+|/)|/(?:home|users)/[^/\s]+/|https?://[^/\s:@]+:[^/\s@]+@)"
+)
 
 
 class ValidationIssue(DomainModel):
@@ -88,8 +110,14 @@ def _jsonl(path: Path, model: type[DomainModel]) -> list[DomainModel]:
 
 
 def _bound_path(relative: str, *, root: Path) -> Path:
-    path = (root / relative).resolve(strict=True)
-    if not path.is_file() or not path.is_relative_to(root) or path.is_symlink():
+    candidate = root / relative
+    current = root
+    for component in Path(relative).parts:
+        current /= component
+        if current.is_symlink():
+            raise ValueError("bound artifact path is invalid")
+    path = candidate.resolve(strict=True)
+    if not path.is_file() or not path.is_relative_to(root):
         raise ValueError("bound artifact path is invalid")
     return path
 
@@ -102,20 +130,19 @@ def _frozen_evidence(
     manifest_bytes = manifest_path.read_bytes()
     if f"sha256:{hashlib.sha256(manifest_bytes).hexdigest()}" != lock.frozen_data.manifest.sha256:
         raise ValueError("frozen manifest hash mismatch")
-    payload = json.loads(manifest_bytes)
-    partitions = payload["partitions"]
-    if not isinstance(partitions, list):
-        raise ValueError("formal validator requires a V2 frozen manifest")
-    partition = next(item for item in partitions if item["name"] == lock.frozen_data.split)
+    manifest = FreezeManifestV2.model_validate_json(manifest_bytes)
+    if manifest.identifier_map.sha256 != lock.frozen_data.identifier_map.sha256:
+        raise ValueError("frozen identifier-map binding mismatch")
+    partition = next(item for item in manifest.partitions if item.name == lock.frozen_data.split)
     if (
-        partition["sha256"] != lock.frozen_data.partition_sha256
-        or partition["query_count"] != lock.frozen_data.query_count
+        partition.sha256 != lock.frozen_data.partition_sha256
+        or partition.query_count != lock.frozen_data.query_count
     ):
         raise ValueError("frozen partition binding mismatch")
     data_root = manifest_path.parent
-    partition_path = _bound_path(partition["path"], root=data_root)
+    partition_path = _bound_path(partition.path, root=data_root)
     partition_bytes = partition_path.read_bytes()
-    if f"sha256:{hashlib.sha256(partition_bytes).hexdigest()}" != partition["sha256"]:
+    if f"sha256:{hashlib.sha256(partition_bytes).hexdigest()}" != partition.sha256:
         raise ValueError("frozen partition hash mismatch")
     queries = [EvaluationQuery.model_validate_json(line) for line in partition_bytes.splitlines() if line]
     if len(queries) != lock.frozen_data.query_count or len({item.query_id for item in queries}) != len(queries):
@@ -129,6 +156,57 @@ def _frozen_evidence(
     if f"sha256:{hashlib.sha256(gate_bytes).hexdigest()}" != lock.quality_gates.sha256:
         raise ValueError("Gate policy hash mismatch")
     return queries, IdentifierMap.from_bytes(identifier_bytes), parse_quality_gate_policy_bytes(gate_bytes)
+
+
+def _replay_inherits_live_lock(
+    replay: ReplayLock,
+    live: CandidateLock | ValidationLock,
+    manifest: RunManifest,
+) -> bool:
+    return (
+        replay.source_capture_run_id == manifest.run_id
+        and replay.created_at == manifest.started_at
+        and replay.source_git_sha == live.source_git_sha
+        and replay.runtime_allow_live == live.runtime_allow_live
+        and replay.frozen_data == live.frozen_data
+        and replay.baseline == live.baseline
+        and replay.budget_config == live.budget_config
+        and replay.pricing_policy == live.pricing_policy
+        and replay.quality_gates == live.quality_gates
+        and replay.capture_policy == live.capture_policy
+        and replay.snapshot_set_id == manifest.snapshot_set_id
+        and replay.snapshot_manifest_sha256 == manifest.snapshot_manifest_sha256
+    )
+
+
+def _diagnostics_sha256(diagnostics: object) -> str:
+    encoded = (
+        json.dumps(
+            diagnostics,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _sum_usage(records: Sequence[object]) -> dict[str, int | Decimal | None]:
+    usages = [getattr(record, "usage") for record in records]
+    costs = [usage.cost_cny for usage in usages]
+    return {
+        "search_api_calls": sum(usage.search_api_calls for usage in usages),
+        "llm_calls": sum(usage.llm_calls for usage in usages),
+        "input_tokens": sum(usage.input_tokens for usage in usages),
+        "output_tokens": sum(usage.output_tokens for usage in usages),
+        "elapsed_ms": sum(usage.elapsed_ms for usage in usages),
+        "cost_cny": (
+            sum((cost for cost in costs if cost is not None), Decimal("0"))
+            if all(cost is not None for cost in costs)
+            else None
+        ),
+    }
 
 
 def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None]:
@@ -195,6 +273,17 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             raise ValueError("replay lock has wrong kind")
         if mode == "replay" and replay_lock != lock:
             raise ValueError("replay lock does not match exact run input lock")
+        if mode == "live" and (
+            not isinstance(lock, (CandidateLock, ValidationLock))
+            or not _replay_inherits_live_lock(replay_lock, lock, manifest)
+        ):
+            issues.append(
+                _issue(
+                    "replay_binding_invalid",
+                    "replay.lock.yaml",
+                    "Replay lock does not inherit the live input lock",
+                )
+            )
         snapshot_bytes = (root / "snapshot-manifest.json").read_bytes()
         snapshot = DependencySnapshotManifestV2.model_validate_json(snapshot_bytes)
         if _RUN_ID.fullmatch(replay_lock.source_capture_run_id) is None:
@@ -203,6 +292,33 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
         snapshot_root = snapshot_root.resolve(strict=True)
         if mode == "replay" and not snapshot_root.is_relative_to(root.parent.resolve()):
             raise ValueError("replay source path escapes artifact root")
+        if mode == "replay":
+            source_root = snapshot_root.parent
+            source_manifest = RunManifest.model_validate_json(
+                (source_root / "run.json").read_bytes()
+            )
+            if (
+                source_manifest.status != "complete"
+                or source_manifest.execution_mode != "live"
+                or source_manifest.run_id != replay_lock.source_capture_run_id
+            ):
+                issues.append(
+                    _issue(
+                        "source_capture_invalid",
+                        "replay.lock.yaml",
+                        "Replay source capture is not a complete live run",
+                    )
+                )
+            else:
+                source_result, _, source_mode = _validate(source_root)
+                if not source_result.valid or source_mode != "live":
+                    issues.append(
+                        _issue(
+                            "source_capture_invalid",
+                            "replay.lock.yaml",
+                            "Replay source capture validation failed",
+                        )
+                    )
         reader_manifest = snapshot_root / "snapshot-manifest.json"
         if reader_manifest.read_bytes() != snapshot_bytes:
             raise ValueError("snapshot manifest exact bytes differ")
@@ -291,45 +407,86 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
         )
         if metrics != recomputed_metrics:
             issues.append(_issue("metrics_invalid", "metrics.json", "Stored metrics do not match frozen evidence"))
-        if usage.run_id != manifest.run_id or not usage.within_caps:
-            issues.append(_issue("ledger_invalid", "usage.json", "Budget ledger is not closed within caps"))
-        execution_usage = [
-            record.usage
-            for record in executions
-            if isinstance(record, EvaluationExecutionRecord)
+        execution_records = [
+            record for record in executions if isinstance(record, EvaluationExecutionRecord)
         ]
-        if any(
-            getattr(usage.actual, field)
-            != sum(getattr(item, field) for item in execution_usage)
-            for field in (
-                "search_api_calls",
-                "llm_calls",
-                "input_tokens",
-                "output_tokens",
-                "elapsed_ms",
+        expected_usage = _sum_usage(execution_records)
+        run_receipts = [receipt for receipt in usage.receipts if receipt.run_id == manifest.run_id]
+        receipt_by_query = {receipt.query_id: receipt for receipt in run_receipts}
+        expected_run_cap = (
+            DEV_RUN_CAP_CNY if manifest.split == "dev" else VALIDATION_RUN_CAP_CNY
+        )
+        project_actual = sum(
+            (
+                receipt.actual.cost_cny
+                for receipt in usage.receipts
+                if receipt.state in {"settled", "failed"}
+                and receipt.actual is not None
+                and receipt.actual.cost_cny is not None
+            ),
+            Decimal("0"),
+        )
+        project_reserved = sum(
+            (
+                receipt.estimate.cost_cny or Decimal("0")
+                for receipt in usage.receipts
+                if receipt.state == "reserved" and receipt.actual is None
+            ),
+            Decimal("0"),
+        )
+        costs_known = all(
+            receipt.actual is not None and receipt.actual.cost_cny is not None
+            for receipt in usage.receipts
+            if receipt.state in {"settled", "failed"}
+        )
+        recomputed_within_caps = (
+            costs_known
+            and all(
+                receipt.actual is None
+                or receipt.actual.cost_cny is None
+                or receipt.actual.cost_cny <= REQUEST_HARD_CAP_CNY
+                for receipt in run_receipts
             )
-        ):
-            issues.append(_issue("ledger_invalid", "usage.json", "Actual usage does not match executions"))
+            and Decimal(expected_usage["cost_cny"] or 0) <= expected_run_cap
+            and project_actual + project_reserved <= PROJECT_HARD_CAP_CNY
+        )
+        ledger_valid = (
+            usage.run_id == manifest.run_id
+            and usage.reserved == type(usage.reserved)(cost_cny=Decimal("0"))
+            and usage.run_cap_cny == expected_run_cap
+            and usage.project_soft_stop_cny == PROJECT_SOFT_STOP_CNY
+            and usage.project_hard_cap_cny == PROJECT_HARD_CAP_CNY
+            and usage.project_actual_cny == project_actual
+            and usage.within_caps == recomputed_within_caps
+            and usage.within_caps
+            and [receipt.query_id for receipt in run_receipts] == query_ids
+            and len(receipt_by_query) == len(run_receipts)
+            and all(receipt.state in {"settled", "failed"} for receipt in run_receipts)
+            and all(
+                receipt_by_query[execution.query_id].actual == execution.usage
+                for execution in execution_records
+                if execution.query_id in receipt_by_query
+            )
+            and all(
+                getattr(usage.actual, field) == value
+                for field, value in expected_usage.items()
+            )
+        )
+        if not ledger_valid:
+            issues.append(_issue("ledger_invalid", "usage.json", "Budget ledger evidence is invalid"))
         failure_records = [
             record for record in failures if isinstance(record, EvaluationFailureRecord)
         ]
         failure_count = len(failure_records)
-        denominator = len(frozen_queries)
-        audit = {
-            "hard_failure_rate": MeasureValue(
-                numerator=Decimal(failure_count),
-                denominator=Decimal(denominator),
-                value=Decimal(failure_count) / Decimal(denominator),
-            ),
-            **{
-                f"hard_failed_query:{failure.query_id}": MeasureValue(
-                    numerator=Decimal(1),
-                    denominator=Decimal(1),
-                    value=Decimal(1),
-                )
-                for failure in failure_records
-            },
-        }
+        audit = formal_audit_measures(
+            frozen_queries=frozen_queries,
+            executions=execution_records,
+            business_results=[
+                record for record in business if isinstance(record, BusinessResultRecord)
+            ],
+            failures=failure_records,
+            ledger_report=usage,
+        )
         recomputed_gate = evaluate_gates(
             frozen_queries=frozen_queries,
             predictions=official_predictions,
@@ -344,6 +501,20 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
         if manifest.failure_count != failure_count:
             issues.append(_issue("failure_coverage_invalid", "run.json", "Failure count is invalid"))
         failure_by_query = {record.query_id: record for record in failure_records}
+        if any(
+            failure.diagnostics_sha256
+            != _diagnostics_sha256(
+                [item.model_dump(mode="json") for item in failure.diagnostics]
+            )
+            for failure in failure_records
+        ):
+            issues.append(
+                _issue(
+                    "diagnostic_hash_invalid",
+                    "failures.jsonl",
+                    "Diagnostic digest does not match canonical diagnostics",
+                )
+            )
         for execution in executions:
             if not isinstance(execution, EvaluationExecutionRecord):
                 continue
@@ -364,12 +535,20 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
         ]
         if any(
             diagnostic.endpoint != "dependency"
-            or any(error.request_id is not None for error in diagnostic.errors)
+            or any(
+                error.request_id is not None
+                or error.message != "Dependency execution reported an error"
+                or error.provider != diagnostic.dependency
+                for error in diagnostic.errors
+            )
             for diagnostic in diagnostics
         ):
             issues.append(_issue("sanitization_invalid", "executions.jsonl", "Diagnostics are not sanitized"))
         for child in root.rglob("*"):
-            if child.is_file() and any(marker in child.read_bytes().lower() for marker in _SECRET_MARKERS):
+            if child.is_file() and (
+                any(marker in child.read_bytes().lower() for marker in _SECRET_MARKERS)
+                or _PRIVATE_PATH.search(child.read_bytes()) is not None
+            ):
                 issues.append(_issue("sanitization_invalid", child.name, "Artifact contains prohibited private fields"))
                 break
         business_bytes = (root / "business-results.jsonl").read_bytes()

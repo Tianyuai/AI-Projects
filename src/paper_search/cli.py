@@ -173,6 +173,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (OSError, RuntimeError, TypeError, ValueError):
             print("evaluation failed: invalid input", file=sys.stderr)
             return 2
+        except Exception:  # noqa: BLE001
+            print("evaluation failed: internal error", file=sys.stderr)
+            return 6
         print(
             json.dumps(
                 {

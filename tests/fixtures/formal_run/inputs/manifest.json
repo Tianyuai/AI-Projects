@@ -1,11 +1,36 @@
 {
+  "annotation_status": "frozen",
+  "approval": {
+    "approved_at": "2026-08-02T00:00:00+00:00",
+    "approver_ref": "synthetic-fixture",
+    "report_path": "approval.json",
+    "report_sha256": "sha256:5a20c2aed655e3ec17ec444592fd385c5a7135abdb2ee2f1b52ba5655f2327d0"
+  },
+  "created_at": "2026-08-02T00:00:00+00:00",
+  "dataset_revision": "synthetic-formal-fixture-v1",
+  "freeze_status": "approved",
+  "gold_sha256": "sha256:2c7d7c2b6979a85eef52332ef200f74553ca1890385c286ff7aa83967065002e",
+  "identifier_map": {
+    "entry_count": 1,
+    "path": "identifier-map.json",
+    "sha256": "sha256:420728bdf408ac4607beeb99392c0fe23218a8e4b1681023b6a7d44349e37eb4"
+  },
+  "partition_immutability": "content_addressed",
   "partitions": [
     {
       "name": "dev",
       "path": "dev.jsonl",
       "query_count": 2,
-      "sha256": "sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5"
+      "sha256": "sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5",
+      "zero_answer_policy": "allow"
+    },
+    {
+      "name": "validation",
+      "path": "validation.jsonl",
+      "query_count": 1,
+      "sha256": "sha256:032400a2fcf1c681b860b974762b2e60b9d3523fc4819019f92732dbe31e7d4d",
+      "zero_answer_policy": "allow"
     }
   ],
-  "schema_version": "evaluation-manifest-v2"
+  "schema_version": "paper-search-freeze-v2"
 }

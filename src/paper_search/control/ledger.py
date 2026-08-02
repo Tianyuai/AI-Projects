@@ -58,7 +58,17 @@ class LedgerReservation(DomainModel):
     state: Literal["reserved", "settled", "failed"]
 
 
+class LedgerReceipt(DomainModel):
+    reservation_id: NonEmptyStr
+    run_id: NonEmptyStr
+    query_id: NonEmptyStr
+    estimate: UsageEstimate
+    state: Literal["reserved", "settled", "failed"]
+    actual: UsageActual | None
+
+
 class LedgerReport(DomainModel):
+    policy_version: Literal["budget-ledger-policy-v1"] = "budget-ledger-policy-v1"
     run_id: NonEmptyStr
     reserved: UsageEstimate
     actual: UsageActual
@@ -67,6 +77,7 @@ class LedgerReport(DomainModel):
     project_soft_stop_cny: MoneyCny
     project_hard_cap_cny: MoneyCny
     within_caps: bool
+    receipts: list[LedgerReceipt] = []
 
 
 def _utc_now() -> datetime:
@@ -894,6 +905,34 @@ class SQLiteBudgetLedger:
                 and run_known_cost + reserved_cost <= run_cap_micro
                 and project_actual + project_reserved <= self._hard_micro
             )
+            receipt_rows = connection.execute(
+                "SELECT * FROM reservations ORDER BY run_id, query_id, reservation_id"
+            ).fetchall()
+            receipts = [
+                LedgerReceipt(
+                    reservation_id=row["reservation_id"],
+                    run_id=row["run_id"],
+                    query_id=row["query_id"],
+                    estimate=_usage_from_row(row, prefix="estimate", actual=False),
+                    state=row["state"],
+                    actual=(
+                        None
+                        if row["state"] == "reserved" and not row["checkpoint_present"]
+                        else UsageActual.model_validate(
+                            _usage_from_row(
+                                row,
+                                prefix=(
+                                    "checkpoint"
+                                    if row["state"] == "reserved"
+                                    else "actual"
+                                ),
+                                actual=True,
+                            ).model_dump()
+                        )
+                    ),
+                )
+                for row in receipt_rows
+            ]
             return LedgerReport(
                 run_id=run_id,
                 reserved=reserved,
@@ -905,6 +944,7 @@ class SQLiteBudgetLedger:
                 project_soft_stop_cny=_from_micro(self._soft_micro),
                 project_hard_cap_cny=_from_micro(self._hard_micro),
                 within_caps=within_caps,
+                receipts=receipts,
             )
 
     def close(self) -> None:
@@ -919,6 +959,7 @@ __all__ = [
     "LedgerBudgetExceededError",
     "LedgerError",
     "LedgerReport",
+    "LedgerReceipt",
     "LedgerReservation",
     "LedgerReservationError",
     "LedgerSoftStopError",

@@ -7,10 +7,10 @@ runtime_allow_live: true
 frozen_data:
   manifest:
     path: tests/fixtures/formal_run/inputs/manifest.json
-    sha256: sha256:14d561274749db7a9a34aaff18a5e5ed22af31cf7bd46257dfb41895ce6df6ee
+    sha256: sha256:3a92ca6448152e3bc3fed6d35605818a839044f9e5956404a4d5ab7db3327783
   identifier_map:
     path: tests/fixtures/formal_run/inputs/identifier-map.json
-    sha256: sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
+    sha256: sha256:420728bdf408ac4607beeb99392c0fe23218a8e4b1681023b6a7d44349e37eb4
   split: dev
   query_count: 2
   partition_sha256: sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5

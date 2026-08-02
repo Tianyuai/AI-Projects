@@ -121,12 +121,12 @@
       "applies": true,
       "classification": "baseline_quality",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2",
+        "value": "1"
       },
       "operator": "gte",
-      "passed": false,
+      "passed": true,
       "rule_id": "retrieval-response-rate",
       "threshold": "0.95"
     },
@@ -160,12 +160,12 @@
       "applies": true,
       "classification": "baseline_quality",
       "measure": {
-        "denominator": "0",
+        "denominator": "2",
         "numerator": "0",
-        "value": null
+        "value": "0"
       },
       "operator": "lte",
-      "passed": false,
+      "passed": true,
       "rule_id": "hard-filter-recall-loss",
       "threshold": "0.02"
     },
@@ -173,12 +173,12 @@
       "applies": true,
       "classification": "baseline_quality",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2.0",
+        "value": "1.0"
       },
       "operator": "gt",
-      "passed": false,
+      "passed": true,
       "rule_id": "macro-recall-positive",
       "threshold": 0
     },
@@ -186,12 +186,12 @@
       "applies": true,
       "classification": "baseline_quality",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2",
+        "value": "1.0"
       },
       "operator": "gt",
-      "passed": false,
+      "passed": true,
       "rule_id": "micro-recall-positive",
       "threshold": 0
     },
@@ -199,12 +199,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2.0",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "report-macro-precision",
       "threshold": 0
     },
@@ -212,12 +212,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "report-micro-precision",
       "threshold": 0
     },
@@ -225,12 +225,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2.0",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "report-macro-recall",
       "threshold": 0
     },
@@ -238,12 +238,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "report-micro-recall",
       "threshold": 0
     },
@@ -251,12 +251,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2.0",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "report-macro-f1",
       "threshold": 0
     },
@@ -264,12 +264,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "4",
+        "numerator": "4",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "report-micro-f1",
       "threshold": 0
     },
@@ -277,12 +277,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2.0",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "report-recall-at-5",
       "threshold": 0
     },
@@ -290,12 +290,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2.0",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "report-recall-at-10",
       "threshold": 0
     },
@@ -303,12 +303,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2.0",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "report-recall-at-20",
       "threshold": 0
     },
@@ -420,8 +420,8 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "2",
-        "numerator": "2",
+        "denominator": "3",
+        "numerator": "3",
         "value": "1"
       },
       "operator": "gte",
@@ -472,12 +472,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2.0",
+        "value": "1.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "dev-macro-f1-min",
       "threshold": "0.30"
     },
@@ -485,12 +485,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "1",
+        "numerator": "0.0",
+        "value": "0.0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": false,
       "rule_id": "dev-macro-f1-delta",
       "threshold": "0.03"
     },
@@ -511,12 +511,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2",
+        "value": "1"
       },
       "operator": "eq",
-      "passed": null,
+      "passed": true,
       "rule_id": "structured-schema-valid-rate",
       "threshold": 1
     },
@@ -524,12 +524,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2",
+        "value": "1"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": true,
       "rule_id": "structured-valid-paper-link-rate",
       "threshold": "0.99"
     },
@@ -537,12 +537,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
+        "denominator": "2",
         "numerator": "0",
-        "value": null
+        "value": "0"
       },
       "operator": "gte",
-      "passed": null,
+      "passed": false,
       "rule_id": "structured-reason-complete-rate",
       "threshold": "0.95"
     },
@@ -550,12 +550,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "2",
+        "numerator": "2",
+        "value": "1"
       },
       "operator": "eq",
-      "passed": null,
+      "passed": true,
       "rule_id": "structured-verifiable-citation-edge-rate",
       "threshold": 1
     },
@@ -563,12 +563,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
+        "denominator": "1",
         "numerator": "0",
-        "value": null
+        "value": "0"
       },
       "operator": "eq",
-      "passed": null,
+      "passed": true,
       "rule_id": "structured-fabrication-count",
       "threshold": 0
     },
@@ -680,12 +680,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "0",
-        "numerator": "0",
-        "value": null
+        "denominator": "1",
+        "numerator": "1",
+        "value": "1"
       },
       "operator": "lte",
-      "passed": null,
+      "passed": true,
       "rule_id": "cached-repeat-latency-p50-ms",
       "threshold": 8000
     },

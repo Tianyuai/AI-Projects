@@ -21,23 +21,23 @@
       "value": "1.0"
     },
     "micro_f1": {
-      "denominator": "0",
-      "numerator": "0",
+      "denominator": "4",
+      "numerator": "4",
       "value": "1.0"
     },
     "micro_identifier_map_recall": {
-      "denominator": "0",
-      "numerator": "0",
+      "denominator": "2",
+      "numerator": "2",
       "value": "1.0"
     },
     "micro_precision": {
-      "denominator": "0",
-      "numerator": "0",
+      "denominator": "2",
+      "numerator": "2",
       "value": "1.0"
     },
     "micro_recall": {
-      "denominator": "0",
-      "numerator": "0",
+      "denominator": "2",
+      "numerator": "2",
       "value": "1.0"
     },
     "recall_at_10": {
@@ -61,29 +61,41 @@
       "f1": 1.0,
       "false_negative_count": 0,
       "false_positive_count": 0,
-      "gold_ids": [],
-      "hit_ids": [],
+      "gold_ids": [
+        "openalex:W1"
+      ],
+      "hit_ids": [
+        "openalex:W1"
+      ],
       "precision": 1.0,
-      "predicted_ids": [],
+      "predicted_ids": [
+        "openalex:W1"
+      ],
       "recall": 1.0,
       "recall_at_10": 1.0,
       "recall_at_20": 1.0,
       "recall_at_5": 1.0,
-      "true_positive_count": 0
+      "true_positive_count": 1
     },
     "q2": {
       "f1": 1.0,
       "false_negative_count": 0,
       "false_positive_count": 0,
-      "gold_ids": [],
-      "hit_ids": [],
+      "gold_ids": [
+        "openalex:W2"
+      ],
+      "hit_ids": [
+        "openalex:W2"
+      ],
       "precision": 1.0,
-      "predicted_ids": [],
+      "predicted_ids": [
+        "openalex:W2"
+      ],
       "recall": 1.0,
       "recall_at_10": 1.0,
       "recall_at_20": 1.0,
       "recall_at_5": 1.0,
-      "true_positive_count": 0
+      "true_positive_count": 1
     }
   },
   "summary": {

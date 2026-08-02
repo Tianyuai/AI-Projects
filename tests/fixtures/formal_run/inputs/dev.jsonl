@@ -1,2 +1,2 @@
-{"metadata": {"split": "dev"}, "query": "q1", "query_id": "q1", "relevant_paper_ids": []}
-{"metadata": {"split": "dev"}, "query": "q2", "query_id": "q2", "relevant_paper_ids": []}
+{"metadata": {"split": "dev"}, "query": "q1", "query_id": "q1", "relevant_paper_ids": ["openalex:W1"]}
+{"metadata": {"split": "dev"}, "query": "q2", "query_id": "q2", "relevant_paper_ids": ["openalex:W2"]}

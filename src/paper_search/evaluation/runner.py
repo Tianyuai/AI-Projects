@@ -1216,6 +1216,8 @@ async def _run_formal_evaluation(
         readiness_summary=readiness.dependencies,
         failure_count=0,
     )
+    workspace: FormalRunWorkspace | None = None
+    ledger: SQLiteBudgetLedger | None = None
     try:
         workspace = FormalRunWorkspace(
             runs_root=request.output_root,
@@ -1236,15 +1238,25 @@ async def _run_formal_evaluation(
             clock=clock,
             replay=request.mode == "replay",
         )
-        checkpoint_count, checkpoint_sha256 = ledger.project_checkpoint()
-        if (
-            checkpoint_count != inputs.lock.project_ledger.receipt_count
-            or checkpoint_sha256 != inputs.lock.project_ledger.receipts_sha256
-        ):
-            raise ValueError("project ledger checkpoint does not match input lock")
+        if not isinstance(inputs.lock, ReplayLock):
+            checkpoint_count, checkpoint_sha256 = ledger.project_checkpoint()
+            if (
+                checkpoint_count != inputs.lock.project_ledger.receipt_count
+                or checkpoint_sha256 != inputs.lock.project_ledger.receipts_sha256
+            ):
+                raise ValueError("project ledger checkpoint does not match input lock")
     except BaseException:
+        if ledger is not None:
+            ledger.close()
+        if workspace is not None and workspace.work_dir.exists():
+            try:
+                workspace.fail("internal_error")
+            except Exception:  # noqa: BLE001
+                pass
         await bundle.aclose()
         raise
+    assert workspace is not None
+    assert ledger is not None
     per_query_cost = (
         Decimal("0")
         if request.mode == "replay"
@@ -1336,6 +1348,7 @@ async def _run_formal_evaluation(
                 failures=failures,
                 ledger_report=report,
                 identifier_map=inputs.identifier_map,
+                metrics=metrics,
             ),
             policy=inputs.gate_policy,
             split=request.split,
@@ -1440,6 +1453,7 @@ async def _run_formal_evaluation(
             workspace.fail("internal_error")
         raise
     finally:
+        ledger.close()
         await bundle.aclose()
 
 

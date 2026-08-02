@@ -20,6 +20,7 @@ import yaml
 import paper_search.evaluation.runner as runner_module
 from paper_search.control.ledger import LedgerReport
 from paper_search.application.contracts import (
+    DependencyDiagnostic,
     SearchErrorResponse,
     SearchExecutionResult,
     SearchFailure,
@@ -2368,6 +2369,9 @@ def test_partial_second_reservation_failure_closes_bundle_and_first_query(
                 lock.project_ledger.receipts_sha256,
             )
 
+        def close(self) -> None:
+            return None
+
         def reserve(self, **kwargs: object) -> runner_module.LedgerReservation:
             self.count += 1
             query_id = str(kwargs["query_id"])
@@ -2624,7 +2628,14 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
     closed = False
     validator_seen: object | None = None
 
+    class ArtifactFactory:
+        def __init__(self) -> None:
+            self._sessions: dict[str, object] = {}
+
     class FakeBundle:
+        def __init__(self) -> None:
+            self.artifact_factory = ArtifactFactory()
+
         def readiness_probe(self) -> object:
             return SimpleNamespace(status="ready", dependencies=[])
 
@@ -2658,6 +2669,7 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
         validator_seen = kwargs.get("validator")
         raise LookupError("workspace setup failed")
 
+    real_workspace = runner_module.FormalRunWorkspace
     monkeypatch.setattr(runner_module, "FormalRunWorkspace", fail_workspace)
 
     with pytest.raises(LookupError, match="workspace setup"):
@@ -2679,6 +2691,34 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
 
     assert closed
     assert callable(validator_seen)
+
+    closed = False
+    monkeypatch.setattr(runner_module, "FormalRunWorkspace", real_workspace)
+
+    def fail_ledger(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise LookupError("ledger setup failed")
+
+    monkeypatch.setattr(runner_module, "SQLiteBudgetLedger", fail_ledger)
+    with pytest.raises(LookupError, match="ledger setup"):
+        asyncio.run(
+            runner_module._run_formal_evaluation(
+                EvaluationRunRequest(
+                    split="dev",
+                    mode="live",
+                    lock_path=tmp_path / "candidate.lock.yaml",
+                    output_root=tmp_path / "runs-ledger",
+                    snapshot_manifest_path=None,
+                    network_authorized=True,
+                ),
+                composition_root=FakeRoot,
+                attempt_store_factory=runner_module.ValidationAttemptStore,
+                clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+            )
+        )
+
+    assert closed
+    assert not list((tmp_path / "runs-ledger").glob(".incomplete-*"))
 
 
 def test_stale_prepublication_claim_is_reconciled_to_interrupted(
@@ -2728,8 +2768,7 @@ def test_missing_reporting_measures_are_not_fabricated_as_zero() -> None:
         {}, policy=policy, split="dev"
     )
 
-    assert measures["dev_macro_f1"].denominator == 0
-    assert measures["dev_macro_f1"].value is None
+    assert "dev_macro_f1" not in measures
 
 
 def test_retrieval_and_filter_gates_use_frozen_relevant_ids() -> None:
@@ -2747,7 +2786,18 @@ def test_retrieval_and_filter_gates_use_frozen_relevant_ids() -> None:
         outcome_kind="success",
         business_result_sha256="sha256:" + "a" * 64,
         usage=UsageActual(cost_cny=Decimal("0")),
-        diagnostics=[],
+        diagnostics=[
+            DependencyDiagnostic(
+                dependency="openalex",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=1,
+                cache_hit=False,
+                snapshot_refs=[],
+                errors=[],
+            )
+        ],
         retrieved_paper_ids=["openalex:W1", "openalex:W2"],
         post_filter_paper_ids=["openalex:W1"],
         is_partial=False,
@@ -2777,4 +2827,66 @@ def test_retrieval_and_filter_gates_use_frozen_relevant_ids() -> None:
     )
     assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
         numerator=1, denominator=2, value=Decimal("0.5")
+    )
+
+
+def test_invalid_openalex_response_cannot_self_report_retrieval_hits() -> None:
+    execution = EvaluationExecutionRecord(
+        query_id="q1",
+        run_id="formal-1",
+        outcome_kind="success",
+        business_result_sha256="sha256:" + "a" * 64,
+        usage=UsageActual(cost_cny=Decimal("0")),
+        diagnostics=[
+            DependencyDiagnostic(
+                dependency="openalex",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=1,
+                cache_hit=False,
+                snapshot_refs=[],
+                errors=[
+                    ErrorDetail(
+                        code="invalid_response",
+                        message="safe",
+                        retryable=False,
+                        provider="openalex",
+                    )
+                ],
+            )
+        ],
+        retrieved_paper_ids=["openalex:W1"],
+        post_filter_paper_ids=["openalex:W1"],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        stop_reason="completed",
+    )
+    measures = runner_module.formal_audit_measures(
+        frozen_queries=[
+            EvaluationQuery(
+                query_id="q1",
+                query="one",
+                relevant_paper_ids=["openalex:W1"],
+                metadata={"split": "dev"},
+            )
+        ],
+        executions=[execution],
+        business_results=[],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("3"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+    )
+
+    assert measures["parseable_configured_retrieval_response_rate"] == MeasureValue(
+        numerator=0, denominator=1, value=0
     )

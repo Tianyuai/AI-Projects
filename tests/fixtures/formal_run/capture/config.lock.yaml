@@ -5,13 +5,13 @@ runtime_allow_live: true
 frozen_data:
   manifest:
     path: tests/fixtures/formal_run/inputs/manifest.json
-    sha256: sha256:3a92ca6448152e3bc3fed6d35605818a839044f9e5956404a4d5ab7db3327783
+    sha256: sha256:451d33a1f5d75c01df25e4e8ce7a7e1e1a446e94c40d01ef4bdca4a41dc1c65f
   identifier_map:
     path: tests/fixtures/formal_run/inputs/identifier-map.json
     sha256: sha256:420728bdf408ac4607beeb99392c0fe23218a8e4b1681023b6a7d44349e37eb4
   split: dev
   query_count: 2
-  partition_sha256: sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5
+  partition_sha256: sha256:19b3ba1a584ab488ecb0aed1b10a63726880d9747e407099b9963656f1588fc4
 baseline:
   primary_model: qwen3.7-plus
   fallback_model: qwen3.6-flash

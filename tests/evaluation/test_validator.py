@@ -163,6 +163,42 @@ def test_capture_replay_lock_must_inherit_live_config(tmp_path: Path) -> None:
     assert "replay_binding_invalid" in {issue.code for issue in result.issues}
 
 
+def test_capture_replay_lock_must_inherit_project_ledger_anchor(tmp_path: Path) -> None:
+    run = tmp_path / "capture"
+    shutil.copytree(FIXTURE_ROOT / "capture", run)
+    replay_lock_path = run / "replay.lock.yaml"
+    payload = yaml.safe_load(replay_lock_path.read_bytes())
+    payload["project_ledger"] = {
+        "receipt_count": 1,
+        "receipts_sha256": "sha256:" + "b" * 64,
+    }
+    replay_lock_path.write_text(
+        yaml.safe_dump(payload, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    result = validate_run_directory(run)
+
+    assert not result.valid
+    assert "replay_binding_invalid" in {issue.code for issue in result.issues}
+
+
+def test_replay_uses_fresh_ledger_while_retaining_capture_anchor() -> None:
+    payload = yaml.safe_load(
+        (FIXTURE_ROOT / "replay" / "config.lock.yaml").read_bytes()
+    )
+    payload["project_ledger"] = {
+        "receipt_count": 7,
+        "receipts_sha256": "sha256:" + "b" * 64,
+    }
+    lock = runner_module.ReplayLock.model_validate(payload)
+
+    assert validator_module._project_ledger_anchor(lock) == (
+        0,
+        validator_module._receipts_sha256([]),
+    )
+
+
 def test_validator_rejects_private_platform_path(tmp_path: Path) -> None:
     run = tmp_path / "capture"
     shutil.copytree(FIXTURE_ROOT / "capture", run)
@@ -395,6 +431,40 @@ def test_canonical_formal_pair_publishes_every_gate_check() -> None:
     payload = json.loads((FIXTURE_ROOT / "capture" / "gates.json").read_bytes())
 
     assert [check["rule_id"] for check in payload["checks"] if check["applies"]] == expected
+
+
+def test_canonical_fixture_has_nonempty_gold_and_filter_evidence() -> None:
+    gold = [
+        json.loads(line)
+        for line in (FIXTURE_ROOT / "inputs" / "dev.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    executions = [
+        json.loads(line)
+        for line in (FIXTURE_ROOT / "capture" / "executions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+
+    assert all(item["relevant_paper_ids"] for item in gold)
+    assert all(item["retrieved_paper_ids"] for item in executions)
+    assert all(item["post_filter_paper_ids"] for item in executions)
+
+
+def test_canonical_gate_evidence_has_no_missing_reporting_values() -> None:
+    gate = json.loads((FIXTURE_ROOT / "capture" / "gates.json").read_bytes())
+    applicable_reporting = [
+        check
+        for check in gate["checks"]
+        if check["applies"] and check["classification"] == "reporting_only"
+    ]
+    checks_by_id = {check["rule_id"]: check for check in gate["checks"]}
+
+    assert len(applicable_reporting) == 30
+    assert all(check["measure"]["value"] is not None for check in applicable_reporting)
+    assert checks_by_id["retrieval-response-rate"]["measure"]["value"] == "1"
+    assert checks_by_id["hard-filter-recall-loss"]["measure"]["value"] == "0"
 
 
 def test_validator_rejects_symlink_run_root(tmp_path: Path) -> None:

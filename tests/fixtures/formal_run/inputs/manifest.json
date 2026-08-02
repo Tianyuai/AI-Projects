@@ -9,7 +9,7 @@
   "created_at": "2026-08-02T00:00:00+00:00",
   "dataset_revision": "synthetic-formal-fixture-v1",
   "freeze_status": "approved",
-  "gold_sha256": "sha256:2c7d7c2b6979a85eef52332ef200f74553ca1890385c286ff7aa83967065002e",
+  "gold_sha256": "sha256:efb2efe7c4d0b06a7f69a3404ded35905628519587dff0648a0011c2dc830619",
   "identifier_map": {
     "entry_count": 1,
     "path": "identifier-map.json",
@@ -21,7 +21,7 @@
       "name": "dev",
       "path": "dev.jsonl",
       "query_count": 2,
-      "sha256": "sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5",
+      "sha256": "sha256:19b3ba1a584ab488ecb0aed1b10a63726880d9747e407099b9963656f1588fc4",
       "zero_answer_policy": "allow"
     },
     {

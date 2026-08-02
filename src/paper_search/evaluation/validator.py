@@ -178,6 +178,7 @@ def _replay_inherits_live_lock(
         and replay.pricing_policy == live.pricing_policy
         and replay.quality_gates == live.quality_gates
         and replay.capture_policy == live.capture_policy
+        and replay.project_ledger == live.project_ledger
         and replay.snapshot_set_id == manifest.snapshot_set_id
         and replay.snapshot_manifest_sha256 == manifest.snapshot_manifest_sha256
     )
@@ -207,6 +208,13 @@ def _receipts_sha256(receipts: object) -> str:
         + b"\n"
     )
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _project_ledger_anchor(lock: InputLock) -> tuple[int, str]:
+    """Replay accounting starts fresh while retaining the source anchor in its lock."""
+    if isinstance(lock, ReplayLock):
+        return 0, _receipts_sha256([])
+    return lock.project_ledger.receipt_count, lock.project_ledger.receipts_sha256
 
 
 def _sum_usage(records: Sequence[object]) -> dict[str, int | Decimal | None]:
@@ -472,7 +480,7 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             and Decimal(expected_usage["cost_cny"] or 0) <= expected_run_cap
             and project_actual + project_reserved <= PROJECT_HARD_CAP_CNY
         )
-        prior_receipt_count = lock.project_ledger.receipt_count
+        prior_receipt_count, prior_receipts_sha256 = _project_ledger_anchor(lock)
         prior_receipts = usage.receipts[:prior_receipt_count]
         current_receipts = usage.receipts[prior_receipt_count:]
         ledger_valid = (
@@ -493,7 +501,7 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             and _receipts_sha256(
                 [receipt.model_dump(mode="json") for receipt in prior_receipts]
             )
-            == lock.project_ledger.receipts_sha256
+            == prior_receipts_sha256
             and current_receipts == run_receipts
             and usage.within_caps == recomputed_within_caps
             and usage.within_caps
@@ -532,6 +540,7 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
                 failures=failure_records,
                 ledger_report=usage,
                 identifier_map=identifier_map,
+                metrics=recomputed_metrics,
             ),
             policy=gate_policy,
             split=manifest.split,

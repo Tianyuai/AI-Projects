@@ -8,12 +8,18 @@ from decimal import Decimal
 from paper_search.control.ledger import LedgerReport
 from paper_search.control.pricing import QualityGatePolicy
 from paper_search.evaluation.business_results import BusinessResultRecord
-from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap
+from paper_search.evaluation.dataset import (
+    EvaluationQuery,
+    IdentifierMap,
+    PredictionRecord,
+    normalize_paper_id,
+)
 from paper_search.evaluation.execution_adapter import (
     EvaluationExecutionRecord,
     EvaluationFailureRecord,
 )
 from paper_search.evaluation.gates import MeasureValue
+from paper_search.evaluation.metrics import EvaluationResult, evaluate
 
 
 def _measure(numerator: int | Decimal, denominator: int | Decimal) -> MeasureValue:
@@ -28,6 +34,13 @@ def _measure(numerator: int | Decimal, denominator: int | Decimal) -> MeasureVal
     )
 
 
+def _has_parseable_openalex(execution: EvaluationExecutionRecord) -> bool:
+    diagnostics = [
+        item for item in execution.diagnostics if item.dependency == "openalex"
+    ]
+    return bool(diagnostics) and all(not item.errors for item in diagnostics)
+
+
 def formal_audit_measures(
     *,
     frozen_queries: Sequence[EvaluationQuery],
@@ -36,6 +49,7 @@ def formal_audit_measures(
     failures: Sequence[EvaluationFailureRecord],
     ledger_report: LedgerReport,
     identifier_map: IdentifierMap | None = None,
+    metrics: EvaluationResult | None = None,
 ) -> dict[str, MeasureValue]:
     """Derive all applicable enforced and core reporting measures."""
     count = len(frozen_queries)
@@ -53,10 +67,17 @@ def formal_audit_measures(
         execution = execution_by_query.get(query.query_id)
         if execution is None:
             continue
-        retrieved = {resolve(identifier) for identifier in execution.retrieved_paper_ids}
-        post_filter = {
-            resolve(identifier) for identifier in execution.post_filter_paper_ids
-        }
+        parseable = _has_parseable_openalex(execution)
+        retrieved = (
+            {resolve(identifier) for identifier in execution.retrieved_paper_ids}
+            if parseable
+            else set()
+        )
+        post_filter = (
+            {resolve(identifier) for identifier in execution.post_filter_paper_ids}
+            if parseable
+            else set()
+        )
         retrieved_relevant_count += len(relevant & retrieved)
         post_filter_relevant_count += len(relevant & post_filter)
     actual_matches = all(
@@ -90,6 +111,57 @@ def formal_audit_measures(
     latency_values = sorted(execution.usage.elapsed_ms for execution in executions)
     p50 = latency_values[(len(latency_values) - 1) // 2] if latency_values else 0
     p95 = latency_values[max(0, (95 * len(latency_values) + 99) // 100 - 1)] if latency_values else 0
+    cached_latency_values = sorted(
+        item.latency_ms for item in diagnostics if item.cache_hit
+    )
+    cached_p50 = (
+        cached_latency_values[(len(cached_latency_values) - 1) // 2]
+        if cached_latency_values
+        else 0
+    )
+
+    def canonical_id(identifier: str) -> bool:
+        try:
+            return normalize_paper_id(identifier) == identifier
+        except ValueError:
+            return False
+
+    structured_by_query = {record.query_id: record for record in business_results}
+    schema_valid_queries = sum(
+        query.query_id in structured_by_query for query in frozen_queries
+    )
+    valid_link_queries = 0
+    reason_complete_queries = 0
+    verifiable_edge_queries = 0
+    fabricated_count = 0
+    for query in frozen_queries:
+        record = structured_by_query.get(query.query_id)
+        execution = execution_by_query.get(query.query_id)
+        if record is None:
+            continue
+        ranked = [*record.high_relevance, *record.partial_relevance]
+        ranked_ids = {item.paper.canonical_id for item in ranked}
+        linked_ids = [
+            *record.selected_paper_ids,
+            *ranked_ids,
+            *(edge.citing_canonical_id for edge in record.citation_edges),
+            *(edge.cited_canonical_id for edge in record.citation_edges),
+        ]
+        links_valid = all(canonical_id(identifier) for identifier in linked_ids)
+        valid_link_queries += links_valid
+        reason_complete_queries += set(record.selected_paper_ids) <= ranked_ids
+        edges_valid = all(
+            canonical_id(edge.citing_canonical_id)
+            and canonical_id(edge.cited_canonical_id)
+            and bool(edge.source_edge_hash)
+            for edge in record.citation_edges
+        )
+        verifiable_edge_queries += edges_valid
+        post_filter_ids = set(execution.post_filter_paper_ids) if execution else set()
+        fabricated_count += sum(
+            not canonical_id(identifier) or identifier not in post_filter_ids
+            for identifier in record.selected_paper_ids
+        )
     measures = {
         "integrity_failures": _measure(
             sum(failure.error_code == "integrity_failure" for failure in failures),
@@ -133,7 +205,37 @@ def formal_audit_measures(
         "cache_hit_rate": _measure(
             sum(item.cache_hit for item in diagnostics), len(diagnostics)
         ),
+        "schema_valid_rate": _measure(schema_valid_queries, count),
+        "valid_paper_link_rate": _measure(valid_link_queries, count),
+        "reason_complete_rate": _measure(reason_complete_queries, count),
+        "verifiable_citation_edge_rate": _measure(verifiable_edge_queries, count),
+        "fabricated_paper_or_relation_count": _measure(fabricated_count, 1),
+        "cached_repeat_latency_p50_ms": _measure(cached_p50, 1),
     }
+    if metrics is not None:
+        splits = {query.metadata.get("split") for query in frozen_queries}
+        if len(splits) != 1 or not splits <= {"dev", "validation"}:
+            raise ValueError("formal reporting requires one dev or validation split")
+        split = str(next(iter(splits)))
+        macro_f1 = metrics.measures["macro_f1"]
+        measures[f"{split}_macro_f1"] = MeasureValue.model_validate(macro_f1.model_dump())
+        raw_predictions = [
+            PredictionRecord(
+                query_id=query.query_id,
+                predicted_paper_ids=(
+                    execution_by_query[query.query_id].retrieved_paper_ids
+                    if query.query_id in execution_by_query
+                    and _has_parseable_openalex(execution_by_query[query.query_id])
+                    else []
+                ),
+            )
+            for query in frozen_queries
+        ]
+        raw_macro_f1 = evaluate(
+            frozen_queries, raw_predictions, id_map=identifier_map
+        ).measures["macro_f1"].value
+        delta = (macro_f1.value or Decimal(0)) - (raw_macro_f1 or Decimal(0))
+        measures[f"{split}_macro_f1_delta_vs_raw_openalex"] = _measure(delta, 1)
     measures.update(
         {
             f"hard_failed_query:{failure.query_id}": _measure(1, 1)
@@ -149,15 +251,9 @@ def complete_policy_measures(
     policy: QualityGatePolicy,
     split: str,
 ) -> dict[str, MeasureValue]:
-    """Represent every applicable policy measure, explicitly marking unavailable data."""
+    """Preserve evidence without manufacturing rows that can mask real metrics."""
     completed = measures.copy()
-    unavailable = MeasureValue(numerator=Decimal(0), denominator=Decimal(0), value=None)
-    for rule in policy.rules:
-        if split in rule.applies_to:
-            completed.setdefault(
-                rule.measure,
-                unavailable,
-            )
+    del policy, split
     return completed
 
 

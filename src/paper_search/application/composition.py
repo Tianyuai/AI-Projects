@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import os
-import hashlib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -13,6 +12,7 @@ from typing import Any, Literal, Protocol
 import httpx
 from pydantic import SecretStr
 
+from paper_search.application.artifacts import ArtifactFactory
 from paper_search.application.contracts import ReadyHealthResponse
 from paper_search.application.locks import (
     InputLock,
@@ -85,39 +85,6 @@ class _AnalyzerBridge:
             payload={"query": query},
             reservation=reservation,
         )
-
-
-@dataclass(frozen=True)
-class ArtifactFactory:
-    """Create isolated capture stores and own any in-flight live clients."""
-
-    output_root: Path
-    _clients: list[httpx.AsyncClient] = field(
-        default_factory=list,
-        repr=False,
-        compare=False,
-    )
-
-    def start_capture(self, *, run_id: str) -> DependencyCaptureStore:
-        run_key = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
-        return DependencyCaptureStore(
-            self.output_root / "captures" / run_key / "dependency-snapshot"
-        )
-
-    def register_client(self, client: httpx.AsyncClient) -> None:
-        self._clients.append(client)
-
-    def release_client(self, client: httpx.AsyncClient) -> None:
-        try:
-            self._clients.remove(client)
-        except ValueError:
-            pass
-
-    async def aclose(self) -> None:
-        clients = list(self._clients)
-        self._clients.clear()
-        for client in clients:
-            await client.aclose()
 
 
 @dataclass(frozen=True)
@@ -393,7 +360,7 @@ class _LiveOrchestratorFactory:
         run_id: str,
     ) -> _LiveRunOrchestrator:
         lock = self._lock
-        capture_store = self._artifact_factory.start_capture(run_id=run_id)
+        capture_store = self._artifact_factory.start_dependency_capture(run_id=run_id)
         timeout = httpx.Timeout(
             connect=lock.baseline.timeout.connect_seconds,
             read=lock.baseline.timeout.read_seconds,

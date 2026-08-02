@@ -4,6 +4,12 @@ import tomllib
 from pathlib import Path
 
 
+def test_console_entry_point_is_stable() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+
+    assert project["project"]["scripts"] == {"paper-search": "paper_search.cli:main"}
+
+
 def test_torch_profiles_are_explicit_and_mutually_exclusive() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     dependencies = project["project"]["dependencies"]

@@ -41,7 +41,8 @@ from paper_search.domain.models import (
 
 _LAZY_EXPORTS = {
     "ApplicationBundle": ("paper_search.application.composition", "ApplicationBundle"),
-    "ArtifactFactory": ("paper_search.application.composition", "ArtifactFactory"),
+    "ArtifactFactory": ("paper_search.application.artifacts", "ArtifactFactory"),
+    "CaptureSession": ("paper_search.application.artifacts", "CaptureSession"),
     "CompositionRoot": ("paper_search.application.composition", "CompositionRoot"),
     "SearchApplicationError": (
         "paper_search.application.service",
@@ -75,6 +76,7 @@ __all__ = [
     "DependencyStatus",
     "ArtifactBinding",
     "CandidateLock",
+    "CaptureSession",
     "CompositionRoot",
     "InputLock",
     "MoneyCny",

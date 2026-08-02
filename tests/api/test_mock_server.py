@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from paper_search.api import mock_server
-from paper_search.api.mock_server import create_mock_app, mock_readiness
+from paper_search.api.mock_server import create_mock_app
 
 
 def _child_environment() -> dict[str, str]:
@@ -28,13 +28,6 @@ async def _request(application: object, method: str, path: str) -> httpx.Respons
     transport = httpx.ASGITransport(app=application)  # type: ignore[arg-type]
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.request(method, path)
-
-
-def test_mock_readiness_is_fixed_and_complete() -> None:
-    assert mock_readiness() == {
-        "openalex": True,
-        "semantic_scholar": True,
-    }
 
 
 def test_create_mock_app_reports_both_fixed_providers_ready() -> None:

@@ -6,7 +6,10 @@ from collections.abc import Callable
 from typing import Final
 from uuid import uuid4
 
-from paper_search.api.service import LiveSearchService, SearchExecutionService
+from paper_search.api.service import (
+    RequestScopedLiveSearchService,
+    SearchExecutionService,
+)
 from paper_search.application.contracts import (
     ReadyHealthResponse,
     SearchErrorCode,
@@ -70,13 +73,15 @@ class SearchServiceRouter:
         *,
         replay_service: SearchExecutionService,
         readiness: ReadyHealthResponse,
-        live_service_factory: Callable[[], LiveSearchService] | None = None,
+        live_service_factory: Callable[[], RequestScopedLiveSearchService] | None = None,
+        runtime_allow_live: bool = False,
         server_live_authorized: bool = False,
         run_id_factory: Callable[[], str] | None = None,
     ) -> None:
         self._replay_service = replay_service
         self._readiness = readiness
         self._live_service_factory = live_service_factory
+        self._runtime_allow_live = runtime_allow_live
         self._server_live_authorized = server_live_authorized
         self._run_id_factory = run_id_factory or (lambda: str(uuid4()))
 
@@ -87,24 +92,46 @@ class SearchServiceRouter:
     async def execute(self, request: SearchRequest) -> SearchExecutionResult:
         if request.mode == "replay":
             return await self._replay_service.execute(request)
-        if not self._server_live_authorized or self._live_service_factory is None:
+        if (
+            not self._runtime_allow_live
+            or not self._server_live_authorized
+            or self._live_service_factory is None
+        ):
             return self._live_not_authorized(request)
 
         live_service = self._live_service_factory()
-        execution = await live_service.execute(request)
-        if isinstance(execution.outcome, SearchSuccess):
-            await live_service.publish(execution)
+        execution = await live_service.execute_and_publish(request)
+        if (
+            isinstance(execution.outcome, SearchSuccess)
+            and execution.outcome.response.execution_mode != "live"
+        ):
+            return self._failure(
+                request,
+                code="integrity_failure",
+                run_id=execution.outcome.response.run_id,
+                usage=execution.outcome.response.usage,
+            )
         return execution
 
     def _live_not_authorized(self, request: SearchRequest) -> SearchExecutionResult:
-        run_id = self._run_id_factory()
+        return self._failure(request, code="live_not_authorized")
+
+    def _failure(
+        self,
+        request: SearchRequest,
+        *,
+        code: SearchErrorCode,
+        run_id: str | None = None,
+        usage: UsageActual | None = None,
+    ) -> SearchExecutionResult:
+        resolved_run_id = self._run_id_factory() if run_id is None else run_id
         return SearchExecutionResult(
             outcome=SearchFailure(
                 query_id=request.query_id,
-                run_id=run_id,
-                error=safe_error_response("live_not_authorized", run_id=run_id),
-                usage=UsageActual(),
-                stop_reason="live_not_authorized",
+                run_id=resolved_run_id,
+                error=safe_error_response(code, run_id=resolved_run_id),
+                usage=UsageActual() if usage is None else usage,
+                stop_reason=code,
             ),
             diagnostics=[],
             business_result_sha256=None,

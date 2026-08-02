@@ -10,9 +10,9 @@ from paper_search.api.contracts import (
     UnavailableResponse,
 )
 from paper_search.api.service import (
-    LiveSearchService,
     MockApiSearchService,
     OrchestratorFactory,
+    RequestScopedLiveSearchService,
     SearchExecutionService,
     SearchOrchestrator,
 )
@@ -22,10 +22,10 @@ from paper_search.api.routing import SearchServiceRouter
 __all__ = [
     "BudgetProfile",
     "LiveHealthResponse",
-    "LiveSearchService",
     "MockApiSearchService",
     "OrchestratorFactory",
     "ProviderHealthStatus",
+    "RequestScopedLiveSearchService",
     "ReadyHealthResponse",
     "SearchOrchestrator",
     "SearchRequest",

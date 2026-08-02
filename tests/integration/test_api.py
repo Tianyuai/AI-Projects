@@ -232,6 +232,7 @@ async def _post(
     application: object,
     *,
     query_id: str = "q1",
+    mode: Literal["replay", "live"] = "replay",
 ) -> httpx.Response:
     transport = httpx.ASGITransport(app=application)  # type: ignore[arg-type]
     async with httpx.AsyncClient(
@@ -244,6 +245,7 @@ async def _post(
                 "query_id": query_id,
                 "query": "graph retrieval",
                 "budget_profile": "low",
+                "mode": mode,
             },
         )
 
@@ -393,9 +395,38 @@ class _RouterService:
             business_result_sha256=None,
         )
 
-    async def publish(self, execution: SearchExecutionResult) -> None:
-        assert isinstance(execution.outcome, SearchSuccess)
-        self.events.append(f"publish:{self.label}")
+
+
+class _LiveRouterService:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        execution_mode: Literal["replay", "live"] = "live",
+        publication_error: bool = False,
+    ) -> None:
+        self._events = events
+        self._execution_mode = execution_mode
+        self._publication_error = publication_error
+
+    async def execute_and_publish(self, request: SearchRequest) -> SearchExecutionResult:
+        self._events.append("execute:live")
+        if self._publication_error:
+            self._events.append("publish:live")
+            raise RuntimeError("private publication failure")
+        response = _structured_success_response().model_copy(
+            update={
+                "execution_mode": self._execution_mode,
+                "query_id": request.query_id,
+            }
+        )
+        execution = SearchExecutionResult(
+            outcome=SearchSuccess(response=response),
+            diagnostics=[],
+            business_result_sha256=None,
+        )
+        self._events.append("publish:live")
+        return execution
 
 
 def _structured_success_response() -> StructuredSearchResponse:
@@ -457,10 +488,10 @@ def _structured_success_response() -> StructuredSearchResponse:
 def test_router_binds_replay_and_requires_all_live_authorization_keys() -> None:
     events: list[str] = []
     replay = _RouterService("replay", events)
-    live = _RouterService("live", events)
+    live = _LiveRouterService(events)
     factory_calls: list[str] = []
 
-    def live_factory() -> _RouterService:
+    def live_factory() -> _LiveRouterService:
         factory_calls.append("live")
         return live
 
@@ -468,6 +499,7 @@ def test_router_binds_replay_and_requires_all_live_authorization_keys() -> None:
         replay_service=replay,
         readiness=_router_readiness(),
         live_service_factory=live_factory,
+        runtime_allow_live=True,
         server_live_authorized=True,
     )
     replay_result = asyncio.run(
@@ -490,15 +522,24 @@ def test_router_binds_replay_and_requires_all_live_authorization_keys() -> None:
         replay_service=replay,
         readiness=_router_readiness(),
         live_service_factory=None,
+        runtime_allow_live=True,
+        server_live_authorized=True,
+    )
+    lock_disallowed = SearchServiceRouter(
+        replay_service=replay,
+        readiness=_router_readiness(),
+        live_service_factory=live_factory,
+        runtime_allow_live=False,
         server_live_authorized=True,
     )
     server_disallowed = SearchServiceRouter(
         replay_service=replay,
         readiness=_router_readiness(),
         live_service_factory=live_factory,
+        runtime_allow_live=True,
         server_live_authorized=False,
     )
-    for unavailable in (missing_factory, server_disallowed):
+    for unavailable in (missing_factory, lock_disallowed, server_disallowed):
         result = asyncio.run(
             unavailable.execute(
                 SearchRequest(query_id="live-denied", query="graph retrieval", mode="live")
@@ -506,3 +547,41 @@ def test_router_binds_replay_and_requires_all_live_authorization_keys() -> None:
         )
         assert result.outcome.kind == "failure"
         assert result.outcome.error.code == "live_not_authorized"
+
+
+def test_live_publication_failure_never_returns_http_success() -> None:
+    events: list[str] = []
+    live = _LiveRouterService(events, publication_error=True)
+    router = SearchServiceRouter(
+        replay_service=_RouterService("replay", events),
+        readiness=_router_readiness(),
+        live_service_factory=lambda: live,
+        runtime_allow_live=True,
+        server_live_authorized=True,
+    )
+
+    response = asyncio.run(_post(create_app(router), mode="live"))
+
+    assert response.status_code == 500
+    assert events == ["execute:live", "publish:live"]
+    assert "private publication failure" not in response.text
+
+
+def test_live_response_with_replay_mode_becomes_integrity_failure() -> None:
+    events: list[str] = []
+    live = _LiveRouterService(events, execution_mode="replay")
+    router = SearchServiceRouter(
+        replay_service=_RouterService("replay", events),
+        readiness=_router_readiness(),
+        live_service_factory=lambda: live,
+        runtime_allow_live=True,
+        server_live_authorized=True,
+    )
+
+    result = asyncio.run(
+        router.execute(SearchRequest(query_id="q1", query="graph retrieval", mode="live"))
+    )
+
+    assert result.outcome.kind == "failure"
+    assert result.outcome.error.code == "integrity_failure"
+    assert events == ["execute:live", "publish:live"]

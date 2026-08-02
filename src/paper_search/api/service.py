@@ -31,10 +31,13 @@ class SearchExecutionService(Protocol):
     async def execute(self, request: SearchRequest) -> SearchExecutionResult: ...
 
 
-class LiveSearchService(SearchExecutionService, Protocol):
-    """A request-scoped live service whose capture is published atomically."""
+class RequestScopedLiveSearchService(Protocol):
+    """Complete one live execution and its validated atomic publication."""
 
-    async def publish(self, execution: SearchExecutionResult) -> None: ...
+    async def execute_and_publish(
+        self,
+        request: SearchRequest,
+    ) -> SearchExecutionResult: ...
 
 
 class MockApiSearchService:

@@ -39,14 +39,6 @@ _NAME_TARGET_EVENTS = frozenset(
 )
 
 
-def mock_readiness() -> dict[str, bool]:
-    """Return the fixed readiness map for the offline mock composition."""
-    return {
-        "openalex": True,
-        "semantic_scholar": True,
-    }
-
-
 def create_mock_app() -> FastAPI:
     """Build the only app composition exposed by the mock-server entry point."""
     router = SearchServiceRouter(

@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
+from datetime import UTC, datetime
 from typing import Any, cast
 
 import httpx
 import pytest
 
 from paper_search.api.app import create_app
-from paper_search.api.contracts import SearchRequest
+from paper_search.api.contracts import ReadyHealthResponse, SearchRequest
+from paper_search.api.routing import SearchServiceRouter
+from paper_search.application.contracts import (
+    SearchErrorResponse,
+    SearchExecutionResult,
+    SearchFailure,
+    SearchSuccess,
+)
 from paper_search.domain.models import (
     DependencyStatus,
     QueryAnalysisResult,
@@ -20,11 +27,20 @@ from paper_search.domain.models import (
 )
 
 
+_SAFE_DETAILS = {
+    "invalid_request": "The search request is invalid",
+    "live_not_authorized": "Live search is not authorized",
+    "config_mismatch": "The requested mode does not match the application binding",
+    "validation_attempt_conflict": "The validation attempt conflicts with prior state",
+    "budget_exhausted": "The search budget was exhausted",
+    "snapshot_unavailable": "Required replay data is unavailable",
+    "dependency_failure": "A required search dependency failed",
+    "integrity_failure": "Search integrity validation failed",
+    "internal_error": "The search could not be completed",
+}
+
+
 def _structured_response(query_id: str = "q1") -> StructuredSearchResponse:
-    spec = QuerySpec(
-        original_query="graph retrieval",
-        research_goal="find graph retrieval papers",
-    )
     return StructuredSearchResponse(
         run_id="app-run-1",
         query_id=query_id,
@@ -32,7 +48,10 @@ def _structured_response(query_id: str = "q1") -> StructuredSearchResponse:
         snapshot_set_id="app-snapshot-v1",
         snapshot_captured_at=None,
         query_analysis=QueryAnalysisResult(
-            query_spec=spec,
+            query_spec=QuerySpec(
+                original_query="graph retrieval",
+                research_goal="find graph retrieval papers",
+            ),
             search_plan=SearchPlan(
                 subqueries=[
                     SubQuery(
@@ -48,18 +67,20 @@ def _structured_response(query_id: str = "q1") -> StructuredSearchResponse:
                 rationale="synthetic",
             ),
         ),
-        selected_paper_ids=["openalex:W1"],
+        selected_paper_ids=[],
         high_relevance=[],
         partial_relevance=[],
         citation_edges=[],
-        search_trace=[{"step": "fuse", "count": 1}],
-        usage=UsageActual(search_api_calls=1),
+        search_trace=[],
+        usage=UsageActual(),
         stop_reason="completed",
         is_partial=False,
         planner_fallback=False,
         planner_status="primary",
         dependency_status=[
-            DependencyStatus(dependency="llm", state="replayed", cache_hit=True, error_codes=[]),
+            DependencyStatus(
+                dependency="llm", state="replayed", cache_hit=True, error_codes=[]
+            ),
             DependencyStatus(
                 dependency="openalex", state="replayed", cache_hit=True, error_codes=[]
             ),
@@ -77,19 +98,76 @@ def _structured_response(query_id: str = "q1") -> StructuredSearchResponse:
     )
 
 
-class RecordingService:
-    def __init__(self, *, raises: bool = False) -> None:
-        self.raises = raises
+def _readiness(
+    *,
+    observed_at: datetime | None = None,
+) -> ReadyHealthResponse:
+    return ReadyHealthResponse(
+        status="ready",
+        execution_mode="replay",
+        snapshot_set_id="bound-snapshot-v1",
+        dependencies=[
+            DependencyStatus(
+                dependency="llm", state="replayed", cache_hit=True, error_codes=[]
+            ),
+            DependencyStatus(
+                dependency="openalex", state="replayed", cache_hit=True, error_codes=[]
+            ),
+            DependencyStatus(
+                dependency="semantic_scholar",
+                state="replayed",
+                cache_hit=True,
+                error_codes=[],
+            ),
+        ],
+        last_authorized_probe_at=observed_at,
+    )
+
+
+class OutcomeService:
+    def __init__(self, result: SearchExecutionResult | Exception) -> None:
+        self.result = result
         self.requests: list[SearchRequest] = []
 
-    async def __call__(
-        self,
-        request: SearchRequest,
-    ) -> StructuredSearchResponse:
+    async def execute(self, request: SearchRequest) -> SearchExecutionResult:
         self.requests.append(request)
-        if self.raises:
-            raise RuntimeError("private failure detail")
-        return _structured_response(request.query_id)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+def _router(result: SearchExecutionResult | Exception) -> tuple[SearchServiceRouter, OutcomeService]:
+    service = OutcomeService(result)
+    return SearchServiceRouter(replay_service=service, readiness=_readiness()), service
+
+
+def _execution_success(*, partial: bool = False) -> SearchExecutionResult:
+    return SearchExecutionResult(
+        outcome=SearchSuccess(
+            response=_structured_response().model_copy(update={"is_partial": partial})
+        ),
+        diagnostics=[],
+        business_result_sha256=None,
+    )
+
+
+def _execution_failure(code: str) -> SearchExecutionResult:
+    return SearchExecutionResult(
+        outcome=SearchFailure(
+            query_id="q1",
+            run_id="router-run-1",
+            error=SearchErrorResponse(
+                code=cast(Any, code),
+                detail="private failure detail",
+                retryable=False,
+                run_id="router-run-1",
+            ),
+            usage=UsageActual(),
+            stop_reason=code,
+        ),
+        diagnostics=[],
+        business_result_sha256=None,
+    )
 
 
 async def _request(
@@ -100,10 +178,7 @@ async def _request(
     json: dict[str, Any] | None = None,
 ) -> httpx.Response:
     transport = httpx.ASGITransport(app=application)  # type: ignore[arg-type]
-    async with httpx.AsyncClient(
-        transport=transport,
-        base_url="http://test",
-    ) as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.request(method, path, json=json)
 
 
@@ -114,253 +189,137 @@ def test_live_is_always_ok() -> None:
     assert response.json() == {"status": "ok"}
 
 
-def test_ready_requires_service_and_all_nonempty_provider_states() -> None:
-    ready = asyncio.run(
-        _request(
-            create_app(
-                RecordingService(),
-                readiness_probe=lambda: {
-                    "semantic_scholar": True,
-                    "openalex": True,
-                },
-            ),
-            "GET",
-            "/health/ready",
-        )
-    )
-
-    assert ready.status_code == 200
-    assert ready.json() == {
-        "status": "ready",
-        "execution_mode": "replay",
-        "snapshot_set_id": "mock-snapshot-v1",
-        "dependencies": [
-            {"dependency": "llm", "state": "ready", "cache_hit": False, "error_codes": []},
-            {"dependency": "openalex", "state": "ready", "cache_hit": False, "error_codes": []},
-            {
-                "dependency": "semantic_scholar",
-                "state": "ready",
-                "cache_hit": False,
-                "error_codes": [],
-            },
-        ],
-        "last_authorized_probe_at": None,
-    }
-    assert [item["dependency"] for item in ready.json()["dependencies"]] == [
-        "llm",
-        "openalex",
-        "semantic_scholar",
-    ]
-
-    degraded = asyncio.run(
-        _request(create_app(), "GET", "/health/ready")
-    )
-
-    assert degraded.status_code == 503
-    assert degraded.json() == {
-        "status": "degraded",
-        "execution_mode": "replay",
-        "snapshot_set_id": "mock-snapshot-v1",
-        "dependencies": [
-            {"dependency": "llm", "state": "failed", "cache_hit": False, "error_codes": []},
-            {"dependency": "openalex", "state": "failed", "cache_hit": False, "error_codes": []},
-            {
-                "dependency": "semantic_scholar",
-                "state": "failed",
-                "cache_hit": False,
-                "error_codes": [],
-            },
-        ],
-        "last_authorized_probe_at": None,
-    }
-
-
-def test_ready_reports_false_provider_and_probe_failure_as_degraded() -> None:
-    unavailable = asyncio.run(
-        _request(
-            create_app(
-                RecordingService(),
-                readiness_probe=lambda: {
-                    "openalex": True,
-                    "semantic_scholar": False,
-                },
-            ),
-            "GET",
-            "/health/ready",
-        )
-    )
-
-    def fail_probe() -> dict[str, bool]:
-        raise RuntimeError("private readiness detail")
-
-    failed = asyncio.run(
-        _request(
-            create_app(RecordingService(), readiness_probe=fail_probe),
-            "GET",
-            "/health/ready",
-        )
-    )
-
-    assert unavailable.status_code == 503
-    assert unavailable.json() == {
-        "status": "degraded",
-        "execution_mode": "replay",
-        "snapshot_set_id": "mock-snapshot-v1",
-        "dependencies": [
-            {"dependency": "llm", "state": "ready", "cache_hit": False, "error_codes": []},
-            {"dependency": "openalex", "state": "ready", "cache_hit": False, "error_codes": []},
-            {
-                "dependency": "semantic_scholar",
-                "state": "degraded",
-                "cache_hit": False,
-                "error_codes": [],
-            },
-        ],
-        "last_authorized_probe_at": None,
-    }
-    assert failed.status_code == 503
-    assert failed.json()["status"] == "degraded"
-    assert [item["state"] for item in failed.json()["dependencies"]] == [
-        "ready",
-        "failed",
-        "failed",
-    ]
-    assert "private readiness detail" not in failed.text
-
-
-@pytest.mark.parametrize(
-    "providers",
-    [
-        {"": True},
-        {1: True},
-        {"openalex": "false"},
-        {"openalex": 1},
-        {"openalex": True, 1: False},
-    ],
-)
-def test_ready_fails_closed_for_malformed_probe_mapping(
-    providers: object,
-) -> None:
-    response = asyncio.run(
-        _request(
-            create_app(
-                RecordingService(),
-                readiness_probe=cast(
-                    Any,
-                    lambda: providers,
-                ),
-            ),
-            "GET",
-            "/health/ready",
-        )
-    )
-
-    assert response.status_code == 503
-    assert response.json()["status"] == "degraded"
-    assert [item["state"] for item in response.json()["dependencies"]] == [
-        "ready",
-        "failed",
-        "failed",
-    ]
-
-
-def test_default_module_app_is_explicitly_degraded() -> None:
-    api_module = importlib.import_module("paper_search.api.app")
-
-    response = asyncio.run(
-        _request(api_module.app, "GET", "/health/ready")
-    )
-
-    assert response.status_code == 503
-    assert response.json()["status"] == "degraded"
-    assert [item["state"] for item in response.json()["dependencies"]] == [
-        "failed",
-        "failed",
-        "failed",
-    ]
-
-
-def test_search_validates_request_and_serializes_fixed_response() -> None:
-    service = RecordingService()
-    application = create_app(
-        service,
-        readiness_probe=lambda: {"openalex": True},
-    )
+def test_invalid_search_request_returns_fixed_safe_400_without_service_call() -> None:
+    router, service = _router(_execution_success())
 
     response = asyncio.run(
         _request(
-            application,
-            "POST",
-            "/v1/search",
-            json={
-                "query_id": " q1 ",
-                "query": " graph retrieval ",
-                "budget_profile": "low",
-                "include_trace": False,
-            },
-        )
-    )
-
-    assert response.status_code == 200
-    assert StructuredSearchResponse.model_validate(response.json()).query_id == "q1"
-    assert service.requests == [
-        SearchRequest(
-            query_id="q1",
-            query="graph retrieval",
-            budget_profile="low",
-            include_trace=False,
-        )
-    ]
-
-
-def test_invalid_search_request_does_not_call_service() -> None:
-    service = RecordingService()
-    application = create_app(service)
-
-    response = asyncio.run(
-        _request(
-            application,
+            create_app(router),
             "POST",
             "/v1/search",
             json={"query_id": "q1", "query": "valid", "extra": True},
         )
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 400
+    assert response.json() == {
+        "code": "invalid_request",
+        "detail": _SAFE_DETAILS["invalid_request"],
+        "retryable": False,
+        "run_id": None,
+    }
     assert service.requests == []
 
 
-def test_search_unavailable_and_service_failure_return_constant_safe_503() -> None:
-    unavailable = asyncio.run(
+@pytest.mark.parametrize(
+    ("code", "status"),
+    [
+        ("invalid_request", 400),
+        ("live_not_authorized", 403),
+        ("config_mismatch", 409),
+        ("validation_attempt_conflict", 409),
+        ("budget_exhausted", 429),
+        ("snapshot_unavailable", 503),
+        ("dependency_failure", 503),
+        ("integrity_failure", 500),
+        ("internal_error", 500),
+    ],
+)
+def test_search_maps_each_typed_failure_to_its_stable_safe_http_body(
+    code: str,
+    status: int,
+) -> None:
+    router, _ = _router(_execution_failure(code))
+
+    response = asyncio.run(
         _request(
-            create_app(),
+            create_app(router),
             "POST",
             "/v1/search",
             json={"query_id": "q1", "query": "graph retrieval"},
         )
     )
-    failed = asyncio.run(
+
+    assert response.status_code == status
+    assert response.json() == {
+        "code": code,
+        "detail": _SAFE_DETAILS[code],
+        "retryable": code in {"snapshot_unavailable", "dependency_failure"},
+        "run_id": "router-run-1",
+    }
+    assert "private failure detail" not in response.text
+
+
+def test_search_maps_unexpected_exception_to_fixed_internal_error() -> None:
+    router, _ = _router(RuntimeError("private exception detail"))
+
+    response = asyncio.run(
         _request(
-            create_app(RecordingService(raises=True)),
+            create_app(router),
             "POST",
             "/v1/search",
             json={"query_id": "q1", "query": "graph retrieval"},
         )
     )
 
-    expected = {"detail": "search temporarily unavailable"}
-    assert unavailable.status_code == 503
-    assert unavailable.json() == expected
-    assert failed.status_code == 503
-    assert failed.json() == expected
-    assert "private failure detail" not in failed.text
+    assert response.status_code == 500
+    assert response.json() == {
+        "code": "internal_error",
+        "detail": _SAFE_DETAILS["internal_error"],
+        "retryable": False,
+        "run_id": None,
+    }
+    assert "private exception detail" not in response.text
 
 
-def test_search_openapi_declares_fixed_503_json_schema() -> None:
+def test_partial_success_is_a_200_structured_response() -> None:
+    router, _ = _router(_execution_success(partial=True))
+
+    response = asyncio.run(
+        _request(
+            create_app(router),
+            "POST",
+            "/v1/search",
+            json={"query_id": "q1", "query": "graph retrieval"},
+        )
+    )
+
+    assert response.status_code == 200
+    assert StructuredSearchResponse.model_validate(response.json()).is_partial is True
+
+
+def test_ready_returns_cached_mode_snapshot_and_dependency_state_without_calls() -> None:
+    observed_at = datetime(2026, 8, 3, 9, 30, tzinfo=UTC)
+    service = OutcomeService(_execution_success())
+    router = SearchServiceRouter(replay_service=service, readiness=_readiness(observed_at=observed_at))
+
+    response = asyncio.run(_request(create_app(router), "GET", "/health/ready"))
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ready",
+        "execution_mode": "replay",
+        "snapshot_set_id": "bound-snapshot-v1",
+        "dependencies": [
+            {"dependency": "llm", "state": "replayed", "cache_hit": True, "error_codes": []},
+            {"dependency": "openalex", "state": "replayed", "cache_hit": True, "error_codes": []},
+            {
+                "dependency": "semantic_scholar",
+                "state": "replayed",
+                "cache_hit": True,
+                "error_codes": [],
+            },
+        ],
+        "last_authorized_probe_at": "2026-08-03T09:30:00Z",
+    }
+    assert service.requests == []
+
+
+def test_search_openapi_declares_typed_error_json_schema() -> None:
     schema = create_app().openapi()
 
-    unavailable = schema["paths"]["/v1/search"]["post"]["responses"]["503"]
+    typed_error = schema["paths"]["/v1/search"]["post"]["responses"]["503"]
 
-    assert unavailable["content"]["application/json"]["schema"] == {
-        "$ref": "#/components/schemas/UnavailableResponse"
+    assert typed_error["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/SearchErrorResponse"
     }

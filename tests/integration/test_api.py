@@ -8,10 +8,17 @@ import httpx
 import pytest
 
 from paper_search.api.app import create_app
-from paper_search.api.contracts import BudgetProfile
+from paper_search.api.contracts import BudgetProfile, SearchRequest
+from paper_search.api.routing import SearchServiceRouter
 from paper_search.api.service import MockApiSearchService
+from paper_search.application.contracts import (
+    ReadyHealthResponse,
+    SearchExecutionResult,
+    SearchSuccess,
+)
 from paper_search.control.budget import HardBudgetController
 from paper_search.domain.models import (
+    DependencyStatus,
     ErrorDetail,
     Paper,
     ProviderResult,
@@ -296,11 +303,10 @@ def test_mock_api_covers_required_end_to_end_scenarios(
         max_provider_results=5,
     )
     application = create_app(
-        service,
-        readiness_probe=lambda: {
-            "openalex": True,
-            "semantic_scholar": True,
-        },
+        SearchServiceRouter(
+            replay_service=service,
+            readiness=_router_readiness(),
+        )
     )
 
     raw_response = asyncio.run(_post(application))
@@ -322,8 +328,10 @@ def test_api_requests_use_fresh_budget_controllers() -> None:
         max_provider_results=5,
     )
     application = create_app(
-        service,
-        readiness_probe=lambda: {"openalex": True},
+        SearchServiceRouter(
+            replay_service=service,
+            readiness=_router_readiness(),
+        )
     )
 
     first = StructuredSearchResponse.model_validate(
@@ -341,3 +349,160 @@ def test_api_requests_use_fresh_budget_controllers() -> None:
         2,
         2,
     ]
+
+
+def _router_readiness() -> ReadyHealthResponse:
+    return ReadyHealthResponse(
+        status="ready",
+        execution_mode="replay",
+        snapshot_set_id="bound-snapshot-v1",
+        dependencies=[
+            DependencyStatus(
+                dependency="llm", state="replayed", cache_hit=True, error_codes=[]
+            ),
+            DependencyStatus(
+                dependency="openalex", state="replayed", cache_hit=True, error_codes=[]
+            ),
+            DependencyStatus(
+                dependency="semantic_scholar",
+                state="replayed",
+                cache_hit=True,
+                error_codes=[],
+            ),
+        ],
+        last_authorized_probe_at=None,
+    )
+
+
+class _RouterService:
+    def __init__(self, label: str, events: list[str]) -> None:
+        self.label = label
+        self.events = events
+
+    async def execute(self, request: object) -> SearchExecutionResult:
+        self.events.append(f"execute:{self.label}")
+        response = StructuredSearchResponse.model_validate(
+            {
+                **_structured_success_response().model_dump(mode="python"),
+                "query_id": getattr(request, "query_id"),
+            }
+        )
+        return SearchExecutionResult(
+            outcome=SearchSuccess(response=response),
+            diagnostics=[],
+            business_result_sha256=None,
+        )
+
+    async def publish(self, execution: SearchExecutionResult) -> None:
+        assert isinstance(execution.outcome, SearchSuccess)
+        self.events.append(f"publish:{self.label}")
+
+
+def _structured_success_response() -> StructuredSearchResponse:
+    return StructuredSearchResponse.model_validate(
+        {
+            "run_id": "router-run-1",
+            "query_id": "q1",
+            "execution_mode": "replay",
+            "snapshot_set_id": "bound-snapshot-v1",
+            "snapshot_captured_at": None,
+            "query_analysis": {
+                "query_spec": {
+                    "original_query": "graph retrieval",
+                    "research_goal": "find papers",
+                },
+                "search_plan": {
+                    "subqueries": [
+                        {
+                            "query_id": "sq-1",
+                            "text": "graph retrieval",
+                            "query_type": "exact",
+                            "target_constraints": [],
+                            "priority": 1,
+                            "provider_hint": "either",
+                        }
+                    ],
+                    "inherited_hard_filters": {},
+                    "rationale": "synthetic",
+                },
+            },
+            "selected_paper_ids": [],
+            "high_relevance": [],
+            "partial_relevance": [],
+            "citation_edges": [],
+            "search_trace": [],
+            "usage": {},
+            "stop_reason": "completed",
+            "is_partial": False,
+            "planner_fallback": False,
+            "planner_status": "primary",
+            "dependency_status": [
+                {"dependency": "llm", "state": "replayed", "cache_hit": True, "error_codes": []},
+                {"dependency": "openalex", "state": "replayed", "cache_hit": True, "error_codes": []},
+                {
+                    "dependency": "semantic_scholar",
+                    "state": "replayed",
+                    "cache_hit": True,
+                    "error_codes": [],
+                },
+            ],
+            "warnings": [],
+            "prompt_version": "query-analyze-v1",
+            "config_hash": "sha256:" + "a" * 64,
+            "git_sha": "abc1234",
+        }
+    )
+
+
+def test_router_binds_replay_and_requires_all_live_authorization_keys() -> None:
+    events: list[str] = []
+    replay = _RouterService("replay", events)
+    live = _RouterService("live", events)
+    factory_calls: list[str] = []
+
+    def live_factory() -> _RouterService:
+        factory_calls.append("live")
+        return live
+
+    router = SearchServiceRouter(
+        replay_service=replay,
+        readiness=_router_readiness(),
+        live_service_factory=live_factory,
+        server_live_authorized=True,
+    )
+    replay_result = asyncio.run(
+        router.execute(
+            SearchRequest(query_id="replay", query="graph retrieval", mode="replay")
+        )
+    )
+    live_result = asyncio.run(
+        router.execute(
+            SearchRequest(query_id="live", query="graph retrieval", mode="live")
+        )
+    )
+
+    assert isinstance(replay_result.outcome, SearchSuccess)
+    assert isinstance(live_result.outcome, SearchSuccess)
+    assert events == ["execute:replay", "execute:live", "publish:live"]
+    assert factory_calls == ["live"]
+
+    missing_factory = SearchServiceRouter(
+        replay_service=replay,
+        readiness=_router_readiness(),
+        live_service_factory=None,
+        server_live_authorized=True,
+    )
+    server_disallowed = SearchServiceRouter(
+        replay_service=replay,
+        readiness=_router_readiness(),
+        live_service_factory=live_factory,
+        server_live_authorized=False,
+    )
+    for unavailable in (missing_factory, server_disallowed):
+        result = asyncio.run(
+            unavailable.execute(
+                SearchRequest(query_id="live-denied", query="graph retrieval", mode="live")
+            )
+        )
+        assert result.outcome.kind == "failure"
+        assert result.outcome.error.code == "live_not_authorized"

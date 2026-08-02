@@ -1,11 +1,6 @@
 """Dependency-injected HTTP contracts for offline mock search."""
 
-from paper_search.api.app import (
-    ReadinessProbe,
-    SearchService,
-    app,
-    create_app,
-)
+from paper_search.api.app import app, create_app
 from paper_search.api.contracts import (
     BudgetProfile,
     LiveHealthResponse,
@@ -15,23 +10,27 @@ from paper_search.api.contracts import (
     UnavailableResponse,
 )
 from paper_search.api.service import (
+    LiveSearchService,
     MockApiSearchService,
     OrchestratorFactory,
+    SearchExecutionService,
     SearchOrchestrator,
 )
+from paper_search.api.routing import SearchServiceRouter
 
 
 __all__ = [
     "BudgetProfile",
     "LiveHealthResponse",
+    "LiveSearchService",
     "MockApiSearchService",
     "OrchestratorFactory",
     "ProviderHealthStatus",
-    "ReadinessProbe",
     "ReadyHealthResponse",
     "SearchOrchestrator",
     "SearchRequest",
-    "SearchService",
+    "SearchExecutionService",
+    "SearchServiceRouter",
     "UnavailableResponse",
     "app",
     "create_app",

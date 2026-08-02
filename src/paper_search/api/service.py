@@ -5,6 +5,10 @@ from typing import Protocol
 
 from paper_search.api.contracts import BudgetProfile, SearchRequest
 from paper_search.application import StructuredSearchResponse
+from paper_search.application.contracts import (
+    SearchExecutionResult,
+    SearchSuccess,
+)
 from paper_search.pipeline.orchestrator import MinimalSearchResult
 from paper_search.pipeline.response import to_structured_response
 
@@ -19,6 +23,18 @@ class SearchOrchestrator(Protocol):
 
 
 OrchestratorFactory = Callable[[BudgetProfile], SearchOrchestrator]
+
+
+class SearchExecutionService(Protocol):
+    """The canonical application service shape consumed by API routing."""
+
+    async def execute(self, request: SearchRequest) -> SearchExecutionResult: ...
+
+
+class LiveSearchService(SearchExecutionService, Protocol):
+    """A request-scoped live service whose capture is published atomically."""
+
+    async def publish(self, execution: SearchExecutionResult) -> None: ...
 
 
 class MockApiSearchService:
@@ -54,3 +70,11 @@ class MockApiSearchService:
         if not request.include_trace:
             return response.model_copy(update={"search_trace": []})
         return response
+
+    async def execute(self, request: SearchRequest) -> SearchExecutionResult:
+        """Expose the mock path through the same canonical result contract."""
+        return SearchExecutionResult(
+            outcome=SearchSuccess(response=await self(request)),
+            diagnostics=[],
+            business_result_sha256=None,
+        )

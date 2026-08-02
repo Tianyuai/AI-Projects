@@ -12,6 +12,9 @@ from fastapi import FastAPI
 import uvicorn
 
 from paper_search.api.app import create_app
+from paper_search.api.routing import SearchServiceRouter
+from paper_search.application.contracts import ReadyHealthResponse
+from paper_search.domain.models import DependencyStatus
 from paper_search.evaluation.synthetic_mocks import build_synthetic_search_service
 
 
@@ -46,10 +49,25 @@ def mock_readiness() -> dict[str, bool]:
 
 def create_mock_app() -> FastAPI:
     """Build the only app composition exposed by the mock-server entry point."""
-    return create_app(
-        build_synthetic_search_service(),
-        readiness_probe=mock_readiness,
+    router = SearchServiceRouter(
+        replay_service=build_synthetic_search_service(),
+        readiness=ReadyHealthResponse(
+            status="ready",
+            execution_mode="replay",
+            snapshot_set_id="mock-snapshot-v1",
+            dependencies=[
+                DependencyStatus(
+                    dependency=dependency,
+                    state="ready",
+                    cache_hit=False,
+                    error_codes=[],
+                )
+                for dependency in ("llm", "openalex", "semantic_scholar")
+            ],
+            last_authorized_probe_at=None,
+        ),
     )
+    return create_app(router)
 
 
 def _port(value: str) -> int:

@@ -906,7 +906,8 @@ class SQLiteBudgetLedger:
                 and project_actual + project_reserved <= self._hard_micro
             )
             receipt_rows = connection.execute(
-                "SELECT * FROM reservations ORDER BY run_id, query_id, reservation_id"
+                "SELECT * FROM reservations WHERE run_id = ? ORDER BY rowid",
+                (run_id,),
             ).fetchall()
             receipts = [
                 LedgerReceipt(
@@ -938,9 +939,7 @@ class SQLiteBudgetLedger:
                 reserved=reserved,
                 actual=UsageActual.model_validate(actual.model_dump()),
                 run_cap_cny=_from_micro(run_cap_micro),
-                project_actual_cny=(
-                    Decimal("0") if self._replay else _from_micro(project_actual)
-                ),
+                project_actual_cny=actual.cost_cny or Decimal("0"),
                 project_soft_stop_cny=_from_micro(self._soft_micro),
                 project_hard_cap_cny=_from_micro(self._hard_micro),
                 within_caps=within_caps,

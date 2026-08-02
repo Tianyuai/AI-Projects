@@ -51,8 +51,11 @@ from paper_search.control.pricing import (
     parse_quality_gate_policy_bytes,
 )
 from paper_search.evaluation.freeze_schema import FreezeManifestV2
-from paper_search.evaluation.formal_evidence import formal_audit_measures
-from paper_search.evaluation.gates import evaluate_gates
+from paper_search.evaluation.formal_evidence import (
+    complete_policy_measures,
+    formal_audit_measures,
+)
+from paper_search.evaluation.gates import MeasureValue, evaluate_gates
 from paper_search.evaluation.official_adapter import adapt_prediction_record
 from paper_search.control import HardBudgetController
 from paper_search.domain.models import (
@@ -1043,6 +1046,22 @@ def _close_outstanding_reservations(
             continue
 
 
+def _stop_on_formal_evidence_failure(
+    measures: dict[str, MeasureValue],
+) -> None:
+    required_zero = (
+        "integrity_failures",
+        "provenance_failures",
+        "sanitization_failures",
+        "unaccounted_usage_failures",
+    )
+    if any(
+        (measure := measures.get(name)) is None or measure.value != 0
+        for name in required_zero
+    ):
+        raise ValueError("formal evidence integrity check failed")
+
+
 def _reject_or_recover_existing_attempt(
     *,
     store: ValidationAttemptStore,
@@ -1163,24 +1182,28 @@ async def _run_formal_evaluation(
         readiness_summary=readiness.dependencies,
         failure_count=0,
     )
-    workspace = FormalRunWorkspace(
-        runs_root=request.output_root,
-        manifest=manifest,
-        input_lock_bytes=inputs.lock_bytes,
-        nonce_factory=lambda: hashlib.sha256(run_id.encode()).hexdigest()[:12],
-        clock=clock,
-        replay_snapshot_root=inputs.snapshot_root,
-    )
-    if request.mode == "live":
-        bundle.artifact_factory._sessions[run_id.casefold()] = _FormalCaptureBinding(  # type: ignore[assignment]  # noqa: SLF001
-            run_id=run_id,
-            store=workspace.snapshot_store,
+    try:
+        workspace = FormalRunWorkspace(
+            runs_root=request.output_root,
+            manifest=manifest,
+            input_lock_bytes=inputs.lock_bytes,
+            nonce_factory=lambda: hashlib.sha256(run_id.encode()).hexdigest()[:12],
+            clock=clock,
+            replay_snapshot_root=inputs.snapshot_root,
         )
-    ledger = SQLiteBudgetLedger(
-        request.output_root / ".ledger" / "formal.sqlite3",
-        clock=clock,
-        replay=request.mode == "replay",
-    )
+        if request.mode == "live":
+            bundle.artifact_factory._sessions[run_id.casefold()] = _FormalCaptureBinding(  # type: ignore[assignment]  # noqa: SLF001
+                run_id=run_id,
+                store=workspace.snapshot_store,
+            )
+        ledger = SQLiteBudgetLedger(
+            request.output_root / ".ledger" / "formal.sqlite3",
+            clock=clock,
+            replay=request.mode == "replay",
+        )
+    except BaseException:
+        await bundle.aclose()
+        raise
     per_query_cost = (
         Decimal("0")
         if request.mode == "replay"
@@ -1258,13 +1281,18 @@ async def _run_formal_evaluation(
         report = ledger.report(run_id)
         failures = [record.failure for record in adapted if record.failure is not None]
         business_results = [record.business_result for record in adapted]
-        audit_measures = formal_audit_measures(
-            frozen_queries=inputs.gold,
-            executions=[record.execution for record in adapted],
-            business_results=business_results,
-            failures=failures,
-            ledger_report=report,
+        audit_measures = complete_policy_measures(
+            formal_audit_measures(
+                frozen_queries=inputs.gold,
+                executions=[record.execution for record in adapted],
+                business_results=business_results,
+                failures=failures,
+                ledger_report=report,
+            ),
+            policy=inputs.gate_policy,
+            split=request.split,
         )
+        _stop_on_formal_evidence_failure(audit_measures)
         gate = evaluate_gates(
             frozen_queries=inputs.gold,
             predictions=predictions,

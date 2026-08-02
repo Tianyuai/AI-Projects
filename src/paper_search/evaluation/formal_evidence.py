@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from decimal import Decimal
 
 from paper_search.control.ledger import LedgerReport
+from paper_search.control.pricing import QualityGatePolicy
 from paper_search.evaluation.business_results import BusinessResultRecord
 from paper_search.evaluation.dataset import EvaluationQuery
 from paper_search.evaluation.execution_adapter import (
@@ -127,4 +128,19 @@ def formal_audit_measures(
     return measures
 
 
-__all__ = ["formal_audit_measures"]
+def complete_policy_measures(
+    measures: dict[str, MeasureValue],
+    *,
+    policy: QualityGatePolicy,
+    split: str,
+) -> dict[str, MeasureValue]:
+    """Represent every applicable policy measure, explicitly marking unavailable data."""
+    completed = measures.copy()
+    unavailable = MeasureValue(numerator=Decimal(0), denominator=Decimal(0), value=None)
+    for rule in policy.rules:
+        if split in rule.applies_to:
+            completed.setdefault(rule.measure, unavailable)
+    return completed
+
+
+__all__ = ["complete_policy_measures", "formal_audit_measures"]

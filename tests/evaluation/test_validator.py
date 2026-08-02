@@ -295,3 +295,84 @@ def test_frozen_evidence_requires_v2_schema_and_identifier_binding(
 
     with pytest.raises(ValueError):
         validator_module._frozen_evidence(lock)
+
+
+def test_execution_snapshot_refs_must_bind_exact_manifest_entries(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "capture"
+    shutil.copytree(FIXTURE_ROOT / "capture", run)
+    lines = (run / "executions.jsonl").read_text(encoding="utf-8").splitlines()
+    execution = json.loads(lines[0])
+    execution["diagnostics"] = [
+        {
+            "dependency": "openalex",
+            "endpoint": "dependency",
+            "model_id": None,
+            "usage": {
+                "search_api_calls": 0,
+                "llm_calls": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cost_cny": "0",
+                "elapsed_ms": 0,
+            },
+            "latency_ms": 0,
+            "cache_hit": True,
+            "snapshot_refs": [
+                {
+                    "entry_id": "forged-entry",
+                    "dependency": "openalex",
+                    "cache_key": "sha256:" + "a" * 64,
+                    "response_sha256": "sha256:" + "b" * 64,
+                    "captured_at": "2026-08-02T00:00:00Z",
+                    "snapshot_path": "responses/openalex/forged.bin",
+                }
+            ],
+            "errors": [],
+        }
+    ]
+    lines[0] = json.dumps(execution)
+    (run / "executions.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    result = validate_run_directory(run)
+
+    assert not result.valid
+    assert "snapshot_ref_invalid" in {issue.code for issue in result.issues}
+
+
+def test_validator_rejects_foreign_project_receipts(tmp_path: Path) -> None:
+    run = tmp_path / "capture"
+    shutil.copytree(FIXTURE_ROOT / "capture", run)
+    payload = json.loads((run / "usage.json").read_bytes())
+    foreign = dict(payload["receipts"][0])
+    foreign.update(
+        {
+            "reservation_id": "foreign-reservation",
+            "run_id": "foreign-run",
+            "query_id": "foreign-query",
+        }
+    )
+    foreign["actual"] = dict(foreign["actual"])
+    foreign["actual"]["cost_cny"] = "100"
+    payload["receipts"].append(foreign)
+    payload["project_actual_cny"] = "100"
+    (run / "usage.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    result = validate_run_directory(run)
+
+    assert not result.valid
+    assert "ledger_invalid" in {issue.code for issue in result.issues}
+
+
+def test_validator_rejects_symlink_run_root(tmp_path: Path) -> None:
+    link = tmp_path / "capture-link"
+    try:
+        link.symlink_to(FIXTURE_ROOT.resolve() / "capture", target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"symlink creation is unavailable: {error}")
+
+    result = validate_run_directory(link)
+
+    assert not result.valid
+    assert "run_directory_unavailable" in {issue.code for issue in result.issues}

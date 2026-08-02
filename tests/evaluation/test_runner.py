@@ -35,6 +35,7 @@ from paper_search.domain.models import (
 )
 from paper_search.evaluation.dataset import EvaluationQuery, PredictionRecord
 from paper_search.evaluation.metrics import CONTRACT_VERSION
+from paper_search.evaluation.gates import MeasureValue
 from paper_search.evaluation.runner import (
     EvaluationRunRequest,
     EvaluationRunResult,
@@ -2577,3 +2578,81 @@ def test_post_publication_attempt_transition_error_does_not_mark_run_failed(
     assert result.status == "complete"
     assert result.run_path.is_dir()
     assert targets == ["complete"]
+
+
+def test_formal_integrity_guard_stops_unaccounted_usage() -> None:
+    guard = getattr(runner_module, "_stop_on_formal_evidence_failure", None)
+
+    assert guard is not None
+    with pytest.raises(ValueError, match="formal evidence integrity"):
+        guard(
+            {
+                "integrity_failures": MeasureValue(numerator=0, denominator=1, value=0),
+                "provenance_failures": MeasureValue(numerator=0, denominator=1, value=0),
+                "sanitization_failures": MeasureValue(numerator=0, denominator=1, value=0),
+                "unaccounted_usage_failures": MeasureValue(numerator=1, denominator=1, value=1),
+            }
+        )
+
+
+def test_formal_runner_closes_bundle_when_workspace_setup_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_bytes = Path("tests/fixtures/formal_run/capture/config.lock.yaml").read_bytes()
+    lock = runner_module.CandidateLock.model_validate(yaml.safe_load(lock_bytes))
+    closed = False
+
+    class FakeBundle:
+        def readiness_probe(self) -> object:
+            return SimpleNamespace(status="ready", dependencies=[])
+
+        async def aclose(self) -> None:
+            nonlocal closed
+            closed = True
+
+    class FakeRoot:
+        @staticmethod
+        def compose(**kwargs: object) -> FakeBundle:
+            del kwargs
+            return FakeBundle()
+
+    monkeypatch.setattr(
+        runner_module,
+        "_load_formal_inputs",
+        lambda request: runner_module._FormalInputs(
+            lock=lock,
+            lock_bytes=lock_bytes,
+            gold=[EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"})],
+            identifier_map=runner_module.IdentifierMap.from_bytes(b"{}\n"),
+            gate_policy=runner_module.parse_quality_gate_policy_bytes(
+                Path("configs/quality_gates_v1.yaml").read_bytes()
+            ),
+            snapshot_manifest=None,
+            snapshot_root=None,
+        ),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "FormalRunWorkspace",
+        lambda **kwargs: (_ for _ in ()).throw(LookupError("workspace setup failed")),
+    )
+
+    with pytest.raises(LookupError, match="workspace setup"):
+        asyncio.run(
+            runner_module._run_formal_evaluation(
+                EvaluationRunRequest(
+                    split="dev",
+                    mode="live",
+                    lock_path=tmp_path / "candidate.lock.yaml",
+                    output_root=tmp_path / "runs",
+                    snapshot_manifest_path=None,
+                    network_authorized=True,
+                ),
+                composition_root=FakeRoot,
+                attempt_store_factory=runner_module.ValidationAttemptStore,
+                clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+            )
+        )
+
+    assert closed

@@ -39,7 +39,10 @@ from paper_search.evaluation.execution_adapter import (
     EvaluationFailureRecord,
 )
 from paper_search.evaluation.freeze_schema import FreezeManifestV2
-from paper_search.evaluation.formal_evidence import formal_audit_measures
+from paper_search.evaluation.formal_evidence import (
+    complete_policy_measures,
+    formal_audit_measures,
+)
 from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap
 from paper_search.evaluation.gates import evaluate_gates
 from paper_search.evaluation.metrics import EvaluationResult, evaluate
@@ -221,6 +224,8 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             )
         ],
     )
+    if path.is_symlink():
+        return unavailable, None, None
     try:
         root = path.resolve(strict=True)
     except OSError:
@@ -459,6 +464,7 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             and usage.project_actual_cny == project_actual
             and usage.within_caps == recomputed_within_caps
             and usage.within_caps
+            and len(run_receipts) == len(usage.receipts)
             and [receipt.query_id for receipt in run_receipts] == query_ids
             and len(receipt_by_query) == len(run_receipts)
             and all(receipt.state in {"settled", "failed"} for receipt in run_receipts)
@@ -478,14 +484,20 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             record for record in failures if isinstance(record, EvaluationFailureRecord)
         ]
         failure_count = len(failure_records)
-        audit = formal_audit_measures(
-            frozen_queries=frozen_queries,
-            executions=execution_records,
-            business_results=[
-                record for record in business if isinstance(record, BusinessResultRecord)
-            ],
-            failures=failure_records,
-            ledger_report=usage,
+        audit = complete_policy_measures(
+            formal_audit_measures(
+                frozen_queries=frozen_queries,
+                executions=execution_records,
+                business_results=[
+                    record
+                    for record in business
+                    if isinstance(record, BusinessResultRecord)
+                ],
+                failures=failure_records,
+                ledger_report=usage,
+            ),
+            policy=gate_policy,
+            split=manifest.split,
         )
         recomputed_gate = evaluate_gates(
             frozen_queries=frozen_queries,
@@ -533,6 +545,38 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             if isinstance(execution, EvaluationExecutionRecord)
             for diagnostic in execution.diagnostics
         ]
+        entry_by_key = {
+            (entry.request.dependency, entry.cache_key): entry
+            for entry in snapshot.entries
+        }
+        seen_snapshot_keys: list[tuple[str, str]] = []
+        snapshot_refs_valid = True
+        for diagnostic in diagnostics:
+            for ref in diagnostic.snapshot_refs:
+                key = (ref.dependency, ref.cache_key)
+                bound_entry = entry_by_key.get(key)
+                seen_snapshot_keys.append(key)
+                if (
+                    bound_entry is None
+                    or diagnostic.dependency != ref.dependency
+                    or ref.entry_id != bound_entry.entry_id
+                    or ref.response_sha256 != bound_entry.response_sha256
+                    or ref.captured_at != bound_entry.captured_at
+                    or ref.snapshot_path != bound_entry.response_path
+                ):
+                    snapshot_refs_valid = False
+        if (
+            not snapshot_refs_valid
+            or len(seen_snapshot_keys) != len(set(seen_snapshot_keys))
+            or set(seen_snapshot_keys) != set(entry_by_key)
+        ):
+            issues.append(
+                _issue(
+                    "snapshot_ref_invalid",
+                    "executions.jsonl",
+                    "Execution snapshot references do not bind the sealed manifest",
+                )
+            )
         if any(
             diagnostic.endpoint != "dependency"
             or any(

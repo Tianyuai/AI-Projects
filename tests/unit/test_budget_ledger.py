@@ -982,3 +982,17 @@ def test_malformed_restored_receipt_cannot_terminalize_prepared_ledger(
             "SELECT state, checkpoint_present FROM reservations"
         ).fetchone()
     assert stored == ("reserved", 1)
+def test_report_preserves_reservation_creation_order(tmp_path: Path) -> None:
+    ledger = SQLiteBudgetLedger(tmp_path / "ledger.sqlite3")
+    for query_id in ("q2", "q1"):
+        reservation = ledger.reserve(
+            run_id="ordered-run",
+            query_id=query_id,
+            estimate=UsageEstimate(cost_cny=Decimal("0.1")),
+            run_cap_cny=Decimal("18"),
+        )
+        ledger.settle(reservation, UsageActual(cost_cny=Decimal("0.1")))
+
+    report = ledger.report("ordered-run")
+
+    assert [receipt.query_id for receipt in report.receipts] == ["q2", "q1"]

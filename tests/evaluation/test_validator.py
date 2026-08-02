@@ -460,9 +460,16 @@ def test_canonical_gate_evidence_has_no_missing_reporting_values() -> None:
         if check["applies"] and check["classification"] == "reporting_only"
     ]
     checks_by_id = {check["rule_id"]: check for check in gate["checks"]}
+    cached_repeat_latency = checks_by_id["cached-repeat-latency-p50-ms"]
 
     assert len(applicable_reporting) == 30
-    assert all(check["measure"]["value"] is not None for check in applicable_reporting)
+    assert cached_repeat_latency["measure"]["value"] is None
+    assert cached_repeat_latency["passed"] is None
+    assert all(
+        check["measure"]["value"] is not None
+        for check in applicable_reporting
+        if check["rule_id"] != "cached-repeat-latency-p50-ms"
+    )
     assert checks_by_id["retrieval-response-rate"]["measure"]["value"] == "1"
     assert checks_by_id["hard-filter-recall-loss"]["measure"]["value"] == "0"
 

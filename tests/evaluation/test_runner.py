@@ -2788,7 +2788,7 @@ def test_retrieval_and_filter_gates_use_frozen_relevant_ids() -> None:
         usage=UsageActual(cost_cny=Decimal("0")),
         diagnostics=[
             DependencyDiagnostic(
-                dependency="openalex",
+                dependency="semantic_scholar",
                 endpoint="dependency",
                 model_id=None,
                 usage=UsageActual(cost_cny=Decimal("0")),
@@ -2796,7 +2796,24 @@ def test_retrieval_and_filter_gates_use_frozen_relevant_ids() -> None:
                 cache_hit=False,
                 snapshot_refs=[],
                 errors=[],
-            )
+            ),
+            DependencyDiagnostic(
+                dependency="openalex",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=2,
+                cache_hit=False,
+                snapshot_refs=[],
+                errors=[
+                    ErrorDetail(
+                        code="invalid_response",
+                        message="safe",
+                        retryable=False,
+                        provider="openalex",
+                    )
+                ],
+            ),
         ],
         retrieved_paper_ids=["openalex:W1", "openalex:W2"],
         post_filter_paper_ids=["openalex:W1"],
@@ -2823,11 +2840,12 @@ def test_retrieval_and_filter_gates_use_frozen_relevant_ids() -> None:
     )
 
     assert measures["parseable_configured_retrieval_response_rate"] == MeasureValue(
-        numerator=2, denominator=2, value=1
+        numerator=1, denominator=1, value=1
     )
     assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
         numerator=1, denominator=2, value=Decimal("0.5")
     )
+    assert "cached_repeat_latency_p50_ms" not in measures
 
 
 def test_invalid_openalex_response_cannot_self_report_retrieval_hits() -> None:

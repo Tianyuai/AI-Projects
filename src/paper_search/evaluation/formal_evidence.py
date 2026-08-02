@@ -34,11 +34,15 @@ def _measure(numerator: int | Decimal, denominator: int | Decimal) -> MeasureVal
     )
 
 
-def _has_parseable_openalex(execution: EvaluationExecutionRecord) -> bool:
-    diagnostics = [
-        item for item in execution.diagnostics if item.dependency == "openalex"
-    ]
-    return bool(diagnostics) and all(not item.errors for item in diagnostics)
+def _has_parseable_retrieval_response(
+    execution: EvaluationExecutionRecord,
+    *,
+    dependencies: frozenset[str] = frozenset({"openalex", "semantic_scholar"}),
+) -> bool:
+    return any(
+        item.dependency in dependencies and not item.errors
+        for item in execution.diagnostics
+    )
 
 
 def formal_audit_measures(
@@ -61,13 +65,15 @@ def formal_audit_measures(
     relevant_count = 0
     retrieved_relevant_count = 0
     post_filter_relevant_count = 0
+    parseable_retrieval_query_count = 0
     for query in frozen_queries:
         relevant = {resolve(identifier) for identifier in query.relevant_paper_ids}
         relevant_count += len(relevant)
         execution = execution_by_query.get(query.query_id)
         if execution is None:
             continue
-        parseable = _has_parseable_openalex(execution)
+        parseable = _has_parseable_retrieval_response(execution)
+        parseable_retrieval_query_count += parseable
         retrieved = (
             {resolve(identifier) for identifier in execution.retrieved_paper_ids}
             if parseable
@@ -113,11 +119,6 @@ def formal_audit_measures(
     p95 = latency_values[max(0, (95 * len(latency_values) + 99) // 100 - 1)] if latency_values else 0
     cached_latency_values = sorted(
         item.latency_ms for item in diagnostics if item.cache_hit
-    )
-    cached_p50 = (
-        cached_latency_values[(len(cached_latency_values) - 1) // 2]
-        if cached_latency_values
-        else 0
     )
 
     def canonical_id(identifier: str) -> bool:
@@ -181,8 +182,8 @@ def formal_audit_measures(
             count,
         ),
         "parseable_configured_retrieval_response_rate": _measure(
-            retrieved_relevant_count,
-            relevant_count,
+            parseable_retrieval_query_count,
+            count,
         ),
         "hard_filter_absolute_recall_loss": _measure(
             retrieved_relevant_count - post_filter_relevant_count,
@@ -210,8 +211,10 @@ def formal_audit_measures(
         "reason_complete_rate": _measure(reason_complete_queries, count),
         "verifiable_citation_edge_rate": _measure(verifiable_edge_queries, count),
         "fabricated_paper_or_relation_count": _measure(fabricated_count, 1),
-        "cached_repeat_latency_p50_ms": _measure(cached_p50, 1),
     }
+    if cached_latency_values:
+        cached_p50 = cached_latency_values[(len(cached_latency_values) - 1) // 2]
+        measures["cached_repeat_latency_p50_ms"] = _measure(cached_p50, 1)
     if metrics is not None:
         splits = {query.metadata.get("split") for query in frozen_queries}
         if len(splits) != 1 or not splits <= {"dev", "validation"}:
@@ -225,7 +228,10 @@ def formal_audit_measures(
                 predicted_paper_ids=(
                     execution_by_query[query.query_id].retrieved_paper_ids
                     if query.query_id in execution_by_query
-                    and _has_parseable_openalex(execution_by_query[query.query_id])
+                    and _has_parseable_retrieval_response(
+                        execution_by_query[query.query_id],
+                        dependencies=frozenset({"openalex"}),
+                    )
                     else []
                 ),
             )

@@ -680,12 +680,12 @@
       "applies": true,
       "classification": "reporting_only",
       "measure": {
-        "denominator": "1",
+        "denominator": "0",
         "numerator": "0",
-        "value": "0"
+        "value": null
       },
       "operator": "lte",
-      "passed": true,
+      "passed": null,
       "rule_id": "cached-repeat-latency-p50-ms",
       "threshold": 8000
     },

@@ -26,6 +26,7 @@ from paper_search.llm.client import (
     sanitize_request_id,
     usage_from_response_bytes,
     validate_model_id,
+    validate_prompt_version,
 )
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
@@ -69,6 +70,9 @@ class HardBudgetSettlementAdapter:
 
     def stop_status(self) -> str:
         return self._controller.stop_status()
+
+    def mark_dispatched(self, reservation: BudgetReservation) -> None:
+        self._controller.mark_dispatched(reservation)
 
     def settle(self, reservation: BudgetReservation, actual: UsageActual) -> None:
         self._controller.settle(reservation, actual)
@@ -252,6 +256,11 @@ class LiveCaptureLLMAnalyzer:
             for attempt in range(3):
                 started = time.perf_counter()
                 response: httpx.Response | None = None
+                mark_dispatched = getattr(
+                    self._controller, "mark_dispatched", None
+                )
+                if callable(mark_dispatched):
+                    mark_dispatched(reservation)
                 in_flight_started = started
                 try:
                     response = await self._client.request_response(
@@ -381,6 +390,18 @@ class LiveCaptureLLMAnalyzer:
                 pass
             raise cancellation from None
         except Exception:
+            if in_flight_started is not None:
+                measured_attempts.append(
+                    UsageActual(
+                        llm_calls=1,
+                        elapsed_ms=max(
+                            0,
+                            round(
+                                (time.perf_counter() - in_flight_started) * 1000
+                            ),
+                        ),
+                    )
+                )
             try:
                 _fail_closed_terminal(
                     self._controller,
@@ -407,8 +428,10 @@ class ReplayLLMAnalyzer:
     ) -> None:
         self._reader = reader
         self._model_id = validate_model_id(model_id)
-        self._prompt_version = prompt_version
-        self._decoder = decoder or LLMResponseDecoder(prompt_version=prompt_version)
+        self._prompt_version = validate_prompt_version(prompt_version)
+        self._decoder = decoder or LLMResponseDecoder(
+            prompt_version=self._prompt_version
+        )
         self._clock = clock
 
     async def generate_json(

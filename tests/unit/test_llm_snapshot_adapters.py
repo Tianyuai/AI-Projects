@@ -17,7 +17,7 @@ from paper_search.domain.models import (
     UsageActual,
     UsageEstimate,
 )
-from paper_search.llm.client import OpenAICompatibleLLMClient
+from paper_search.llm.client import LLMResponseDecoder, OpenAICompatibleLLMClient
 from paper_search.llm.snapshot_adapters import (
     HardBudgetSettlementAdapter,
     LLMAdapterError,
@@ -262,6 +262,48 @@ def test_cancellation_after_dispatch_fail_closes_then_reraises_cancelled_error(
     assert settlement.committed_usage.llm_calls == 1
 
 
+def test_unexpected_exception_after_dispatch_commits_conservative_usage(
+    tmp_path: Path,
+) -> None:
+    controller = _budget_controller()
+    reservation = _controller_reservation(controller)
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        raise RuntimeError("sensitive response boundary failure")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://llm.example.test/v1",
+                    model="qwen-test-v1",
+                    api_key="unit-test-secret",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "unexpected"),
+                pricer=_pricer(),
+                controller=HardBudgetSettlementAdapter(controller),
+            )
+            with pytest.raises(LLMAdapterError) as error:
+                await analyzer.generate_json(
+                    prompt_name="query_analyze",
+                    payload={"query": "x"},
+                    reservation=reservation,
+                )
+            assert str(error.value) == "LLM live capture failed"
+            assert "sensitive" not in repr(error.value)
+
+    asyncio.run(run())
+
+    assert controller.stop_status() == "hard_stop"
+    assert controller.reserved_usage == UsageEstimate()
+    assert controller.committed_usage.llm_calls == 1
+    assert controller.committed_usage.cost_cny is None
+    assert controller.unknown_cost_actions == ["query.analyze"]
+
+
 def test_live_capture_builds_safe_identity_and_stages_exact_success_bytes(
     tmp_path: Path,
 ) -> None:
@@ -365,6 +407,28 @@ def test_replay_rejects_secret_shaped_model_identifier(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="model identifier is not safe"):
         ReplayLLMAnalyzer(reader=reader, model_id="sk-live-replay-secret")
+
+
+def test_injected_decoder_cannot_bypass_replay_prompt_version_validation(
+    tmp_path: Path,
+) -> None:
+    store = DependencyCaptureStore(tmp_path / "empty-prompt-check")
+    store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+    )
+    secret_prompt_version = "query-sk-live-replay-secret"
+
+    with pytest.raises(ValueError, match="prompt version is not safe") as error:
+        ReplayLLMAnalyzer(
+            reader=reader,
+            model_id="qwen-test-v1",
+            prompt_version=secret_prompt_version,
+            decoder=LLMResponseDecoder(prompt_version="query-analyze-v1"),
+        )
+
+    assert secret_prompt_version not in str(error.value)
 
 
 @pytest.mark.parametrize(

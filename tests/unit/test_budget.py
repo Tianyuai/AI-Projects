@@ -440,6 +440,165 @@ def test_terminal_fail_closed_records_dispatched_usage_after_ttl() -> None:
     assert controller.reserved_usage == UsageEstimate()
 
 
+def test_terminal_fail_closed_commits_after_status_expires_reservation() -> None:
+    controller_type, _, reservation_error = budget_api()
+    current = datetime(2026, 8, 2, tzinfo=UTC)
+    controller = controller_type(
+        make_budget(),
+        formal_live=True,
+        clock=lambda: current,
+        reservation_ttl_seconds=1,
+    )
+    reservation = controller.reserve(
+        "llm.status-race",
+        UsageEstimate(llm_calls=1, cost_cny=0.5),
+    )
+    controller.mark_dispatched(reservation)
+    current += timedelta(seconds=2)
+
+    assert controller.stop_status() == "continue"
+    assert controller.reserved_usage == UsageEstimate()
+    controller.fail_closed(
+        reservation,
+        UsageActual(llm_calls=1, cost_cny=None),
+    )
+
+    assert controller.stop_status() == "hard_stop"
+    assert controller.committed_usage.llm_calls == 1
+    assert controller.unknown_cost_actions == ["llm.status-race"]
+    with pytest.raises(reservation_error, match="reservation is unknown"):
+        controller.fail_closed(reservation, UsageActual(llm_calls=1))
+
+
+def test_unused_expiry_remains_uncommitted_after_public_observation() -> None:
+    controller_type, _, reservation_error = budget_api()
+    current = datetime(2026, 8, 2, tzinfo=UTC)
+    controller = controller_type(
+        make_budget(),
+        clock=lambda: current,
+        reservation_ttl_seconds=1,
+    )
+    reservation = controller.reserve(
+        "provider.unused", UsageEstimate(search_api_calls=1)
+    )
+    current += timedelta(seconds=2)
+
+    assert controller.reserved_usage == UsageEstimate()
+    assert controller.committed_usage == UsageActual()
+    assert controller.can_reserve(UsageEstimate(search_api_calls=1)) is True
+    with pytest.raises(reservation_error, match="reservation is unknown"):
+        controller.fail_closed(reservation, UsageActual(search_api_calls=1))
+
+
+def test_expired_terminal_authority_survives_export_and_restore() -> None:
+    controller_type, _, _ = budget_api()
+    current = datetime(2026, 8, 2, tzinfo=UTC)
+    controller = controller_type(
+        make_budget(),
+        formal_live=True,
+        clock=lambda: current,
+        reservation_ttl_seconds=1,
+    )
+    reservation = controller.reserve(
+        "llm.restored-terminal",
+        UsageEstimate(llm_calls=1, cost_cny=0.5),
+    )
+    controller.mark_dispatched(reservation)
+    current += timedelta(seconds=2)
+    state = controller.export_state()
+
+    restored = controller_type.from_state(
+        make_budget(),
+        state,
+        clock=lambda: current,
+    )
+    restored.fail_closed(
+        reservation,
+        UsageActual(llm_calls=1, cost_cny=None),
+    )
+
+    assert state["version"] == 3
+    assert restored.stop_status() == "hard_stop"
+    assert restored.committed_usage.llm_calls == 1
+    assert restored.unknown_cost_actions == ["llm.restored-terminal"]
+
+
+def test_expiry_observer_and_terminal_finalizer_do_not_double_count() -> None:
+    controller_type, _, reservation_error = budget_api()
+    current = datetime(2026, 8, 2, tzinfo=UTC)
+    controller = controller_type(
+        make_budget(),
+        formal_live=True,
+        clock=lambda: current,
+        reservation_ttl_seconds=1,
+    )
+    reservation = controller.reserve(
+        "llm.expiry-race",
+        UsageEstimate(llm_calls=1, cost_cny=0.5),
+    )
+    controller.mark_dispatched(reservation)
+    current += timedelta(seconds=2)
+    barrier = threading.Barrier(3)
+    observed_expiry = threading.Event()
+    outcomes: list[str] = []
+
+    def observe() -> None:
+        barrier.wait()
+        controller.reserved_usage
+        outcomes.append("observed")
+        observed_expiry.set()
+
+    def finalize() -> None:
+        barrier.wait()
+        observed_expiry.wait()
+        try:
+            controller.fail_closed(
+                reservation,
+                UsageActual(llm_calls=1, cost_cny=None),
+            )
+        except reservation_error:
+            outcomes.append("rejected")
+        else:
+            outcomes.append("committed")
+
+    threads = [threading.Thread(target=observe), threading.Thread(target=finalize)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["committed", "observed"]
+    assert controller.committed_usage.llm_calls == 1
+    with pytest.raises(reservation_error, match="reservation is unknown"):
+        controller.fail_closed(reservation, UsageActual(llm_calls=1))
+
+
+@pytest.mark.parametrize("completed_as", ["settled", "released"])
+def test_terminal_fail_closed_rejects_settled_or_released_reservation(
+    completed_as: str,
+) -> None:
+    controller_type, _, reservation_error = budget_api()
+    controller = controller_type(
+        make_budget(max_search_api_calls=2, target_search_api_calls=1)
+    )
+    reservation = controller.reserve(
+        "provider.completed",
+        UsageEstimate(search_api_calls=1),
+    )
+    if completed_as == "settled":
+        controller.settle(reservation, UsageActual(search_api_calls=1))
+    else:
+        controller.release(reservation)
+
+    with pytest.raises(reservation_error, match="reservation is unknown"):
+        controller.fail_closed(reservation, UsageActual(search_api_calls=1))
+
+    expected_calls = 1 if completed_as == "settled" else 0
+    assert controller.committed_usage.search_api_calls == expected_calls
+    assert controller.stop_status() == "continue"
+
+
 def test_terminal_fail_closed_is_concurrent_exact_once() -> None:
     controller_type, _, reservation_error = budget_api()
     controller = controller_type(make_budget(), formal_live=True)
@@ -514,7 +673,7 @@ def test_recovery_preserves_strict_v1_formal_live_when_present() -> None:
     assert restored.formal_live is True
 
 
-def test_exported_v2_formal_live_state_preserves_unknown_cost_rejection() -> None:
+def test_exported_v3_formal_live_state_preserves_unknown_cost_rejection() -> None:
     controller_type, _, reservation_error = budget_api()
     controller = controller_type(make_budget(), formal_live=True)
 
@@ -522,7 +681,7 @@ def test_exported_v2_formal_live_state_preserves_unknown_cost_rejection() -> Non
     restored = controller_type.from_state(make_budget(), state)
     reservation = restored.reserve("provider.search", UsageEstimate(search_api_calls=1))
 
-    assert state["version"] == 2
+    assert state["version"] == 3
     with pytest.raises(reservation_error, match="formal live"):
         restored.settle(reservation, UsageActual())
 
@@ -544,4 +703,4 @@ def test_recovery_rejects_unknown_budget_state_version() -> None:
     controller_type, _, _ = budget_api()
 
     with pytest.raises(ValueError, match="version"):
-        controller_type.from_state(make_budget(), legacy_v1_state(version=3))
+        controller_type.from_state(make_budget(), legacy_v1_state(version=4))

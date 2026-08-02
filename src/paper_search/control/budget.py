@@ -73,6 +73,8 @@ class HardBudgetController:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._lock = threading.RLock()
         self._reservations: dict[str, BudgetReservation] = {}
+        self._expired_reservations: dict[str, BudgetReservation] = {}
+        self._dispatched_reservations: set[str] = set()
         self._committed: list[UsageActual] = []
         self._committed_actions: list[str] = []
         self._fail_closed = False
@@ -167,6 +169,7 @@ class HardBudgetController:
             ]
             self._check_hard_limits([*self._committed, *other_reserved, actual])
             del self._reservations[reservation.reservation_id]
+            self._dispatched_reservations.discard(reservation.reservation_id)
             self._committed.append(actual)
             self._committed_actions.append(active.action)
 
@@ -178,6 +181,19 @@ class HardBudgetController:
             if active != reservation:
                 raise ReservationError("reservation is unknown or does not match the active reservation")
             del self._reservations[reservation.reservation_id]
+            self._dispatched_reservations.discard(reservation.reservation_id)
+
+    def mark_dispatched(self, reservation: BudgetReservation) -> None:
+        """Retain terminal authority only after an external call is dispatched."""
+
+        with self._lock:
+            self._expire_locked()
+            active = self._reservations.get(reservation.reservation_id)
+            if active != reservation:
+                raise ReservationError(
+                    "reservation is unknown or does not match the active reservation"
+                )
+            self._dispatched_reservations.add(reservation.reservation_id)
 
     def expire_reservations(self) -> list[str]:
         """Release expired reservations and return their stable IDs."""
@@ -197,9 +213,7 @@ class HardBudgetController:
         exceeds the reservation, because the controller is hard-stopped at the same time.
         """
         with self._lock:
-            active = self._reservations.get(reservation.reservation_id)
-            if active != reservation:
-                raise ReservationError("reservation is unknown or does not match the active reservation")
+            active = self._terminal_reservation_locked(reservation)
             self._fail_closed = True
             if actual is None:
                 return
@@ -219,11 +233,21 @@ class HardBudgetController:
         if not committed:
             raise ReservationError("terminal settlement requires actual usage")
         with self._lock:
-            active = self._reservations.get(reservation.reservation_id)
-            if active != reservation:
-                raise ReservationError("reservation is unknown or does not match the active reservation")
+            active = self._terminal_reservation_locked(reservation)
             self._fail_closed = True
             self._commit_terminal_locked(active, committed)
+
+    def _terminal_reservation_locked(
+        self, reservation: BudgetReservation
+    ) -> BudgetReservation:
+        active = self._reservations.get(reservation.reservation_id)
+        expired = self._expired_reservations.get(reservation.reservation_id)
+        terminal = active if active is not None else expired
+        if terminal != reservation:
+            raise ReservationError(
+                "reservation is unknown or does not match the active reservation"
+            )
+        return terminal
 
     def _commit_terminal_locked(
         self,
@@ -234,7 +258,9 @@ class HardBudgetController:
             UsageActual.model_validate(actual.model_dump(mode="python"))
             for actual in actuals
         ]
-        del self._reservations[reservation.reservation_id]
+        self._reservations.pop(reservation.reservation_id, None)
+        self._expired_reservations.pop(reservation.reservation_id, None)
+        self._dispatched_reservations.discard(reservation.reservation_id)
         self._committed.extend(committed)
         self._committed_actions.extend(reservation.action for _ in committed)
 
@@ -264,11 +290,18 @@ class HardBudgetController:
         with self._lock:
             self._expire_locked()
             return {
-                "version": 2,
+                "version": 3,
                 "reservation_ttl_seconds": self.reservation_ttl_seconds,
                 "formal_live": self.formal_live,
                 "fail_closed": self._fail_closed,
                 "reservations": [item.model_dump(mode="json") for item in self._reservations.values()],
+                "expired_reservations": [
+                    item.model_dump(mode="json")
+                    for item in self._expired_reservations.values()
+                ],
+                "dispatched_reservation_ids": sorted(
+                    self._dispatched_reservations
+                ),
                 "committed": [
                     {"action": action, "usage": usage.model_dump(mode="json")}
                     for action, usage in zip(self._committed_actions, self._committed, strict=True)
@@ -285,7 +318,7 @@ class HardBudgetController:
     ) -> HardBudgetController:
         """Restore validated state without bypassing budget accounting invariants."""
         version = state.get("version")
-        if type(version) is not int or version not in {1, 2}:
+        if type(version) is not int or version not in {1, 2, 3}:
             raise ValueError("invalid budget controller state version")
 
         reservation_ttl_seconds = state.get("reservation_ttl_seconds")
@@ -310,18 +343,65 @@ class HardBudgetController:
             formal_live=formal_live,
         )
         reservations = state.get("reservations")
+        expired_reservations = (
+            state.get("expired_reservations") if version == 3 else []
+        )
+        dispatched_reservation_ids = (
+            state.get("dispatched_reservation_ids") if version == 3 else None
+        )
         committed = state.get("committed")
-        if not isinstance(reservations, list) or not isinstance(committed, list):
+        if (
+            not isinstance(reservations, list)
+            or not isinstance(expired_reservations, list)
+            or (
+                version == 3
+                and not isinstance(dispatched_reservation_ids, list)
+            )
+            or not isinstance(committed, list)
+        ):
             raise ValueError("invalid budget controller state")
         try:
             restored_reservations = [BudgetReservation.model_validate(raw) for raw in reservations]
-            if len({item.reservation_id for item in restored_reservations}) != len(
-                restored_reservations
+            restored_expired = [
+                BudgetReservation.model_validate(raw) for raw in expired_reservations
+            ]
+            all_reservations = [*restored_reservations, *restored_expired]
+            if len({item.reservation_id for item in all_reservations}) != len(
+                all_reservations
             ):
                 raise ValueError("duplicate reservation IDs")
             controller._reservations = {
                 item.reservation_id: item for item in restored_reservations
             }
+            controller._expired_reservations = {
+                item.reservation_id: item for item in restored_expired
+            }
+            all_reservation_ids = {
+                item.reservation_id for item in all_reservations
+            }
+            expired_ids = {item.reservation_id for item in restored_expired}
+            if version == 3:
+                assert isinstance(dispatched_reservation_ids, list)
+                if (
+                    any(
+                        not isinstance(reservation_id, str)
+                        for reservation_id in dispatched_reservation_ids
+                    )
+                    or len(set(dispatched_reservation_ids))
+                    != len(dispatched_reservation_ids)
+                ):
+                    raise ValueError("invalid dispatched reservation IDs")
+                restored_dispatched = set(dispatched_reservation_ids)
+                if (
+                    not restored_dispatched <= all_reservation_ids
+                    or not expired_ids <= restored_dispatched
+                ):
+                    raise ValueError("invalid dispatched reservation IDs")
+            else:
+                restored_dispatched = {
+                    item.reservation_id for item in restored_reservations
+                }
+            controller._dispatched_reservations = restored_dispatched
             controller._committed = []
             controller._committed_actions = []
             for raw in committed:
@@ -346,7 +426,11 @@ class HardBudgetController:
             if reservation.expires_at <= now
         ]
         for reservation_id in expired:
-            del self._reservations[reservation_id]
+            reservation = self._reservations.pop(reservation_id)
+            if reservation_id in self._dispatched_reservations:
+                self._expired_reservations[reservation_id] = reservation
+            else:
+                self._dispatched_reservations.discard(reservation_id)
         return sorted(expired)
 
     def _check_hard_limits(self, usages: list[UsageEstimate]) -> None:

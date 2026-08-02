@@ -22,6 +22,10 @@ from paper_search.application.locks import (
     load_input_lock,
     lock_sha256,
 )
+from paper_search.application.service import (
+    SearchApplicationError,
+    SearchApplicationService,
+)
 from paper_search.domain.models import (
     DependencyErrorCode,
     DependencyName,
@@ -50,6 +54,8 @@ __all__ = [
     "SafeRelativePath",
     "SearchErrorResponse",
     "SearchErrorCode",
+    "SearchApplicationError",
+    "SearchApplicationService",
     "SearchExecutionResult",
     "SearchFailure",
     "SearchMode",

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 from paper_search.control.budget import HardBudgetController
+from paper_search.application.contracts import SnapshotRef
 from paper_search.domain.models import (
     ErrorDetail,
     Paper,
@@ -156,6 +158,38 @@ class FakeProvider:
             [] if self.failed or self.empty else [paper],
             UsageActual(search_api_calls=1),
             failed=self.failed,
+        )
+
+
+class SnapshotProvider(FakeProvider):
+    async def search(
+        self,
+        query: str,
+        filters: dict[str, object],
+        limit: int,
+        reservation: object,
+    ) -> ProviderResult[list[Paper]]:
+        result = await super().search(query, filters, limit, reservation)
+        index = len(self.events)
+        ref = SnapshotRef(
+            entry_id=f"entry-{index}",
+            dependency=self.name,
+            cache_key="sha256:" + f"{index:x}" * 64,
+            response_sha256="sha256:" + f"{index:x}" * 64,
+            captured_at=datetime(2026, 7, 23, tzinfo=UTC),
+            snapshot_path=f"responses/{self.name}/{index}.bin",
+        )
+        return result.model_copy(
+            update={
+                "cache_hit": True,
+                "provenance": {
+                    **result.provenance,
+                    "snapshot_refs": json.dumps(
+                        [ref.model_dump(mode="json")],
+                        separators=(",", ":"),
+                    ),
+                },
+            }
         )
 
 
@@ -365,12 +399,39 @@ def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
         "fuse",
     ]
     assert set(result.provider_results) == {"openalex", "semantic_scholar"}
+    assert result.fused_papers[0].paper.canonical_id == "openalex:W1"
+    assert result.fused_papers[0].score > 0
+    assert result.fused_papers[0].source_ranks == {"openalex": 1}
     assert result.config_hash == "sha256:" + "b" * 64
     assert result.prompt_version == "query-analyze-v1"
     assert result.stop_reason == "completed"
 
 
-def test_orchestrator_uses_rule_fallback_for_structured_analyzer_error() -> None:
+def test_orchestrator_aggregates_snapshot_refs_from_every_subquery() -> None:
+    events: list[str] = []
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": SnapshotProvider("openalex", events)},
+        config_hash="sha256:" + "b" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    diagnostic = next(
+        item for item in result.diagnostics if item.dependency == "openalex"
+    )
+    assert len(diagnostic.snapshot_refs) == 2
+    assert [ref.entry_id for ref in diagnostic.snapshot_refs] == [
+        "entry-2",
+        "entry-3",
+    ]
+
+
+def test_orchestrator_rejects_structured_planner_transport_error() -> None:
     events: list[str] = []
     orchestrator = MockSearchOrchestrator(
         controller=HardBudgetController(_budget()),
@@ -387,9 +448,10 @@ def test_orchestrator_uses_rule_fallback_for_structured_analyzer_error() -> None
     )
 
     assert result.query_analysis.query_spec.ambiguities == ["rules_only_fallback"]
-    assert result.warnings[0] == "analysis: analyzer returned errors"
+    assert result.warnings == ["analysis: dependency failure"]
+    assert result.stop_reason == "dependency_failure"
     assert result.is_partial is True
-    assert "openalex" in events
+    assert events == ["analyze"]
 
 
 def test_orchestrator_fails_closed_on_analyzer_exception_without_calling_provider() -> None:

@@ -6,19 +6,13 @@ import math
 from collections.abc import Mapping
 from typing import Literal
 
-from pydantic import Field
-
-from paper_search.domain.models import DomainModel, Paper, ProviderResult
+from paper_search.domain.models import FusedPaper, Paper, ProviderResult
 from paper_search.processing.deduplicate import deduplicate_papers
+
+__all__ = ["FusedPaper", "FusionMethod", "fuse_provider_results"]
 
 
 FusionMethod = Literal["rrf", "weighted"]
-
-
-class FusedPaper(DomainModel):
-    paper: Paper
-    score: float = Field(ge=0, allow_inf_nan=False)
-    source_ranks: dict[str, int]
 
 
 def fuse_provider_results(

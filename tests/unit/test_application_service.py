@@ -188,7 +188,8 @@ def _service(
 ) -> SearchApplicationService:
     observed = controllers if controllers is not None else []
 
-    def factory(controller: object) -> StubOrchestrator:
+    def factory(controller: object, run_id: str) -> StubOrchestrator:
+        assert run_id
         observed.append(controller)
         return StubOrchestrator(result)
 
@@ -291,6 +292,72 @@ def test_service_rules_fallback_is_partial_success_with_fixed_warning() -> None:
     assert "planner_rules_fallback" in execution.outcome.response.warnings
 
 
+@pytest.mark.parametrize("code", ["invalid_json", "invalid_response", "empty_response"])
+def test_service_malformed_llm_content_can_succeed_via_rules_fallback(code: str) -> None:
+    malformed = ErrorDetail(
+        code=code,
+        message="malformed model content",
+        retryable=False,
+        provider="llm",
+    )
+    result = _result(
+        planner_status="rules_fallback",
+        diagnostics=[
+            _diagnostic("llm", errors=[malformed]),
+            _diagnostic("openalex"),
+            _diagnostic("semantic_scholar"),
+        ],
+    )
+
+    execution = asyncio.run(_service(result).execute(_request()))
+
+    assert isinstance(execution.outcome, SearchSuccess)
+    assert execution.outcome.response.planner_fallback is True
+
+
+def test_service_maps_provider_snapshot_miss_to_snapshot_unavailable() -> None:
+    miss = [
+        ErrorDetail(
+            code="snapshot_unavailable",
+            message="snapshot unavailable",
+            retryable=False,
+            provider=provider,
+        )
+        for provider in ("openalex", "semantic_scholar")
+    ]
+    result = _result(
+        papers=[],
+        diagnostics=[
+            _diagnostic("llm"),
+            _diagnostic("openalex", errors=[miss[0]]),
+            _diagnostic("semantic_scholar", errors=[miss[1]]),
+        ],
+    )
+
+    execution = asyncio.run(_service(result).execute(_request()))
+
+    assert isinstance(execution.outcome, SearchFailure)
+    assert execution.outcome.error.code == "snapshot_unavailable"
+
+
+def test_business_hash_includes_fusion_scores_and_source_ranks() -> None:
+    original = _result()
+    changed = original.model_copy(
+        update={
+            "fused_papers": [
+                original.fused_papers[0].model_copy(
+                    update={"score": 0.5, "source_ranks": {"openalex": 2}}
+                )
+            ]
+        }
+    )
+
+    first = asyncio.run(_service(original).execute(_request()))
+    second = asyncio.run(_service(changed).execute(_request()))
+
+    assert first.business_result_sha256 != second.business_result_sha256
+
+
 def test_service_suppresses_trace_without_changing_business_hash() -> None:
     service = _service(_result())
 
@@ -358,8 +425,8 @@ def test_application_package_exports_canonical_service_boundary() -> None:
 
 
 def test_execute_maps_factory_failure_to_safe_typed_outcome() -> None:
-    def broken_factory(controller: object) -> StubOrchestrator:
-        del controller
+    def broken_factory(controller: object, run_id: str) -> StubOrchestrator:
+        del controller, run_id
         raise RuntimeError("private-path=/secret/query")
 
     service = SearchApplicationService(

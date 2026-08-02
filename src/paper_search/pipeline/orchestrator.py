@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping
+from datetime import datetime
 from typing import Any, Protocol, cast
 
 from pydantic import Field, model_validator
@@ -26,6 +27,7 @@ from paper_search.domain.models import (
     SubQuery,
     UsageActual,
     UsageEstimate,
+    SearchMode,
 )
 from paper_search.processing.deduplicate import deduplicate_papers
 from paper_search.processing.filter import apply_hard_filters
@@ -40,6 +42,7 @@ from paper_search.graph.citation_expand import CitationExpansionResult
 from paper_search.ranking.fusion import FusedPaper, fuse_provider_results
 from paper_search.ranking.rerank import ConstraintRerankResult, ConstraintScoredPaper
 from paper_search.retrieval.base import SearchProvider
+from paper_search.retrieval.routing import route_baseline_subqueries
 
 
 Analyzer = Callable[[str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]]
@@ -73,6 +76,8 @@ class OrchestratorResult(DomainModel):
     warnings: list[str]
     config_hash: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
     prompt_version: str
+    snapshot_set_id: str | None = None
+    snapshot_captured_at: datetime | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -128,6 +133,9 @@ class MockSearchOrchestrator:
         prompt_version: str,
         analysis_estimate: UsageEstimate,
         provider_estimate: UsageEstimate,
+        provider_estimates: Mapping[str, UsageEstimate] | None = None,
+        routing_limits: tuple[int, int, int] | None = None,
+        execution_mode: SearchMode = "live",
         embedding_ranker: EmbeddingRankingStage | None = None,
         citation_expander: CitationExpansionStage | None = None,
         constraint_reranker: ConstraintRerankingStage | None = None,
@@ -145,6 +153,9 @@ class MockSearchOrchestrator:
         self._prompt_version = prompt_version
         self._analysis_estimate = analysis_estimate
         self._provider_estimate = provider_estimate
+        self._provider_estimates = dict(provider_estimates or {})
+        self._routing_limits = routing_limits
+        self._execution_mode = execution_mode
         self._embedding_ranker = embedding_ranker
         self._citation_expander = citation_expander
         self._constraint_reranker = constraint_reranker
@@ -240,7 +251,11 @@ class MockSearchOrchestrator:
         )
 
     @staticmethod
-    def _failure_diagnostic(dependency: DependencyName) -> DependencyDiagnostic:
+    def _failure_diagnostic(
+        dependency: DependencyName,
+        *,
+        code: str = "provider_error",
+    ) -> DependencyDiagnostic:
         return DependencyDiagnostic(
             dependency=dependency,
             endpoint="dependency",
@@ -251,13 +266,30 @@ class MockSearchOrchestrator:
             snapshot_refs=[],
             errors=[
                 ErrorDetail(
-                    code="provider_error",
+                    code=code,
                     message="Dependency execution failed",
                     retryable=False,
                     provider=dependency,
                 )
             ],
         )
+
+    def _settle_or_verify(
+        self,
+        reservation: BudgetReservation,
+        actual: UsageActual,
+    ) -> None:
+        terminal = self._controller.terminal_outcome(reservation)
+        if terminal is None:
+            self._controller.settle(reservation, actual)
+            return
+        mode, recorded = terminal
+        if mode != "settled" or recorded != actual:
+            raise ReservationError("dependency settlement receipt does not match result")
+
+    def _fail_closed_if_active(self, reservation: BudgetReservation) -> None:
+        if self._controller.terminal_outcome(reservation) is None:
+            self._controller.fail_closed(reservation)
 
     @staticmethod
     def _ranked_paper(
@@ -309,8 +341,15 @@ class MockSearchOrchestrator:
         try:
             analysis_result = await self._analyzer(query, analysis_reservation)
         except Exception:
-            self._controller.fail_closed(analysis_reservation)
-            diagnostics.append(self._failure_diagnostic("llm"))
+            if self._execution_mode == "replay":
+                if self._controller.terminal_outcome(analysis_reservation) is None:
+                    self._controller.release(analysis_reservation)
+                diagnostics.append(
+                    self._failure_diagnostic("llm", code="integrity_failure")
+                )
+            else:
+                self._fail_closed_if_active(analysis_reservation)
+                diagnostics.append(self._failure_diagnostic("llm"))
             return self._result(
                 self._fallback(query),
                 [],
@@ -323,9 +362,9 @@ class MockSearchOrchestrator:
                 planner_status="rules_fallback",
             )
         try:
-            self._controller.settle(analysis_reservation, analysis_result.usage)
+            self._settle_or_verify(analysis_reservation, analysis_result.usage)
         except ReservationError:
-            self._controller.fail_closed(analysis_reservation)
+            self._fail_closed_if_active(analysis_reservation)
             raise
         if analysis_result.errors:
             warnings.append("analysis: analyzer returned errors")
@@ -356,12 +395,32 @@ class MockSearchOrchestrator:
 
         collected: dict[DependencyName, list[ProviderResult[list[Paper]]]] = {}
         stopped = False
-        for subquery in analysis.search_plan.subqueries:
-            names = [
-                name
-                for name in sorted(self._providers)
-                if subquery.provider_hint == "either" or subquery.provider_hint == name
+        if self._routing_limits is None:
+            routes = [
+                (
+                    subquery.query_id,
+                    subquery.text,
+                    [
+                        name
+                        for name in sorted(self._providers)
+                        if subquery.provider_hint == "either"
+                        or subquery.provider_hint == name
+                    ],
+                )
+                for subquery in analysis.search_plan.subqueries
             ]
+        else:
+            minimum, openalex_maximum, semantic_maximum = self._routing_limits
+            routes = [
+                (item.subquery_id, item.text, list(item.providers))
+                for item in route_baseline_subqueries(
+                    analysis.search_plan,
+                    min_openalex_calls=minimum,
+                    max_openalex_calls=openalex_maximum,
+                    max_semantic_scholar_calls=semantic_maximum,
+                )
+            ]
+        for subquery_id, subquery_text, names in routes:
             for name in names:
                 status = self._controller.stop_status()
                 if status != "continue":
@@ -370,7 +429,8 @@ class MockSearchOrchestrator:
                     break
                 try:
                     reservation = self._controller.reserve(
-                        f"{name}.search:{subquery.query_id}", self._provider_estimate
+                        f"{name}.search:{subquery_id}",
+                        self._provider_estimates.get(name, self._provider_estimate),
                     )
                 except BudgetExceededError:
                     warnings.append(f"{name}: budget unavailable")
@@ -378,31 +438,44 @@ class MockSearchOrchestrator:
                     break
                 try:
                     result = await self._providers[name].search(
-                        subquery.text,
+                        subquery_text,
                         analysis.search_plan.inherited_hard_filters,
                         max_provider_results,
                         reservation,
                     )
-                    self._controller.settle(reservation, result.usage)
+                    self._settle_or_verify(reservation, result.usage)
                 except ReservationError:
-                    self._controller.fail_closed(reservation)
+                    self._fail_closed_if_active(reservation)
                     raise
                 except Exception:  # noqa: BLE001
-                    try:
-                        self._controller.settle(
-                            reservation,
-                            UsageActual(search_api_calls=1),
+                    if self._execution_mode == "replay":
+                        if self._controller.terminal_outcome(reservation) is None:
+                            self._controller.release(reservation)
+                        diagnostics.append(
+                            self._failure_diagnostic(
+                                name,
+                                code="integrity_failure",
+                            )
                         )
-                    except ReservationError:
-                        self._controller.fail_closed(reservation)
-                        raise
+                    elif self._controller.terminal_outcome(reservation) is None:
+                        try:
+                            self._controller.settle(
+                                reservation,
+                                UsageActual(search_api_calls=1),
+                            )
+                        except ReservationError:
+                            self._fail_closed_if_active(reservation)
+                            raise
                     warnings.append(f"{name}: provider exception")
-                    if name in {"openalex", "semantic_scholar"}:
+                    if (
+                        self._execution_mode != "replay"
+                        and name in {"openalex", "semantic_scholar"}
+                    ):
                         diagnostics.append(self._failure_diagnostic(name))
                     continue
                 collected.setdefault(name, []).append(result)
                 trace.append(
-                    {"step": "retrieve", "provider": name, "subquery_id": subquery.query_id}
+                    {"step": "retrieve", "provider": name, "subquery_id": subquery_id}
                 )
                 if result.errors:
                     warnings.append(f"{name}: provider returned errors")

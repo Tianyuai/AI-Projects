@@ -9,6 +9,7 @@ from typing import Any
 from paper_search.control.budget import HardBudgetController
 from paper_search.application.contracts import SnapshotRef
 from paper_search.domain.models import (
+    BudgetReservation,
     ErrorDetail,
     Paper,
     ProviderResult,
@@ -159,6 +160,60 @@ class FakeProvider:
             UsageActual(search_api_calls=1),
             failed=self.failed,
         )
+
+
+class SettlingAnalyzer(FakeAnalyzer):
+    def __init__(
+        self,
+        events: list[str],
+        controller: HardBudgetController,
+    ) -> None:
+        super().__init__(events)
+        self.controller = controller
+
+    async def __call__(
+        self,
+        query: str,
+        reservation: BudgetReservation,
+    ) -> ProviderResult[dict[str, object]]:
+        result = await super().__call__(query, reservation)
+        self.controller.settle(reservation, result.usage)
+        return result
+
+
+class SettlingProvider(FakeProvider):
+    def __init__(
+        self,
+        name: str,
+        events: list[str],
+        controller: HardBudgetController,
+    ) -> None:
+        super().__init__(name, events)
+        self.controller = controller
+
+    async def search(
+        self,
+        query: str,
+        filters: dict[str, object],
+        limit: int,
+        reservation: object,
+    ) -> ProviderResult[list[Paper]]:
+        assert isinstance(reservation, BudgetReservation)
+        result = await super().search(query, filters, limit, reservation)
+        self.controller.settle(reservation, result.usage)
+        return result
+
+
+class IntegrityProvider(FakeProvider):
+    async def search(
+        self,
+        query: str,
+        filters: dict[str, object],
+        limit: int,
+        reservation: object,
+    ) -> ProviderResult[list[Paper]]:
+        del query, filters, limit, reservation
+        raise ValueError("snapshot response hash mismatch")
 
 
 class SnapshotProvider(FakeProvider):
@@ -346,6 +401,86 @@ def test_orchestrator_runs_optional_citation_then_rerank_stages() -> None:
         "openalex:W1",
     ]
     assert [item["step"] for item in result.trace[-2:]] == ["citation", "rerank"]
+
+
+def test_orchestrator_accepts_dependency_owned_terminal_settlement() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget())
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=SettlingAnalyzer(events, controller),
+        providers={"openalex": FakeProvider("openalex", events)},
+        config_hash="sha256:" + "8" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert result.stop_reason == "completed"
+    assert controller.committed_usage.llm_calls == 1
+
+
+def test_orchestrator_accepts_provider_owned_terminal_settlement() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget())
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": SettlingProvider("openalex", events, controller)},
+        config_hash="sha256:" + "7" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert result.stop_reason == "completed"
+    assert controller.committed_usage.search_api_calls == 2
+
+
+def test_locked_baseline_router_prevents_unconditional_either_fanout() -> None:
+    events: list[str] = []
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget(max_search_api_calls=12)),
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "openalex": FakeProvider("openalex", events),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "6" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        routing_limits=(3, 6, 2),
+    )
+
+    asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert events.count("openalex") == 3
+    assert events.count("semantic_scholar") <= 2
+
+
+def test_replay_integrity_failure_records_zero_external_spend() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget())
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": IntegrityProvider("openalex", events)},
+        config_hash="sha256:" + "5" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        execution_mode="replay",
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert controller.committed_usage.search_api_calls == 0
+    assert result.diagnostics[-1].errors[0].code == "integrity_failure"
 
 
 def test_orchestrator_keeps_order_when_optional_stage_degrades() -> None:

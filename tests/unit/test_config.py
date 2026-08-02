@@ -284,6 +284,15 @@ def test_mode_authorization_accepts_only_the_exact_allowed_matrix(mode: str) -> 
     )
 
 
+def test_mode_authorization_rejects_unknown_mode_before_dependency_construction() -> None:
+    with pytest.raises(ValueError, match="mode"):
+        validate_mode_authorization(
+            mode="unknown",  # type: ignore[arg-type]
+            runtime_allow_live=True,
+            network_authorized=True,
+        )
+
+
 @pytest.mark.parametrize(
     "secret_field",
     ["openalex_api_key", "semantic_scholar_api_key", "llm_api_key"],

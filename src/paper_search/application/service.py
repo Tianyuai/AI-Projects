@@ -39,7 +39,7 @@ class SearchOrchestrator(Protocol):
     ) -> OrchestratorResult: ...
 
 
-OrchestratorFactory = Callable[[HardBudgetController], SearchOrchestrator]
+OrchestratorFactory = Callable[[HardBudgetController, str], SearchOrchestrator]
 RunIdFactory = Callable[[], str]
 
 _SAFE_WARNING_EXACT = frozenset(
@@ -62,6 +62,9 @@ _SAFE_PROVIDER_WARNING_SUFFIXES = frozenset(
         "provider exception",
         "provider returned errors",
     }
+)
+_MALFORMED_LLM_CODES = frozenset(
+    {"invalid_json", "invalid_response", "empty_response"}
 )
 _SAFE_ERROR_DETAILS: dict[SearchErrorCode, str] = {
     "invalid_request": "The search request is invalid",
@@ -139,8 +142,24 @@ class SearchApplicationService:
         }
         if "snapshot_unavailable" in llm_errors:
             return "snapshot_unavailable"
-        if llm_errors:
+        if "integrity_failure" in llm_errors:
+            return "integrity_failure"
+        if llm_errors and not (
+            result.planner_status == "rules_fallback"
+            and llm_errors.issubset(_MALFORMED_LLM_CODES)
+        ):
             return "dependency_failure"
+
+        provider_error_codes = {
+            error.code
+            for diagnostic in result.diagnostics
+            if diagnostic.dependency in {"openalex", "semantic_scholar"}
+            for error in diagnostic.errors
+        }
+        if not result.papers and "integrity_failure" in provider_error_codes:
+            return "integrity_failure"
+        if not result.papers and "snapshot_unavailable" in provider_error_codes:
+            return "snapshot_unavailable"
 
         provider_failures = {
             diagnostic.dependency
@@ -191,6 +210,9 @@ class SearchApplicationService:
             "query_id": request.query_id,
             "query_analysis": result.query_analysis.model_dump(mode="json"),
             "selected_paper_ids": [paper.canonical_id for paper in result.papers],
+            "fused_papers": [
+                item.model_dump(mode="json") for item in result.fused_papers
+            ],
             "high_relevance": [
                 item.model_dump(mode="json") for item in result.high_relevance
             ],
@@ -299,7 +321,7 @@ class SearchApplicationService:
             formal_live=self._mode == "live",
         )
         try:
-            orchestrator = self._orchestrator_factory(controller)
+            orchestrator = self._orchestrator_factory(controller, run_id)
             result = await orchestrator.run(
                 request.query,
                 max_provider_results=self._max_provider_results,
@@ -344,8 +366,10 @@ class SearchApplicationService:
             git_sha=self._git_sha,
             run_id=run_id,
             execution_mode=self._mode,
-            snapshot_set_id=self._snapshot_set_id,
-            snapshot_captured_at=self._snapshot_captured_at,
+            snapshot_set_id=result.snapshot_set_id or self._snapshot_set_id,
+            snapshot_captured_at=(
+                result.snapshot_captured_at or self._snapshot_captured_at
+            ),
             include_trace=request.include_trace,
         )
         return SearchExecutionResult(

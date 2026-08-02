@@ -6,10 +6,12 @@ from datetime import datetime
 from typing import cast
 
 from paper_search.domain.models import (
+    CandidateEvidence,
     DependencyErrorCode,
     DependencyName,
     DependencyStatus,
     SearchMode,
+    RankedPaper,
     StructuredSearchResponse,
 )
 from paper_search.pipeline.orchestrator import OrchestratorResult
@@ -91,6 +93,51 @@ def to_structured_response(
     planner_fallback = result.planner_status == "rules_fallback"
     if planner_fallback and "planner_rules_fallback" not in warnings:
         warnings.append("planner_rules_fallback")
+    fused_by_id = {item.paper.canonical_id: item for item in result.fused_papers}
+
+    def enrich(item: RankedPaper) -> RankedPaper:
+        fused = fused_by_id.get(item.paper.canonical_id)
+        if fused is None:
+            return item
+        return item.model_copy(
+            update={
+                "evidence": item.evidence.model_copy(
+                    update={
+                        "fusion_score": fused.score,
+                        "source_ranks": fused.source_ranks,
+                    }
+                )
+            }
+        )
+
+    high_relevance = [enrich(item) for item in result.high_relevance]
+    partial_relevance = [enrich(item) for item in result.partial_relevance]
+    ranked_ids = {
+        item.paper.canonical_id for item in [*high_relevance, *partial_relevance]
+    }
+    for fused in result.fused_papers:
+        if fused.paper.canonical_id in ranked_ids:
+            continue
+        partial_relevance.append(
+            RankedPaper(
+                paper=fused.paper,
+                evidence=CandidateEvidence(
+                    paper_id=fused.paper.canonical_id,
+                    lexical_score=0.0,
+                    embedding_score=0.0,
+                    constraint_coverage=0.0,
+                    source_agreement=min(1.0, len(fused.source_ranks) / 2),
+                    authority_score=0.0,
+                    recency_score=0.0,
+                    final_score=min(1.0, fused.score),
+                    scoring_version="rrf-v1",
+                    relevance_level="partial",
+                    fusion_score=fused.score,
+                    source_ranks=fused.source_ranks,
+                ),
+            )
+        )
+    selected = [*high_relevance, *partial_relevance]
     return StructuredSearchResponse(
         run_id=run_id,
         query_id=query_id,
@@ -98,9 +145,10 @@ def to_structured_response(
         snapshot_set_id=snapshot_set_id,
         snapshot_captured_at=snapshot_captured_at,
         query_analysis=result.query_analysis,
-        selected_paper_ids=[paper.canonical_id for paper in result.papers],
-        high_relevance=result.high_relevance,
-        partial_relevance=result.partial_relevance,
+        selected_paper_ids=[item.paper.canonical_id for item in selected],
+        fused_papers=result.fused_papers,
+        high_relevance=high_relevance,
+        partial_relevance=partial_relevance,
         citation_edges=result.citation_edges,
         search_trace=result.trace if include_trace else [],
         usage=result.usage,

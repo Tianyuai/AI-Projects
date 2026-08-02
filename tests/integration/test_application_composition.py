@@ -11,13 +11,23 @@ import yaml
 from pydantic import ValidationError
 
 import paper_search.application.service as service_module
+import paper_search.application.composition as composition_module
 from paper_search.application.composition import ApplicationBundle, CompositionRoot
 from paper_search.application.contracts import SearchRequest
+from paper_search.application.contracts import SearchSuccess
 from paper_search.application.modes import ModeBinding
 from paper_search.control.budget import HardBudgetController
-from paper_search.domain.models import SearchBudget
+from paper_search.domain.models import (
+    QueryAnalysisResult,
+    QuerySpec,
+    SearchBudget,
+    SearchPlan,
+    SubQuery,
+    UsageActual,
+)
 from paper_search.llm.snapshot_adapters import ReplayLLMAnalyzer
 from paper_search.retrieval.snapshot_adapters import ReplaySearchProvider
+from paper_search.pipeline.orchestrator import OrchestratorResult
 from paper_search.storage.dependency_snapshot import DependencyCaptureStore
 
 
@@ -58,6 +68,7 @@ def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
         "configs/budget_balanced.yaml": (
             Path("configs/budget_balanced.yaml").read_bytes()
         ),
+        "configs/budget_low.yaml": Path("configs/budget_low.yaml").read_bytes(),
         "configs/pricing_v1.yaml": _pricing_policy(),
         "configs/quality_gates_v1.yaml": b"{}",
     }
@@ -70,7 +81,12 @@ def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
     manifest = store.seal()
     manifest_path = store.manifest_path
 
-    def write_lock(kind: str, *, runtime_allow_live: bool = True) -> Path:
+    def write_lock(
+        kind: str,
+        *,
+        runtime_allow_live: bool = True,
+        budget_profile: str = "balanced",
+    ) -> Path:
         fixture_path = Path(f"tests/fixtures/application/{kind}.lock.yaml")
         raw = yaml.safe_load(fixture_path.read_bytes())
         raw["runtime_allow_live"] = runtime_allow_live
@@ -83,15 +99,16 @@ def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
             "configs/prompts/query_analyze.yaml"
         ]
         for key, relative in (
-            ("budget_config", "configs/budget_balanced.yaml"),
+            ("budget_config", f"configs/budget_{budget_profile}.yaml"),
             ("pricing_policy", "configs/pricing_v1.yaml"),
             ("quality_gates", "configs/quality_gates_v1.yaml"),
         ):
+            raw[key]["path"] = relative
             raw[key]["sha256"] = hashes[relative]
         if kind == "replay":
             raw["snapshot_set_id"] = manifest.snapshot_set_id
             raw["snapshot_manifest_sha256"] = store.manifest_sha256
-        lock_path = tmp_path / f"{kind}-{runtime_allow_live}.lock.yaml"
+        lock_path = tmp_path / f"{kind}-{runtime_allow_live}-{budget_profile}.lock.yaml"
         lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
         return lock_path
 
@@ -102,6 +119,7 @@ def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
         "replay_lock": write_lock("replay"),
         "replay_no_live_lock": write_lock("replay", runtime_allow_live=False),
         "candidate_lock": write_lock("candidate"),
+        "candidate_low_lock": write_lock("candidate", budget_profile="low"),
     }
 
 
@@ -216,8 +234,23 @@ def test_mode_composition_rejects_each_missing_authorization_key(
 
 def test_live_secret_is_resolved_only_into_private_clients(
     composition_fixture: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     secret = "composition-live-secret"
+    client_calls: list[dict[str, object]] = []
+
+    class RecordingLLMClient:
+        prompt_version = "query-analyze-v1"
+
+    def recording_llm_client(**kwargs: object) -> RecordingLLMClient:
+        client_calls.append(kwargs)
+        return RecordingLLMClient()
+
+    monkeypatch.setattr(
+        composition_module,
+        "OpenAICompatibleLLMClient",
+        recording_llm_client,
+    )
     bundle = CompositionRoot.compose(
         lock_path=composition_fixture["candidate_lock"],
         mode="live",
@@ -232,6 +265,7 @@ def test_live_secret_is_resolved_only_into_private_clients(
     assert secret not in repr(bundle.__dict__)
     assert not hasattr(bundle, "environ")
     assert not hasattr(bundle, "llm_api_key")
+    assert client_calls == []
     readiness = bundle.readiness_probe()
     assert readiness.status == "degraded"
     assert readiness.last_authorized_probe_at is None
@@ -276,7 +310,8 @@ def test_replay_orchestrator_uses_only_replay_adapters_and_baseline_modules(
         )
     )
     orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
-        HardBudgetController(budget, formal_live=False)
+        HardBudgetController(budget, formal_live=False),
+        "routing-inspection-run",
     )
 
     analyzer_owner = orchestrator._analyzer.adapter  # type: ignore[attr-defined]  # noqa: SLF001
@@ -288,6 +323,172 @@ def test_replay_orchestrator_uses_only_replay_adapters_and_baseline_modules(
     assert orchestrator._embedding_ranker is None  # noqa: SLF001
     assert orchestrator._citation_expander is None  # noqa: SLF001
     assert orchestrator._constraint_reranker is None  # noqa: SLF001
+    assert orchestrator._routing_limits == (3, 6, 2)  # noqa: SLF001
+
+
+def test_low_budget_lock_accepts_low_profile_request(
+    composition_fixture: dict[str, Path],
+) -> None:
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["candidate_low_lock"],
+        mode="live",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        network_authorized=True,
+        environ={"LLM_API_KEY": "fixture-secret"},
+    )
+    request = SearchRequest(
+        query_id="low-1",
+        query="offline fixture",
+        mode="live",
+        budget_profile="low",
+    )
+
+    assert "low" in bundle.service._budgets  # noqa: SLF001
+    assert "balanced" not in bundle.service._budgets  # noqa: SLF001
+    assert request.budget_profile == "low"
+
+
+def test_provider_secrets_are_confined_to_redacted_private_factory(
+    composition_fixture: dict[str, Path],
+) -> None:
+    secrets = {
+        "LLM_API_KEY": "llm-closure-secret",
+        "OPENALEX_API_KEY": "openalex-closure-secret",
+        "SEMANTIC_SCHOLAR_API_KEY": "s2-closure-secret",
+    }
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["candidate_lock"],
+        mode="live",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        network_authorized=True,
+        environ=secrets,
+    )
+    factory = bundle.service._orchestrator_factory  # noqa: SLF001
+    closure = getattr(factory, "__closure__", ()) or ()
+    exposed = repr([cell.cell_contents for cell in closure])
+
+    assert all(secret not in repr(factory) for secret in secrets.values())
+    assert all(secret not in exposed for secret in secrets.values())
+
+
+def _empty_live_result() -> OrchestratorResult:
+    return OrchestratorResult(
+        query_analysis=QueryAnalysisResult(
+            query_spec=QuerySpec(
+                original_query="offline fixture",
+                research_goal="offline fixture",
+            ),
+            search_plan=SearchPlan(
+                subqueries=[
+                    SubQuery(
+                        query_id="sq-1",
+                        text="offline fixture",
+                        query_type="exact",
+                        target_constraints=[],
+                        priority=1,
+                        provider_hint="either",
+                    )
+                ],
+                inherited_hard_filters={},
+                rationale="fixture",
+            ),
+        ),
+        fused_papers=[],
+        high_relevance=[],
+        partial_relevance=[],
+        citation_edges=[],
+        provider_results={},
+        diagnostics=[],
+        planner_status="primary",
+        trace=[],
+        usage=UsageActual(),
+        stop_reason="completed",
+        is_partial=False,
+        warnings=[],
+        config_hash="sha256:" + "4" * 64,
+        prompt_version="query-analyze-v1",
+    )
+
+
+def test_live_requests_use_priced_estimates_and_isolated_sealed_resources(
+    composition_fixture: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[object] = []
+    constructed: list[dict[str, object]] = []
+
+    class RecordingClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.kwargs = kwargs
+            self.closed = False
+            clients.append(self)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class RecordingOrchestrator:
+        def __init__(self, **kwargs: object) -> None:
+            constructed.append(kwargs)
+
+        async def run(
+            self,
+            query: str,
+            *,
+            max_provider_results: int,
+        ) -> OrchestratorResult:
+            assert query == "offline fixture"
+            assert max_provider_results == 50
+            return _empty_live_result()
+
+    monkeypatch.setattr(composition_module.httpx, "AsyncClient", RecordingClient)
+    monkeypatch.setattr(
+        composition_module,
+        "MockSearchOrchestrator",
+        RecordingOrchestrator,
+    )
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["candidate_lock"],
+        mode="live",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        network_authorized=True,
+        environ={"LLM_API_KEY": "fixture-secret"},
+    )
+
+    first = asyncio.run(
+        bundle.service.execute(
+            SearchRequest(query_id="live-1", query="offline fixture", mode="live")
+        )
+    )
+    second = asyncio.run(
+        bundle.service.execute(
+            SearchRequest(query_id="live-2", query="offline fixture", mode="live")
+        )
+    )
+    asyncio.run(bundle.aclose())
+
+    assert isinstance(first.outcome, SearchSuccess)
+    assert isinstance(second.outcome, SearchSuccess)
+    assert first.outcome.response.snapshot_set_id.startswith("sha256:")
+    assert second.outcome.response.snapshot_set_id.startswith("sha256:")
+    manifests = list(
+        (composition_fixture["output_root"] / "captures").glob(
+            "*/dependency-snapshot/snapshot-manifest.json"
+        )
+    )
+    assert len(manifests) == 2
+    assert len(clients) == 2
+    assert all(getattr(client, "closed") for client in clients)
+    assert len(constructed) == 2
+    for kwargs in constructed:
+        estimates = kwargs["provider_estimates"]
+        assert isinstance(estimates, dict)
+        assert estimates["openalex"].cost_cny is not None
+        assert estimates["semantic_scholar"].cost_cny is not None
+        assert estimates["openalex"].cost_cny != estimates["semantic_scholar"].cost_cny
+        assert kwargs["routing_limits"] == (3, 6, 2)
 
 
 def test_snapshot_binding_is_immutable_after_composition(

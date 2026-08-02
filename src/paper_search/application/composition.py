@@ -3,23 +3,25 @@
 from __future__ import annotations
 
 import os
+import hashlib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 import httpx
+from pydantic import SecretStr
 
 from paper_search.application.contracts import ReadyHealthResponse
 from paper_search.application.locks import (
+    InputLock,
     ReplayLock,
     load_input_lock,
     lock_sha256,
 )
 from paper_search.application.modes import ModeBinding
-from paper_search.application.service import SearchApplicationService
+from paper_search.application.service import SearchApplicationService, SearchOrchestrator
 from paper_search.config import load_budget, validate_mode_authorization
 from paper_search.control.budget import HardBudgetController
 from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
@@ -29,7 +31,9 @@ from paper_search.domain.models import (
     DependencyStatus,
     ProviderResult,
     SearchMode,
+    SearchBudget,
     Sha256,
+    UsageActual,
     UsageEstimate,
 )
 from paper_search.llm.client import OpenAICompatibleLLMClient
@@ -37,7 +41,7 @@ from paper_search.llm.snapshot_adapters import (
     LiveCaptureLLMAnalyzer,
     ReplayLLMAnalyzer,
 )
-from paper_search.pipeline.orchestrator import MockSearchOrchestrator
+from paper_search.pipeline.orchestrator import MockSearchOrchestrator, OrchestratorResult
 from paper_search.retrieval.snapshot_adapters import (
     LiveCaptureSearchProvider,
     ReplaySearchProvider,
@@ -85,9 +89,35 @@ class _AnalyzerBridge:
 
 @dataclass(frozen=True)
 class ArtifactFactory:
-    """Task-6 output binding extended with capture sessions in Task 7."""
+    """Create isolated capture stores and own any in-flight live clients."""
 
     output_root: Path
+    _clients: list[httpx.AsyncClient] = field(
+        default_factory=list,
+        repr=False,
+        compare=False,
+    )
+
+    def start_capture(self, *, run_id: str) -> DependencyCaptureStore:
+        run_key = hashlib.sha256(run_id.encode("utf-8")).hexdigest()
+        return DependencyCaptureStore(
+            self.output_root / "captures" / run_key / "dependency-snapshot"
+        )
+
+    def register_client(self, client: httpx.AsyncClient) -> None:
+        self._clients.append(client)
+
+    def release_client(self, client: httpx.AsyncClient) -> None:
+        try:
+            self._clients.remove(client)
+        except ValueError:
+            pass
+
+    async def aclose(self) -> None:
+        clients = list(self._clients)
+        self._clients.clear()
+        for client in clients:
+            await client.aclose()
 
 
 @dataclass(frozen=True)
@@ -101,10 +131,13 @@ class ApplicationBundle:
     prompt_version: Literal["query-analyze-v1"]
     mode_binding: ModeBinding
 
+    async def aclose(self) -> None:
+        await self.artifact_factory.aclose()
 
-def _baseline_estimates(
+
+def _replay_estimates(
     controller: HardBudgetController,
-) -> tuple[UsageEstimate, UsageEstimate]:
+) -> tuple[UsageEstimate, dict[str, UsageEstimate]]:
     budget = controller.budget
     output_tokens = budget.max_total_tokens // 6
     input_tokens = budget.max_total_tokens - output_tokens
@@ -114,20 +147,65 @@ def _baseline_estimates(
     )
     return (
         UsageEstimate(
-            llm_calls=1,
+            llm_calls=3,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            cost_cny=max(
-                Decimal("0"),
-                Decimal(str(budget.max_cost_cny)) - Decimal("0.000001"),
-            ),
+            cost_cny=0,
             elapsed_ms=elapsed_ms,
         ),
-        UsageEstimate(
-            search_api_calls=3,
-            elapsed_ms=elapsed_ms,
+        {
+            dependency: UsageEstimate(
+                search_api_calls=3,
+                cost_cny=0,
+                elapsed_ms=elapsed_ms,
+            )
+            for dependency in ("openalex", "semantic_scholar")
+        },
+    )
+
+
+def _live_estimates(
+    controller: HardBudgetController,
+    *,
+    lock: InputLock,
+    pricer: ActualCostPricer,
+) -> tuple[UsageEstimate, dict[str, UsageEstimate]]:
+    budget = controller.budget
+    output_tokens = budget.max_total_tokens // 6
+    input_tokens = budget.max_total_tokens - output_tokens
+    elapsed_ms = min(
+        budget.max_elapsed_seconds * 1_000,
+        lock.baseline.retry.max_attempts * lock.baseline.timeout.read_seconds * 1_000,
+    )
+    llm_usage = pricer.value_actual(
+        dependency="llm",
+        model_or_adapter=lock.baseline.primary_model,
+        usage=UsageActual(
+            llm_calls=lock.baseline.retry.max_attempts,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         ),
     )
+    analysis = UsageEstimate.model_validate(
+        {**llm_usage.model_dump(mode="python"), "elapsed_ms": elapsed_ms}
+    )
+    adapter_names = {
+        "openalex": "openalex-works-v1",
+        "semantic_scholar": "semantic-graph-v1",
+    }
+    provider_estimates = {}
+    for dependency, adapter_name in adapter_names.items():
+        valued = pricer.value_actual(
+            dependency=dependency,  # type: ignore[arg-type]
+            model_or_adapter=adapter_name,
+            usage=UsageActual(
+                search_api_calls=lock.baseline.retry.max_attempts,
+            ),
+        )
+        provider_estimates[dependency] = UsageEstimate.model_validate(
+            {**valued.model_dump(mode="python"), "elapsed_ms": elapsed_ms}
+        )
+    return analysis, provider_estimates
 
 
 def _confined_manifest_path(path: Path, *, artifact_root: Path) -> Path:
@@ -139,6 +217,15 @@ def _confined_manifest_path(path: Path, *, artifact_root: Path) -> Path:
     if not resolved.is_file() or not resolved.is_relative_to(root):
         raise ValueError("snapshot manifest must be a file beneath artifact root")
     return resolved
+
+
+def _locked_budget_profile(path: str) -> Literal["low", "balanced"]:
+    name = Path(path).name
+    if name == "budget_low.yaml":
+        return "low"
+    if name == "budget_balanced.yaml":
+        return "balanced"
+    raise ValueError("lock budget path must identify the low or balanced profile")
 
 
 def _replay_readiness(binding: ModeBinding) -> Callable[[], ReadyHealthResponse]:
@@ -192,9 +279,13 @@ def _replay_factory(
     reader: DependencySnapshotReader,
     lock: ReplayLock,
     config_hash: Sha256,
-) -> Callable[[HardBudgetController], MockSearchOrchestrator]:
-    def create(controller: HardBudgetController) -> MockSearchOrchestrator:
-        analysis_estimate, provider_estimate = _baseline_estimates(controller)
+) -> Callable[[HardBudgetController, str], MockSearchOrchestrator]:
+    def create(
+        controller: HardBudgetController,
+        run_id: str,
+    ) -> MockSearchOrchestrator:
+        del run_id
+        analysis_estimate, provider_estimates = _replay_estimates(controller)
         analyzer = ReplayLLMAnalyzer(
             reader=reader,
             model_id=lock.baseline.primary_model,
@@ -214,13 +305,172 @@ def _replay_factory(
             config_hash=config_hash,
             prompt_version=lock.baseline.prompt_version,
             analysis_estimate=analysis_estimate,
-            provider_estimate=provider_estimate,
+            provider_estimate=provider_estimates["openalex"],
+            provider_estimates=provider_estimates,
+            routing_limits=(
+                lock.baseline.retrieval.openalex_calls_min,
+                lock.baseline.retrieval.openalex_calls_max,
+                lock.baseline.retrieval.semantic_scholar_calls_max,
+            ),
+            execution_mode="replay",
             embedding_ranker=None,
             citation_expander=None,
             constraint_reranker=None,
         )
 
     return create
+
+
+@dataclass(frozen=True, repr=False)
+class _LiveCredentials:
+    llm: SecretStr
+    openalex: SecretStr | None
+    semantic_scholar: SecretStr | None
+
+    def __repr__(self) -> str:
+        return "_LiveCredentials(llm=**********, openalex=**********, semantic_scholar=**********)"
+
+
+class _LiveRunOrchestrator:
+    def __init__(
+        self,
+        *,
+        orchestrator: MockSearchOrchestrator,
+        capture_store: DependencyCaptureStore,
+        client: httpx.AsyncClient,
+        artifact_factory: ArtifactFactory,
+    ) -> None:
+        self._orchestrator = orchestrator
+        self._capture_store = capture_store
+        self._client = client
+        self._artifact_factory = artifact_factory
+
+    async def run(
+        self,
+        query: str,
+        *,
+        max_provider_results: int,
+    ) -> OrchestratorResult:
+        try:
+            result = await self._orchestrator.run(
+                query,
+                max_provider_results=max_provider_results,
+            )
+            manifest = self._capture_store.seal()
+            return result.model_copy(
+                update={
+                    "snapshot_set_id": manifest.snapshot_set_id,
+                    "snapshot_captured_at": manifest.sealed_at,
+                }
+            )
+        finally:
+            await self._client.aclose()
+            self._artifact_factory.release_client(self._client)
+
+
+class _LiveOrchestratorFactory:
+    def __init__(
+        self,
+        *,
+        lock: InputLock,
+        config_hash: Sha256,
+        pricer: ActualCostPricer,
+        credentials: _LiveCredentials,
+        artifact_factory: ArtifactFactory,
+    ) -> None:
+        self._lock = lock
+        self._config_hash = config_hash
+        self._pricer = pricer
+        self._credentials = credentials
+        self._artifact_factory = artifact_factory
+
+    def __repr__(self) -> str:
+        return "_LiveOrchestratorFactory(credentials=**********)"
+
+    def __call__(
+        self,
+        controller: HardBudgetController,
+        run_id: str,
+    ) -> _LiveRunOrchestrator:
+        lock = self._lock
+        capture_store = self._artifact_factory.start_capture(run_id=run_id)
+        timeout = httpx.Timeout(
+            connect=lock.baseline.timeout.connect_seconds,
+            read=lock.baseline.timeout.read_seconds,
+            write=lock.baseline.timeout.write_seconds,
+            pool=lock.baseline.timeout.pool_seconds,
+        )
+        client = httpx.AsyncClient(timeout=timeout)
+        self._artifact_factory.register_client(client)
+        llm_client = OpenAICompatibleLLMClient(
+            client=client,
+            base_url=_LLM_BASE_URL,
+            model=lock.baseline.primary_model,
+            api_key=self._credentials.llm.get_secret_value(),
+            prompt_version=lock.baseline.prompt_version,
+        )
+        analysis_estimate, provider_estimates = _live_estimates(
+            controller,
+            lock=lock,
+            pricer=self._pricer,
+        )
+        analyzer = LiveCaptureLLMAnalyzer(
+            client=llm_client,
+            capture_store=capture_store,
+            pricer=self._pricer,
+            controller=controller,
+        )
+        providers = {
+            "openalex": LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=capture_store,
+                pricer=self._pricer,
+                controller=controller,
+                api_key=(
+                    self._credentials.openalex.get_secret_value()
+                    if self._credentials.openalex is not None
+                    else None
+                ),
+            ),
+            "semantic_scholar": LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=capture_store,
+                pricer=self._pricer,
+                controller=controller,
+                api_key=(
+                    self._credentials.semantic_scholar.get_secret_value()
+                    if self._credentials.semantic_scholar is not None
+                    else None
+                ),
+            ),
+        }
+        orchestrator = MockSearchOrchestrator(
+            controller=controller,
+            analyzer=_AnalyzerBridge(analyzer),
+            providers=providers,
+            config_hash=self._config_hash,
+            prompt_version=lock.baseline.prompt_version,
+            analysis_estimate=analysis_estimate,
+            provider_estimate=provider_estimates["openalex"],
+            provider_estimates=provider_estimates,
+            routing_limits=(
+                lock.baseline.retrieval.openalex_calls_min,
+                lock.baseline.retrieval.openalex_calls_max,
+                lock.baseline.retrieval.semantic_scholar_calls_max,
+            ),
+            execution_mode="live",
+            embedding_ranker=None,
+            citation_expander=None,
+            constraint_reranker=None,
+        )
+        return _LiveRunOrchestrator(
+            orchestrator=orchestrator,
+            capture_store=capture_store,
+            client=client,
+            artifact_factory=self._artifact_factory,
+        )
 
 
 class CompositionRoot:
@@ -245,10 +495,15 @@ class CompositionRoot:
             network_authorized=network_authorized,
         )
         config_hash = lock_sha256(lock)
-        budgets = {
-            "balanced": load_budget(artifact_root / lock.budget_config.path),
+        budget_profile = _locked_budget_profile(lock.budget_config.path)
+        budgets: dict[str, SearchBudget] = {
+            budget_profile: load_budget(artifact_root / lock.budget_config.path),
         }
+        artifact_factory = ArtifactFactory(output_root=output_root.resolve())
         binding: ModeBinding
+        orchestrator_factory: Callable[
+            [HardBudgetController, str], SearchOrchestrator
+        ]
         snapshot_captured_at: datetime | None = None
 
         if mode == "replay":
@@ -287,62 +542,26 @@ class CompositionRoot:
                 artifact_root / lock.pricing_policy.path
             )
             pricer = ActualCostPricer(pricing_policy)
-            capture_store = DependencyCaptureStore(output_root / ".dependency-capture")
-            timeout = httpx.Timeout(
-                connect=lock.baseline.timeout.connect_seconds,
-                read=lock.baseline.timeout.read_seconds,
-                write=lock.baseline.timeout.write_seconds,
-                pool=lock.baseline.timeout.pool_seconds,
+            credentials = _LiveCredentials(
+                llm=SecretStr(llm_api_key),
+                openalex=(
+                    SecretStr(resolved_environ["OPENALEX_API_KEY"])
+                    if resolved_environ.get("OPENALEX_API_KEY")
+                    else None
+                ),
+                semantic_scholar=(
+                    SecretStr(resolved_environ["SEMANTIC_SCHOLAR_API_KEY"])
+                    if resolved_environ.get("SEMANTIC_SCHOLAR_API_KEY")
+                    else None
+                ),
             )
-            client = httpx.AsyncClient(timeout=timeout)
-
-            def orchestrator_factory(
-                controller: HardBudgetController,
-            ) -> MockSearchOrchestrator:
-                analysis_estimate, provider_estimate = _baseline_estimates(controller)
-                llm_client = OpenAICompatibleLLMClient(
-                    client=client,
-                    base_url=_LLM_BASE_URL,
-                    model=lock.baseline.primary_model,
-                    api_key=llm_api_key,
-                    prompt_version=lock.baseline.prompt_version,
-                )
-                analyzer = LiveCaptureLLMAnalyzer(
-                    client=llm_client,
-                    capture_store=capture_store,
-                    pricer=pricer,
-                    controller=controller,
-                )
-                providers = {
-                    "openalex": LiveCaptureSearchProvider(
-                        dependency="openalex",
-                        client=client,
-                        capture_store=capture_store,
-                        pricer=pricer,
-                        controller=controller,
-                        api_key=resolved_environ.get("OPENALEX_API_KEY"),
-                    ),
-                    "semantic_scholar": LiveCaptureSearchProvider(
-                        dependency="semantic_scholar",
-                        client=client,
-                        capture_store=capture_store,
-                        pricer=pricer,
-                        controller=controller,
-                        api_key=resolved_environ.get("SEMANTIC_SCHOLAR_API_KEY"),
-                    ),
-                }
-                return MockSearchOrchestrator(
-                    controller=controller,
-                    analyzer=_AnalyzerBridge(analyzer),
-                    providers=providers,
-                    config_hash=config_hash,
-                    prompt_version=lock.baseline.prompt_version,
-                    analysis_estimate=analysis_estimate,
-                    provider_estimate=provider_estimate,
-                    embedding_ranker=None,
-                    citation_expander=None,
-                    constraint_reranker=None,
-                )
+            orchestrator_factory = _LiveOrchestratorFactory(
+                lock=lock,
+                config_hash=config_hash,
+                pricer=pricer,
+                credentials=credentials,
+                artifact_factory=artifact_factory,
+            )
 
             binding = ModeBinding(
                 mode="live",
@@ -365,7 +584,7 @@ class CompositionRoot:
             service=service,
             readiness_probe=readiness_probe,
             config_hash=config_hash,
-            artifact_factory=ArtifactFactory(output_root=output_root.resolve()),
+            artifact_factory=artifact_factory,
             experiment_id="main-baseline",
             source_git_sha=lock.source_git_sha,
             prompt_version="query-analyze-v1",

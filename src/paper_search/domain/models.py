@@ -184,11 +184,19 @@ class CandidateEvidence(DomainModel):
     final_score: UnitFloat
     scoring_version: NonEmptyStr
     relevance_level: Literal["high", "partial", "irrelevant"]
+    fusion_score: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    source_ranks: dict[str, int] = Field(default_factory=dict)
 
 
 class RankedPaper(DomainModel):
     paper: Paper
     evidence: CandidateEvidence
+
+
+class FusedPaper(DomainModel):
+    paper: Paper
+    score: float = Field(ge=0, allow_inf_nan=False)
+    source_ranks: dict[str, int]
 
 
 class SearchBudget(DomainModel):
@@ -306,6 +314,7 @@ class StructuredSearchResponse(DomainModel):
     snapshot_captured_at: datetime | None
     query_analysis: QueryAnalysisResult
     selected_paper_ids: list[NonEmptyStr]
+    fused_papers: list[FusedPaper] = Field(default_factory=list)
     high_relevance: list[RankedPaper]
     partial_relevance: list[RankedPaper]
     citation_edges: list[ResolvedCitationEdge]

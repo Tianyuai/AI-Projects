@@ -32,6 +32,8 @@ def validate_mode_authorization(
 ) -> None:
     """Fail closed unless replay or live has exactly its required authority."""
 
+    if mode not in {"replay", "live"}:
+        raise ValueError("execution mode must be replay or live")
     if mode == "replay":
         if network_authorized:
             raise ValueError("replay mode must not authorize network access")

@@ -6,11 +6,12 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Callable, Literal, Protocol
+from typing import Callable, Literal, Protocol, cast
 
 import yaml
 from pydantic import TypeAdapter
@@ -38,6 +39,7 @@ from paper_search.domain.models import (
     UsageActual,
 )
 from paper_search.evaluation.business_results import BusinessResultRecord
+from paper_search.evaluation.business_results import business_result_sha256
 from paper_search.evaluation.execution_adapter import (
     EvaluationExecutionRecord,
     EvaluationFailureRecord,
@@ -172,6 +174,7 @@ class FormalRunWorkspace:
         validator: Callable[[Path], None] | None = None,
         writer: Callable[[Path, bytes], None] = _atomic_write,
         publisher: Callable[[Path, Path], None] = os.replace,
+        replay_snapshot_root: Path | None = None,
     ) -> None:
         if not _is_valid_run_id(manifest.run_id):
             raise ValueError("run_id is invalid")
@@ -187,6 +190,27 @@ class FormalRunWorkspace:
             raise ValueError("formal workspace paths must use the same filesystem")
         self._manifest = manifest
         self._input_lock_bytes = bytes(input_lock_bytes)
+        if _sha256(self._input_lock_bytes) != manifest.input_lock_sha256:
+            raise ValueError("input lock sha256 does not match exact input bytes")
+        self._input_lock = _parse_lock(self._input_lock_bytes)
+        expected_mode: SearchMode = (
+            "replay" if isinstance(self._input_lock, ReplayLock) else "live"
+        )
+        if manifest.execution_mode != expected_mode:
+            raise ValueError("formal run execution mode does not match input lock")
+        if (
+            manifest.split != self._input_lock.frozen_data.split
+            or manifest.frozen_manifest_sha256
+            != self._input_lock.frozen_data.manifest.sha256
+            or manifest.partition_sha256
+            != self._input_lock.frozen_data.partition_sha256
+            or manifest.identifier_map_sha256
+            != self._input_lock.frozen_data.identifier_map.sha256
+            or manifest.source_git_sha != self._input_lock.source_git_sha
+            or manifest.config_hash != lock_sha256(self._input_lock)
+            or manifest.prompt_version != self._input_lock.baseline.prompt_version
+        ):
+            raise ValueError("formal run manifest does not match input lock bindings")
         self._validator = validator or (lambda path: None)
         self._writer = writer
         self._publisher = publisher
@@ -207,14 +231,61 @@ class FormalRunWorkspace:
         self._terminal = False
         self._metrics_written = False
         self._usage_written = False
+        self._metrics: EvaluationResult | None = None
+        self._snapshot_store: DependencyCaptureStore | None = None
+        self._replay_snapshot_manifest: DependencySnapshotManifestV2 | None = None
+        self._replay_snapshot_bytes: bytes | None = None
         self._write(self._work_dir / "config.lock.yaml", self._input_lock_bytes)
         self._write_manifest()
         for filename in self._JSONL_FILES.values():
             self._write(self._work_dir / filename, b"")
+        if manifest.execution_mode == "live":
+            if replay_snapshot_root is not None:
+                raise ValueError("live workspace cannot accept replay snapshots")
+            self._snapshot_store = DependencyCaptureStore(
+                self._work_dir / "snapshots",
+                clock=clock,
+            )
+            self._snapshot_store.root.mkdir(exist_ok=False)
+        elif replay_snapshot_root is not None:
+            if not isinstance(self._input_lock, ReplayLock):
+                raise ValueError("replay snapshots require a replay input lock")
+            source_root = replay_snapshot_root.resolve(strict=True)
+            snapshot_root = self._work_dir / "snapshots"
+            shutil.copytree(source_root, snapshot_root)
+            manifest_path = snapshot_root / "snapshot-manifest.json"
+            try:
+                snapshot_bytes = manifest_path.read_bytes()
+                snapshot_manifest = DependencySnapshotManifestV2.model_validate_json(
+                    snapshot_bytes
+                )
+                reader = DependencySnapshotReader(
+                    manifest_path,
+                    snapshot_manifest_sha256=self._input_lock.snapshot_manifest_sha256,
+                    snapshot_set_id=self._input_lock.snapshot_set_id,
+                )
+                for entry in snapshot_manifest.entries:
+                    reader.read(entry.request)
+            except (OSError, ValueError) as error:
+                raise ValueError("replay snapshot evidence is invalid") from error
+            self._replay_snapshot_manifest = snapshot_manifest
+            self._replay_snapshot_bytes = snapshot_bytes
 
     @property
     def work_dir(self) -> Path:
         return self._work_dir
+
+    @property
+    def snapshot_store(self) -> DependencyCaptureStore:
+        if self._snapshot_store is None:
+            raise RuntimeError("snapshot capture is available only for live workspaces")
+        return self._snapshot_store
+
+    def seal_snapshots(self) -> DependencySnapshotManifestV2:
+        self._ensure_active()
+        if self._snapshot_store is None:
+            raise RuntimeError("snapshot capture is available only for live workspaces")
+        return self._snapshot_store.seal()
 
     def _ensure_active(self) -> None:
         if self._terminal:
@@ -263,6 +334,7 @@ class FormalRunWorkspace:
             raise RuntimeError("metrics are already written")
         self._write(self._work_dir / "metrics.json", _model_json_bytes(metrics))
         self._metrics_written = True
+        self._metrics = metrics
 
     def write_usage(self, report: LedgerReport) -> None:
         self._ensure_active()
@@ -278,9 +350,65 @@ class FormalRunWorkspace:
             raise FileExistsError("formal run destination already exists")
         destination.parent.mkdir(parents=True, exist_ok=True)
         self._publisher(self._work_dir, destination)
-        _fsync_directory(destination.parent)
         self._terminal = True
+        _fsync_directory(destination.parent)
         return destination
+
+    def _validate_ordered_records(self) -> None:
+        prediction_records = cast(
+            list[InternalPredictionRecord],
+            self._records["prediction"],
+        )
+        prediction_ids = [
+            record.query_id for record in prediction_records
+        ]
+        execution_records = cast(
+            list[EvaluationExecutionRecord],
+            self._records["execution"],
+        )
+        execution_ids = [record.query_id for record in execution_records]
+        business_records = cast(
+            list[BusinessResultRecord],
+            self._records["business_result"],
+        )
+        business_ids = [record.query_id for record in business_records]
+        failure_records = cast(
+            list[EvaluationFailureRecord],
+            self._records["failure"],
+        )
+        failure_ids = [record.query_id for record in failure_records]
+        metrics_ids = list(self._metrics.per_query) if self._metrics is not None else []
+        if not (
+            prediction_ids
+            == execution_ids
+            == business_ids
+            == metrics_ids
+            and len(prediction_ids) == self._input_lock.frozen_data.query_count
+        ):
+            raise ValueError("formal artifacts have inconsistent ordered query coverage")
+        expected_failure_ids = [
+            record.query_id
+            for record in execution_records
+            if isinstance(record, EvaluationExecutionRecord)
+            and record.outcome_kind == "failure"
+        ]
+        if (
+            failure_ids != expected_failure_ids
+            or self._manifest.failure_count != len(failure_ids)
+        ):
+            raise ValueError("formal artifacts have inconsistent failure coverage")
+        for execution, business in zip(
+            execution_records,
+            business_records,
+            strict=True,
+        ):
+            if (
+                isinstance(execution, EvaluationExecutionRecord)
+                and isinstance(business, BusinessResultRecord)
+                and execution.business_result_sha256
+                != business_result_sha256(business)
+            ):
+                raise ValueError("formal business result hash does not match execution")
 
     def finalize(
         self,
@@ -296,19 +424,57 @@ class FormalRunWorkspace:
             raise RuntimeError("metrics and usage must be written before finalization")
         if gate_evaluation.split != self._manifest.split:
             raise ValueError("Gate split does not match formal run")
+        self._validate_ordered_records()
+        if isinstance(self._input_lock, ReplayLock):
+            if (
+                self._replay_snapshot_manifest is None
+                or self._replay_snapshot_bytes is None
+                or snapshot_manifest != self._replay_snapshot_manifest
+            ):
+                raise ValueError("replay run requires its exact verified snapshot evidence")
+            snapshot_bytes = self._replay_snapshot_bytes
+        else:
+            if self._snapshot_store is None or not self._snapshot_store.manifest_path.is_file():
+                raise RuntimeError("sealed snapshot manifest is required")
+            snapshot_bytes = self._snapshot_store.manifest_path.read_bytes()
+            try:
+                captured_manifest = DependencySnapshotManifestV2.model_validate_json(
+                    snapshot_bytes
+                )
+            except ValueError as error:
+                raise ValueError("sealed snapshot manifest is invalid") from error
+            if captured_manifest != snapshot_manifest:
+                raise ValueError("sealed snapshot manifest does not match capture")
+        snapshot_sha256 = _sha256(snapshot_bytes)
         if (
             replay_lock.snapshot_set_id != snapshot_manifest.snapshot_set_id
             or replay_lock.snapshot_set_id != self._manifest.snapshot_set_id
             or replay_lock.snapshot_manifest_sha256
             != self._manifest.snapshot_manifest_sha256
+            or snapshot_sha256 != replay_lock.snapshot_manifest_sha256
         ):
-            raise ValueError("sealed snapshot identity does not match formal run")
+            raise ValueError("snapshot manifest sha256 or identity does not match formal run")
+        if isinstance(self._input_lock, ReplayLock):
+            if replay_lock != self._input_lock:
+                raise ValueError("replay run must retain its bound replay lock")
+            replay_bytes = self._input_lock_bytes
+        else:
+            if replay_lock.source_capture_run_id != self._manifest.run_id:
+                raise ValueError("capture replay lock does not bind the formal run")
+            replay_bytes = _replay_lock_bytes(replay_lock)
+        reader = DependencySnapshotReader(
+            self._work_dir / "snapshots" / "snapshot-manifest.json",
+            snapshot_manifest_sha256=replay_lock.snapshot_manifest_sha256,
+            snapshot_set_id=replay_lock.snapshot_set_id,
+        )
+        for entry in snapshot_manifest.entries:
+            reader.read(entry.request)
         if self._complete_dir.exists():
             raise FileExistsError("formal run destination already exists")
-        self._write(self._work_dir / "replay.lock.yaml", _replay_lock_bytes(replay_lock))
+        self._write(self._work_dir / "replay.lock.yaml", replay_bytes)
         self._write(
             self._work_dir / "snapshot-manifest.json",
-            _model_json_bytes(snapshot_manifest),
+            snapshot_bytes,
         )
         self._manifest = self._manifest.model_copy(
             update={

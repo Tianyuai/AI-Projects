@@ -323,3 +323,18 @@ def test_search_openapi_declares_typed_error_json_schema() -> None:
     assert typed_error["content"]["application/json"]["schema"] == {
         "$ref": "#/components/schemas/SearchErrorResponse"
     }
+
+
+def test_api_application_serves_the_browser_ui_assets() -> None:
+    application = create_app()
+
+    home = asyncio.run(_request(application, "GET", "/"))
+    script = asyncio.run(_request(application, "GET", "/static/app.js"))
+    stylesheet = asyncio.run(_request(application, "GET", "/static/styles.css"))
+
+    assert home.status_code == 200
+    assert 'src="/static/app.js"' in home.text
+    assert script.status_code == 200
+    assert 'fetch("/v1/search"' in script.text
+    assert stylesheet.status_code == 200
+    assert "font-family" in stylesheet.text

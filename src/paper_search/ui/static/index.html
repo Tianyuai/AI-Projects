@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Paper search</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <main>
+      <h1>Paper search</h1>
+      <form id="search-form">
+        <label for="query">Research query</label>
+        <input id="query" name="query" type="search" required>
+        <label for="mode">Execution mode</label>
+        <select id="mode" name="mode">
+          <option value="replay" selected>Replay</option>
+          <option value="live">Live</option>
+        </select>
+        <button type="submit">Search</button>
+      </form>
+      <p id="status" role="status" aria-live="polite"></p>
+      <section aria-labelledby="results-heading">
+        <h2 id="results-heading">Results</h2>
+        <ol id="results"></ol>
+      </section>
+      <section aria-labelledby="provenance-heading">
+        <h2 id="provenance-heading">Provenance</h2>
+        <dl id="provenance"></dl>
+      </section>
+      <section aria-labelledby="diagnostics-heading">
+        <h2 id="diagnostics-heading">Diagnostics</h2>
+        <div id="diagnostics"></div>
+      </section>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

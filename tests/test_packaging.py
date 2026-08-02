@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import tomllib
+import subprocess
+import tarfile
+import zipfile
 from pathlib import Path
 
 
@@ -8,6 +11,31 @@ def test_console_entry_point_is_stable() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
 
     assert project["project"]["scripts"] == {"paper-search": "paper_search.cli:main"}
+
+
+def test_ui_assets_are_in_built_wheel_and_source_distributions(tmp_path: Path) -> None:
+    expected = {
+        "paper_search/ui/static/index.html",
+        "paper_search/ui/static/app.js",
+        "paper_search/ui/static/styles.css",
+    }
+    subprocess.run(
+        ["uv", "build", "--wheel", "--sdist", "--out-dir", str(tmp_path)],
+        check=True,
+        cwd=Path.cwd(),
+        capture_output=True,
+        text=True,
+    )
+
+    wheel = next(tmp_path.glob("*.whl"))
+    source_distribution = next(tmp_path.glob("*.tar.gz"))
+    with zipfile.ZipFile(wheel) as archive:
+        wheel_entries = set(archive.namelist())
+    with tarfile.open(source_distribution) as archive:
+        source_entries = {member.name for member in archive.getmembers()}
+
+    assert expected.issubset(wheel_entries)
+    assert all(any(entry.endswith(f"/{asset}") for entry in source_entries) for asset in expected)
 
 
 def test_torch_profiles_are_explicit_and_mutually_exclusive() -> None:

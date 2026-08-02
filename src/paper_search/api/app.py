@@ -25,6 +25,7 @@ from paper_search.application import (
     SearchSuccess,
     StructuredSearchResponse,
 )
+from paper_search.ui import install_ui
 
 
 _DEFAULT_READINESS: Final[ReadyHealthResponse] = ReadyHealthResponse(
@@ -61,6 +62,7 @@ def create_app(
 ) -> FastAPI:
     """Create an API that exposes only typed, safe application outcomes."""
     application = FastAPI()
+    install_ui(application)
 
     @application.exception_handler(RequestValidationError)
     async def invalid_request(_: Request, __: RequestValidationError) -> JSONResponse:

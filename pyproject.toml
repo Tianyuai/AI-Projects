@@ -46,6 +46,18 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/paper_search"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"src/paper_search/ui/static/index.html" = "paper_search/ui/static/index.html"
+"src/paper_search/ui/static/app.js" = "paper_search/ui/static/app.js"
+"src/paper_search/ui/static/styles.css" = "paper_search/ui/static/styles.css"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/paper_search/ui/static/index.html",
+    "src/paper_search/ui/static/app.js",
+    "src/paper_search/ui/static/styles.css",
+]
+
 [tool.pytest.ini_options]
 addopts = "-ra -p no:cacheprovider --import-mode=importlib"
 pythonpath = ["src"]

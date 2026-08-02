@@ -232,6 +232,7 @@ class FormalRunWorkspace:
         self._usage_written = False
         self._metrics: EvaluationResult | None = None
         self._snapshot_store: DependencyCaptureStore | None = None
+        self._replay_snapshot_root: Path | None = None
         self._replay_snapshot_manifest: DependencySnapshotManifestV2 | None = None
         self._replay_snapshot_bytes: bytes | None = None
         self._write(self._work_dir / "config.lock.yaml", self._input_lock_bytes)
@@ -267,6 +268,7 @@ class FormalRunWorkspace:
                 raise ValueError("replay snapshot evidence is invalid") from error
             self._replay_snapshot_manifest = snapshot_manifest
             self._replay_snapshot_bytes = snapshot_bytes
+            self._replay_snapshot_root = source_root
 
     @property
     def work_dir(self) -> Path:
@@ -407,6 +409,28 @@ class FormalRunWorkspace:
             ):
                 raise ValueError("formal business result hash does not match execution")
 
+    def _revalidate_replay_source(self) -> None:
+        if (
+            self._replay_snapshot_root is None
+            or self._replay_snapshot_manifest is None
+            or self._replay_snapshot_bytes is None
+            or not isinstance(self._input_lock, ReplayLock)
+        ):
+            raise ValueError("replay run requires its exact verified snapshot evidence")
+        manifest_path = self._replay_snapshot_root / "snapshot-manifest.json"
+        try:
+            if manifest_path.read_bytes() != self._replay_snapshot_bytes:
+                raise ValueError("replay snapshot manifest changed after verification")
+        except OSError as error:
+            raise ValueError("replay snapshot manifest is unavailable") from error
+        reader = DependencySnapshotReader(
+            manifest_path,
+            snapshot_manifest_sha256=self._input_lock.snapshot_manifest_sha256,
+            snapshot_set_id=self._input_lock.snapshot_set_id,
+        )
+        for entry in self._replay_snapshot_manifest.entries:
+            reader.read(entry.request)
+
     def finalize(
         self,
         *,
@@ -423,6 +447,7 @@ class FormalRunWorkspace:
             raise ValueError("Gate split does not match formal run")
         self._validate_ordered_records()
         if isinstance(self._input_lock, ReplayLock):
+            self._revalidate_replay_source()
             if (
                 self._replay_snapshot_manifest is None
                 or self._replay_snapshot_bytes is None

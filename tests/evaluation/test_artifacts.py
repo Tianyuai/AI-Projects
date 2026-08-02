@@ -22,7 +22,11 @@ from paper_search.evaluation.gates import GateEvaluation
 from paper_search.evaluation.dataset import EvaluationQuery, PredictionRecord
 from paper_search.evaluation.metrics import evaluate
 from paper_search.evaluation.official_adapter import InternalPredictionRecord
-from paper_search.storage.dependency_snapshot import DependencySnapshotManifestV2
+from paper_search.storage.dependency_snapshot import (
+    DependencyCaptureStore,
+    DependencyRequestIdentity,
+    DependencySnapshotManifestV2,
+)
 
 
 NOW = datetime(2026, 8, 2, tzinfo=UTC)
@@ -360,6 +364,61 @@ def test_replay_copies_exact_verified_lock_and_manifest_bytes(tmp_path: Path) ->
     assert (destination / "replay.lock.yaml").read_bytes() == input_lock_bytes
     assert (destination / "snapshot-manifest.json").read_bytes() == snapshot_bytes
     assert not (destination / "snapshots").exists()
+
+
+def test_replay_finalize_revalidates_source_response_bytes(tmp_path: Path) -> None:
+    replay_root = tmp_path / "replay-source"
+    capture = DependencyCaptureStore(replay_root, clock=lambda: NOW)
+    identity = DependencyRequestIdentity.from_canonical_request(
+        dependency="openalex",
+        operation="search",
+        method="GET",
+        endpoint="/works",
+        model_or_adapter="adapter-v1",
+        canonical_request={"query": "atomic artifacts"},
+    )
+    capture.stage_success(
+        identity,
+        response_bytes=b'{"results":[]}\n',
+        safe_headers={"content-type": "application/json"},
+        captured_at=NOW,
+    )
+    snapshot_manifest = capture.seal()
+    replay_lock = _replay_lock().model_copy(
+        update={
+            "snapshot_set_id": snapshot_manifest.snapshot_set_id,
+            "snapshot_manifest_sha256": capture.manifest_sha256,
+        }
+    )
+    input_lock_bytes = _lock_bytes(replay_lock)
+    manifest = _manifest().model_copy(
+        update={
+            "execution_mode": "replay",
+            "config_hash": lock_sha256(replay_lock),
+            "input_lock_sha256": _sha256(input_lock_bytes),
+            "snapshot_set_id": replay_lock.snapshot_set_id,
+            "snapshot_manifest_sha256": replay_lock.snapshot_manifest_sha256,
+        }
+    )
+    workspace = FormalRunWorkspace(
+        runs_root=tmp_path / "runs",
+        manifest=manifest,
+        input_lock_bytes=input_lock_bytes,
+        nonce_factory=lambda: "nonce",
+        clock=lambda: NOW,
+        replay_snapshot_root=replay_root,
+    )
+    _populate(workspace)
+    response_path = replay_root / snapshot_manifest.entries[0].response_path
+    response_path.write_bytes(b'{"tampered":true}\n')
+
+    with pytest.raises(ValueError, match="response hash mismatch"):
+        workspace.finalize(
+            gate_evaluation=_gate(),
+            replay_lock=replay_lock,
+            snapshot_manifest=snapshot_manifest,
+        )
+    assert not (tmp_path / "runs" / "formal-1").exists()
 
 
 def test_finalize_rejects_cross_file_query_order_and_coverage(tmp_path: Path) -> None:

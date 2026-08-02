@@ -53,9 +53,7 @@ packages = ["src/paper_search"]
 
 [tool.hatch.build.targets.sdist]
 include = [
-    "src/paper_search/ui/static/index.html",
-    "src/paper_search/ui/static/app.js",
-    "src/paper_search/ui/static/styles.css",
+    "src/paper_search/**",
 ]
 
 [tool.pytest.ini_options]

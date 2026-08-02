@@ -36,6 +36,11 @@ def test_ui_assets_are_in_built_wheel_and_source_distributions(tmp_path: Path) -
 
     assert expected.issubset(wheel_entries)
     assert all(any(entry.endswith(f"/{asset}") for entry in source_entries) for asset in expected)
+    for source_file in (
+        "src/paper_search/__init__.py",
+        "src/paper_search/api/app.py",
+    ):
+        assert any(entry.endswith(f"/{source_file}") for entry in source_entries)
 
 
 def test_torch_profiles_are_explicit_and_mutually_exclusive() -> None:

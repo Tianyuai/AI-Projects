@@ -8,6 +8,7 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+from decimal import Decimal
 from typing import Any
 
 from pydantic import Field
@@ -66,11 +67,20 @@ class MetricSummary(DomainModel):
     micro_f1: float = Field(ge=0, le=1, allow_inf_nan=False)
 
 
+class MetricMeasure(DomainModel):
+    """Exact numerator and denominator accompanying a reported metric value."""
+
+    numerator: Decimal
+    denominator: Decimal = Field(ge=0)
+    value: Decimal | None
+
+
 class EvaluationResult(DomainModel):
     """Aggregate summary plus metrics keyed by gold query identifier."""
 
     summary: MetricSummary
     per_query: dict[str, QueryMetrics]
+    measures: dict[NonEmptyStr, MetricMeasure] = Field(default_factory=dict)
 
 
 def deduplicate_ranked(values: Sequence[str]) -> list[str]:
@@ -229,7 +239,56 @@ def evaluate(
         micro_recall=micro_recall,
         micro_f1=micro_f1,
     )
-    return EvaluationResult(summary=summary, per_query=per_query)
+    query_denominator = Decimal(query_count)
+
+    def macro_measure(values: Sequence[float], value: float) -> MetricMeasure:
+        return MetricMeasure(
+            numerator=sum((Decimal(str(item)) for item in values), Decimal("0")),
+            denominator=query_denominator,
+            value=Decimal(str(value)),
+        )
+
+    def ratio_measure(numerator: int, denominator: int, value: float) -> MetricMeasure:
+        return MetricMeasure(
+            numerator=Decimal(numerator),
+            denominator=Decimal(denominator),
+            value=Decimal(str(value)),
+        )
+
+    macro_values = {
+        "macro_precision": [item.precision for item in per_query.values()],
+        "macro_recall": [item.recall for item in per_query.values()],
+        "macro_f1": [item.f1 for item in per_query.values()],
+        "recall_at_5": [item.recall_at_5 for item in per_query.values()],
+        "recall_at_10": [item.recall_at_10 for item in per_query.values()],
+        "recall_at_20": [item.recall_at_20 for item in per_query.values()],
+    }
+    measures = {
+        name: macro_measure(values, getattr(summary, name if not name.startswith("recall_at_") else f"macro_{name}"))
+        for name, values in macro_values.items()
+    }
+    measures.update(
+        {
+            "micro_precision": ratio_measure(
+                true_positive_count,
+                true_positive_count + false_positive_count,
+                micro_precision,
+            ),
+            "micro_recall": ratio_measure(
+                true_positive_count,
+                true_positive_count + false_negative_count,
+                micro_recall,
+            ),
+            "micro_f1": ratio_measure(
+                2 * true_positive_count,
+                2 * true_positive_count + false_positive_count + false_negative_count,
+                micro_f1,
+            ),
+        }
+    )
+    measures["macro_identifier_map_recall"] = measures["macro_recall"]
+    measures["micro_identifier_map_recall"] = measures["micro_recall"]
+    return EvaluationResult(summary=summary, per_query=per_query, measures=measures)
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:

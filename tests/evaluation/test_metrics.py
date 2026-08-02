@@ -119,6 +119,10 @@ def test_evaluate_reports_macro_micro_and_missing_predictions() -> None:
     assert result.summary.micro_precision == 1.0
     assert result.summary.micro_recall == 1.0
     assert result.summary.micro_f1 == 1.0
+    assert result.measures["macro_recall"].numerator == 2
+    assert result.measures["macro_recall"].denominator == 2
+    assert result.measures["micro_recall"].numerator == 1
+    assert result.measures["micro_recall"].denominator == 1
 
 
 def test_evaluate_micro_metrics_sum_counts_before_scoring() -> None:
@@ -148,6 +152,10 @@ def test_evaluate_micro_metrics_sum_counts_before_scoring() -> None:
     assert result.summary.micro_precision == pytest.approx(1 / 2)
     assert result.summary.micro_recall == pytest.approx(1 / 2)
     assert result.summary.micro_f1 == pytest.approx(1 / 2)
+    assert result.measures["micro_precision"].numerator == 1
+    assert result.measures["micro_precision"].denominator == 2
+    assert result.measures["micro_recall"].numerator == 1
+    assert result.measures["micro_recall"].denominator == 2
 
 
 def test_evaluate_empty_input_has_explicit_perfect_empty_contract() -> None:

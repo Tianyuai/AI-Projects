@@ -7,9 +7,10 @@ import json
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
-from typing import Callable, Protocol
+from typing import Callable, Literal, Protocol
 
 import yaml
 from pydantic import TypeAdapter
@@ -26,7 +27,24 @@ from paper_search.application.locks import (
     ValidationLock,
     lock_sha256,
 )
-from paper_search.domain.models import UsageActual
+from paper_search.control.ledger import LedgerReport
+from paper_search.domain.models import (
+    DependencyStatus,
+    DomainModel,
+    NonEmptyStr,
+    NonNegativeInt,
+    SearchMode,
+    Sha256,
+    UsageActual,
+)
+from paper_search.evaluation.business_results import BusinessResultRecord
+from paper_search.evaluation.execution_adapter import (
+    EvaluationExecutionRecord,
+    EvaluationFailureRecord,
+)
+from paper_search.evaluation.gates import GateEvaluation
+from paper_search.evaluation.metrics import EvaluationResult
+from paper_search.evaluation.official_adapter import InternalPredictionRecord
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
     DependencySnapshotManifestV2,
@@ -54,8 +72,12 @@ def _sha256(payload: bytes) -> str:
 def _atomic_write(path: Path, payload: bytes) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        temporary.write_bytes(payload)
+        with temporary.open("wb") as target:
+            target.write(payload)
+            target.flush()
+            os.fsync(target.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -66,6 +88,263 @@ def _json_bytes(payload: dict[str, object]) -> bytes:
         json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
         + b"\n"
     )
+
+
+def _compact_model_bytes(record: DomainModel) -> bytes:
+    return (
+        json.dumps(
+            record.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _model_json_bytes(record: DomainModel) -> bytes:
+    return (
+        json.dumps(
+            record.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+class RunManifest(DomainModel):
+    schema_version: Literal["formal-run-v1"] = "formal-run-v1"
+    run_id: NonEmptyStr
+    status: Literal["incomplete", "failed", "interrupted", "complete"]
+    gate_result: Literal["passed", "failed", "not_applicable"]
+    execution_mode: SearchMode
+    split: Literal["smoke", "dev", "validation"]
+    frozen_manifest_sha256: Sha256
+    partition_sha256: Sha256
+    identifier_map_sha256: Sha256
+    source_git_sha: NonEmptyStr
+    tracked_source_dirty: bool
+    config_hash: Sha256
+    input_lock_sha256: Sha256
+    prompt_version: NonEmptyStr
+    snapshot_set_id: NonEmptyStr
+    snapshot_manifest_sha256: Sha256
+    experiment_name: NonEmptyStr
+    optional_modules: dict[NonEmptyStr, bool]
+    started_at: datetime
+    ended_at: datetime | None
+    readiness_summary: list[DependencyStatus]
+    failure_count: NonNegativeInt
+
+
+class FormalRunWorkspace:
+    """Stage one formal run and publish it with a single directory rename."""
+
+    _JSONL_FILES = {
+        "prediction": "predictions.jsonl",
+        "execution": "executions.jsonl",
+        "business_result": "business-results.jsonl",
+        "failure": "failures.jsonl",
+    }
+
+    def __init__(
+        self,
+        *,
+        runs_root: Path,
+        manifest: RunManifest,
+        input_lock_bytes: bytes,
+        nonce_factory: Callable[[], str],
+        clock: Callable[[], datetime],
+        validator: Callable[[Path], None] | None = None,
+        writer: Callable[[Path, bytes], None] = _atomic_write,
+        publisher: Callable[[Path, Path], None] = os.replace,
+    ) -> None:
+        if not _is_valid_run_id(manifest.run_id):
+            raise ValueError("run_id is invalid")
+        if (
+            manifest.status != "incomplete"
+            or manifest.gate_result != "not_applicable"
+            or manifest.ended_at is not None
+        ):
+            raise ValueError("formal workspace requires an incomplete manifest")
+        self._runs_root = runs_root.resolve()
+        self._runs_root.mkdir(parents=True, exist_ok=True)
+        if os.stat(self._runs_root).st_dev != os.stat(self._runs_root.parent).st_dev:
+            raise ValueError("formal workspace paths must use the same filesystem")
+        self._manifest = manifest
+        self._input_lock_bytes = bytes(input_lock_bytes)
+        self._validator = validator or (lambda path: None)
+        self._writer = writer
+        self._publisher = publisher
+        self._clock = clock
+        nonce = nonce_factory()
+        if not nonce or not re.fullmatch(r"[A-Za-z0-9._-]+", nonce):
+            raise ValueError("workspace nonce is invalid")
+        self._work_dir = self._runs_root / f".incomplete-{manifest.run_id}-{nonce}"
+        self._complete_dir = self._runs_root / manifest.run_id
+        self._failed_dir = self._runs_root / "_failed" / manifest.run_id
+        if self._complete_dir.exists() or self._failed_dir.exists():
+            raise FileExistsError("formal run destination already exists")
+        self._work_dir.mkdir(exist_ok=False)
+        self._records: dict[str, list[DomainModel]] = {
+            name: [] for name in self._JSONL_FILES
+        }
+        self._seen: dict[str, set[str]] = {name: set() for name in self._JSONL_FILES}
+        self._terminal = False
+        self._metrics_written = False
+        self._usage_written = False
+        self._write(self._work_dir / "config.lock.yaml", self._input_lock_bytes)
+        self._write_manifest()
+        for filename in self._JSONL_FILES.values():
+            self._write(self._work_dir / filename, b"")
+
+    @property
+    def work_dir(self) -> Path:
+        return self._work_dir
+
+    def _ensure_active(self) -> None:
+        if self._terminal:
+            raise RuntimeError("formal workspace is already terminal")
+
+    def _write(self, path: Path, payload: bytes) -> None:
+        self._writer(path, payload)
+
+    def _write_manifest(self) -> None:
+        self._write(self._work_dir / "run.json", _model_json_bytes(self._manifest))
+
+    def _append(self, kind: str, record: DomainModel) -> None:
+        self._ensure_active()
+        query_id = getattr(record, "query_id")
+        if query_id in self._seen[kind]:
+            raise ValueError(f"duplicate query_id in {self._JSONL_FILES[kind]}: {query_id}")
+        records = [*self._records[kind], record]
+        payload = b"".join(_compact_model_bytes(item) for item in records)
+        self._write(self._work_dir / self._JSONL_FILES[kind], payload)
+        self._records[kind] = records
+        self._seen[kind].add(query_id)
+
+    def write_prediction(self, record: InternalPredictionRecord) -> None:
+        self._append("prediction", record)
+
+    def write_execution(self, record: EvaluationExecutionRecord) -> None:
+        if record.run_id != self._manifest.run_id:
+            raise ValueError("execution run_id does not match formal workspace")
+        self._append("execution", record)
+
+    def write_business_result(self, record: BusinessResultRecord) -> None:
+        self._append("business_result", record)
+
+    def write_failure(self, record: EvaluationFailureRecord) -> None:
+        if record.run_id != self._manifest.run_id:
+            raise ValueError("failure run_id does not match formal workspace")
+        self._append("failure", record)
+        self._manifest = self._manifest.model_copy(
+            update={"failure_count": len(self._records["failure"])}
+        )
+        self._write_manifest()
+
+    def write_metrics(self, metrics: EvaluationResult) -> None:
+        self._ensure_active()
+        if self._metrics_written:
+            raise RuntimeError("metrics are already written")
+        self._write(self._work_dir / "metrics.json", _model_json_bytes(metrics))
+        self._metrics_written = True
+
+    def write_usage(self, report: LedgerReport) -> None:
+        self._ensure_active()
+        if self._usage_written:
+            raise RuntimeError("usage is already written")
+        if report.run_id != self._manifest.run_id:
+            raise ValueError("usage run_id does not match formal workspace")
+        self._write(self._work_dir / "usage.json", _model_json_bytes(report))
+        self._usage_written = True
+
+    def _publish(self, destination: Path) -> Path:
+        if destination.exists():
+            raise FileExistsError("formal run destination already exists")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._publisher(self._work_dir, destination)
+        _fsync_directory(destination.parent)
+        self._terminal = True
+        return destination
+
+    def finalize(
+        self,
+        *,
+        gate_evaluation: GateEvaluation,
+        replay_lock: ReplayLock,
+        snapshot_manifest: DependencySnapshotManifestV2,
+    ) -> Path:
+        self._ensure_active()
+        if snapshot_manifest is None:
+            raise RuntimeError("sealed snapshot manifest is required")
+        if not self._metrics_written or not self._usage_written:
+            raise RuntimeError("metrics and usage must be written before finalization")
+        if gate_evaluation.split != self._manifest.split:
+            raise ValueError("Gate split does not match formal run")
+        if (
+            replay_lock.snapshot_set_id != snapshot_manifest.snapshot_set_id
+            or replay_lock.snapshot_set_id != self._manifest.snapshot_set_id
+            or replay_lock.snapshot_manifest_sha256
+            != self._manifest.snapshot_manifest_sha256
+        ):
+            raise ValueError("sealed snapshot identity does not match formal run")
+        if self._complete_dir.exists():
+            raise FileExistsError("formal run destination already exists")
+        self._write(self._work_dir / "replay.lock.yaml", _replay_lock_bytes(replay_lock))
+        self._write(
+            self._work_dir / "snapshot-manifest.json",
+            _model_json_bytes(snapshot_manifest),
+        )
+        self._manifest = self._manifest.model_copy(
+            update={
+                "status": "complete",
+                "gate_result": gate_evaluation.gate_result,
+                "ended_at": self._clock(),
+            }
+        )
+        self._write_manifest()
+        self._validator(self._work_dir)
+        return self._publish(self._complete_dir)
+
+    def fail(self, reason: SearchErrorCode) -> Path:
+        del reason
+        self._ensure_active()
+        self._manifest = self._manifest.model_copy(
+            update={
+                "status": "failed",
+                "gate_result": "not_applicable",
+                "ended_at": self._clock(),
+            }
+        )
+        self._write_manifest()
+        return self._publish(self._failed_dir)
+
+    def interrupt(self) -> Path:
+        self._ensure_active()
+        self._manifest = self._manifest.model_copy(
+            update={
+                "status": "interrupted",
+                "gate_result": "not_applicable",
+                "ended_at": self._clock(),
+            }
+        )
+        self._write_manifest()
+        return self._publish(self._failed_dir)
 
 
 def _parse_lock(payload: bytes) -> CandidateLock | ValidationLock | ReplayLock:
@@ -435,4 +714,9 @@ class ArtifactFactory:
             await client.aclose()
 
 
-__all__ = ["ArtifactFactory", "CaptureSession"]
+__all__ = [
+    "ArtifactFactory",
+    "CaptureSession",
+    "FormalRunWorkspace",
+    "RunManifest",
+]

@@ -525,7 +525,7 @@ def test_expired_terminal_authority_survives_export_and_restore() -> None:
         UsageActual(llm_calls=1, cost_cny=None),
     )
 
-    assert state["version"] == 3
+    assert state["version"] == 4
     assert restored.stop_status() == "hard_stop"
     assert restored.committed_usage.llm_calls == 1
     assert restored.unknown_cost_actions == ["llm.restored-terminal"]
@@ -823,7 +823,7 @@ def legacy_v1_state(**updates: object) -> dict[str, object]:
     return state
 
 
-@pytest.mark.parametrize("version", [1, 2, 3])
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
 def test_restore_rejects_active_llm_reservation_with_unknown_cost(
     version: int,
 ) -> None:
@@ -837,8 +837,9 @@ def test_restore_rejects_active_llm_reservation_with_unknown_cost(
         ),
         "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
     }
-    if version == 3:
+    if version in {3, 4}:
         state = controller_type(make_budget()).export_state()
+        state["version"] = version
         state["reservations"] = [reservation]
     else:
         state = legacy_v1_state(version=version, reservations=[reservation])
@@ -924,7 +925,7 @@ def test_recovery_preserves_strict_v1_formal_live_when_present() -> None:
     assert restored.formal_live is True
 
 
-def test_exported_v3_formal_live_state_preserves_unknown_cost_rejection() -> None:
+def test_exported_v4_formal_live_state_preserves_unknown_cost_rejection() -> None:
     controller_type, _, reservation_error = budget_api()
     controller = controller_type(make_budget(), formal_live=True)
 
@@ -932,7 +933,7 @@ def test_exported_v3_formal_live_state_preserves_unknown_cost_rejection() -> Non
     restored = controller_type.from_state(make_budget(), state)
     reservation = restored.reserve("provider.search", UsageEstimate(search_api_calls=1))
 
-    assert state["version"] == 3
+    assert state["version"] == 4
     with pytest.raises(reservation_error, match="formal live"):
         restored.settle(reservation, UsageActual())
 
@@ -954,4 +955,69 @@ def test_recovery_rejects_unknown_budget_state_version() -> None:
     controller_type, _, _ = budget_api()
 
     with pytest.raises(ValueError, match="version"):
-        controller_type.from_state(make_budget(), legacy_v1_state(version=4))
+        controller_type.from_state(make_budget(), legacy_v1_state(version=5))
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_terminal_outcome_is_exact_read_only_and_survives_restore(
+    failed: bool,
+) -> None:
+    controller_type, _, reservation_error = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+    reservation = controller.reserve(
+        "provider.search",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    controller.mark_dispatched(reservation)
+    actual = UsageActual(search_api_calls=1, cost_cny=Decimal("0.25"))
+    if failed:
+        controller.fail_closed(reservation, actual)
+        expected_mode = "failed"
+    else:
+        controller.settle(reservation, actual)
+        expected_mode = "settled"
+
+    assert controller.terminal_outcome(reservation) == (expected_mode, actual)
+    mismatched = reservation.model_copy(update={"action": "provider.other"})
+    with pytest.raises(reservation_error, match="does not match"):
+        controller.terminal_outcome(mismatched)
+
+    state = controller.export_state()
+    restored = controller_type.from_state(make_budget(), state)
+    assert state["version"] == 4
+    assert restored.terminal_outcome(reservation) == (expected_mode, actual)
+
+
+def test_legacy_v3_committed_usage_round_trips_with_partial_v4_receipts() -> None:
+    controller_type, _, _ = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+    legacy_reservation = controller.reserve(
+        "provider.legacy",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    controller.settle(
+        legacy_reservation,
+        UsageActual(search_api_calls=1, cost_cny=Decimal("0.20")),
+    )
+    legacy_state = controller.export_state()
+    legacy_state["version"] = 3
+    legacy_state.pop("terminal_outcomes")
+
+    restored = controller_type.from_state(make_budget(), legacy_state)
+    new_reservation = restored.reserve(
+        "provider.new",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    new_actual = UsageActual(search_api_calls=1, cost_cny=Decimal("0.20"))
+    restored.settle(new_reservation, new_actual)
+
+    round_tripped = controller_type.from_state(
+        make_budget(),
+        restored.export_state(),
+    )
+    assert round_tripped.committed_usage.search_api_calls == 2
+    assert round_tripped.terminal_outcome(legacy_reservation) is None
+    assert round_tripped.terminal_outcome(new_reservation) == (
+        "settled",
+        new_actual,
+    )

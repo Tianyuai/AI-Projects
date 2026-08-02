@@ -2,15 +2,20 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from paper_search.domain.models import UsageActual, UsageEstimate
-from paper_search.domain.models import SearchBudget
-from paper_search.control.budget import HardBudgetController
+from paper_search.domain.models import (
+    BudgetReservation,
+    SearchBudget,
+    UsageActual,
+    UsageEstimate,
+)
+from paper_search.control.budget import HardBudgetController, ReservationError
 from paper_search.control.ledger import (
     LedgerBudgetExceededError,
     LedgerReservationError,
@@ -49,6 +54,38 @@ def _actual(cost: str | None) -> UsageActual:
         search_api_calls=1,
         cost_cny=Decimal(cost) if cost is not None else None,
     )
+
+
+def _controller_request(
+    *,
+    clock: Callable[[], datetime],
+    ttl_seconds: int = 120,
+    estimate_cost: str = "0.30",
+) -> tuple[HardBudgetController, BudgetReservation]:
+    controller = HardBudgetController(
+        SearchBudget(
+            max_search_api_calls=2,
+            target_search_api_calls=1,
+            max_llm_calls=1,
+            target_llm_calls=0,
+            max_total_tokens=1,
+            max_cost_cny=1.0,
+            max_elapsed_seconds=10,
+            soft_deadline_seconds=9,
+        ),
+        formal_live=True,
+        reservation_ttl_seconds=ttl_seconds,
+        clock=clock,
+    )
+    request = controller.reserve(
+        "provider.search",
+        UsageEstimate(
+            search_api_calls=1,
+            cost_cny=Decimal(estimate_cost),
+        ),
+    )
+    controller.mark_dispatched(request)
+    return controller, request
 
 
 def test_concurrent_reserve_is_atomic_across_sqlite_connections(tmp_path: Path) -> None:
@@ -400,6 +437,18 @@ def test_controller_final_actual_checkpoint_survives_crash_and_recovers_once(
     assert first.actual == final_actual
     assert first.project_actual_cny == Decimal("0.25")
     assert second == first
+    recovered.finalize_controller_actual(
+        ledger_reservation=ledger_reservation,
+        controller=controller,
+        request_reservation=request,
+        actual=final_actual,
+    )
+    recovered.finalize_controller_actual(
+        ledger_reservation=ledger_reservation,
+        controller=controller,
+        request_reservation=request,
+        actual=final_actual,
+    )
     with pytest.raises(LedgerReservationError, match="already terminal"):
         recovered.settle(ledger_reservation, final_actual)
 
@@ -634,3 +683,202 @@ def test_finalize_controller_recovers_crash_after_controller_before_ledger(
 
     assert controller.committed_usage == _actual("0.25")
     assert ledger.report("controller-final-gap").actual == _actual("0.25")
+
+
+def test_finalize_retry_after_controller_ttl_does_not_terminalize_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = NOW
+    path = tmp_path / "ledger.sqlite3"
+    ledger = _ledger(path, clock=lambda: current)
+    ledger_reservation = ledger.reserve(
+        run_id="controller-ttl",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    controller, request = _controller_request(
+        clock=lambda: current,
+        ttl_seconds=2,
+    )
+    original_settle = controller.settle
+
+    def crash_after_checkpoint(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("crash after checkpoint")
+
+    monkeypatch.setattr(controller, "settle", crash_after_checkpoint)
+    with pytest.raises(RuntimeError, match="after checkpoint"):
+        ledger.finalize_controller_actual(
+            ledger_reservation=ledger_reservation,
+            controller=controller,
+            request_reservation=request,
+            actual=_actual("0.25"),
+        )
+    monkeypatch.setattr(controller, "settle", original_settle)
+    current += timedelta(seconds=3)
+
+    for _ in range(2):
+        with pytest.raises(ReservationError, match="unknown or already settled"):
+            ledger.finalize_controller_actual(
+                ledger_reservation=ledger_reservation,
+                controller=controller,
+                request_reservation=request,
+                actual=_actual("0.25"),
+            )
+
+    with sqlite3.connect(path) as connection:
+        stored = connection.execute(
+            "SELECT state, checkpoint_present FROM reservations"
+        ).fetchone()
+    assert stored == ("reserved", 1)
+    assert controller.committed_usage == UsageActual()
+    assert ledger.report("controller-ttl").actual == _actual("0.25")
+
+
+def test_finalize_repeated_permanent_reservation_error_keeps_ledger_prepared(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ledger = _ledger(path)
+    ledger_reservation = ledger.reserve(
+        run_id="permanent-error",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    controller, request = _controller_request(
+        clock=lambda: NOW,
+        estimate_cost="0.20",
+    )
+
+    for _ in range(2):
+        with pytest.raises(ReservationError, match="cost_cny exceeds"):
+            ledger.finalize_controller_actual(
+                ledger_reservation=ledger_reservation,
+                controller=controller,
+                request_reservation=request,
+                actual=_actual("0.25"),
+            )
+
+    with sqlite3.connect(path) as connection:
+        stored = connection.execute(
+            "SELECT state, checkpoint_present FROM reservations"
+        ).fetchone()
+    assert stored == ("reserved", 1)
+    assert controller.committed_usage == UsageActual()
+
+
+def test_finalize_rejects_mismatched_request_reservation_on_every_retry(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ledger = _ledger(path)
+    ledger_reservation = ledger.reserve(
+        run_id="mismatched-request",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    controller, request = _controller_request(clock=lambda: NOW)
+    mismatched = request.model_copy(update={"action": "provider.other"})
+
+    for _ in range(2):
+        with pytest.raises(ReservationError, match="does not match"):
+            ledger.finalize_controller_actual(
+                ledger_reservation=ledger_reservation,
+                controller=controller,
+                request_reservation=mismatched,
+                actual=_actual("0.25"),
+            )
+
+    with sqlite3.connect(path) as connection:
+        stored = connection.execute(
+            "SELECT state, checkpoint_present FROM reservations"
+        ).fetchone()
+    assert stored == ("reserved", 1)
+    assert controller.committed_usage == UsageActual()
+
+
+def test_stale_recovery_preserves_checkpoint_until_controller_reconciles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = NOW
+    path = tmp_path / "ledger.sqlite3"
+    ledger = _ledger(path, clock=lambda: current)
+    ledger_reservation = ledger.reserve(
+        run_id="stale-prepared",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    controller, request = _controller_request(clock=lambda: NOW)
+    original_settle = controller.settle
+
+    def crash_after_checkpoint(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("crash after checkpoint")
+
+    monkeypatch.setattr(controller, "settle", crash_after_checkpoint)
+    with pytest.raises(RuntimeError, match="after checkpoint"):
+        ledger.finalize_controller_actual(
+            ledger_reservation=ledger_reservation,
+            controller=controller,
+            request_reservation=request,
+            actual=_actual("0.25"),
+        )
+    current += timedelta(minutes=1)
+    reopened = _ledger(path, clock=lambda: current)
+
+    with sqlite3.connect(path) as connection:
+        stored = connection.execute(
+            "SELECT state, checkpoint_present FROM reservations"
+        ).fetchone()
+    assert stored == ("reserved", 1)
+    assert reopened.report("stale-prepared").actual == _actual("0.25")
+
+    monkeypatch.setattr(controller, "settle", original_settle)
+    reopened.finalize_controller_actual(
+        ledger_reservation=ledger_reservation,
+        controller=controller,
+        request_reservation=request,
+        actual=_actual("0.25"),
+    )
+    assert reopened.report("stale-prepared").actual == _actual("0.25")
+
+
+def test_finalize_rejects_opposite_terminal_mode_with_identical_usage(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path / "ledger.sqlite3")
+    ledger_reservation = ledger.reserve(
+        run_id="opposite-mode",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    controller, request = _controller_request(clock=lambda: NOW)
+    actual = _actual("0.25")
+    ledger.finalize_controller_actual(
+        ledger_reservation=ledger_reservation,
+        controller=controller,
+        request_reservation=request,
+        actual=actual,
+    )
+
+    with pytest.raises(LedgerReservationError, match="terminal mode"):
+        ledger.finalize_controller_actual(
+            ledger_reservation=ledger_reservation,
+            controller=controller,
+            request_reservation=request,
+            actual=actual,
+            failed=True,
+        )
+
+    assert controller.committed_usage == actual
+    with sqlite3.connect(tmp_path / "ledger.sqlite3") as connection:
+        assert connection.execute("SELECT state FROM reservations").fetchone() == (
+            "settled",
+        )

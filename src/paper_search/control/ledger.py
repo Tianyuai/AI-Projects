@@ -274,7 +274,8 @@ class SQLiteBudgetLedger:
                     actual_elapsed_ms = 0,
                     actual_cost_micro_cny = 0,
                     terminal_at = ?
-                WHERE state = 'reserved' AND expires_at <= ?
+                WHERE state = 'reserved' AND checkpoint_present = 0
+                  AND expires_at <= ?
                 """,
                 (now.isoformat(), now.isoformat()),
             )
@@ -296,7 +297,8 @@ class SQLiteBudgetLedger:
                     actual_cost_micro_cny = CASE checkpoint_present
                         WHEN 1 THEN checkpoint_cost_micro_cny ELSE estimate_cost_micro_cny END,
                     terminal_at = ?
-                WHERE state = 'reserved' AND expires_at <= ?
+                WHERE state = 'reserved' AND checkpoint_present = 0
+                  AND expires_at <= ?
                 """,
                 (now.isoformat(), now.isoformat()),
             )
@@ -574,7 +576,7 @@ class SQLiteBudgetLedger:
         self,
         reservation: LedgerReservation,
         actual: UsageActual,
-    ) -> Literal["reserved", "checkpointed", "terminal"]:
+    ) -> Literal["reserved", "checkpointed", "settled", "failed"]:
         expected = UsageActual(cost_cny=Decimal("0")) if self._replay else actual
         with self._immediate() as connection:
             self._recover_locked(connection)
@@ -599,7 +601,7 @@ class SQLiteBudgetLedger:
                 )
                 if terminal != expected:
                     raise LedgerReservationError("terminal actual does not match")
-                return "terminal"
+                return "settled" if row["state"] == "settled" else "failed"
             if not row["checkpoint_present"]:
                 return "reserved"
             checkpoint = UsageActual.model_validate(
@@ -608,6 +610,23 @@ class SQLiteBudgetLedger:
             if checkpoint != expected:
                 raise LedgerReservationError("actual checkpoint does not match")
             return "checkpointed"
+
+    @staticmethod
+    def _controller_outcome_matches(
+        controller: HardBudgetController,
+        reservation: BudgetReservation,
+        actual: UsageActual,
+        mode: Literal["settled", "failed"],
+    ) -> bool:
+        outcome = controller.terminal_outcome(reservation)
+        if outcome is None:
+            return False
+        terminal_mode, terminal_actual = outcome
+        if terminal_mode != mode or terminal_actual != actual:
+            raise LedgerReservationError(
+                "controller terminal outcome does not match requested outcome"
+            )
+        return True
 
     def finalize_controller_actual(
         self,
@@ -626,8 +645,24 @@ class SQLiteBudgetLedger:
         """
 
         actual = UsageActual.model_validate(actual.model_dump(mode="python"))
+        requested_mode: Literal["settled", "failed"] = (
+            "failed" if failed else "settled"
+        )
         prior = self._coordinated_actual_state(ledger_reservation, actual)
-        if prior == "terminal":
+        if prior in {"settled", "failed"}:
+            if prior != requested_mode:
+                raise LedgerReservationError(
+                    "ledger terminal mode conflicts with requested terminal mode"
+                )
+            if not self._controller_outcome_matches(
+                controller,
+                request_reservation,
+                actual,
+                requested_mode,
+            ):
+                raise LedgerReservationError(
+                    "controller has no matching terminal outcome"
+                )
             return
         self.checkpoint_actual(ledger_reservation, actual)
         try:
@@ -636,8 +671,22 @@ class SQLiteBudgetLedger:
             else:
                 controller.settle(request_reservation, actual)
         except ReservationError:
-            if prior != "checkpointed":
+            if not self._controller_outcome_matches(
+                controller,
+                request_reservation,
+                actual,
+                requested_mode,
+            ):
                 raise
+        if not self._controller_outcome_matches(
+            controller,
+            request_reservation,
+            actual,
+            requested_mode,
+        ):
+            raise LedgerReservationError(
+                "controller has no matching terminal outcome"
+            )
         if failed:
             self.fail(ledger_reservation, actual)
         else:

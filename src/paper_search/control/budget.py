@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import threading
+from typing import Literal
 from uuid import uuid4
 
 from paper_search.domain.models import (
@@ -25,6 +26,8 @@ class ReservationError(RuntimeError):
 
 
 Clock = Callable[[], datetime]
+TerminalMode = Literal["settled", "failed"]
+TerminalRecord = tuple[BudgetReservation, TerminalMode, UsageActual]
 
 
 def _aggregate(usages: Iterable[UsageEstimate]) -> UsageEstimate:
@@ -77,6 +80,8 @@ class HardBudgetController:
         self._dispatched_reservations: set[str] = set()
         self._committed: list[UsageActual] = []
         self._committed_actions: list[str] = []
+        self._terminal_outcomes: dict[str, TerminalRecord] = {}
+        self._terminal_outcomes_complete = True
         self._fail_closed = False
 
     @property
@@ -153,6 +158,7 @@ class HardBudgetController:
     def settle(self, reservation: BudgetReservation, actual: UsageActual) -> None:
         with self._lock:
             self._expire_locked()
+            actual = UsageActual.model_validate(actual.model_dump(mode="python"))
             active = self._reservations.get(reservation.reservation_id)
             if active is None:
                 raise ReservationError("reservation is unknown or already settled")
@@ -172,6 +178,28 @@ class HardBudgetController:
             self._dispatched_reservations.discard(reservation.reservation_id)
             self._committed.append(actual)
             self._committed_actions.append(active.action)
+            self._terminal_outcomes[reservation.reservation_id] = (
+                active,
+                "settled",
+                actual,
+            )
+
+    def terminal_outcome(
+        self,
+        reservation: BudgetReservation,
+    ) -> tuple[TerminalMode, UsageActual] | None:
+        """Return an exact terminal receipt without inferring from exceptions."""
+
+        with self._lock:
+            record = self._terminal_outcomes.get(reservation.reservation_id)
+            if record is None:
+                return None
+            stored, mode, actual = record
+            if stored != reservation:
+                raise ReservationError(
+                    "reservation does not match the terminal reservation"
+                )
+            return mode, UsageActual.model_validate(actual.model_dump(mode="python"))
 
     def release(self, reservation: BudgetReservation) -> None:
         """Release an unused active reservation."""
@@ -271,6 +299,12 @@ class HardBudgetController:
         self._dispatched_reservations.discard(reservation.reservation_id)
         self._committed.extend(committed)
         self._committed_actions.extend(reservation.action for _ in committed)
+        aggregate = UsageActual.model_validate(_aggregate(committed).model_dump())
+        self._terminal_outcomes[reservation.reservation_id] = (
+            reservation,
+            "failed",
+            aggregate,
+        )
 
     def stop_status(self) -> str:
         """Return deterministic continue, soft-stop, or hard-stop state."""
@@ -298,7 +332,7 @@ class HardBudgetController:
         with self._lock:
             self._expire_locked()
             return {
-                "version": 3,
+                "version": 4,
                 "reservation_ttl_seconds": self.reservation_ttl_seconds,
                 "formal_live": self.formal_live,
                 "fail_closed": self._fail_closed,
@@ -314,6 +348,15 @@ class HardBudgetController:
                     {"action": action, "usage": usage.model_dump(mode="json")}
                     for action, usage in zip(self._committed_actions, self._committed, strict=True)
                 ],
+                "terminal_outcomes": [
+                    {
+                        "reservation": reservation.model_dump(mode="json"),
+                        "mode": mode,
+                        "actual": actual.model_dump(mode="json"),
+                    }
+                    for reservation, mode, actual in self._terminal_outcomes.values()
+                ],
+                "terminal_outcomes_complete": self._terminal_outcomes_complete,
             }
 
     @classmethod
@@ -326,7 +369,7 @@ class HardBudgetController:
     ) -> HardBudgetController:
         """Restore validated state without bypassing budget accounting invariants."""
         version = state.get("version")
-        if type(version) is not int or version not in {1, 2, 3}:
+        if type(version) is not int or version not in {1, 2, 3, 4}:
             raise ValueError("invalid budget controller state version")
 
         reservation_ttl_seconds = state.get("reservation_ttl_seconds")
@@ -352,20 +395,28 @@ class HardBudgetController:
         )
         reservations = state.get("reservations")
         expired_reservations = (
-            state.get("expired_reservations") if version == 3 else []
+            state.get("expired_reservations") if version in {3, 4} else []
         )
         dispatched_reservation_ids = (
-            state.get("dispatched_reservation_ids") if version == 3 else None
+            state.get("dispatched_reservation_ids") if version in {3, 4} else None
         )
         committed = state.get("committed")
+        terminal_outcomes = state.get("terminal_outcomes") if version == 4 else []
+        terminal_outcomes_complete = (
+            state.get("terminal_outcomes_complete")
+            if version == 4
+            else not committed
+        )
         if (
             not isinstance(reservations, list)
             or not isinstance(expired_reservations, list)
             or (
-                version == 3
+                version in {3, 4}
                 and not isinstance(dispatched_reservation_ids, list)
             )
             or not isinstance(committed, list)
+            or not isinstance(terminal_outcomes, list)
+            or not isinstance(terminal_outcomes_complete, bool)
         ):
             raise ValueError("invalid budget controller state")
         try:
@@ -392,7 +443,7 @@ class HardBudgetController:
                 item.reservation_id for item in all_reservations
             }
             expired_ids = {item.reservation_id for item in restored_expired}
-            if version == 3:
+            if version in {3, 4}:
                 assert isinstance(dispatched_reservation_ids, list)
                 if (
                     any(
@@ -421,6 +472,36 @@ class HardBudgetController:
                     raise ValueError("invalid committed usage state")
                 controller._committed_actions.append(raw["action"])
                 controller._committed.append(UsageActual.model_validate(raw.get("usage")))
+            controller._terminal_outcomes = {}
+            controller._terminal_outcomes_complete = terminal_outcomes_complete
+            for raw in terminal_outcomes:
+                if not isinstance(raw, Mapping):
+                    raise ValueError("invalid terminal outcome")
+                terminal_reservation = BudgetReservation.model_validate(
+                    raw.get("reservation")
+                )
+                mode = raw.get("mode")
+                if mode not in {"settled", "failed"}:
+                    raise ValueError("invalid terminal outcome")
+                terminal_actual = UsageActual.model_validate(raw.get("actual"))
+                reservation_id = terminal_reservation.reservation_id
+                if (
+                    reservation_id in controller._terminal_outcomes
+                    or reservation_id in all_reservation_ids
+                ):
+                    raise ValueError("invalid terminal outcome")
+                controller._terminal_outcomes[reservation_id] = (
+                    terminal_reservation,
+                    mode,
+                    terminal_actual,
+                )
+            if version == 4 and terminal_outcomes_complete:
+                terminal_usage = _aggregate(
+                    record[2] for record in controller._terminal_outcomes.values()
+                )
+                committed_usage = _aggregate(controller._committed)
+                if terminal_usage != committed_usage:
+                    raise ValueError("invalid terminal outcome")
             if (
                 formal_live
                 and not fail_closed

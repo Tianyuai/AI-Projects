@@ -341,11 +341,21 @@ def load_input_lock(path: Path, *, artifact_root: Path) -> InputLock:
     """Load one exact lock and verify each referenced artifact from one byte read."""
 
     try:
-        raw = yaml.safe_load(path.read_bytes())
+        payload = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"could not read input lock: {path}") from error
+    return load_input_lock_bytes(payload, artifact_root=artifact_root)
+
+
+def load_input_lock_bytes(payload: bytes, *, artifact_root: Path) -> InputLock:
+    """Validate already-read lock bytes and every content-addressed dependency."""
+
+    try:
+        raw = yaml.safe_load(payload)
     except yaml.YAMLError as error:
-        raise ValueError(f"invalid lock YAML: {path}") from error
+        raise ValueError("invalid lock YAML") from error
     if not isinstance(raw, dict):
-        raise ValueError(f"lock file must contain a mapping: {path}")
+        raise ValueError("lock file must contain a mapping")
     lock = _INPUT_LOCK_ADAPTER.validate_python(raw)
     _verify_artifact_bindings(lock, artifact_root)
     return lock

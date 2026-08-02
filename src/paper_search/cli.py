@@ -75,6 +75,7 @@ async def _run_smoke(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
             output_root=Path(args.output_root),
             snapshot_manifest_path=args.snapshot_manifest,
             network_authorized=bool(args.allow_network),
+            lock_bytes=input_lock_bytes,
         )
         run_id = f"smoke-{uuid4()}"
         session = bundle.artifact_factory.start_capture(
@@ -88,7 +89,8 @@ async def _run_smoke(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
                 query=_SMOKE_QUERY,
                 budget_profile=budget_profile,
                 mode=args.mode,
-            )
+            ),
+            run_id=run_id,
         )
         session.record_execution(execution)
         if isinstance(execution.outcome, SearchFailure):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import socket
@@ -11,9 +12,13 @@ import httpx
 import yaml
 
 import paper_search.application.composition as composition_module
-from paper_search.application.artifacts import ArtifactFactory
-from paper_search.application.contracts import SearchExecutionResult, SearchSuccess
-from paper_search.application.locks import ReplayLock
+from paper_search.application.artifacts import ArtifactFactory, CaptureSession
+from paper_search.application.contracts import (
+    SearchExecutionResult,
+    SearchRequest,
+    SearchSuccess,
+)
+from paper_search.application.locks import CandidateLock, ReplayLock, lock_sha256
 from paper_search.cli import build_parser, main
 from paper_search.domain.models import StructuredSearchResponse, UsageActual
 from paper_search.retrieval.openalex import OPENALEX_SELECT_FIELDS
@@ -229,10 +234,42 @@ rates:
     }
 
 
-def _success_execution() -> SearchExecutionResult:
+def _fake_live_client_factory(fixture: dict[str, Path]) -> object:
+    real_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            payload = fixture["llm_fixture"].read_bytes()
+        elif request.url.host == "api.openalex.org":
+            payload = fixture["openalex_fixture"].read_bytes()
+        elif request.url.host == "api.semanticscholar.org":
+            payload = fixture["semantic_fixture"].read_bytes()
+        else:
+            raise AssertionError(f"unexpected fake-live URL: {request.url}")
+        return httpx.Response(
+            200,
+            content=payload,
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    def client_factory(**kwargs: object) -> httpx.AsyncClient:
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    return client_factory
+
+
+def _success_execution(*, run_id: str = "smoke-live-1") -> SearchExecutionResult:
+    input_lock = CandidateLock.model_validate(yaml.safe_load(_candidate_lock_bytes()))
     return SearchExecutionResult.model_construct(
         outcome=SearchSuccess.model_construct(
-            response=StructuredSearchResponse.model_construct(usage=UsageActual())
+            response=StructuredSearchResponse.model_construct(
+                run_id=run_id,
+                query_id="smoke-query-1",
+                usage=UsageActual(),
+                stop_reason="completed",
+                config_hash=lock_sha256(input_lock),
+            )
         ),
         diagnostics=[],
         business_result_sha256=_sha256(b"business-result-v1\n"),
@@ -275,6 +312,21 @@ def test_parser_exposes_stable_smoke_contract_and_defaults_to_replay(tmp_path: P
     assert args.allow_network is False
 
 
+@pytest.mark.parametrize(
+    "run_id",
+    ["CON", "con.txt", "smoke.", "smoke-", "a" * 65],
+)
+def test_capture_rejects_windows_hostile_or_oversized_run_ids(
+    tmp_path: Path,
+    run_id: str,
+) -> None:
+    with pytest.raises(ValueError, match="run_id is invalid"):
+        ArtifactFactory(output_root=tmp_path).start_capture(
+            run_id=run_id,
+            input_lock_bytes=_candidate_lock_bytes(),
+        )
+
+
 def test_capture_session_seals_manifest_replay_lock_and_publishes_atomically(
     tmp_path: Path,
 ) -> None:
@@ -306,6 +358,37 @@ def test_capture_session_seals_manifest_replay_lock_and_publishes_atomically(
     assert run["business_result_sha256"] == _success_execution().business_result_sha256
 
 
+def test_capture_store_claims_are_bound_to_exact_run_ids_under_concurrency(
+    tmp_path: Path,
+) -> None:
+    factory = ArtifactFactory(output_root=tmp_path)
+    first = factory.start_capture(
+        run_id="smoke-concurrent-a",
+        input_lock_bytes=_candidate_lock_bytes(),
+    )
+    second = factory.start_capture(
+        run_id="smoke-concurrent-b",
+        input_lock_bytes=_candidate_lock_bytes(),
+    )
+
+    async def claim(run_id: str) -> DependencyCaptureStore:
+        await asyncio.sleep(0)
+        return factory.start_dependency_capture(run_id=run_id)
+
+    async def claim_both() -> tuple[DependencyCaptureStore, DependencyCaptureStore]:
+        return tuple(
+            await asyncio.gather(
+                claim("smoke-concurrent-a"),
+                claim("smoke-concurrent-b"),
+            )
+        )  # type: ignore[return-value]
+
+    first_store, second_store = asyncio.run(claim_both())
+
+    assert first_store is first.snapshot_store
+    assert second_store is second.snapshot_store
+
+
 def test_failed_capture_is_diagnostic_and_never_emits_replay_lock(tmp_path: Path) -> None:
     session = ArtifactFactory(output_root=tmp_path).start_capture(
         run_id="smoke-failed-1",
@@ -332,7 +415,7 @@ def test_capture_refuses_to_publish_tampered_snapshot_bytes(tmp_path: Path) -> N
         input_lock_bytes=_candidate_lock_bytes(runtime_allow_live=True),
     )
     _stage_response(session)
-    session.record_execution(_success_execution())
+    session.record_execution(_success_execution(run_id="smoke-live-corrupt"))
     manifest, _ = session.seal()
     response_path = session.work_dir / manifest.entries[0].response_path
     response_path.write_bytes(b"tampered\n")
@@ -342,6 +425,145 @@ def test_capture_refuses_to_publish_tampered_snapshot_bytes(tmp_path: Path) -> N
 
     assert session.work_dir.is_dir()
     assert not (tmp_path / "smoke-live-corrupt").exists()
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "tampered"),
+    [
+        ("execution.json", b"{}\n"),
+        ("usage.json", b'{"cost_cny":"999"}\n'),
+        ("run.json", b'{"business_result_sha256":null}\n'),
+    ],
+)
+def test_capture_refuses_tampered_canonical_execution_evidence(
+    tmp_path: Path,
+    artifact_name: str,
+    tampered: bytes,
+) -> None:
+    run_id = "smoke-evidence-corrupt"
+    session = ArtifactFactory(output_root=tmp_path).start_capture(
+        run_id=run_id,
+        input_lock_bytes=_candidate_lock_bytes(),
+    )
+    _stage_response(session)
+    session.record_execution(_success_execution(run_id=run_id))
+    session.seal()
+    (session.work_dir / artifact_name).write_bytes(tampered)
+
+    with pytest.raises(ValueError, match="captured smoke evidence changed"):
+        session.publish()
+
+    assert session.work_dir.is_dir()
+    assert not (tmp_path / run_id).exists()
+
+
+@pytest.mark.parametrize(
+    ("binding_path", "replacement"),
+    [
+        (("source_capture_run_id",), "different-run"),
+        (("source_git_sha",), "b" * 40),
+        (("runtime_allow_live",), False),
+        (("frozen_data", "partition_sha256"), "sha256:" + "1" * 64),
+        (
+            ("baseline", "planner", "prompt_config", "sha256"),
+            "sha256:" + "2" * 64,
+        ),
+        (("budget_config", "sha256"), "sha256:" + "3" * 64),
+        (("pricing_policy", "sha256"), "sha256:" + "4" * 64),
+        (("quality_gates", "sha256"), "sha256:" + "5" * 64),
+        (("capture_policy", "capture_policy_sha256"), "sha256:" + "6" * 64),
+    ],
+)
+def test_capture_refuses_tampered_replay_lock_input_bindings(
+    tmp_path: Path,
+    binding_path: tuple[str, ...],
+    replacement: object,
+) -> None:
+    run_id = "smoke-replay-lock-corrupt"
+    session = ArtifactFactory(output_root=tmp_path).start_capture(
+        run_id=run_id,
+        input_lock_bytes=_candidate_lock_bytes(),
+    )
+    _stage_response(session)
+    session.record_execution(_success_execution(run_id=run_id))
+    session.seal()
+    replay_path = session.work_dir / "replay.lock.yaml"
+    replay = yaml.safe_load(replay_path.read_bytes())
+    cursor = replay
+    for component in binding_path[:-1]:
+        cursor = cursor[component]
+    cursor[binding_path[-1]] = replacement
+    replay_path.write_text(yaml.safe_dump(replay, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sealed replay lock changed"):
+        session.publish()
+
+    assert session.work_dir.is_dir()
+
+
+def test_failed_capture_removes_replay_lock_emitted_before_failure(tmp_path: Path) -> None:
+    run_id = "smoke-failed-after-seal"
+    session = ArtifactFactory(output_root=tmp_path).start_capture(
+        run_id=run_id,
+        input_lock_bytes=_candidate_lock_bytes(),
+    )
+    _stage_response(session)
+    session.record_execution(_success_execution(run_id=run_id))
+    session.seal()
+
+    failed = session.fail("internal_error")
+
+    assert not (failed / "replay.lock.yaml").exists()
+
+
+def test_capture_refuses_coordinated_manifest_and_replay_lock_replacement(
+    tmp_path: Path,
+) -> None:
+    run_id = "smoke-coordinated-replacement"
+    session = ArtifactFactory(output_root=tmp_path).start_capture(
+        run_id=run_id,
+        input_lock_bytes=_candidate_lock_bytes(),
+    )
+    _stage_response(session)
+    session.record_execution(_success_execution(run_id=run_id))
+    session.seal()
+
+    replacement_store = DependencyCaptureStore(tmp_path / "replacement-snapshot")
+    replacement_identity = DependencyRequestIdentity.from_canonical_request(
+        dependency="llm",
+        operation="generate_json",
+        method="POST",
+        endpoint="/chat/completions",
+        model_or_adapter="qwen3.7-plus",
+        canonical_request={
+            "prompt_name": "query_analyze",
+            "payload": {"query": "replacement"},
+            "prompt_version": "query-analyze-v1",
+        },
+    )
+    replacement_store.stage_success(
+        replacement_identity,
+        response_bytes=b'{"replacement":true}\n',
+        safe_headers={"content-type": "application/json"},
+        captured_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    replacement_manifest = replacement_store.seal()
+    for entry in replacement_manifest.entries:
+        source = replacement_store.root / entry.response_path
+        destination = session.work_dir / entry.response_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+    (session.work_dir / "snapshot-manifest.json").write_bytes(
+        replacement_store.manifest_path.read_bytes()
+    )
+    replay_path = session.work_dir / "replay.lock.yaml"
+    replay = yaml.safe_load(replay_path.read_bytes())
+    replay["snapshot_set_id"] = replacement_manifest.snapshot_set_id
+    replay["snapshot_manifest_sha256"] = replacement_store.manifest_sha256
+    replay_path.write_text(yaml.safe_dump(replay, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sealed replay lock changed"):
+        session.publish()
 
 
 def test_replay_requires_manifest_with_fixed_safe_error(
@@ -444,30 +666,27 @@ def test_fake_live_capture_is_priced_sealed_and_immediately_replayable(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     fixture = _smoke_fixture(tmp_path)
-    real_client = httpx.AsyncClient
+    client_factory = _fake_live_client_factory(fixture)
+    events: list[str] = []
+    real_record_execution = CaptureSession.record_execution
+    real_seal = DependencyCaptureStore.seal
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/chat/completions"):
-            payload = fixture["llm_fixture"].read_bytes()
-        elif request.url.host == "api.openalex.org":
-            payload = fixture["openalex_fixture"].read_bytes()
-        elif request.url.host == "api.semanticscholar.org":
-            payload = fixture["semantic_fixture"].read_bytes()
-        else:
-            raise AssertionError(f"unexpected fake-live URL: {request.url}")
-        return httpx.Response(
-            200,
-            content=payload,
-            headers={"content-type": "application/json"},
-            request=request,
-        )
+    def record_execution(
+        self: CaptureSession,
+        result: SearchExecutionResult,
+    ) -> None:
+        events.append("record")
+        real_record_execution(self, result)
 
-    def client_factory(**kwargs: object) -> httpx.AsyncClient:
-        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+    def seal(self: DependencyCaptureStore) -> object:
+        events.append("seal")
+        return real_seal(self)
 
     monkeypatch.chdir(fixture["root"])
     monkeypatch.setenv("LLM_API_KEY", "fake-live-secret-must-not-leak")
     monkeypatch.setattr(composition_module.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(CaptureSession, "record_execution", record_execution)
+    monkeypatch.setattr(DependencyCaptureStore, "seal", seal)
     live_output = fixture["root"] / "live-runs"
 
     assert (
@@ -488,6 +707,7 @@ def test_fake_live_capture_is_priced_sealed_and_immediately_replayable(
     live_summary = json.loads(capsys.readouterr().out)
     live_path = Path(live_summary["path"])
 
+    assert events[:2] == ["record", "seal"]
     assert (live_path / "snapshot-manifest.json").is_file()
     assert (live_path / "replay.lock.yaml").is_file()
     usage = json.loads((live_path / "usage.json").read_bytes())
@@ -521,3 +741,117 @@ def test_fake_live_capture_is_priced_sealed_and_immediately_replayable(
     assert "fake-live-secret-must-not-leak" not in (
         json.dumps(live_summary) + json.dumps(replay_summary)
     )
+
+
+def test_live_smoke_binds_execution_to_the_single_archived_lock_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    fixture = _smoke_fixture(tmp_path)
+    client_factory = _fake_live_client_factory(fixture)
+    candidate_path = fixture["candidate_lock"]
+    archived_lock_bytes = candidate_path.read_bytes()
+    replacement = yaml.safe_load(archived_lock_bytes)
+    replacement["source_git_sha"] = "b" * 40
+    replacement_lock_bytes = yaml.safe_dump(replacement, sort_keys=False).encode("utf-8")
+    original_compose = composition_module.CompositionRoot.compose
+
+    def replace_before_compose(**kwargs: object) -> object:
+        candidate_path.write_bytes(replacement_lock_bytes)
+        return original_compose(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.chdir(fixture["root"])
+    monkeypatch.setenv("LLM_API_KEY", "fake-live-secret-must-not-leak")
+    monkeypatch.setattr(composition_module.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(
+        composition_module.CompositionRoot,
+        "compose",
+        replace_before_compose,
+    )
+    output_root = fixture["root"] / "r"
+
+    assert (
+        main(
+            [
+                "smoke",
+                "--lock",
+                str(candidate_path),
+                "--output-root",
+                str(output_root),
+                "--mode",
+                "live",
+                "--allow-network",
+            ]
+        )
+        == 0
+    )
+    run_path = Path(json.loads(capsys.readouterr().out)["path"])
+    execution = json.loads((run_path / "execution.json").read_bytes())
+    archived_lock = CandidateLock.model_validate(yaml.safe_load(archived_lock_bytes))
+
+    assert (run_path / "config.lock.yaml").read_bytes() == archived_lock_bytes
+    assert execution["config_hash"] == lock_sha256(archived_lock)
+
+
+def test_overlapping_live_executions_keep_capture_artifacts_bound_to_run_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _smoke_fixture(tmp_path)
+    client_factory = _fake_live_client_factory(fixture)
+    lock_bytes = fixture["candidate_lock"].read_bytes()
+    monkeypatch.chdir(fixture["root"])
+    monkeypatch.setattr(composition_module.httpx, "AsyncClient", client_factory)
+    bundle = composition_module.CompositionRoot.compose(
+        lock_path=fixture["candidate_lock"],
+        lock_bytes=lock_bytes,
+        mode="live",
+        artifact_root=fixture["root"],
+        output_root=fixture["root"] / "overlap",
+        network_authorized=True,
+        environ={"LLM_API_KEY": "fake-live-secret-must-not-leak"},
+    )
+    run_ids = ("smoke-overlap-a", "smoke-overlap-b")
+    sessions = {
+        run_id: bundle.artifact_factory.start_capture(
+            run_id=run_id,
+            input_lock_bytes=lock_bytes,
+        )
+        for run_id in run_ids
+    }
+
+    async def execute(run_id: str) -> tuple[Path, SearchExecutionResult]:
+        execution = await bundle.service.execute(
+            SearchRequest(
+                query_id="smoke-query-1",
+                query="resource-aware scholarly paper search",
+                mode="live",
+            ),
+            run_id=run_id,
+        )
+        session = sessions[run_id]
+        session.record_execution(execution)
+        session.seal()
+        return session.publish(), execution
+
+    async def execute_both() -> list[tuple[Path, SearchExecutionResult]]:
+        try:
+            return list(await asyncio.gather(*(execute(run_id) for run_id in run_ids)))
+        finally:
+            await bundle.aclose()
+
+    completed = asyncio.run(execute_both())
+
+    assert all(
+        not bundle.artifact_factory.has_capture_session(run_id=run_id)
+        for run_id in run_ids
+    )
+    for expected_run_id, (run_path, execution) in zip(run_ids, completed, strict=True):
+        assert isinstance(execution.outcome, SearchSuccess)
+        assert execution.outcome.response.run_id == expected_run_id
+        replay_lock = ReplayLock.model_validate(
+            yaml.safe_load((run_path / "replay.lock.yaml").read_bytes())
+        )
+        assert replay_lock.source_capture_run_id == expected_run_id
+        assert (run_path / "responses" / "llm").is_dir()

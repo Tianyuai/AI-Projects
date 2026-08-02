@@ -290,8 +290,13 @@ class SearchApplicationService:
             ),
         )
 
-    async def execute(self, request: SearchRequest) -> SearchExecutionResult:
-        run_id = self._run_id_factory()
+    async def execute(
+        self,
+        request: SearchRequest,
+        *,
+        run_id: str | None = None,
+    ) -> SearchExecutionResult:
+        run_id = self._run_id_factory() if run_id is None else run_id
         if request.mode != self._mode:
             code: SearchErrorCode = (
                 "live_not_authorized" if request.mode == "live" else "config_mismatch"

@@ -18,6 +18,7 @@ from paper_search.application.locks import (
     InputLock,
     ReplayLock,
     load_input_lock,
+    load_input_lock_bytes,
     lock_sha256,
 )
 from paper_search.application.modes import ModeBinding
@@ -306,11 +307,13 @@ class _LiveRunOrchestrator:
         capture_store: DependencyCaptureStore,
         client: httpx.AsyncClient,
         artifact_factory: ArtifactFactory,
+        seal_on_completion: bool,
     ) -> None:
         self._orchestrator = orchestrator
         self._capture_store = capture_store
         self._client = client
         self._artifact_factory = artifact_factory
+        self._seal_on_completion = seal_on_completion
 
     async def run(
         self,
@@ -323,13 +326,15 @@ class _LiveRunOrchestrator:
                 query,
                 max_provider_results=max_provider_results,
             )
-            manifest = self._capture_store.seal()
-            return result.model_copy(
-                update={
-                    "snapshot_set_id": manifest.snapshot_set_id,
-                    "snapshot_captured_at": manifest.sealed_at,
-                }
-            )
+            if self._seal_on_completion:
+                manifest = self._capture_store.seal()
+                return result.model_copy(
+                    update={
+                        "snapshot_set_id": manifest.snapshot_set_id,
+                        "snapshot_captured_at": manifest.sealed_at,
+                    }
+                )
+            return result
         finally:
             await self._client.aclose()
             self._artifact_factory.release_client(self._client)
@@ -360,6 +365,9 @@ class _LiveOrchestratorFactory:
         run_id: str,
     ) -> _LiveRunOrchestrator:
         lock = self._lock
+        seal_on_completion = not self._artifact_factory.has_capture_session(
+            run_id=run_id
+        )
         capture_store = self._artifact_factory.start_dependency_capture(run_id=run_id)
         timeout = httpx.Timeout(
             connect=lock.baseline.timeout.connect_seconds,
@@ -437,6 +445,7 @@ class _LiveOrchestratorFactory:
             capture_store=capture_store,
             client=client,
             artifact_factory=self._artifact_factory,
+            seal_on_completion=seal_on_completion,
         )
 
 
@@ -454,8 +463,13 @@ class CompositionRoot:
         snapshot_manifest_path: Path | None = None,
         network_authorized: bool = False,
         environ: Mapping[str, str] | None = None,
+        lock_bytes: bytes | None = None,
     ) -> ApplicationBundle:
-        lock = load_input_lock(lock_path, artifact_root=artifact_root)
+        lock = (
+            load_input_lock(lock_path, artifact_root=artifact_root)
+            if lock_bytes is None
+            else load_input_lock_bytes(lock_bytes, artifact_root=artifact_root)
+        )
         validate_mode_authorization(
             mode=mode,
             runtime_allow_live=lock.runtime_allow_live,

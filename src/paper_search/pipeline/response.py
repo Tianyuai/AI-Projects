@@ -118,9 +118,7 @@ def to_structured_response(
         snapshot_set_id=snapshot_set_id,
         snapshot_captured_at=snapshot_captured_at,
         query_analysis=result.query_analysis,
-        selected_paper_ids=[
-            item.paper.canonical_id for item in result.fused_papers
-        ],
+        selected_paper_ids=[paper.canonical_id for paper in result.papers],
         fused_papers=result.fused_papers,
         high_relevance=high_relevance,
         partial_relevance=partial_relevance,

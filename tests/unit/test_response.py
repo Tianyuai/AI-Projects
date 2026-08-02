@@ -145,7 +145,7 @@ def test_to_structured_response_preserves_fusion_and_optional_evidence() -> None
     assert response.run_id == "run-1"
     assert response.execution_mode == "replay"
     assert response.snapshot_set_id == "snapshot-set-1"
-    assert response.selected_paper_ids == ["openalex:W1", "s2:S1"]
+    assert response.selected_paper_ids == ["openalex:W1"]
     assert response.fused_papers == result.fused_papers
     assert response.high_relevance[0].evidence.fusion_score == 0.25
     assert response.high_relevance[0].evidence.source_ranks == {"openalex": 1}
@@ -175,6 +175,38 @@ def test_to_structured_response_preserves_fusion_and_optional_evidence() -> None
     assert response.warnings == result.warnings
     assert response.config_hash == result.config_hash
     assert response.git_sha == "abc1234"
+
+
+def test_selected_ids_follow_real_ranked_order_and_include_citation_expansion() -> None:
+    result = _orchestrator_result()
+    citation_paper = Paper(
+        canonical_id="doi:10.1/citation",
+        title="Citation Expanded Paper",
+        doi="10.1/citation",
+        sources=["openalex"],
+    )
+    citation_ranked = _ranked(citation_paper)
+    citation_ranked = citation_ranked.model_copy(
+        update={
+            "evidence": citation_ranked.evidence.model_copy(
+                update={"relevance_level": "partial"}
+            )
+        }
+    )
+    result = result.model_copy(update={"partial_relevance": [citation_ranked]})
+
+    response = to_structured_response(
+        result,
+        query_id="query-1",
+        git_sha="abc1234",
+    )
+
+    assert response.selected_paper_ids == [
+        "openalex:W1",
+        "doi:10.1/citation",
+    ]
+    assert response.partial_relevance == [citation_ranked]
+    assert "s2:S1" not in response.selected_paper_ids
 
 
 @pytest.mark.parametrize(

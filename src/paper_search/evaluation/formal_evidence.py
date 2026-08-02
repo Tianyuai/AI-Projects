@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from decimal import Decimal
+from urllib.parse import unquote
 
 from paper_search.control.ledger import LedgerReport
 from paper_search.control.pricing import QualityGatePolicy
+from paper_search.domain.models import CitationEdge, Paper, ProviderPaperId, QuerySpec
 from paper_search.evaluation.business_results import BusinessResultRecord
 from paper_search.evaluation.dataset import (
     EvaluationQuery,
@@ -22,6 +24,13 @@ from paper_search.evaluation.execution_adapter import (
 )
 from paper_search.evaluation.gates import MeasureValue
 from paper_search.evaluation.metrics import EvaluationResult, evaluate
+from paper_search.processing import apply_hard_filters
+from paper_search.retrieval.openalex import decode_openalex_page
+from paper_search.retrieval.semantic_scholar import (
+    decode_semantic_scholar_batch,
+    decode_semantic_scholar_expansion,
+    decode_semantic_scholar_search,
+)
 from paper_search.storage.dependency_snapshot import (
     DependencySnapshotManifestV2,
     DependencySnapshotReader,
@@ -54,71 +63,111 @@ def configured_retrieval_endpoints(config: object) -> dict[str, str]:
     }
 
 
-def _canonical_response_id(value: object, *, kind: str) -> str | None:
-    if not isinstance(value, str):
-        return None
-    try:
-        return normalize_paper_id(value, kind=kind)
-    except ValueError:
-        return None
-
-
 def _source_edge_hash(provider: str, citing: str, cited: str) -> str:
     return "sha256:" + hashlib.sha256(
         f"{provider}|{citing}|{cited}".encode("utf-8")
     ).hexdigest()
 
 
-def _decoded_response_ids(entry: SnapshotEntryV2, response_bytes: bytes) -> set[str] | None:
-    try:
-        payload = json.loads(response_bytes)
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        return None
+@dataclass(frozen=True)
+class _DecodedResponse:
+    papers: tuple[Paper, ...]
+    candidate_papers: tuple[Paper, ...]
+    raw_edges: tuple[CitationEdge, ...]
+
+
+@dataclass(frozen=True)
+class _RetrievalEvidence:
+    parseable_search: bool
+    candidate_papers: tuple[Paper, ...]
+    all_papers: tuple[Paper, ...]
+    bound_edges: frozenset[tuple[str, str, str]]
+    openalex_candidate_ids: frozenset[str]
+
+
+def _decode_provider_response(
+    entry: SnapshotEntryV2,
+    response_bytes: bytes,
+) -> _DecodedResponse | None:
     dependency = entry.request.dependency
     operation = entry.request.operation
-    if dependency == "openalex" and operation == "search":
-        records = payload.get("results") if isinstance(payload, Mapping) else None
-        if not isinstance(records, list):
-            return None
-        return {
-            identifier
-            for record in records
-            if isinstance(record, Mapping)
-            if (identifier := _canonical_response_id(record.get("id"), kind="openalex"))
-            is not None
-        }
-    if dependency == "semantic_scholar":
-        records = payload.get("data") if isinstance(payload, Mapping) else None
-        if operation == "batch" and isinstance(payload, list):
-            records = payload
-        if not isinstance(records, list):
-            return None
-        item_key = "citedPaper" if operation == "references" else "citingPaper"
-        paper_records = (
-            [
-                record.get(item_key) if isinstance(record, Mapping) else None
-                for record in records
-            ]
-            if operation in {"references", "citations"}
-            else records
-        )
-        identifiers: set[str] = set()
-        for record in paper_records:
-            if not isinstance(record, Mapping):
-                continue
-            external_ids = record.get("externalIds")
-            if isinstance(external_ids, Mapping):
-                for field, kind in (("DOI", "doi"), ("OpenAlex", "openalex")):
-                    identifier = _canonical_response_id(external_ids.get(field), kind=kind)
-                    if identifier is not None:
-                        identifiers.add(identifier)
-            identifier = _canonical_response_id(
-                record.get("paperId"), kind="semantic_scholar"
+    try:
+        if dependency == "openalex" and operation == "search":
+            decoded = decode_openalex_page(response_bytes, limit=10_000)
+            if decoded.errors:
+                return None
+            papers = tuple(decoded.papers)
+            return _DecodedResponse(
+                papers=papers,
+                candidate_papers=papers,
+                raw_edges=(),
             )
-            if identifier is not None:
-                identifiers.add(identifier)
-        return identifiers
-    return None
+        if dependency != "semantic_scholar":
+            return None
+        if operation == "search":
+            decoded_papers = decode_semantic_scholar_search(
+                response_bytes,
+                limit=10_000,
+            )
+        elif operation == "batch":
+            decoded_papers = decode_semantic_scholar_batch(response_bytes)
+        elif operation in {"references", "citations"}:
+            endpoint_parts = entry.request.endpoint.strip("/").split("/")
+            if len(endpoint_parts) != 3 or endpoint_parts[0] != "paper":
+                return None
+            decoded_expansion = decode_semantic_scholar_expansion(
+                response_bytes,
+                direction=operation,
+                paper_id=ProviderPaperId(
+                    provider="semantic_scholar",
+                    value=unquote(endpoint_parts[1]),
+                ),
+                limit=10_000,
+            )
+            if decoded_expansion.errors:
+                return None
+            return _DecodedResponse(
+                papers=tuple(decoded_expansion.expansion.papers),
+                candidate_papers=(),
+                raw_edges=tuple(decoded_expansion.expansion.raw_edges),
+            )
+        else:
+            return None
+        if decoded_papers.errors:
+            return None
+        papers = tuple(decoded_papers.papers)
+        return _DecodedResponse(
+            papers=papers,
+            candidate_papers=papers,
+            raw_edges=(),
+        )
+    except ValueError:
+        return None
+
+
+def _provider_id_bindings(papers: Sequence[Paper]) -> dict[tuple[str, str], str]:
+    bindings: dict[tuple[str, str], str] = {}
+    for paper in papers:
+        if paper.openalex_id is not None:
+            bindings[("openalex", paper.openalex_id)] = paper.canonical_id
+        if paper.semantic_scholar_id is not None:
+            bindings[("semantic_scholar", paper.semantic_scholar_id)] = paper.canonical_id
+    return bindings
+
+
+def _resolved_provider_id(
+    provider_id: ProviderPaperId,
+    *,
+    bindings: Mapping[tuple[str, str], str],
+    resolve: Callable[[str], str],
+) -> str | None:
+    identifier = bindings.get((provider_id.provider, provider_id.value))
+    if identifier is None:
+        try:
+            identifier = normalize_paper_id(provider_id.value, kind=provider_id.provider)
+        except ValueError:
+            return None
+    return resolve(identifier)
 
 
 def _snapshot_retrieval_evidence(
@@ -127,15 +176,19 @@ def _snapshot_retrieval_evidence(
     configured_endpoints: Mapping[str, str],
     snapshot_manifest: DependencySnapshotManifestV2 | None,
     snapshot_reader: DependencySnapshotReader | None,
-) -> tuple[bool, set[str]]:
+    resolve: Callable[[str], str],
+) -> _RetrievalEvidence:
     if snapshot_manifest is None or snapshot_reader is None:
-        return False, set()
+        return _RetrievalEvidence(False, (), (), frozenset(), frozenset())
     entries = {
         (entry.request.dependency, entry.cache_key): entry
         for entry in snapshot_manifest.entries
     }
     parseable_search = False
-    response_ids: set[str] = set()
+    candidate_papers: list[Paper] = []
+    all_papers: list[Paper] = []
+    raw_edges: list[CitationEdge] = []
+    openalex_candidate_ids: set[str] = set()
     for diagnostic in execution.diagnostics:
         configured_endpoint = configured_endpoints.get(diagnostic.dependency)
         if configured_endpoint is None or diagnostic.errors:
@@ -145,7 +198,8 @@ def _snapshot_retrieval_evidence(
             if (
                 entry is None
                 or entry.request.dependency != diagnostic.dependency
-                or not configured_endpoint.endswith(entry.request.endpoint)
+                or entry.request.operation == "search"
+                and not configured_endpoint.endswith(entry.request.endpoint)
             ):
                 continue
             try:
@@ -154,12 +208,40 @@ def _snapshot_retrieval_evidence(
                 continue
             if snapshot.ref != ref:
                 continue
-            decoded_ids = _decoded_response_ids(entry, snapshot.response_bytes)
-            if decoded_ids is None:
+            decoded = _decode_provider_response(entry, snapshot.response_bytes)
+            if decoded is None:
                 continue
-            response_ids.update(decoded_ids)
+            candidate_papers.extend(decoded.candidate_papers)
+            all_papers.extend(decoded.papers)
+            raw_edges.extend(decoded.raw_edges)
+            if entry.request.dependency == "openalex":
+                openalex_candidate_ids.update(
+                    resolve(paper.canonical_id)
+                    for paper in decoded.candidate_papers
+                )
             parseable_search |= entry.request.operation == "search"
-    return parseable_search, response_ids
+    bindings = _provider_id_bindings(all_papers)
+    bound_edges: set[tuple[str, str, str]] = set()
+    for edge in raw_edges:
+        citing = _resolved_provider_id(
+            edge.citing_provider_id,
+            bindings=bindings,
+            resolve=resolve,
+        )
+        cited = _resolved_provider_id(
+            edge.cited_provider_id,
+            bindings=bindings,
+            resolve=resolve,
+        )
+        if citing is not None and cited is not None:
+            bound_edges.add((edge.provider, citing, cited))
+    return _RetrievalEvidence(
+        parseable_search=parseable_search,
+        candidate_papers=tuple(candidate_papers),
+        all_papers=tuple(all_papers),
+        bound_edges=frozenset(bound_edges),
+        openalex_candidate_ids=frozenset(openalex_candidate_ids),
+    )
 
 
 def formal_audit_measures(
@@ -182,42 +264,45 @@ def formal_audit_measures(
     hard_failure_count = len(failures)
     resolve = identifier_map.resolve if identifier_map is not None else lambda value: value
     execution_by_query = {execution.query_id: execution for execution in executions}
-    relevant_count = 0
+    structured_by_query = {record.query_id: record for record in business_results}
     retrieved_relevant_count = 0
     post_filter_relevant_count = 0
     parseable_retrieval_query_count = 0
     response_ids_by_query: dict[str, set[str]] = {}
+    bound_edges_by_query: dict[str, frozenset[tuple[str, str, str]]] = {}
+    openalex_ids_by_query: dict[str, frozenset[str]] = {}
     configured = configured_endpoints or {}
     for query in frozen_queries:
         relevant = {resolve(identifier) for identifier in query.relevant_paper_ids}
-        relevant_count += len(relevant)
         execution = execution_by_query.get(query.query_id)
         if execution is None:
             continue
-        parseable, response_ids = _snapshot_retrieval_evidence(
+        evidence = _snapshot_retrieval_evidence(
             execution,
             configured_endpoints=configured,
             snapshot_manifest=snapshot_manifest,
             snapshot_reader=snapshot_reader,
+            resolve=resolve,
         )
-        response_ids_by_query[query.query_id] = {resolve(value) for value in response_ids}
-        parseable_retrieval_query_count += parseable
-        retrieved = (
-            {
-                resolve(identifier) for identifier in execution.retrieved_paper_ids
-            }
-            & response_ids_by_query[query.query_id]
-            if parseable
-            else set()
+        response_ids_by_query[query.query_id] = {
+            resolve(paper.canonical_id) for paper in evidence.all_papers
+        }
+        bound_edges_by_query[query.query_id] = evidence.bound_edges
+        openalex_ids_by_query[query.query_id] = evidence.openalex_candidate_ids
+        parseable_retrieval_query_count += evidence.parseable_search
+        retrieved = {
+            resolve(paper.canonical_id) for paper in evidence.candidate_papers
+        }
+        record = structured_by_query.get(query.query_id)
+        query_spec = (
+            record.query_analysis.query_spec
+            if record is not None and record.query_analysis is not None
+            else QuerySpec(original_query=query.query, research_goal=query.query)
         )
-        post_filter = (
-            {
-                resolve(identifier) for identifier in execution.post_filter_paper_ids
-            }
-            & response_ids_by_query[query.query_id]
-            if parseable
-            else set()
-        )
+        filtered = apply_hard_filters(evidence.candidate_papers, query_spec)
+        post_filter = {
+            resolve(item.paper.canonical_id) for item in filtered.accepted
+        }
         retrieved_relevant_count += len(relevant & retrieved)
         post_filter_relevant_count += len(relevant & post_filter)
     actual_matches = all(
@@ -261,7 +346,6 @@ def formal_audit_measures(
         except ValueError:
             return False
 
-    structured_by_query = {record.query_id: record for record in business_results}
     schema_valid_queries = sum(
         query.query_id in structured_by_query for query in frozen_queries
     )
@@ -299,6 +383,12 @@ def formal_audit_measures(
                 edge.citing_canonical_id,
                 edge.cited_canonical_id,
             )
+            and (
+                edge.provider,
+                resolve(edge.citing_canonical_id),
+                resolve(edge.cited_canonical_id),
+            )
+            in bound_edges_by_query.get(query.query_id, frozenset())
             for edge in record.citation_edges
         ]
         edges_valid = all(bound_edges)
@@ -333,7 +423,7 @@ def formal_audit_measures(
         ),
         "hard_filter_absolute_recall_loss": _measure(
             retrieved_relevant_count - post_filter_relevant_count,
-            relevant_count,
+            retrieved_relevant_count,
         ),
         "hard_failure_rate": _measure(hard_failure_count, count),
         "partial_result_rate": _measure(
@@ -371,20 +461,8 @@ def formal_audit_measures(
         raw_predictions = [
             PredictionRecord(
                 query_id=query.query_id,
-                predicted_paper_ids=(
-                    execution_by_query[query.query_id].retrieved_paper_ids
-                    if query.query_id in execution_by_query
-                    and _snapshot_retrieval_evidence(
-                        execution_by_query[query.query_id],
-                        configured_endpoints={
-                            dependency: endpoint
-                            for dependency, endpoint in configured.items()
-                            if dependency == "openalex"
-                        },
-                        snapshot_manifest=snapshot_manifest,
-                        snapshot_reader=snapshot_reader,
-                    )[0]
-                    else []
+                predicted_paper_ids=sorted(
+                    openalex_ids_by_query.get(query.query_id, frozenset())
                 ),
             )
             for query in frozen_queries

@@ -2849,7 +2849,7 @@ def test_retrieval_response_without_snapshot_refs_is_not_parseable() -> None:
         numerator=0, denominator=1, value=0
     )
     assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
-        numerator=0, denominator=2, value=0
+        numerator=0, denominator=0, value=None
     )
     assert "cached_repeat_latency_p50_ms" not in measures
 
@@ -2857,9 +2857,11 @@ def test_retrieval_response_without_snapshot_refs_is_not_parseable() -> None:
 @pytest.mark.parametrize(
     ("response_bytes", "configured_endpoint", "expected"),
     [
-        (b'{"results":[{"id":"W1"}]}', "/works", 1),
-        (b'{"results":[{"id":"W1"}]}', "/different", 0),
+        (b'{"results":[{"id":"W1","title":"One"}]}', "/works", 1),
+        (b'{"results":[{"id":"W1","title":"One"}]}', "/different", 0),
         (b"not-json", "/works", 0),
+        (b'{"results":null}', "/works", 0),
+        (b'{"results":[{"id":"W1"}]}', "/works", 0),
     ],
 )
 def test_retrieval_response_requires_bound_decodable_configured_snapshot(
@@ -2960,6 +2962,245 @@ def test_retrieval_response_requires_bound_decodable_configured_snapshot(
 
     assert measures["parseable_configured_retrieval_response_rate"] == MeasureValue(
         numerator=expected, denominator=1, value=expected
+    )
+
+
+@pytest.mark.parametrize("published_post_filter_ids", [[], ["openalex:W1"]])
+def test_hard_filter_loss_is_derived_from_decoded_candidates(
+    tmp_path: Path,
+    published_post_filter_ids: list[str],
+) -> None:
+    store = DependencyCaptureStore(tmp_path / "snapshots")
+    identity = DependencyRequestIdentity.from_canonical_request(
+        dependency="openalex",
+        operation="search",
+        method="GET",
+        endpoint="/works",
+        model_or_adapter="openalex-v1",
+        canonical_request={"query": "one"},
+    )
+    ref = store.stage_success(
+        identity,
+        response_bytes=(
+            b'{"results":[{"id":"W1","title":"One",'
+            b'"is_retracted":true}]}'
+        ),
+        safe_headers={"content-type": "application/json"},
+        captured_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    manifest = store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+    execution = EvaluationExecutionRecord(
+        query_id="q1",
+        run_id="formal-1",
+        outcome_kind="success",
+        business_result_sha256="sha256:" + "a" * 64,
+        usage=UsageActual(cost_cny=Decimal("0")),
+        diagnostics=[
+            DependencyDiagnostic(
+                dependency="openalex",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=1,
+                cache_hit=False,
+                snapshot_refs=[ref],
+                errors=[],
+            )
+        ],
+        retrieved_paper_ids=["openalex:W1"],
+        post_filter_paper_ids=published_post_filter_ids,
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        stop_reason="completed",
+    )
+    measures = runner_module.formal_audit_measures(
+        frozen_queries=[
+            EvaluationQuery(
+                query_id="q1",
+                query="one",
+                relevant_paper_ids=["openalex:W1"],
+                metadata={"split": "dev"},
+            )
+        ],
+        executions=[execution],
+        business_results=[],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("3"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+        configured_endpoints={"openalex": "/works"},
+        snapshot_manifest=manifest,
+        snapshot_reader=reader,
+    )
+
+    assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
+        numerator=1, denominator=1, value=1
+    )
+
+
+@pytest.mark.parametrize("include_expansion", [False, True])
+def test_relation_requires_bound_expansion_edge(
+    tmp_path: Path,
+    include_expansion: bool,
+) -> None:
+    first_id = "a" * 40
+    second_id = "b" * 40
+    store = DependencyCaptureStore(tmp_path / "snapshots")
+    identity = DependencyRequestIdentity.from_canonical_request(
+        dependency="semantic_scholar",
+        operation="search",
+        method="GET",
+        endpoint="/paper/search",
+        model_or_adapter="semantic-graph-v1",
+        canonical_request={"query": "one"},
+    )
+    response = json.dumps(
+        {
+            "data": [
+                {"paperId": first_id, "title": "One"},
+                {"paperId": second_id, "title": "Two"},
+            ]
+        },
+        separators=(",", ":"),
+    ).encode()
+    refs = [store.stage_success(
+        identity,
+        response_bytes=response,
+        safe_headers={"content-type": "application/json"},
+        captured_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )]
+    if include_expansion:
+        expansion_identity = DependencyRequestIdentity.from_canonical_request(
+            dependency="semantic_scholar",
+            operation="references",
+            method="GET",
+            endpoint=f"/paper/{first_id}/references",
+            model_or_adapter="semantic-graph-v1",
+            canonical_request={
+                "fields": "paperId,title",
+                "limit": 10,
+                "offset": 0,
+                "paper_id": first_id,
+            },
+        )
+        refs.append(
+            store.stage_success(
+                expansion_identity,
+                response_bytes=json.dumps(
+                    {
+                        "data": [
+                            {
+                                "citedPaper": {
+                                    "paperId": second_id,
+                                    "title": "Two",
+                                }
+                            }
+                        ]
+                    },
+                    separators=(",", ":"),
+                ).encode(),
+                safe_headers={"content-type": "application/json"},
+                captured_at=datetime(2026, 8, 2, tzinfo=UTC),
+            )
+        )
+    manifest = store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+    citing = f"s2:{first_id}"
+    cited = f"s2:{second_id}"
+    edge = ResolvedCitationEdge(
+        provider="semantic_scholar",
+        citing_canonical_id=citing,
+        cited_canonical_id=cited,
+        source_edge_hash="sha256:"
+        + hashlib.sha256(f"semantic_scholar|{citing}|{cited}".encode()).hexdigest(),
+    )
+    business = BusinessResultRecord(
+        query_id="q1",
+        query_analysis=None,
+        selected_paper_ids=[],
+        high_relevance=[],
+        partial_relevance=[],
+        citation_edges=[edge],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        warnings=[],
+        stop_reason="completed",
+        hard_failure_code=None,
+    )
+    execution = EvaluationExecutionRecord(
+        query_id="q1",
+        run_id="formal-1",
+        outcome_kind="success",
+        business_result_sha256="sha256:" + "a" * 64,
+        usage=UsageActual(cost_cny=Decimal("0")),
+        diagnostics=[
+            DependencyDiagnostic(
+                dependency="semantic_scholar",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=1,
+                cache_hit=False,
+                snapshot_refs=refs,
+                errors=[],
+            )
+        ],
+        retrieved_paper_ids=[citing, cited],
+        post_filter_paper_ids=[citing, cited],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        stop_reason="completed",
+    )
+    measures = runner_module.formal_audit_measures(
+        frozen_queries=[
+            EvaluationQuery(
+                query_id="q1",
+                query="one",
+                relevant_paper_ids=[citing, cited],
+                metadata={"split": "dev"},
+            )
+        ],
+        executions=[execution],
+        business_results=[business],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("3"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+        configured_endpoints={"semantic_scholar": "/graph/v1/paper/search"},
+        snapshot_manifest=manifest,
+        snapshot_reader=reader,
+    )
+
+    assert measures["fabricated_paper_or_relation_count"] == MeasureValue(
+        numerator=0 if include_expansion else 1,
+        denominator=1,
+        value=0 if include_expansion else 1,
     )
 
 

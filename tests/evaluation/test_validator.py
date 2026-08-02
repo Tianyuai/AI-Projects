@@ -376,3 +376,28 @@ def test_validator_rejects_symlink_run_root(tmp_path: Path) -> None:
 
     assert not result.valid
     assert "run_directory_unavailable" in {issue.code for issue in result.issues}
+
+
+def test_canonical_formal_pair_has_nonempty_dependency_provenance() -> None:
+    snapshot = json.loads(
+        (FIXTURE_ROOT / "capture" / "snapshot-manifest.json").read_bytes()
+    )
+    executions = [
+        json.loads(line)
+        for line in (FIXTURE_ROOT / "capture" / "executions.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    entry_ids = {entry["entry_id"] for entry in snapshot["entries"]}
+    ref_ids = {
+        ref["entry_id"]
+        for execution in executions
+        for diagnostic in execution["diagnostics"]
+        for ref in diagnostic["snapshot_refs"]
+    }
+
+    assert {entry["request"]["dependency"] for entry in snapshot["entries"]} >= {
+        "llm",
+        "openalex",
+    }
+    assert ref_ids == entry_ids

@@ -996,3 +996,31 @@ def test_report_preserves_reservation_creation_order(tmp_path: Path) -> None:
     report = ledger.report("ordered-run")
 
     assert [receipt.query_id for receipt in report.receipts] == ["q2", "q1"]
+
+
+def test_report_checkpoints_complete_project_history(tmp_path: Path) -> None:
+    ledger = SQLiteBudgetLedger(tmp_path / "ledger.sqlite3")
+    prior = ledger.reserve(
+        run_id="prior-run",
+        query_id="prior-query",
+        estimate=UsageEstimate(cost_cny=Decimal("0.25")),
+        run_cap_cny=Decimal("18"),
+    )
+    ledger.settle(prior, UsageActual(cost_cny=Decimal("0.25")))
+    current = ledger.reserve(
+        run_id="current-run",
+        query_id="current-query",
+        estimate=UsageEstimate(cost_cny=Decimal("0.10")),
+        run_cap_cny=Decimal("18"),
+    )
+    ledger.settle(current, UsageActual(cost_cny=Decimal("0.10")))
+
+    report = ledger.report("current-run")
+
+    assert report.project_actual_cny == Decimal("0.35")
+    assert [receipt.run_id for receipt in report.receipts] == [
+        "prior-run",
+        "current-run",
+    ]
+    assert report.project_receipt_count == 2
+    assert report.project_receipts_sha256.startswith("sha256:")

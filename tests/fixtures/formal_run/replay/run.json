@@ -1,5 +1,5 @@
 {
-  "config_hash": "sha256:f858445f0c7078a55adb0a7fc9058c7956cbf61254c5154f4dc18db52e8165b4",
+  "config_hash": "sha256:1548be6bdb432630dd150ce10885f896e79e3b3d39e9c0c246c4e5a6f3b4e0ec",
   "ended_at": "2026-08-02T00:00:00Z",
   "execution_mode": "replay",
   "experiment_name": "main-baseline",
@@ -7,11 +7,13 @@
   "frozen_manifest_sha256": "sha256:3a92ca6448152e3bc3fed6d35605818a839044f9e5956404a4d5ab7db3327783",
   "gate_result": "failed",
   "identifier_map_sha256": "sha256:420728bdf408ac4607beeb99392c0fe23218a8e4b1681023b6a7d44349e37eb4",
-  "input_lock_sha256": "sha256:7a6bf83373ac0676f9974a71d34cdfeace3014738a0e4dfe04816cc2511b2ab4",
+  "input_lock_sha256": "sha256:429fdc9fbda14c53c1da719aeacb23f748fc1d9003b4186a34f343de3850c02a",
   "optional_modules": {
     "embedding": false
   },
   "partition_sha256": "sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5",
+  "project_receipt_count": 2,
+  "project_receipts_sha256": "sha256:e4ed78750cb88a746fddaa1292a8dd4347c594cb5cf0f4552b8707cdf086bc6f",
   "prompt_version": "query-analyze-v1",
   "readiness_summary": [
     {
@@ -35,8 +37,8 @@
   ],
   "run_id": "replay",
   "schema_version": "formal-run-v1",
-  "snapshot_manifest_sha256": "sha256:cb8989cfb9c9eedaea483e5a316a2848a2bf72ccf189832a2c60b144c5db5982",
-  "snapshot_set_id": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "snapshot_manifest_sha256": "sha256:145d5e6b44a109a30485ea8f02e6e95d1f6a241eace7dfc2c017579a9f2508f3",
+  "snapshot_set_id": "sha256:719ae63efb62865e219fd272bd8b113e627c46453a13b4ef7a0c7af3b4c06c83",
   "source_git_sha": "task2-fixture-commit",
   "split": "dev",
   "started_at": "2026-08-02T00:00:00Z",

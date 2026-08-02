@@ -2558,6 +2558,11 @@ def test_post_publication_attempt_transition_error_does_not_mark_run_failed(
         "_reject_or_recover_existing_attempt",
         lambda **kwargs: None,
     )
+    monkeypatch.setattr(
+        runner_module,
+        "_validate_formal_workspace",
+        lambda path: None,
+    )
 
     result = asyncio.run(
         runner_module._run_formal_evaluation(
@@ -2602,6 +2607,7 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
     lock_bytes = Path("tests/fixtures/formal_run/capture/config.lock.yaml").read_bytes()
     lock = runner_module.CandidateLock.model_validate(yaml.safe_load(lock_bytes))
     closed = False
+    validator_seen: object | None = None
 
     class FakeBundle:
         def readiness_probe(self) -> object:
@@ -2632,11 +2638,12 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
             snapshot_root=None,
         ),
     )
-    monkeypatch.setattr(
-        runner_module,
-        "FormalRunWorkspace",
-        lambda **kwargs: (_ for _ in ()).throw(LookupError("workspace setup failed")),
-    )
+    def fail_workspace(**kwargs: object) -> object:
+        nonlocal validator_seen
+        validator_seen = kwargs.get("validator")
+        raise LookupError("workspace setup failed")
+
+    monkeypatch.setattr(runner_module, "FormalRunWorkspace", fail_workspace)
 
     with pytest.raises(LookupError, match="workspace setup"):
         asyncio.run(
@@ -2656,3 +2663,58 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
         )
 
     assert closed
+    assert callable(validator_seen)
+
+
+def test_stale_prepublication_claim_is_reconciled_to_interrupted(
+    tmp_path: Path,
+) -> None:
+    validation_hash = "sha256:" + "c" * 64
+    run_id = "validation-crashed"
+    store = runner_module.ValidationAttemptStore(tmp_path)
+    store.claim(
+        validation_lock_sha256=validation_hash,
+        run_id=run_id,
+        claimed_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    incomplete = tmp_path / f".incomplete-{run_id}-fixture"
+    incomplete.mkdir()
+    source_manifest = json.loads(
+        Path("tests/fixtures/formal_run/capture/run.json").read_bytes()
+    )
+    source_manifest.update(
+        {
+            "run_id": run_id,
+            "status": "incomplete",
+            "gate_result": "not_applicable",
+            "ended_at": None,
+            "config_hash": validation_hash,
+        }
+    )
+    (incomplete / "run.json").write_text(json.dumps(source_manifest), encoding="utf-8")
+
+    with pytest.raises(runner_module.ValidationAttemptConflictError):
+        runner_module._reject_or_recover_existing_attempt(
+            store=store,
+            validation_lock_sha256=validation_hash,
+            output_root=tmp_path,
+        )
+
+    claim = store.read(validation_hash)
+    assert claim.state == "interrupted"
+    assert claim.incident_ref == f"automatic-recovery:{run_id}"
+
+
+def test_all_applicable_reporting_measures_have_values() -> None:
+    policy = runner_module.parse_quality_gate_policy_bytes(
+        Path("configs/quality_gates_v1.yaml").read_bytes()
+    )
+    measures = runner_module.complete_policy_measures(
+        {}, policy=policy, split="dev"
+    )
+
+    assert all(
+        measures[rule.measure].value is not None
+        for rule in policy.rules
+        if "dev" in rule.applies_to and rule.classification == "reporting_only"
+    )

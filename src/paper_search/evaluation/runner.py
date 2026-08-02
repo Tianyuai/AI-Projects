@@ -1062,6 +1062,14 @@ def _stop_on_formal_evidence_failure(
         raise ValueError("formal evidence integrity check failed")
 
 
+def _validate_formal_workspace(path: Path) -> None:
+    from paper_search.evaluation.validator import validate_run_directory
+
+    result = validate_run_directory(path)
+    if not result.valid:
+        raise ValueError("formal workspace validation failed before publication")
+
+
 def _reject_or_recover_existing_attempt(
     *,
     store: ValidationAttemptStore,
@@ -1096,6 +1104,30 @@ def _reject_or_recover_existing_attempt(
                 target="complete",
                 completed_at=manifest.ended_at,
             )
+        elif manifest is None:
+            incomplete_paths = sorted(
+                output_root.glob(f".incomplete-{claim.run_id}-*")
+            )
+            for incomplete_path in incomplete_paths:
+                try:
+                    incomplete_manifest = RunManifest.model_validate_json(
+                        (incomplete_path / "run.json").read_bytes()
+                    )
+                except (OSError, ValueError):
+                    continue
+                if (
+                    incomplete_manifest.run_id == claim.run_id
+                    and incomplete_manifest.status == "incomplete"
+                    and incomplete_manifest.config_hash == validation_lock_sha256
+                ):
+                    completed_at = max(datetime.now(UTC), claim.claimed_at)
+                    store.transition(
+                        validation_lock_sha256=validation_lock_sha256,
+                        target="interrupted",
+                        completed_at=completed_at,
+                        incident_ref=f"automatic-recovery:{claim.run_id}",
+                    )
+                    break
     raise ValidationAttemptConflictError(
         "validation lock already has an irrevocable attempt"
     )
@@ -1189,6 +1221,7 @@ async def _run_formal_evaluation(
             input_lock_bytes=inputs.lock_bytes,
             nonce_factory=lambda: hashlib.sha256(run_id.encode()).hexdigest()[:12],
             clock=clock,
+            validator=_validate_formal_workspace,
             replay_snapshot_root=inputs.snapshot_root,
         )
         if request.mode == "live":
@@ -1303,6 +1336,7 @@ async def _run_formal_evaluation(
             policy=inputs.gate_policy,
         )
         workspace.write_metrics(metrics)
+        workspace.bind_ledger_checkpoint(report)
         workspace.write_usage(report)
         if not isinstance(inputs.lock, ReplayLock):
             sealed = workspace.seal_snapshots()

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -17,6 +19,8 @@ from paper_search.domain.models import (
     DomainModel,
     MoneyCny,
     NonEmptyStr,
+    NonNegativeInt,
+    Sha256,
     UsageActual,
     UsageEstimate,
 )
@@ -78,6 +82,10 @@ class LedgerReport(DomainModel):
     project_hard_cap_cny: MoneyCny
     within_caps: bool
     receipts: list[LedgerReceipt] = []
+    project_receipt_count: NonNegativeInt = 0
+    project_receipts_sha256: Sha256 = (
+        "sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+    )
 
 
 def _utc_now() -> datetime:
@@ -906,8 +914,7 @@ class SQLiteBudgetLedger:
                 and project_actual + project_reserved <= self._hard_micro
             )
             receipt_rows = connection.execute(
-                "SELECT * FROM reservations WHERE run_id = ? ORDER BY rowid",
-                (run_id,),
+                "SELECT * FROM reservations ORDER BY rowid",
             ).fetchall()
             receipts = [
                 LedgerReceipt(
@@ -934,16 +941,31 @@ class SQLiteBudgetLedger:
                 )
                 for row in receipt_rows
             ]
+            receipt_bytes = (
+                json.dumps(
+                    [receipt.model_dump(mode="json") for receipt in receipts],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
             return LedgerReport(
                 run_id=run_id,
                 reserved=reserved,
                 actual=UsageActual.model_validate(actual.model_dump()),
                 run_cap_cny=_from_micro(run_cap_micro),
-                project_actual_cny=actual.cost_cny or Decimal("0"),
+                project_actual_cny=(
+                    Decimal("0") if self._replay else _from_micro(project_actual)
+                ),
                 project_soft_stop_cny=_from_micro(self._soft_micro),
                 project_hard_cap_cny=_from_micro(self._hard_micro),
                 within_caps=within_caps,
                 receipts=receipts,
+                project_receipt_count=len(receipts),
+                project_receipts_sha256=(
+                    f"sha256:{hashlib.sha256(receipt_bytes).hexdigest()}"
+                ),
             )
 
     def close(self) -> None:

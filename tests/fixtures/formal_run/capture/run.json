@@ -12,6 +12,8 @@
     "embedding": false
   },
   "partition_sha256": "sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5",
+  "project_receipt_count": 2,
+  "project_receipts_sha256": "sha256:6b6407680656720132e6b17a7044f0dd0713ae7cda46b3223a332eb9de447f96",
   "prompt_version": "query-analyze-v1",
   "readiness_summary": [
     {
@@ -35,8 +37,8 @@
   ],
   "run_id": "capture",
   "schema_version": "formal-run-v1",
-  "snapshot_manifest_sha256": "sha256:cb8989cfb9c9eedaea483e5a316a2848a2bf72ccf189832a2c60b144c5db5982",
-  "snapshot_set_id": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+  "snapshot_manifest_sha256": "sha256:145d5e6b44a109a30485ea8f02e6e95d1f6a241eace7dfc2c017579a9f2508f3",
+  "snapshot_set_id": "sha256:719ae63efb62865e219fd272bd8b113e627c46453a13b4ef7a0c7af3b4c06c83",
   "source_git_sha": "task2-fixture-commit",
   "split": "dev",
   "started_at": "2026-08-02T00:00:00Z",

@@ -1,6 +1,45 @@
 {
-  "entries": [],
+  "entries": [
+    {
+      "cache_key": "sha256:dfdd2374aa783048599b076402d1f88663f635a733a6aae747ff519ff65e6b35",
+      "captured_at": "2026-08-02T00:00:00Z",
+      "entry_id": "sha256:6ae6a7d9579d805f68fd51a7ed6507d5a14b3685dd2beb2f765a9dc6c05ae038",
+      "request": {
+        "canonical_request_sha256": "sha256:4e7d2da733a934cc57eab59325959eb0bca0fa8407c6b78f5b8440ef0c7ad542",
+        "dependency": "llm",
+        "endpoint": "/chat/completions",
+        "method": "POST",
+        "model_or_adapter": "qwen3.7-plus",
+        "operation": "generate_json",
+        "schema_version": "dependency-request-v1"
+      },
+      "response_path": "responses/llm/dfdd2374aa783048599b076402d1f88663f635a733a6aae747ff519ff65e6b35.bin",
+      "response_sha256": "sha256:1a9ea701ee445faddd2cc244e2345668084b88146700feac48c159d964913aad",
+      "safe_headers": {
+        "content-type": "application/json"
+      }
+    },
+    {
+      "cache_key": "sha256:4894088e1ceeb76833e9bff578c2425c92d879c67d9dc4ae3fdb515e3bac9a39",
+      "captured_at": "2026-08-02T00:00:00Z",
+      "entry_id": "sha256:6deb5c10777820ec1febcf21c0857d459a0553fabb8bfec6210d1a3316e8a22c",
+      "request": {
+        "canonical_request_sha256": "sha256:6d23a5a823615253fcd8bff50be2f5a1691d79a1516ecf6b91f55f64632b6140",
+        "dependency": "openalex",
+        "endpoint": "/works",
+        "method": "GET",
+        "model_or_adapter": "openalex-v1",
+        "operation": "search",
+        "schema_version": "dependency-request-v1"
+      },
+      "response_path": "responses/openalex/4894088e1ceeb76833e9bff578c2425c92d879c67d9dc4ae3fdb515e3bac9a39.bin",
+      "response_sha256": "sha256:250a97e605ccc127d0b54b8d69907118ccd5d0a3352b27819891e2dc8c5b4046",
+      "safe_headers": {
+        "content-type": "application/json"
+      }
+    }
+  ],
   "schema_version": "dependency-snapshot-v2",
   "sealed_at": "2026-08-02T00:00:00Z",
-  "snapshot_set_id": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+  "snapshot_set_id": "sha256:719ae63efb62865e219fd272bd8b113e627c46453a13b4ef7a0c7af3b4c06c83"
 }

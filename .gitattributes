@@ -1,3 +1,4 @@
 data/manifest.json text eol=lf
 data/splits/*.json text eol=lf
 data/freeze_reports/*.json text eol=lf
+tests/fixtures/formal_run/**/snapshots/responses/**/*.bin -text

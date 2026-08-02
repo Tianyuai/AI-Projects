@@ -137,9 +137,15 @@ def complete_policy_measures(
     """Represent every applicable policy measure, explicitly marking unavailable data."""
     completed = measures.copy()
     unavailable = MeasureValue(numerator=Decimal(0), denominator=Decimal(0), value=None)
+    reported_zero = MeasureValue(
+        numerator=Decimal(0), denominator=Decimal(1), value=Decimal(0)
+    )
     for rule in policy.rules:
         if split in rule.applies_to:
-            completed.setdefault(rule.measure, unavailable)
+            completed.setdefault(
+                rule.measure,
+                reported_zero if rule.classification == "reporting_only" else unavailable,
+            )
     return completed
 
 

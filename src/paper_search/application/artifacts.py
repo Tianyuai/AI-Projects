@@ -150,6 +150,10 @@ class RunManifest(DomainModel):
     ended_at: datetime | None
     readiness_summary: list[DependencyStatus]
     failure_count: NonNegativeInt
+    project_receipt_count: NonNegativeInt = 0
+    project_receipts_sha256: Sha256 = (
+        "sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+    )
 
 
 class FormalRunWorkspace:
@@ -352,6 +356,18 @@ class FormalRunWorkspace:
             raise ValueError("usage run_id does not match formal workspace")
         self._write(self._work_dir / "usage.json", _model_json_bytes(report))
         self._usage_written = True
+
+    def bind_ledger_checkpoint(self, report: LedgerReport) -> None:
+        self._ensure_active()
+        if report.run_id != self._manifest.run_id:
+            raise ValueError("ledger checkpoint run ID does not match formal run")
+        self._manifest = self._manifest.model_copy(
+            update={
+                "project_receipt_count": report.project_receipt_count,
+                "project_receipts_sha256": report.project_receipts_sha256,
+            }
+        )
+        self._write_manifest()
 
     def _publish(self, destination: Path) -> Path:
         if destination.exists():

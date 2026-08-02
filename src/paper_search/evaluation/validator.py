@@ -195,6 +195,19 @@ def _diagnostics_sha256(diagnostics: object) -> str:
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _receipts_sha256(receipts: object) -> str:
+    encoded = (
+        json.dumps(
+            receipts,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def _sum_usage(records: Sequence[object]) -> dict[str, int | Decimal | None]:
     usages = [getattr(record, "usage") for record in records]
     costs = [usage.cost_cny for usage in usages]
@@ -462,11 +475,21 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             and usage.project_soft_stop_cny == PROJECT_SOFT_STOP_CNY
             and usage.project_hard_cap_cny == PROJECT_HARD_CAP_CNY
             and usage.project_actual_cny == project_actual
+            and usage.project_receipt_count == len(usage.receipts)
+            and usage.project_receipts_sha256
+            == _receipts_sha256(
+                [receipt.model_dump(mode="json") for receipt in usage.receipts]
+            )
+            and manifest.project_receipt_count == usage.project_receipt_count
+            and manifest.project_receipts_sha256 == usage.project_receipts_sha256
             and usage.within_caps == recomputed_within_caps
             and usage.within_caps
-            and len(run_receipts) == len(usage.receipts)
             and [receipt.query_id for receipt in run_receipts] == query_ids
             and len(receipt_by_query) == len(run_receipts)
+            and len({receipt.reservation_id for receipt in usage.receipts})
+            == len(usage.receipts)
+            and len({(receipt.run_id, receipt.query_id) for receipt in usage.receipts})
+            == len(usage.receipts)
             and all(receipt.state in {"settled", "failed"} for receipt in run_receipts)
             and all(
                 receipt_by_query[execution.query_id].actual == execution.usage

@@ -11,7 +11,10 @@ import re
 import stat
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import BinaryIO, Literal, Protocol
 
@@ -19,6 +22,31 @@ import httpx
 from pydantic import BaseModel, ValidationError
 
 from paper_search.config import RuntimeConfig, load_runtime_config
+from paper_search.application.composition import CompositionRoot
+from paper_search.application.contracts import (
+    SearchErrorResponse,
+    SearchExecutionResult,
+    SearchFailure,
+    SearchRequest,
+)
+from paper_search.evaluation.attempts import ValidationAttemptStore
+from paper_search.evaluation.execution_adapter import AdaptedExecution, adapt_execution
+from paper_search.application.artifacts import FormalRunWorkspace, RunManifest
+from paper_search.application.locks import (
+    CandidateLock,
+    ReplayLock,
+    ValidationLock,
+    load_verified_input_lock,
+    lock_sha256,
+)
+from paper_search.control.ledger import SQLiteBudgetLedger
+from paper_search.control.pricing import (
+    QualityGatePolicy,
+    parse_quality_gate_policy_bytes,
+)
+from paper_search.evaluation.freeze_schema import FreezeManifestV2
+from paper_search.evaluation.gates import MeasureValue, evaluate_gates
+from paper_search.evaluation.official_adapter import adapt_prediction_record
 from paper_search.control import HardBudgetController
 from paper_search.domain.models import (
     BudgetReservation,
@@ -29,6 +57,7 @@ from paper_search.domain.models import (
     Paper,
     ProviderResult,
     QuerySpec,
+    SearchMode,
     UsageActual,
     UsageEstimate,
 )
@@ -63,6 +92,7 @@ from paper_search.ranking import (
 from paper_search.retrieval import OpenAlexProvider
 from paper_search.storage import SQLiteResponseCache, validate_snapshot_manifest
 from paper_search.storage.cache import PreparedSnapshot
+from paper_search.storage.dependency_snapshot import DependencySnapshotManifestV2
 
 
 class PipelineResult(DomainModel):
@@ -119,6 +149,101 @@ class FrozenSplit(DomainModel):
     identity: RunIdentity
 
 
+class EvaluationRunRequest(DomainModel):
+    """Immutable inputs that authorize one canonical formal evaluation."""
+
+    split: Literal["dev", "validation"]
+    mode: SearchMode
+    lock_path: Path
+    output_root: Path
+    snapshot_manifest_path: Path | None
+    network_authorized: bool
+
+
+class EvaluationRunResult(DomainModel):
+    """Safe terminal summary for one formal evaluation."""
+
+    run_id: NonEmptyStr
+    run_path: Path
+    status: Literal["complete", "failed", "interrupted"]
+    gate_result: Literal["passed", "failed", "not_applicable"]
+
+
+@dataclass(frozen=True)
+class _FormalInputs:
+    lock: CandidateLock | ValidationLock | ReplayLock
+    lock_bytes: bytes
+    gold: list[EvaluationQuery]
+    identifier_map: IdentifierMap
+    gate_policy: QualityGatePolicy
+    snapshot_manifest: DependencySnapshotManifestV2 | None
+    snapshot_root: Path | None
+
+
+def _load_formal_inputs(request: EvaluationRunRequest) -> _FormalInputs:
+    artifact_root = Path.cwd().resolve()
+    lock_bytes = request.lock_path.read_bytes()
+    verified = load_verified_input_lock(request.lock_path, artifact_root=artifact_root)
+    lock = verified.lock
+    if request.split != lock.frozen_data.split:
+        raise ValueError("evaluation split does not match input lock")
+    if request.mode == "replay" and not isinstance(lock, ReplayLock):
+        raise ValueError("replay evaluation requires a replay lock")
+    if request.mode == "live" and isinstance(lock, ReplayLock):
+        raise ValueError("live evaluation requires a live input lock")
+    if request.mode == "live" and not request.network_authorized:
+        raise ValueError("live evaluation requires explicit network authorization")
+    if request.mode == "replay" and request.network_authorized:
+        raise ValueError("replay evaluation cannot authorize network access")
+
+    manifest = FreezeManifestV2.model_validate_json(
+        verified.artifact_bytes[lock.frozen_data.manifest.path]
+    )
+    partition = next(item for item in manifest.partitions if item.name == request.split)
+    if (
+        partition.sha256 != lock.frozen_data.partition_sha256
+        or partition.query_count != lock.frozen_data.query_count
+        or manifest.identifier_map.sha256 != lock.frozen_data.identifier_map.sha256
+    ):
+        raise ValueError("frozen data does not match input lock")
+    data_root = (artifact_root / lock.frozen_data.manifest.path).parent.resolve()
+    partition_path = (data_root / partition.path).resolve(strict=True)
+    if not partition_path.is_relative_to(data_root):
+        raise ValueError("frozen partition path escapes data root")
+    partition_bytes = partition_path.read_bytes()
+    if _sha256_bytes(partition_bytes) != partition.sha256:
+        raise ValueError("frozen partition hash mismatch")
+    gold = read_jsonl(partition_path, EvaluationQuery)
+    if len(gold) != partition.query_count:
+        raise ValueError("frozen partition count mismatch")
+    identifier_map = IdentifierMap.from_bytes(
+        verified.artifact_bytes[lock.frozen_data.identifier_map.path]
+    )
+    gate_policy = parse_quality_gate_policy_bytes(
+        verified.artifact_bytes[lock.quality_gates.path]
+    )
+    snapshot_manifest: DependencySnapshotManifestV2 | None = None
+    snapshot_root: Path | None = None
+    if isinstance(lock, ReplayLock):
+        if request.snapshot_manifest_path is None:
+            raise ValueError("snapshot manifest is required for replay")
+        snapshot_manifest = DependencySnapshotManifestV2.model_validate_json(
+            request.snapshot_manifest_path.read_bytes()
+        )
+        snapshot_root = request.snapshot_manifest_path.parent
+    elif request.snapshot_manifest_path is not None:
+        raise ValueError("live evaluation cannot accept a replay manifest")
+    return _FormalInputs(
+        lock=lock,
+        lock_bytes=lock_bytes,
+        gold=gold,
+        identifier_map=identifier_map,
+        gate_policy=gate_policy,
+        snapshot_manifest=snapshot_manifest,
+        snapshot_root=snapshot_root,
+    )
+
+
 class SearchProvider(Protocol):
     """Injected provider boundary used by the evaluation runner."""
 
@@ -129,6 +254,15 @@ class SearchProvider(Protocol):
         limit: int,
         reservation: BudgetReservation,
     ) -> ProviderResult[list[Paper]]: ...
+
+
+class _ApplicationService(Protocol):
+    async def execute(
+        self,
+        request: SearchRequest,
+        *,
+        run_id: str | None = None,
+    ) -> SearchExecutionResult: ...
 
 
 class _CliInputError(ValueError):
@@ -741,7 +875,7 @@ def _write_artifacts(
     )
 
 
-async def run_evaluation(
+async def _run_legacy_evaluation(
     gold: Sequence[EvaluationQuery],
     *,
     identity: RunIdentity,
@@ -810,6 +944,291 @@ async def run_evaluation(
     )
     _write_artifacts(gold, result, cache=cache, config=config, output=output)
     return result
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+async def _execute_service_batch(
+    gold: Sequence[EvaluationQuery],
+    *,
+    service: _ApplicationService,
+    run_id: str,
+    mode: SearchMode,
+) -> list[AdaptedExecution]:
+    records: list[AdaptedExecution] = []
+    for query in gold:
+        request = SearchRequest(
+            query_id=query.query_id,
+            query=query.query,
+            mode=mode,
+        )
+        try:
+            result = await service.execute(request, run_id=run_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            result = SearchExecutionResult(
+                outcome=SearchFailure(
+                    query_id=query.query_id,
+                    run_id=run_id,
+                    error=SearchErrorResponse(
+                        code="internal_error",
+                        detail="The search could not be completed",
+                        retryable=False,
+                        run_id=run_id,
+                    ),
+                    usage=UsageActual(),
+                    stop_reason="internal_error",
+                ),
+                diagnostics=[],
+                business_result_sha256=None,
+            )
+        records.append(adapt_execution(expected_query_id=query.query_id, result=result))
+    return records
+
+
+async def _run_formal_evaluation(
+    request: EvaluationRunRequest,
+    *,
+    composition_root: type[CompositionRoot],
+    attempt_store_factory: Callable[[Path], ValidationAttemptStore],
+    clock: Callable[[], datetime],
+) -> EvaluationRunResult:
+    inputs = _load_formal_inputs(request)
+    started_at = clock()
+    if started_at.tzinfo is None:
+        raise ValueError("formal runner clock must be timezone-aware")
+    run_id = (
+        f"{request.split}-{started_at.astimezone(UTC):%Y%m%dT%H%M%SZ}-"
+        f"{lock_sha256(inputs.lock).removeprefix('sha256:')[:12]}"
+    )
+    bundle = composition_root.compose(
+        lock_path=request.lock_path,
+        mode=request.mode,
+        artifact_root=Path.cwd(),
+        output_root=request.output_root / ".runtime",
+        snapshot_manifest_path=request.snapshot_manifest_path,
+        network_authorized=request.network_authorized,
+        lock_bytes=inputs.lock_bytes,
+    )
+    readiness = bundle.readiness_probe()
+    if request.mode == "live" and readiness.status != "ready":
+        await bundle.aclose()
+        raise ValueError("authorized live readiness is not current")
+
+    if isinstance(inputs.lock, ReplayLock):
+        if inputs.snapshot_manifest is None:
+            raise ValueError("replay snapshot manifest is unavailable")
+        snapshot_manifest = inputs.snapshot_manifest
+        snapshot_sha256 = inputs.lock.snapshot_manifest_sha256
+        snapshot_set_id = inputs.lock.snapshot_set_id
+    else:
+        snapshot_set_id = _sha256_bytes(b"[]")
+        snapshot_manifest = DependencySnapshotManifestV2(
+            snapshot_set_id=snapshot_set_id,
+            sealed_at=started_at,
+            entries=[],
+        )
+        snapshot_sha256 = _sha256_bytes(_frozen_json_bytes(snapshot_manifest.model_dump(mode="json")))
+
+    manifest = RunManifest(
+        run_id=run_id,
+        status="incomplete",
+        gate_result="not_applicable",
+        execution_mode=request.mode,
+        split=request.split,
+        frozen_manifest_sha256=inputs.lock.frozen_data.manifest.sha256,
+        partition_sha256=inputs.lock.frozen_data.partition_sha256,
+        identifier_map_sha256=inputs.lock.frozen_data.identifier_map.sha256,
+        source_git_sha=inputs.lock.source_git_sha,
+        tracked_source_dirty=False,
+        config_hash=lock_sha256(inputs.lock),
+        input_lock_sha256=_sha256_bytes(inputs.lock_bytes),
+        prompt_version=inputs.lock.baseline.prompt_version,
+        snapshot_set_id=snapshot_set_id,
+        snapshot_manifest_sha256=snapshot_sha256,
+        experiment_name="main-baseline",
+        optional_modules=inputs.lock.baseline.optional_modules.model_dump(),
+        started_at=started_at,
+        ended_at=None,
+        readiness_summary=readiness.dependencies,
+        failure_count=0,
+    )
+    workspace = FormalRunWorkspace(
+        runs_root=request.output_root,
+        manifest=manifest,
+        input_lock_bytes=inputs.lock_bytes,
+        nonce_factory=lambda: hashlib.sha256(run_id.encode()).hexdigest()[:12],
+        clock=lambda: started_at,
+        replay_snapshot_root=inputs.snapshot_root,
+    )
+    ledger = SQLiteBudgetLedger(
+        request.output_root / ".ledger" / "formal.sqlite3",
+        clock=lambda: started_at,
+        replay=request.mode == "replay",
+    )
+    reservations = [
+        ledger.reserve(
+            run_id=run_id,
+            query_id=query.query_id,
+            estimate=UsageEstimate(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("18"),
+        )
+        for query in inputs.gold
+    ]
+    attempt_store: ValidationAttemptStore | None = None
+    attempt_hash: str | None = None
+    if request.mode == "live" and isinstance(inputs.lock, ValidationLock):
+        attempt_store = attempt_store_factory(request.output_root)
+        attempt_hash = lock_sha256(inputs.lock)
+        attempt_store.claim(
+            validation_lock_sha256=attempt_hash,
+            run_id=run_id,
+            claimed_at=started_at,
+        )
+    try:
+        adapted = await _execute_service_batch(
+            inputs.gold,
+            service=bundle.service,
+            run_id=run_id,
+            mode=request.mode,
+        )
+        for reservation, record in zip(reservations, adapted, strict=True):
+            ledger.settle(reservation, record.execution.usage)
+            workspace.write_prediction(record.prediction)
+            workspace.write_execution(record.execution)
+            workspace.write_business_result(record.business_result)
+            if record.failure is not None:
+                workspace.write_failure(record.failure)
+        predictions = [adapt_prediction_record(record.prediction) for record in adapted]
+        metrics = evaluate(inputs.gold, predictions, id_map=inputs.identifier_map)
+        report = ledger.report(run_id)
+        failures = [record.failure for record in adapted if record.failure is not None]
+        failure_count = len(failures)
+        denominator = len(inputs.gold)
+        audit_measures = {
+            "hard_failure_rate": MeasureValue(
+                numerator=Decimal(failure_count),
+                denominator=Decimal(denominator),
+                value=Decimal(failure_count) / Decimal(denominator),
+            ),
+            **{
+                f"hard_failed_query:{failure.query_id}": MeasureValue(
+                    numerator=Decimal(1), denominator=Decimal(1), value=Decimal(1)
+                )
+                for failure in failures
+            },
+        }
+        gate = evaluate_gates(
+            frozen_queries=inputs.gold,
+            predictions=predictions,
+            failures=failures,
+            metrics=metrics,
+            audit_measures=audit_measures,
+            ledger_report=report,
+            policy=inputs.gate_policy,
+        )
+        workspace.write_metrics(metrics)
+        workspace.write_usage(report)
+        if not isinstance(inputs.lock, ReplayLock):
+            sealed = workspace.seal_snapshots()
+            if sealed != snapshot_manifest:
+                raise ValueError("live snapshot seal changed unexpectedly")
+            replay_lock = ReplayLock(
+                schema_version=inputs.lock.schema_version,
+                lock_kind="replay",
+                created_at=started_at,
+                source_capture_run_id=run_id,
+                source_git_sha=inputs.lock.source_git_sha,
+                runtime_allow_live=inputs.lock.runtime_allow_live,
+                frozen_data=inputs.lock.frozen_data,
+                baseline=inputs.lock.baseline,
+                budget_config=inputs.lock.budget_config,
+                pricing_policy=inputs.lock.pricing_policy,
+                quality_gates=inputs.lock.quality_gates,
+                capture_policy=inputs.lock.capture_policy,
+                snapshot_set_id=snapshot_set_id,
+                snapshot_manifest_sha256=snapshot_sha256,
+            )
+        else:
+            replay_lock = inputs.lock
+        run_path = workspace.finalize(
+            gate_evaluation=gate,
+            replay_lock=replay_lock,
+            snapshot_manifest=snapshot_manifest,
+        )
+        if attempt_store is not None and attempt_hash is not None:
+            attempt_store.transition(
+                validation_lock_sha256=attempt_hash,
+                target="complete",
+                completed_at=started_at,
+            )
+        return EvaluationRunResult(
+            run_id=run_id,
+            run_path=run_path,
+            status="complete",
+            gate_result=gate.gate_result,
+        )
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        if attempt_store is not None and attempt_hash is not None:
+            attempt_store.transition(
+                validation_lock_sha256=attempt_hash,
+                target="interrupted",
+                completed_at=started_at,
+                incident_ref=f"automatic-interruption:{run_id}",
+            )
+        workspace.interrupt()
+        raise
+    except Exception:
+        if attempt_store is not None and attempt_hash is not None:
+            attempt_store.transition(
+                validation_lock_sha256=attempt_hash,
+                target="failed",
+                completed_at=started_at,
+                incident_ref=f"automatic-failure:{run_id}",
+            )
+        workspace.fail("internal_error")
+        raise
+    finally:
+        await bundle.aclose()
+
+
+async def run_evaluation(
+    request: EvaluationRunRequest | Sequence[EvaluationQuery],
+    *,
+    composition_root: type[CompositionRoot] = CompositionRoot,
+    attempt_store_factory: Callable[[Path], ValidationAttemptStore] = (
+        ValidationAttemptStore
+    ),
+    clock: Callable[[], datetime] = _utc_now,
+    identity: RunIdentity | None = None,
+    provider: SearchProvider | None = None,
+    cache: SQLiteResponseCache | None = None,
+    config: RuntimeConfig | None = None,
+    output: Path | None = None,
+    id_map: IdentifierMap | None = None,
+) -> EvaluationRunResult | RunResult:
+    """Run the canonical formal path; retain the Week-1 path as compatibility."""
+    if isinstance(request, EvaluationRunRequest):
+        return await _run_formal_evaluation(
+            request,
+            composition_root=composition_root,
+            attempt_store_factory=attempt_store_factory,
+            clock=clock,
+        )
+    if identity is None or provider is None or cache is None or config is None or output is None:
+        raise TypeError("legacy evaluation requires identity, provider, cache, config, and output")
+    return await _run_legacy_evaluation(
+        request,
+        identity=identity,
+        provider=provider,
+        cache=cache,
+        config=config,
+        output=output,
+        id_map=id_map,
+    )
 
 
 async def _run_cli_evaluation(

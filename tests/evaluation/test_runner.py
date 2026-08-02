@@ -15,6 +15,11 @@ from typing import Any, IO
 import pytest
 
 import paper_search.evaluation.runner as runner_module
+from paper_search.application.contracts import (
+    SearchErrorResponse,
+    SearchExecutionResult,
+    SearchFailure,
+)
 from paper_search.config import RuntimeConfig, load_budget, load_runtime_config
 from paper_search.domain.models import (
     BudgetReservation,
@@ -26,7 +31,13 @@ from paper_search.domain.models import (
 )
 from paper_search.evaluation.dataset import EvaluationQuery, PredictionRecord
 from paper_search.evaluation.metrics import CONTRACT_VERSION
-from paper_search.evaluation.runner import RunIdentity, process_candidates, run_evaluation
+from paper_search.evaluation.runner import (
+    EvaluationRunRequest,
+    EvaluationRunResult,
+    RunIdentity,
+    process_candidates,
+    run_evaluation,
+)
 from paper_search.processing import (
     FUZZY_TITLE_THRESHOLD,
     MINIMUM_UNCERTAINTY_MULTIPLIER,
@@ -587,11 +598,13 @@ def test_frozen_split_returns_complete_typed_run_identity(tmp_path: Path) -> Non
     }
 
 
-def test_run_evaluation_requires_explicit_run_identity() -> None:
+def test_legacy_run_evaluation_requires_explicit_run_identity_at_runtime() -> None:
     parameter = inspect.signature(run_evaluation).parameters.get("identity")
 
     assert parameter is not None
-    assert parameter.default is inspect.Parameter.empty
+    assert parameter.default is None
+    with pytest.raises(TypeError, match="legacy evaluation requires identity"):
+        asyncio.run(run_evaluation([]))
 
 
 def test_behavior_constants_are_publicly_exported() -> None:
@@ -1936,3 +1949,76 @@ def test_run_evaluation_preflights_existing_artifacts_before_snapshot_write(
 
     assert not (output / "snapshot_manifest.json").exists()
     assert not (output / "snapshots").exists()
+def test_formal_run_request_and_result_contracts(tmp_path: Path) -> None:
+    request = EvaluationRunRequest(
+        split="dev",
+        mode="replay",
+        lock_path=tmp_path / "replay.lock.yaml",
+        output_root=tmp_path / "runs",
+        snapshot_manifest_path=tmp_path / "snapshot-manifest.json",
+        network_authorized=False,
+    )
+    result = EvaluationRunResult(
+        run_id="formal-1",
+        run_path=tmp_path / "runs" / "formal-1",
+        status="complete",
+        gate_result="passed",
+    )
+
+    assert request.mode == "replay"
+    assert result.status == "complete"
+
+
+def test_formal_runner_exposes_canonical_request_and_injection_boundary() -> None:
+    parameters = inspect.signature(run_evaluation).parameters
+
+    assert next(iter(parameters)) == "request"
+    assert "composition_root" in parameters
+    assert "attempt_store_factory" in parameters
+    assert "clock" in parameters
+
+
+def test_ordered_service_batch_continues_after_query_scoped_exception() -> None:
+    calls: list[str] = []
+
+    class FakeService:
+        async def execute(self, request: object, *, run_id: str | None = None):
+            query_id = getattr(request, "query_id")
+            calls.append(query_id)
+            if query_id == "q1":
+                raise RuntimeError("provider detail must be sanitized")
+            return SearchExecutionResult(
+                outcome=SearchFailure(
+                    query_id=query_id,
+                    run_id=run_id or "formal-1",
+                    error=SearchErrorResponse(
+                        code="dependency_failure",
+                        detail="safe",
+                        retryable=True,
+                        run_id=run_id,
+                    ),
+                    usage=UsageActual(),
+                    stop_reason="dependency_failure",
+                ),
+                diagnostics=[],
+                business_result_sha256=None,
+            )
+
+    records = asyncio.run(
+        runner_module._execute_service_batch(
+            [
+                EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"}),
+                EvaluationQuery(query_id="q2", query="two", metadata={"split": "dev"}),
+            ],
+            service=FakeService(),
+            run_id="formal-1",
+            mode="replay",
+        )
+    )
+
+    assert calls == ["q1", "q2"]
+    assert [record.prediction.query_id for record in records] == ["q1", "q2"]
+    assert [record.failure.error_code for record in records if record.failure] == [
+        "internal_error",
+        "dependency_failure",
+    ]

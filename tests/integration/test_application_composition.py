@@ -1,0 +1,302 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import socket
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+import yaml
+from pydantic import ValidationError
+
+import paper_search.application.service as service_module
+from paper_search.application.composition import ApplicationBundle, CompositionRoot
+from paper_search.application.contracts import SearchRequest
+from paper_search.application.modes import ModeBinding
+from paper_search.control.budget import HardBudgetController
+from paper_search.domain.models import SearchBudget
+from paper_search.llm.snapshot_adapters import ReplayLLMAnalyzer
+from paper_search.retrieval.snapshot_adapters import ReplaySearchProvider
+from paper_search.storage.dependency_snapshot import DependencyCaptureStore
+
+
+def _sha256(payload: bytes) -> str:
+    return f"sha256:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _write_artifact(root: Path, relative: str, payload: bytes) -> str:
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(payload)
+    return _sha256(payload)
+
+
+def _pricing_policy() -> bytes:
+    return b"""schema_version: pricing-policy-v1
+currency: CNY
+effective_at: '2026-07-01T00:00:00Z'
+source_identity: composition-test-policy
+rounding_quantum_cny: '0.000001'
+rates:
+  - {dependency: llm, model_or_adapter: qwen3.7-plus, unit: input_token, price_cny_per_unit: '0.000002'}
+  - {dependency: llm, model_or_adapter: qwen3.7-plus, unit: output_token, price_cny_per_unit: '0.000003'}
+  - {dependency: llm, model_or_adapter: qwen3.7-plus, unit: request, price_cny_per_unit: '0.000100'}
+  - {dependency: openalex, model_or_adapter: openalex-works-v1, unit: request, price_cny_per_unit: '0.000050'}
+  - {dependency: semantic_scholar, model_or_adapter: semantic-graph-v1, unit: request, price_cny_per_unit: '0.000060'}
+"""
+
+
+@pytest.fixture
+def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    payloads = {
+        "data/manifest.json": b"{}",
+        "data/identifier-map.json": b"{}",
+        "configs/prompts/query_analyze.yaml": b"prompt: composition fixture\n",
+        "configs/budget_balanced.yaml": (
+            Path("configs/budget_balanced.yaml").read_bytes()
+        ),
+        "configs/pricing_v1.yaml": _pricing_policy(),
+        "configs/quality_gates_v1.yaml": b"{}",
+    }
+    hashes = {
+        relative: _write_artifact(artifact_root, relative, payload)
+        for relative, payload in payloads.items()
+    }
+    snapshot_root = artifact_root / "snapshots" / "fixture"
+    store = DependencyCaptureStore(snapshot_root)
+    manifest = store.seal()
+    manifest_path = store.manifest_path
+
+    def write_lock(kind: str, *, runtime_allow_live: bool = True) -> Path:
+        fixture_path = Path(f"tests/fixtures/application/{kind}.lock.yaml")
+        raw = yaml.safe_load(fixture_path.read_bytes())
+        raw["runtime_allow_live"] = runtime_allow_live
+        for section, key, relative in (
+            ("frozen_data", "manifest", "data/manifest.json"),
+            ("frozen_data", "identifier_map", "data/identifier-map.json"),
+        ):
+            raw[section][key]["sha256"] = hashes[relative]
+        raw["baseline"]["planner"]["prompt_config"]["sha256"] = hashes[
+            "configs/prompts/query_analyze.yaml"
+        ]
+        for key, relative in (
+            ("budget_config", "configs/budget_balanced.yaml"),
+            ("pricing_policy", "configs/pricing_v1.yaml"),
+            ("quality_gates", "configs/quality_gates_v1.yaml"),
+        ):
+            raw[key]["sha256"] = hashes[relative]
+        if kind == "replay":
+            raw["snapshot_set_id"] = manifest.snapshot_set_id
+            raw["snapshot_manifest_sha256"] = store.manifest_sha256
+        lock_path = tmp_path / f"{kind}-{runtime_allow_live}.lock.yaml"
+        lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+        return lock_path
+
+    yield {
+        "artifact_root": artifact_root,
+        "output_root": tmp_path / "output",
+        "manifest_path": manifest_path,
+        "replay_lock": write_lock("replay"),
+        "replay_no_live_lock": write_lock("replay", runtime_allow_live=False),
+        "candidate_lock": write_lock("candidate"),
+    }
+
+
+def _compose_replay(fixture: dict[str, Path]) -> ApplicationBundle:
+    return CompositionRoot.compose(
+        lock_path=fixture["replay_lock"],
+        mode="replay",
+        artifact_root=fixture["artifact_root"],
+        output_root=fixture["output_root"],
+        snapshot_manifest_path=fixture["manifest_path"],
+        environ={},
+    )
+
+
+def test_replay_composition_binds_one_snapshot_and_pure_readiness(
+    composition_fixture: dict[str, Path],
+) -> None:
+    bundle = _compose_replay(composition_fixture)
+
+    assert bundle.experiment_id == "main-baseline"
+    assert bundle.prompt_version == "query-analyze-v1"
+    assert bundle.config_hash.startswith("sha256:")
+    assert bundle.mode_binding == ModeBinding(
+        mode="replay",
+        network_authorized=False,
+        snapshot_set_id=bundle.mode_binding.snapshot_set_id,
+        snapshot_manifest_sha256=bundle.mode_binding.snapshot_manifest_sha256,
+    )
+    first = bundle.readiness_probe()
+    second = bundle.readiness_probe()
+    assert first == second
+    assert first.status == "ready"
+    assert first.execution_mode == "replay"
+    assert first.snapshot_set_id == bundle.mode_binding.snapshot_set_id
+    assert [status.state for status in first.dependencies] == [
+        "replayed",
+        "replayed",
+        "replayed",
+    ]
+    assert all(status.cache_hit for status in first.dependencies)
+    assert first.last_authorized_probe_at is None
+
+
+@pytest.mark.parametrize("manifest_case", ["missing", "mismatched", "outside"])
+def test_replay_rejects_invalid_operator_manifest(
+    composition_fixture: dict[str, Path],
+    tmp_path: Path,
+    manifest_case: str,
+) -> None:
+    manifest_path = composition_fixture["manifest_path"]
+    if manifest_case == "missing":
+        selected: Path | None = None
+    elif manifest_case == "mismatched":
+        manifest_path.write_bytes(b"{}")
+        selected = manifest_path
+    else:
+        selected = tmp_path / "outside-snapshot-manifest.json"
+        selected.write_bytes(manifest_path.read_bytes())
+
+    with pytest.raises(ValueError, match="manifest"):
+        CompositionRoot.compose(
+            lock_path=composition_fixture["replay_lock"],
+            mode="replay",
+            artifact_root=composition_fixture["artifact_root"],
+            output_root=composition_fixture["output_root"],
+            snapshot_manifest_path=selected,
+            environ={},
+        )
+
+
+def test_replay_composition_and_readiness_never_touch_network(
+    composition_fixture: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def tripwire(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("replay attempted network access")
+
+    monkeypatch.setattr(socket, "socket", tripwire)
+    monkeypatch.setattr(socket, "getaddrinfo", tripwire)
+
+    bundle = _compose_replay(composition_fixture)
+    assert bundle.readiness_probe().status == "ready"
+
+
+@pytest.mark.parametrize(
+    ("lock_key", "mode", "network_authorized", "environ", "message"),
+    [
+        ("candidate_lock", "replay", False, {}, "replay lock"),
+        ("replay_no_live_lock", "live", True, {"LLM_API_KEY": "secret"}, "allow live"),
+        ("candidate_lock", "live", False, {"LLM_API_KEY": "secret"}, "network"),
+        ("candidate_lock", "live", True, {}, "LLM_API_KEY"),
+    ],
+)
+def test_mode_composition_rejects_each_missing_authorization_key(
+    composition_fixture: dict[str, Path],
+    lock_key: str,
+    mode: str,
+    network_authorized: bool,
+    environ: dict[str, str],
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        CompositionRoot.compose(
+            lock_path=composition_fixture[lock_key],
+            mode=mode,  # type: ignore[arg-type]
+            artifact_root=composition_fixture["artifact_root"],
+            output_root=composition_fixture["output_root"],
+            network_authorized=network_authorized,
+            environ=environ,
+        )
+
+
+def test_live_secret_is_resolved_only_into_private_clients(
+    composition_fixture: dict[str, Path],
+) -> None:
+    secret = "composition-live-secret"
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["candidate_lock"],
+        mode="live",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        network_authorized=True,
+        environ={"LLM_API_KEY": secret},
+    )
+
+    assert bundle.mode_binding.network_authorized is True
+    assert secret not in repr(bundle)
+    assert secret not in repr(bundle.__dict__)
+    assert not hasattr(bundle, "environ")
+    assert not hasattr(bundle, "llm_api_key")
+    readiness = bundle.readiness_probe()
+    assert readiness.status == "degraded"
+    assert readiness.last_authorized_probe_at is None
+
+
+def test_service_constructs_a_fresh_controller_for_each_request(
+    composition_fixture: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controllers: list[HardBudgetController] = []
+    real_controller = service_module.HardBudgetController
+
+    def recording_controller(*args: object, **kwargs: object) -> HardBudgetController:
+        controller = real_controller(*args, **kwargs)  # type: ignore[arg-type]
+        controllers.append(controller)
+        return controller
+
+    monkeypatch.setattr(service_module, "HardBudgetController", recording_controller)
+    bundle = _compose_replay(composition_fixture)
+    request = SearchRequest(query_id="q1", query="offline fixture", mode="replay")
+
+    first = asyncio.run(bundle.service.execute(request))
+    second = asyncio.run(
+        bundle.service.execute(request.model_copy(update={"query_id": "q2"}))
+    )
+
+    assert len(controllers) == 2
+    assert controllers[0] is not controllers[1]
+    assert first.outcome.kind == "failure"
+    assert first.outcome.error.code == "snapshot_unavailable"
+    assert second.outcome.kind == "failure"
+    assert second.outcome.error.code == "snapshot_unavailable"
+
+
+def test_replay_orchestrator_uses_only_replay_adapters_and_baseline_modules(
+    composition_fixture: dict[str, Path],
+) -> None:
+    bundle = _compose_replay(composition_fixture)
+    budget = SearchBudget.model_validate(
+        yaml.safe_load(
+            (composition_fixture["artifact_root"] / "configs/budget_balanced.yaml").read_bytes()
+        )
+    )
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False)
+    )
+
+    analyzer_owner = orchestrator._analyzer.adapter  # type: ignore[attr-defined]  # noqa: SLF001
+    assert isinstance(analyzer_owner, ReplayLLMAnalyzer)
+    assert all(
+        isinstance(provider, ReplaySearchProvider)
+        for provider in orchestrator._providers.values()  # noqa: SLF001
+    )
+    assert orchestrator._embedding_ranker is None  # noqa: SLF001
+    assert orchestrator._citation_expander is None  # noqa: SLF001
+    assert orchestrator._constraint_reranker is None  # noqa: SLF001
+
+
+def test_snapshot_binding_is_immutable_after_composition(
+    composition_fixture: dict[str, Path],
+) -> None:
+    bundle = _compose_replay(composition_fixture)
+    original = bundle.mode_binding.snapshot_set_id
+
+    with pytest.raises(ValidationError):
+        bundle.mode_binding.snapshot_set_id = "replacement"  # type: ignore[misc]
+
+    assert bundle.mode_binding.snapshot_set_id == original

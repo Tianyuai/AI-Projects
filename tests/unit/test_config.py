@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 import paper_search.config as config_module
-from paper_search.config import RuntimeConfig
+from paper_search.config import RuntimeConfig, validate_mode_authorization
 
 
 def load_runtime_config(
@@ -251,6 +251,37 @@ def test_direct_runtime_config_constructors_receive_safe_runtime_defaults() -> N
 
     assert config.runtime.allow_live is False
     assert config.runtime.artifact_root == Path("artifacts")
+
+
+@pytest.mark.parametrize(
+    ("mode", "runtime_allow_live", "network_authorized", "message"),
+    [
+        ("replay", True, True, "network"),
+        ("live", False, True, "allow live"),
+        ("live", True, False, "network"),
+    ],
+)
+def test_mode_authorization_fails_closed(
+    mode: str,
+    runtime_allow_live: bool,
+    network_authorized: bool,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        validate_mode_authorization(
+            mode=mode,  # type: ignore[arg-type]
+            runtime_allow_live=runtime_allow_live,
+            network_authorized=network_authorized,
+        )
+
+
+@pytest.mark.parametrize("mode", ["replay", "live"])
+def test_mode_authorization_accepts_only_the_exact_allowed_matrix(mode: str) -> None:
+    validate_mode_authorization(
+        mode=mode,  # type: ignore[arg-type]
+        runtime_allow_live=mode == "live",
+        network_authorized=mode == "live",
+    )
 
 
 @pytest.mark.parametrize(

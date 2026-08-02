@@ -1,5 +1,8 @@
 """Stable application contracts shared by replay and live execution paths."""
 
+from importlib import import_module
+from typing import Any
+
 from paper_search.application.contracts import (
     DependencyDiagnostic,
     ReadyHealthResponse,
@@ -22,10 +25,7 @@ from paper_search.application.locks import (
     load_input_lock,
     lock_sha256,
 )
-from paper_search.application.service import (
-    SearchApplicationError,
-    SearchApplicationService,
-)
+from paper_search.application.modes import ModeBinding
 from paper_search.domain.models import (
     DependencyErrorCode,
     DependencyName,
@@ -39,7 +39,35 @@ from paper_search.domain.models import (
     StructuredSearchResponse,
 )
 
+_LAZY_EXPORTS = {
+    "ApplicationBundle": ("paper_search.application.composition", "ApplicationBundle"),
+    "ArtifactFactory": ("paper_search.application.composition", "ArtifactFactory"),
+    "CompositionRoot": ("paper_search.application.composition", "CompositionRoot"),
+    "SearchApplicationError": (
+        "paper_search.application.service",
+        "SearchApplicationError",
+    ),
+    "SearchApplicationService": (
+        "paper_search.application.service",
+        "SearchApplicationService",
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve runtime-heavy public boundaries without import cycles."""
+
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute = target
+    value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
 __all__ = [
+    "ApplicationBundle",
+    "ArtifactFactory",
     "DependencyDiagnostic",
     "DependencyErrorCode",
     "DependencyName",
@@ -47,8 +75,10 @@ __all__ = [
     "DependencyStatus",
     "ArtifactBinding",
     "CandidateLock",
+    "CompositionRoot",
     "InputLock",
     "MoneyCny",
+    "ModeBinding",
     "PlannerStatus",
     "ReadyHealthResponse",
     "SafeRelativePath",

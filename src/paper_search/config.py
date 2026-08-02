@@ -18,10 +18,28 @@ from pydantic import (
     SecretStr,
 )
 
-from paper_search.domain.models import SafeRelativePath, SearchBudget
+from paper_search.domain.models import SafeRelativePath, SearchBudget, SearchMode
 
 
 BudgetConfig = SearchBudget
+
+
+def validate_mode_authorization(
+    *,
+    mode: SearchMode,
+    runtime_allow_live: bool,
+    network_authorized: bool,
+) -> None:
+    """Fail closed unless replay or live has exactly its required authority."""
+
+    if mode == "replay":
+        if network_authorized:
+            raise ValueError("replay mode must not authorize network access")
+        return
+    if not runtime_allow_live:
+        raise ValueError("input lock does not allow live execution")
+    if not network_authorized:
+        raise ValueError("live execution requires explicit network authorization")
 
 
 class EmbeddingConfig(BaseModel):

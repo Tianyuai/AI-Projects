@@ -6,7 +6,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -251,9 +250,7 @@ class FormalRunWorkspace:
             if not isinstance(self._input_lock, ReplayLock):
                 raise ValueError("replay snapshots require a replay input lock")
             source_root = replay_snapshot_root.resolve(strict=True)
-            snapshot_root = self._work_dir / "snapshots"
-            shutil.copytree(source_root, snapshot_root)
-            manifest_path = snapshot_root / "snapshot-manifest.json"
+            manifest_path = source_root / "snapshot-manifest.json"
             try:
                 snapshot_bytes = manifest_path.read_bytes()
                 snapshot_manifest = DependencySnapshotManifestV2.model_validate_json(
@@ -268,6 +265,14 @@ class FormalRunWorkspace:
                     reader.read(entry.request)
             except (OSError, ValueError) as error:
                 raise ValueError("replay snapshot evidence is invalid") from error
+            snapshot_root = self._work_dir / "snapshots"
+            snapshot_root.mkdir(exist_ok=False)
+            self._write(snapshot_root / "snapshot-manifest.json", snapshot_bytes)
+            for entry in snapshot_manifest.entries:
+                snapshot_read = reader.read(entry.request)
+                response_path = snapshot_root / entry.response_path
+                response_path.parent.mkdir(parents=True, exist_ok=True)
+                self._write(response_path, snapshot_read.response_bytes)
             self._replay_snapshot_manifest = snapshot_manifest
             self._replay_snapshot_bytes = snapshot_bytes
 
@@ -434,9 +439,15 @@ class FormalRunWorkspace:
                 raise ValueError("replay run requires its exact verified snapshot evidence")
             snapshot_bytes = self._replay_snapshot_bytes
         else:
-            if self._snapshot_store is None or not self._snapshot_store.manifest_path.is_file():
+            if self._snapshot_store is None:
                 raise RuntimeError("sealed snapshot manifest is required")
+            try:
+                sealed_sha256 = self._snapshot_store.manifest_sha256
+            except RuntimeError:
+                raise RuntimeError("sealed snapshot manifest is required") from None
             snapshot_bytes = self._snapshot_store.manifest_path.read_bytes()
+            if _sha256(snapshot_bytes) != sealed_sha256:
+                raise ValueError("sealed snapshot manifest changed after sealing")
             try:
                 captured_manifest = DependencySnapshotManifestV2.model_validate_json(
                     snapshot_bytes

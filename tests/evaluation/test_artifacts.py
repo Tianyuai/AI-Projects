@@ -274,6 +274,19 @@ def test_finalize_requires_sealed_snapshot_and_rejects_destination_collision(tmp
         workspace.finalize(gate_evaluation=_gate(), replay_lock=_replay_lock(), snapshot_manifest=_snapshot())
 
 
+def test_finalize_rejects_planted_manifest_without_store_seal(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path, seal_snapshots=False)
+    _populate(workspace)
+    workspace.snapshot_store.manifest_path.write_bytes(_snapshot_bytes())
+
+    with pytest.raises(RuntimeError, match="sealed snapshot"):
+        workspace.finalize(
+            gate_evaluation=_gate(),
+            replay_lock=_replay_lock(),
+            snapshot_manifest=_snapshot(),
+        )
+
+
 def test_complete_status_is_independent_from_failed_gate(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     _populate(workspace)
@@ -327,6 +340,7 @@ def test_replay_copies_exact_verified_lock_and_manifest_bytes(tmp_path: Path) ->
     replay_root = tmp_path / "replay-source"
     replay_root.mkdir()
     (replay_root / "snapshot-manifest.json").write_bytes(snapshot_bytes)
+    (replay_root / "unbound-secret.txt").write_text("must not copy", encoding="utf-8")
     workspace = FormalRunWorkspace(
         runs_root=tmp_path / "runs",
         manifest=manifest,
@@ -345,6 +359,7 @@ def test_replay_copies_exact_verified_lock_and_manifest_bytes(tmp_path: Path) ->
 
     assert (destination / "replay.lock.yaml").read_bytes() == input_lock_bytes
     assert (destination / "snapshot-manifest.json").read_bytes() == snapshot_bytes
+    assert not (destination / "snapshots" / "unbound-secret.txt").exists()
 
 
 def test_finalize_rejects_cross_file_query_order_and_coverage(tmp_path: Path) -> None:

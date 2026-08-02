@@ -68,6 +68,37 @@ def test_concurrent_claim_is_exclusive_and_maps_conflict_code(tmp_path: Path) ->
     assert sorted(outcomes) == ["claimed", "conflict"]
 
 
+def test_concurrent_distinct_hashes_create_only_one_initial_claim(tmp_path: Path) -> None:
+    store = ValidationAttemptStore(tmp_path)
+    barrier = threading.Barrier(3)
+    outcomes: list[str] = []
+
+    def claim(lock_hash: str) -> None:
+        barrier.wait()
+        try:
+            store.claim(
+                validation_lock_sha256=lock_hash,
+                run_id=f"run-{lock_hash[-1]}",
+                claimed_at=NOW,
+            )
+        except ValidationAttemptConflictError:
+            outcomes.append("conflict")
+        else:
+            outcomes.append("claimed")
+
+    threads = [
+        threading.Thread(target=claim, args=(lock_hash,))
+        for lock_hash in (LOCK_A, LOCK_B)
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["claimed", "conflict"]
+
+
 def test_concurrent_terminal_transition_commits_exactly_once(tmp_path: Path) -> None:
     store = ValidationAttemptStore(tmp_path)
     store.claim(validation_lock_sha256=LOCK_A, run_id="validation-1", claimed_at=NOW)
@@ -304,6 +335,31 @@ def test_dispatch_exception_transitions_created_claim_to_failed(tmp_path: Path) 
     claim = store.read(LOCK_A)
     assert claim.state == "failed"
     assert claim.incident_ref == "automatic-failure:validation-1"
+
+
+def test_duplicate_dispatch_conflict_does_not_terminalize_existing_owner(
+    tmp_path: Path,
+) -> None:
+    store = ValidationAttemptStore(tmp_path)
+    original = store.claim(
+        validation_lock_sha256=LOCK_A,
+        run_id="validation-1",
+        claimed_at=NOW,
+    )
+
+    with pytest.raises(ValidationAttemptConflictError):
+        dispatch_with_validation_claim(
+            execution_mode="live",
+            offline_preflight=lambda: None,
+            reserve_run_budget=lambda: None,
+            store=store,
+            validation_lock_sha256=LOCK_A,
+            run_id="validation-1",
+            claimed_at=NOW,
+            dispatch=lambda: None,
+        )
+
+    assert store.read(LOCK_A) == original
 
 
 def test_read_recovers_complete_terminal_sibling_after_crash(tmp_path: Path) -> None:

@@ -48,6 +48,27 @@ def _claim_bytes(claim: ValidationAttemptClaim) -> bytes:
     )
 
 
+def _reserve_exact(path: Path, payload: bytes, *, conflict: str) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as target:
+            target.write(payload)
+            target.flush()
+            os.fsync(target.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            try:
+                reserved = path.read_bytes()
+            except OSError:
+                reserved = b""
+            if reserved != payload:
+                raise ValidationAttemptConflictError(conflict) from None
+        _fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 class ValidationAttemptClaim(DomainModel):
     schema_version: Literal["validation-attempt-v1"] = "validation-attempt-v1"
     validation_lock_sha256: Sha256
@@ -150,6 +171,30 @@ class ValidationAttemptStore:
                 "validation lock already has an irrevocable attempt"
             )
         existing = self._existing_claims()
+        if not existing:
+            initial_bytes = (
+                json.dumps(
+                    {
+                        "claimed_at": claimed_at.isoformat(),
+                        "run_id": run_id,
+                        "validation_lock_sha256": validation_lock_sha256,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            _reserve_exact(
+                self._attempts_root / ".initial",
+                initial_bytes,
+                conflict="another validation lock owns the initial attempt",
+            )
+            existing = self._existing_claims()
+            if path.exists():
+                raise ValidationAttemptConflictError(
+                    "validation lock already has an irrevocable attempt"
+                )
         supersedes_binding: str | None = None
         supersession_bytes: bytes | None = None
         supersession_path: Path | None = None
@@ -209,28 +254,11 @@ class ValidationAttemptStore:
             incident_ref=supersedes_binding,
         )
         if supersession_path is not None and supersession_bytes is not None:
-            temporary = supersession_path.with_name(
-                f".{supersession_path.name}.{uuid4().hex}.tmp"
+            _reserve_exact(
+                supersession_path,
+                supersession_bytes,
+                conflict="prior incident already has a superseding attempt",
             )
-            try:
-                with temporary.open("xb") as target:
-                    target.write(supersession_bytes)
-                    target.flush()
-                    os.fsync(target.fileno())
-                try:
-                    os.link(temporary, supersession_path)
-                except FileExistsError:
-                    try:
-                        reserved = supersession_path.read_bytes()
-                    except OSError:
-                        reserved = b""
-                    if reserved != supersession_bytes:
-                        raise ValidationAttemptConflictError(
-                            "prior incident already has a superseding attempt"
-                        ) from None
-                _fsync_directory(self._attempts_root)
-            finally:
-                temporary.unlink(missing_ok=True)
         try:
             with path.open("xb") as target:
                 target.write(_claim_bytes(claim))
@@ -332,10 +360,14 @@ def dispatch_with_validation_claim(
     if execution_mode == "replay":
         return dispatch()
 
+    created = False
+
     def transition_created_claim(
         target: Literal["failed", "interrupted"],
         incident_ref: str,
     ) -> None:
+        if not created:
+            return
         try:
             current = store.read(validation_lock_sha256)
             if current.run_id != run_id or current.state != "claimed":
@@ -355,6 +387,7 @@ def dispatch_with_validation_claim(
             run_id=run_id,
             claimed_at=claimed_at,
         )
+        created = True
         if on_claim is not None:
             on_claim()
         return dispatch()

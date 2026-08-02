@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypeVar
 from urllib.parse import quote
 
 import httpx
@@ -114,6 +114,116 @@ class _RequestOutcome:
     safe_headers: dict[str, str]
 
 
+ResultT = TypeVar("ResultT")
+
+
+def _aggregate_attempts(attempts: list[UsageActual]) -> UsageActual:
+    costs = [attempt.cost_cny for attempt in attempts]
+    cost = (
+        None
+        if any(value is None for value in costs)
+        else sum((value for value in costs if value is not None), Decimal("0"))
+    )
+    return UsageActual(
+        search_api_calls=sum(item.search_api_calls for item in attempts),
+        llm_calls=sum(item.llm_calls for item in attempts),
+        input_tokens=sum(item.input_tokens for item in attempts),
+        output_tokens=sum(item.output_tokens for item in attempts),
+        cost_cny=cost,
+        elapsed_ms=sum(item.elapsed_ms for item in attempts),
+    )
+
+
+class _LiveOperation:
+    """Track one reservation from first dispatch to exactly one terminal action."""
+
+    def __init__(self, provider: LiveCaptureSearchProvider, reservation: BudgetReservation) -> None:
+        self.provider = provider
+        self.reservation = reservation
+        duration = max(0.0, (reservation.expires_at - provider._clock()).total_seconds())
+        self.deadline = asyncio.get_running_loop().time() + duration
+        self.attempts: list[UsageActual] = []
+        self._attempt_started: float | None = None
+        self.terminal = False
+
+    @property
+    def dispatched(self) -> bool:
+        return bool(self.attempts) or self._attempt_started is not None
+
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.deadline - asyncio.get_running_loop().time())
+
+    def start_attempt(self) -> None:
+        if self._attempt_started is not None:
+            raise RuntimeError("provider attempt is already in flight")
+        self.provider._controller.mark_dispatched(self.reservation)
+        self._attempt_started = time.perf_counter()
+
+    def finish_attempt(self) -> UsageActual:
+        if self._attempt_started is None:
+            raise RuntimeError("provider attempt is not in flight")
+        measured = UsageActual(
+            search_api_calls=1,
+            elapsed_ms=max(
+                0,
+                round((time.perf_counter() - self._attempt_started) * 1000),
+            ),
+        )
+        self._attempt_started = None
+        self.attempts.append(measured)
+        valued = self.provider._pricer.value_actual(
+            dependency=self.provider._dependency,
+            model_or_adapter=self.provider._adapter,
+            usage=measured,
+        )
+        self.attempts[-1] = valued
+        return valued
+
+    def retain_in_flight_unknown(self) -> None:
+        if self._attempt_started is None:
+            return
+        measured = UsageActual(
+            search_api_calls=1,
+            elapsed_ms=max(
+                0,
+                round((time.perf_counter() - self._attempt_started) * 1000),
+            ),
+        )
+        self._attempt_started = None
+        self.attempts.append(measured)
+
+    def settle(self) -> UsageActual:
+        actual = (
+            _aggregate_attempts(self.attempts)
+            if self.attempts
+            else UsageActual(cost_cny=Decimal("0"))
+        )
+        try:
+            self.provider._controller.settle(self.reservation, actual)
+        except Exception:
+            self.fail_closed()
+            raise
+        self.terminal = True
+        return actual
+
+    def fail_closed(self) -> None:
+        if self.terminal or not self.dispatched:
+            return
+        self.retain_in_flight_unknown()
+        terminal_attempts = list(self.attempts)
+        batch = getattr(self.provider._controller, "fail_closed_attempts", None)
+        try:
+            if callable(batch):
+                batch(self.reservation, terminal_attempts)
+            else:
+                self.provider._controller.fail_closed(
+                    self.reservation,
+                    _aggregate_attempts(terminal_attempts),
+                )
+        finally:
+            self.terminal = True
+
+
 def _error(
     dependency: ProviderName,
     code: str,
@@ -214,13 +324,30 @@ class LiveCaptureSearchProvider:
         self._sleep = sleep or asyncio.sleep
         self._jitter = jitter
 
+    async def _run_live(
+        self,
+        reservation: BudgetReservation,
+        call: Callable[[_LiveOperation], Awaitable[ResultT]],
+    ) -> ResultT:
+        operation = _LiveOperation(self, reservation)
+        try:
+            return await call(operation)
+        except asyncio.CancelledError as cancellation:
+            operation.fail_closed()
+            raise cancellation from None
+        except Exception:
+            if not operation.dispatched:
+                raise
+            operation.fail_closed()
+            raise ProviderAdapterError("provider live capture failed") from None
+
     async def _request(
         self,
         *,
         method: Method,
         endpoint: str,
         params: Mapping[str, QueryValue],
-        reservation: BudgetReservation,
+        operation: _LiveOperation,
         body: Mapping[str, object] | None = None,
         remaining_calls: int,
     ) -> _RequestOutcome:
@@ -253,7 +380,7 @@ class LiveCaptureSearchProvider:
         last_error: ErrorDetail | None = None
         attempts_made = 0
         for retry_index in range(attempts_allowed):
-            remaining_seconds = (reservation.expires_at - self._clock()).total_seconds()
+            remaining_seconds = operation.remaining_seconds()
             if remaining_seconds <= 0:
                 last_error = _error(
                     self._dependency,
@@ -262,28 +389,21 @@ class LiveCaptureSearchProvider:
                     retryable=False,
                 )
                 break
-            self._controller.mark_dispatched(reservation)
+            operation.start_attempt()
             attempts_made += 1
             try:
-                response = await self._client.request(
-                    method,
-                    f"{_BASE_URLS[self._dependency]}{endpoint}",
-                    params=request_params,
-                    json=body,
-                    headers=headers,
-                    follow_redirects=False,
-                    timeout=remaining_seconds,
-                )
-            except asyncio.CancelledError as cancellation:
-                try:
-                    self._controller.fail_closed(
-                        reservation,
-                        UsageActual(search_api_calls=attempts_made),
+                async with asyncio.timeout(remaining_seconds):
+                    response = await self._client.request(
+                        method,
+                        f"{_BASE_URLS[self._dependency]}{endpoint}",
+                        params=request_params,
+                        json=body,
+                        headers=headers,
+                        follow_redirects=False,
+                        timeout=remaining_seconds,
                     )
-                except Exception:
-                    pass
-                raise cancellation from None
-            except httpx.TimeoutException:
+            except (TimeoutError, httpx.TimeoutException):
+                operation.finish_attempt()
                 last_error = _error(
                     self._dependency,
                     "timeout",
@@ -291,24 +411,24 @@ class LiveCaptureSearchProvider:
                     retryable=True,
                 )
             except httpx.RequestError:
+                operation.finish_attempt()
                 last_error = _error(
                     self._dependency,
                     "network_error",
                     f"{self._dependency} network request failed",
                     retryable=False,
                 )
-            except Exception:
-                try:
-                    self._controller.fail_closed(
-                        reservation,
-                        UsageActual(search_api_calls=attempts_made),
-                    )
-                except Exception:
-                    pass
-                raise ProviderAdapterError("provider live capture failed") from None
             else:
+                operation.finish_attempt()
                 request_id = response.headers.get("x-request-id") or None
-                if response.status_code == 200:
+                if operation.remaining_seconds() <= 0:
+                    last_error = _error(
+                        self._dependency,
+                        "timeout",
+                        f"{self._dependency} request timed out",
+                        retryable=True,
+                    )
+                elif response.status_code == 200:
                     safe_headers = {
                         name.casefold(): value
                         for name, value in response.headers.items()
@@ -316,16 +436,17 @@ class LiveCaptureSearchProvider:
                     }
                     return _RequestOutcome(
                         content=response.content,
-                        calls=retry_index + 1,
+                        calls=attempts_made,
                         error=None,
                         captured_at=captured_at,
                         safe_headers=safe_headers,
                     )
-                last_error = _status_error(
-                    self._dependency,
-                    response.status_code,
-                    request_id,
-                )
+                else:
+                    last_error = _status_error(
+                        self._dependency,
+                        response.status_code,
+                        request_id,
+                    )
             if (
                 last_error is None
                 or not last_error.retryable
@@ -333,17 +454,17 @@ class LiveCaptureSearchProvider:
             ):
                 break
             delay_seconds = min(8, 2**retry_index) + self._jitter()
-            if delay_seconds >= (
-                reservation.expires_at - self._clock()
-            ).total_seconds():
+            remaining_seconds = operation.remaining_seconds()
+            if delay_seconds >= remaining_seconds:
                 last_error = _error(
                     self._dependency,
-                    "budget_exhausted",
-                    f"{self._dependency} request deadline expired",
-                    retryable=False,
+                    "timeout",
+                    f"{self._dependency} request timed out",
+                    retryable=True,
                 )
                 break
-            await self._sleep(delay_seconds)
+            async with asyncio.timeout(remaining_seconds):
+                await self._sleep(delay_seconds)
 
         if last_error is None:
             raise RuntimeError("provider request ended without a terminal outcome")
@@ -355,32 +476,9 @@ class LiveCaptureSearchProvider:
             safe_headers={},
         )
 
-    def _settle(
-        self,
-        reservation: BudgetReservation,
-        *,
-        calls: int,
-        elapsed_ms: int,
-    ) -> UsageActual:
-        measured = UsageActual(search_api_calls=calls, elapsed_ms=elapsed_ms)
-        try:
-            valued = (
-                self._pricer.value_actual(
-                    dependency=self._dependency,
-                    model_or_adapter=self._adapter,
-                    usage=measured,
-                )
-                if calls
-                else measured.model_copy(update={"cost_cny": Decimal("0")})
-            )
-            self._controller.settle(reservation, valued)
-        except Exception:
-            try:
-                self._controller.fail_closed(reservation, measured)
-            except Exception:
-                pass
-            raise ProviderAdapterError("provider live capture failed") from None
-        return valued
+    @staticmethod
+    def _settle(operation: _LiveOperation) -> UsageActual:
+        return operation.settle()
 
     def _capture(
         self,
@@ -404,15 +502,25 @@ class LiveCaptureSearchProvider:
         reservation: BudgetReservation,
     ) -> ProviderResult[list[Paper]]:
         if self._dependency == "openalex":
-            return await self._openalex_search(query, filters, limit, reservation)
-        return await self._semantic_search(query, filters, limit, reservation)
+            return await self._run_live(
+                reservation,
+                lambda operation: self._openalex_search(
+                    query, filters, limit, operation
+                ),
+            )
+        return await self._run_live(
+            reservation,
+            lambda operation: self._semantic_search(
+                query, filters, limit, operation
+            ),
+        )
 
     async def _openalex_search(
         self,
         query: str,
         filters: dict[str, object],
         limit: int,
-        reservation: BudgetReservation,
+        operation: _LiveOperation,
     ) -> ProviderResult[list[Paper]]:
         normalized_query = _normalize_search_query(query)
         if not normalized_query:
@@ -473,14 +581,18 @@ class LiveCaptureSearchProvider:
                 method="GET",
                 endpoint="/works",
                 params=params,
-                reservation=reservation,
-                remaining_calls=reservation.reserved.search_api_calls - calls,
+                operation=operation,
+                remaining_calls=operation.reservation.reserved.search_api_calls - calls,
             )
             calls += outcome.calls
             if outcome.error is not None or outcome.content is None:
                 if outcome.error is not None:
                     errors.append(outcome.error)
                 break
+            refs.append(self._capture(identity, outcome))
+            hashes.append(_sha256(outcome.content))
+            if operation.remaining_seconds() <= 0:
+                raise TimeoutError("provider deadline expired during capture")
             try:
                 decoded = decode_openalex_page(outcome.content, limit=remaining)
             except ValueError:
@@ -493,8 +605,8 @@ class LiveCaptureSearchProvider:
                     )
                 )
                 break
-            refs.append(self._capture(identity, outcome))
-            hashes.append(_sha256(outcome.content))
+            if operation.remaining_seconds() <= 0:
+                raise TimeoutError("provider deadline expired during decode")
             papers.extend(decoded.papers)
             errors.extend(decoded.errors)
             raw_seen += decoded.raw_count
@@ -502,11 +614,7 @@ class LiveCaptureSearchProvider:
                 break
             cursor = decoded.next_cursor
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
-        usage = self._settle(
-            reservation,
-            calls=calls,
-            elapsed_ms=elapsed_ms,
-        )
+        usage = self._settle(operation)
         return ProviderResult[list[Paper]](
             data=papers,
             usage=usage,
@@ -528,7 +636,7 @@ class LiveCaptureSearchProvider:
         query: str,
         filters: dict[str, object],
         limit: int,
-        reservation: BudgetReservation,
+        operation: _LiveOperation,
     ) -> ProviderResult[list[Paper]]:
         normalized_query = " ".join(query.split())
         if not normalized_query:
@@ -554,12 +662,12 @@ class LiveCaptureSearchProvider:
             params["year"] = year
             canonical["year"] = year
         return await self._semantic_papers_operation(
-            operation="search",
+            request_operation="search",
             method="GET",
             endpoint="/paper/search",
             params=params,
             canonical=canonical,
-            reservation=reservation,
+            operation=operation,
             decode=lambda content: decode_semantic_scholar_search(
                 content,
                 limit=limit,
@@ -576,14 +684,24 @@ class LiveCaptureSearchProvider:
         ids = [value.strip() for value in paper_ids if value.strip()]
         if not ids:
             raise ValueError("paper_ids must not be empty")
+        return await self._run_live(
+            reservation,
+            lambda operation: self._batch_details_operation(ids, operation),
+        )
+
+    async def _batch_details_operation(
+        self,
+        ids: list[str],
+        operation: _LiveOperation,
+    ) -> ProviderResult[list[Paper]]:
         canonical = {"fields": _FIELDS, "ids": ids}
         return await self._semantic_papers_operation(
-            operation="batch",
+            request_operation="batch",
             method="POST",
             endpoint="/paper/batch",
             params={"fields": _FIELDS},
             canonical=canonical,
-            reservation=reservation,
+            operation=operation,
             body={"ids": ids},
             decode=decode_semantic_scholar_batch,
         )
@@ -591,12 +709,12 @@ class LiveCaptureSearchProvider:
     async def _semantic_papers_operation(
         self,
         *,
-        operation: Literal["search", "batch"],
+        request_operation: Literal["search", "batch"],
         method: Method,
         endpoint: str,
         params: Mapping[str, QueryValue],
         canonical: Mapping[str, object],
-        reservation: BudgetReservation,
+        operation: _LiveOperation,
         decode: Callable[[bytes], Any],
         body: Mapping[str, object] | None = None,
     ) -> ProviderResult[list[Paper]]:
@@ -604,7 +722,7 @@ class LiveCaptureSearchProvider:
         requested_at = self._clock()
         identity = _identity(
             dependency="semantic_scholar",
-            operation=operation,
+            operation=request_operation,
             method=method,
             endpoint=endpoint,
             adapter=self._adapter,
@@ -615,8 +733,8 @@ class LiveCaptureSearchProvider:
             endpoint=endpoint,
             params=params,
             body=body,
-            reservation=reservation,
-            remaining_calls=reservation.reserved.search_api_calls,
+            operation=operation,
+            remaining_calls=operation.reservation.reserved.search_api_calls,
         )
         papers: list[Paper] = []
         errors: list[ErrorDetail] = []
@@ -625,18 +743,17 @@ class LiveCaptureSearchProvider:
         if outcome.error is not None:
             errors.append(outcome.error)
         elif outcome.content is not None:
+            refs.append(self._capture(identity, outcome))
+            hashes.append(_sha256(outcome.content))
+            if operation.remaining_seconds() <= 0:
+                raise TimeoutError("provider deadline expired during capture")
             decoded = decode(outcome.content)
+            if operation.remaining_seconds() <= 0:
+                raise TimeoutError("provider deadline expired during decode")
             papers.extend(decoded.papers)
             errors.extend(decoded.errors)
-            if not any(error.code == "invalid_response" for error in decoded.errors):
-                refs.append(self._capture(identity, outcome))
-                hashes.append(_sha256(outcome.content))
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
-        usage = self._settle(
-            reservation,
-            calls=outcome.calls,
-            elapsed_ms=elapsed_ms,
-        )
+        usage = self._settle(operation)
         return ProviderResult[list[Paper]](
             data=papers,
             usage=usage,
@@ -659,7 +776,7 @@ class LiveCaptureSearchProvider:
         direction: Literal["references", "citations"],
         paper_id: ProviderPaperId,
         limit: int,
-        reservation: BudgetReservation,
+        operation: _LiveOperation,
     ) -> ProviderResult[CitationExpansion]:
         if self._dependency != "semantic_scholar":
             raise ValueError("citation expansion requires Semantic Scholar")
@@ -688,8 +805,8 @@ class LiveCaptureSearchProvider:
             method="GET",
             endpoint=endpoint,
             params={"fields": _FIELDS, "limit": limit, "offset": 0},
-            reservation=reservation,
-            remaining_calls=reservation.reserved.search_api_calls,
+            operation=operation,
+            remaining_calls=operation.reservation.reserved.search_api_calls,
         )
         expansion = CitationExpansion(papers=[], raw_edges=[])
         errors: list[ErrorDetail] = []
@@ -698,23 +815,22 @@ class LiveCaptureSearchProvider:
         if outcome.error is not None:
             errors.append(outcome.error)
         elif outcome.content is not None:
+            refs.append(self._capture(identity, outcome))
+            hashes.append(_sha256(outcome.content))
+            if operation.remaining_seconds() <= 0:
+                raise TimeoutError("provider deadline expired during capture")
             decoded = decode_semantic_scholar_expansion(
                 outcome.content,
                 direction=direction,
                 paper_id=paper_id,
                 limit=limit,
             )
+            if operation.remaining_seconds() <= 0:
+                raise TimeoutError("provider deadline expired during decode")
             expansion = decoded.expansion
             errors.extend(decoded.errors)
-            if not any(error.code == "invalid_response" for error in decoded.errors):
-                refs.append(self._capture(identity, outcome))
-                hashes.append(_sha256(outcome.content))
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
-        usage = self._settle(
-            reservation,
-            calls=outcome.calls,
-            elapsed_ms=elapsed_ms,
-        )
+        usage = self._settle(operation)
         return ProviderResult[CitationExpansion](
             data=expansion,
             usage=usage,
@@ -737,11 +853,14 @@ class LiveCaptureSearchProvider:
         limit: int,
         reservation: BudgetReservation,
     ) -> ProviderResult[CitationExpansion]:
-        return await self._expansion(
-            direction="references",
-            paper_id=paper_id,
-            limit=limit,
-            reservation=reservation,
+        return await self._run_live(
+            reservation,
+            lambda operation: self._expansion(
+                direction="references",
+                paper_id=paper_id,
+                limit=limit,
+                operation=operation,
+            ),
         )
 
     async def citations(
@@ -750,11 +869,14 @@ class LiveCaptureSearchProvider:
         limit: int,
         reservation: BudgetReservation,
     ) -> ProviderResult[CitationExpansion]:
-        return await self._expansion(
-            direction="citations",
-            paper_id=paper_id,
-            limit=limit,
-            reservation=reservation,
+        return await self._run_live(
+            reservation,
+            lambda operation: self._expansion(
+                direction="citations",
+                paper_id=paper_id,
+                limit=limit,
+                operation=operation,
+            ),
         )
 
 

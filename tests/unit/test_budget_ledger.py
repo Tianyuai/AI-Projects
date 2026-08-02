@@ -9,6 +9,8 @@ from pathlib import Path
 import pytest
 
 from paper_search.domain.models import UsageActual, UsageEstimate
+from paper_search.domain.models import SearchBudget
+from paper_search.control.budget import HardBudgetController
 from paper_search.control.ledger import (
     LedgerBudgetExceededError,
     LedgerReservationError,
@@ -282,3 +284,121 @@ def test_replay_is_run_local_zero_spend_and_does_not_mutate_live_project(
     assert replay_report.actual == UsageActual(cost_cny=Decimal("0"))
     assert replay_report.project_actual_cny == Decimal("0")
     assert after == before
+
+
+def test_live_project_caps_and_policy_metadata_are_persistent_and_exact_match(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    first = _ledger(path, soft=Decimal("10.00"), hard=Decimal("20.00"))
+    first.reserve(
+        run_id="metadata-run",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    _ledger(path, soft=Decimal("10.00"), hard=Decimal("20.00"))
+
+    with pytest.raises(LedgerReservationError, match="metadata"):
+        _ledger(path, soft=Decimal("11.00"), hard=Decimal("21.00"))
+
+    with sqlite3.connect(path) as connection:
+        metadata = connection.execute(
+            """
+            SELECT schema_version, policy_version,
+                   project_soft_stop_micro_cny, project_hard_cap_micro_cny
+            FROM ledger_metadata WHERE singleton_id = 1
+            """
+        ).fetchone()
+    assert metadata == (2, "budget-ledger-policy-v1", 10_000_000, 20_000_000)
+
+
+def test_live_project_caps_cannot_raise_fixed_production_boundaries(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="fixed production boundaries"):
+        _ledger(
+            tmp_path / "ledger.sqlite3",
+            soft=Decimal("161.00"),
+            hard=Decimal("201.00"),
+        )
+
+
+def test_concurrent_instances_cannot_initialize_different_project_caps(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    barrier = threading.Barrier(3)
+    outcomes: list[str] = []
+
+    def initialize(soft: str, hard: str) -> None:
+        barrier.wait()
+        try:
+            _ledger(path, soft=Decimal(soft), hard=Decimal(hard))
+        except LedgerReservationError:
+            outcomes.append("mismatch")
+        else:
+            outcomes.append("initialized")
+
+    threads = [
+        threading.Thread(target=initialize, args=("10.00", "20.00")),
+        threading.Thread(target=initialize, args=("11.00", "21.00")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["initialized", "mismatch"]
+
+
+def test_controller_final_actual_checkpoint_survives_crash_and_recovers_once(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    current = NOW
+    ledger = _ledger(path, clock=lambda: current)
+    ledger_reservation = ledger.reserve(
+        run_id="crash-run",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    controller = HardBudgetController(
+        SearchBudget(
+            max_search_api_calls=2,
+            target_search_api_calls=1,
+            max_llm_calls=1,
+            target_llm_calls=0,
+            max_total_tokens=1,
+            max_cost_cny=1.0,
+            max_elapsed_seconds=10,
+            soft_deadline_seconds=9,
+        ),
+        formal_live=True,
+        clock=lambda: current,
+    )
+    request = controller.reserve(
+        "provider.search",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    controller.mark_dispatched(request)
+    final_actual = UsageActual(
+        search_api_calls=1,
+        cost_cny=Decimal("0.25"),
+    )
+    controller.settle(request, final_actual)
+
+    ledger.checkpoint_actual(ledger_reservation, final_actual)
+    ledger.checkpoint_actual(ledger_reservation, final_actual)
+    current += timedelta(minutes=1)
+    recovered = _ledger(path, clock=lambda: current)
+    first = recovered.report("crash-run")
+    second = _ledger(path, clock=lambda: current).report("crash-run")
+
+    assert first.actual == final_actual
+    assert first.project_actual_cny == Decimal("0.25")
+    assert second == first
+    with pytest.raises(LedgerReservationError, match="already terminal"):
+        recovered.settle(ledger_reservation, final_actual)

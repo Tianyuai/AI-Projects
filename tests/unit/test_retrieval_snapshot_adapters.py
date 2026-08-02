@@ -9,16 +9,20 @@ from decimal import Decimal
 from pathlib import Path
 
 import httpx
+import pytest
 
+from paper_search.control.budget import HardBudgetController
 from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
 from paper_search.domain.models import (
     BudgetReservation,
     ProviderPaperId,
     UsageActual,
     UsageEstimate,
+    SearchBudget,
 )
 from paper_search.retrieval.snapshot_adapters import (
     LiveCaptureSearchProvider,
+    ProviderAdapterError,
     ReplaySearchProvider,
 )
 from paper_search.storage.dependency_snapshot import (
@@ -71,6 +75,36 @@ def _reader(
         snapshot_manifest_sha256=store.manifest_sha256,
         snapshot_set_id=snapshot_set_id,
     )
+
+
+def _real_controller_reservation(
+    *, estimate_cost: str = "0.01"
+) -> tuple[HardBudgetController, BudgetReservation]:
+    budget = SearchBudget(
+        max_search_api_calls=4,
+        target_search_api_calls=1,
+        max_llm_calls=1,
+        target_llm_calls=0,
+        max_total_tokens=1,
+        max_cost_cny=1.0,
+        max_elapsed_seconds=120,
+        soft_deadline_seconds=100,
+    )
+    controller = HardBudgetController(
+        budget,
+        formal_live=True,
+        reservation_ttl_seconds=60,
+        clock=lambda: CAPTURED_AT,
+    )
+    reservation = controller.reserve(
+        "provider.search",
+        UsageEstimate(
+            search_api_calls=3,
+            cost_cny=Decimal(estimate_cost),
+            elapsed_ms=60_000,
+        ),
+    )
+    return controller, reservation
 
 
 async def _capture(
@@ -304,3 +338,253 @@ def test_expired_deadline_prevents_dispatch_and_accounts_zero_calls(tmp_path: Pa
     assert result.usage.search_api_calls == 0
     assert controller.dispatched == []
     assert controller.settled[0][1].cost_cny == Decimal("0")
+
+
+@pytest.mark.parametrize("fault", ["capture", "decode"])
+def test_dispatched_faults_fail_closed_with_valued_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: str,
+) -> None:
+    controller, reservation = _real_controller_reservation()
+
+    class FailingStore(DependencyCaptureStore):
+        def stage_success(self, *args: object, **kwargs: object) -> object:
+            raise OSError("synthetic snapshot failure")
+
+    store: DependencyCaptureStore = DependencyCaptureStore(tmp_path / "snapshot")
+    if fault == "capture":
+        store = FailingStore(tmp_path / "snapshot")
+    else:
+        def fail_decode(content: bytes, *, limit: int) -> object:
+            del content, limit
+            raise RuntimeError("synthetic decoder failure")
+
+        monkeypatch.setattr(
+            "paper_search.retrieval.snapshot_adapters.decode_semantic_scholar_search",
+            fail_decode,
+        )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=(S2 / "search.json").read_bytes(), request=request)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=store,
+                pricer=_pricer(),
+                controller=controller,
+                clock=lambda: CAPTURED_AT,
+            )
+            with pytest.raises(ProviderAdapterError, match="provider live capture failed"):
+                await provider.search("graph", {}, 2, reservation)
+
+    asyncio.run(run())
+
+    assert controller.committed_usage.search_api_calls == 1
+    assert controller.known_committed_cost_cny == Decimal("0.000060")
+    assert controller.unknown_cost_actions == []
+    assert controller.stop_status() == "hard_stop"
+
+
+def test_settlement_failure_fail_closes_with_known_valued_cost(tmp_path: Path) -> None:
+    controller, reservation = _real_controller_reservation(
+        estimate_cost="0.000001"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=(S2 / "search.json").read_bytes(), request=request)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=_pricer(),
+                controller=controller,
+                clock=lambda: CAPTURED_AT,
+            )
+            with pytest.raises(ProviderAdapterError):
+                await provider.search("graph", {}, 2, reservation)
+
+    asyncio.run(run())
+
+    assert controller.committed_usage.search_api_calls == 1
+    assert controller.known_committed_cost_cny == Decimal("0.000060")
+    assert controller.unknown_cost_actions == []
+
+
+def test_pricing_failure_fail_closes_with_unknown_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, reservation = _real_controller_reservation()
+
+    def fail_pricing(*args: object, **kwargs: object) -> UsageActual:
+        del args, kwargs
+        raise RuntimeError("synthetic pricing failure")
+
+    monkeypatch.setattr(ActualCostPricer, "value_actual", fail_pricing)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=(S2 / "search.json").read_bytes(), request=request)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=_pricer(),
+                controller=controller,
+                clock=lambda: CAPTURED_AT,
+            )
+            with pytest.raises(ProviderAdapterError, match="provider live capture failed"):
+                await provider.search("graph", {}, 2, reservation)
+
+    asyncio.run(run())
+
+    assert controller.committed_usage.search_api_calls == 1
+    assert controller.committed_usage.cost_cny is None
+    assert controller.known_committed_cost_cny == Decimal("0")
+    assert controller.unknown_cost_actions == ["provider.search"]
+    assert controller.stop_status() == "hard_stop"
+
+
+def test_cancellation_during_retry_sleep_terminalizes_prior_attempt(tmp_path: Path) -> None:
+    controller, reservation = _real_controller_reservation()
+    sleep_started = asyncio.Event()
+    never = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, content=b"not captured", request=request)
+
+    async def blocking_sleep(delay: float) -> None:
+        assert delay == 1.0
+        sleep_started.set()
+        await never.wait()
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=_pricer(),
+                controller=controller,
+                clock=lambda: CAPTURED_AT,
+                sleep=blocking_sleep,
+                jitter=lambda: 0.0,
+            )
+            task = asyncio.create_task(provider.search("graph", {}, 2, reservation))
+            await sleep_started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(run())
+
+    assert controller.committed_usage.search_api_calls == 1
+    assert controller.known_committed_cost_cny == Decimal("0.000060")
+    assert controller.stop_status() == "hard_stop"
+
+
+def test_retry_is_not_started_when_backoff_exceeds_remaining_deadline(
+    tmp_path: Path,
+) -> None:
+    settled = SettlementSpy()
+    reservation = _reservation().model_copy(
+        update={"expires_at": datetime.now(UTC) + timedelta(milliseconds=20)}
+    )
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, content=b"not captured", request=request)
+
+    async def forbidden_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def run() -> object:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=_pricer(),
+                controller=settled,
+                clock=lambda: datetime.now(UTC),
+                sleep=forbidden_sleep,
+                jitter=lambda: 0.0,
+            )
+            return await provider.search("graph", {}, 2, reservation)
+
+    result = asyncio.run(run())
+
+    assert sleeps == []
+    assert result.errors[-1].code == "timeout"
+    assert result.usage.search_api_calls == 1
+
+
+def test_total_wall_deadline_rejects_response_that_crosses_deadline(tmp_path: Path) -> None:
+    settled = SettlementSpy()
+    now = datetime.now(UTC)
+    reservation = _reservation().model_copy(
+        update={"expires_at": now + timedelta(milliseconds=20)}
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, content=(S2 / "search.json").read_bytes(), request=request)
+
+    async def run() -> object:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=_pricer(),
+                controller=settled,
+                clock=lambda: datetime.now(UTC),
+                jitter=lambda: 0.0,
+            )
+            return await provider.search("graph", {}, 2, reservation)
+
+    result = asyncio.run(run())
+    assert result.data == []
+    assert result.errors[-1].code == "timeout"
+    assert result.usage.search_api_calls == 1
+
+
+def test_http_200_invalid_bytes_are_captured_before_decode_and_replayed(
+    tmp_path: Path,
+) -> None:
+    raw = b"not-json"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=raw, request=request)
+
+    async def run() -> tuple[object, object, object]:
+        live, store, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+        )
+        async with client:
+            captured = await live.search("RAG", {}, 1, _reservation())
+        manifest = store.seal()
+        replay = ReplaySearchProvider(
+            dependency="openalex",
+            reader=_reader(store, snapshot_set_id=manifest.snapshot_set_id),
+            clock=lambda: CAPTURED_AT,
+        )
+        replayed = await replay.search("RAG", {}, 1, _reservation(0))
+        return captured, replayed, manifest
+
+    captured, replayed, manifest = asyncio.run(run())
+    assert len(manifest.entries) == 1
+    assert captured.errors[-1].code == "invalid_response"
+    assert replayed.errors[-1].code == "invalid_response"
+    assert replayed.errors[-1].code != "snapshot_unavailable"

@@ -59,8 +59,11 @@ def route_baseline_subqueries(
         max_semantic_scholar_calls,
     )
     selected = _ordered(plan.subqueries)[:max_openalex_calls]
-    if len(plan.subqueries) >= min_openalex_calls and len(selected) < min_openalex_calls:
+    if len(selected) < min_openalex_calls:
         raise ValueError("plan cannot satisfy the OpenAlex minimum")
+    query_ids = [item.query_id for item in plan.subqueries]
+    if len(set(query_ids)) != len(query_ids):
+        raise ValueError("routed subquery IDs must be unique")
 
     supplemented: dict[str, str] = {}
     explicit = [

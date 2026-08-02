@@ -28,6 +28,8 @@ DEV_RUN_CAP_CNY = Decimal("18.00")
 VALIDATION_RUN_CAP_CNY = Decimal("9.00")
 PROJECT_SOFT_STOP_CNY = Decimal("160.00")
 PROJECT_HARD_CAP_CNY = Decimal("200.00")
+_SCHEMA_VERSION = 2
+_POLICY_VERSION = "budget-ledger-policy-v1"
 
 
 class LedgerError(RuntimeError):
@@ -113,6 +115,15 @@ def _usage_from_row(
 
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS ledger_metadata (
+    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+    schema_version INTEGER NOT NULL,
+    policy_version TEXT NOT NULL,
+    request_cap_micro_cny INTEGER NOT NULL,
+    project_soft_stop_micro_cny INTEGER NOT NULL,
+    project_hard_cap_micro_cny INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
     run_cap_micro_cny INTEGER NOT NULL CHECK (run_cap_micro_cny >= 0),
@@ -138,6 +149,16 @@ CREATE TABLE IF NOT EXISTS reservations (
     actual_cost_micro_cny INTEGER CHECK (
         actual_cost_micro_cny IS NULL OR actual_cost_micro_cny >= 0
     ),
+    checkpoint_present INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_present IN (0, 1)),
+    checkpoint_search_api_calls INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_search_api_calls >= 0),
+    checkpoint_llm_calls INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_llm_calls >= 0),
+    checkpoint_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_input_tokens >= 0),
+    checkpoint_output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_output_tokens >= 0),
+    checkpoint_elapsed_ms INTEGER NOT NULL DEFAULT 0 CHECK (checkpoint_elapsed_ms >= 0),
+    checkpoint_cost_micro_cny INTEGER CHECK (
+        checkpoint_cost_micro_cny IS NULL OR checkpoint_cost_micro_cny >= 0
+    ),
+    checkpointed_at TEXT,
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
     terminal_at TEXT,
@@ -168,6 +189,11 @@ class SQLiteBudgetLedger:
         self._hard_micro = _to_micro(Decimal(project_hard_cap_cny))
         if self._soft_micro >= self._hard_micro:
             raise ValueError("project soft stop must be below project hard cap")
+        if not replay and (
+            self._soft_micro > _to_micro(PROJECT_SOFT_STOP_CNY)
+            or self._hard_micro > _to_micro(PROJECT_HARD_CAP_CNY)
+        ):
+            raise ValueError("project caps cannot exceed fixed production boundaries")
         self._clock = clock
         self._ttl = reservation_ttl_seconds
         self._replay = replay
@@ -182,14 +208,13 @@ class SQLiteBudgetLedger:
                 check_same_thread=False,
             )
             self._configure(self._memory, wal=False)
-            self._memory.executescript(_SCHEMA)
+            with self._immediate() as connection:
+                self._initialize_locked(connection)
         else:
             self._path = Path(path).resolve()
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._connection() as connection:
-                connection.executescript(_SCHEMA)
             with self._immediate() as connection:
-                self._recover_locked(connection)
+                self._initialize_locked(connection)
 
     @staticmethod
     def _configure(connection: sqlite3.Connection, *, wal: bool) -> None:
@@ -214,7 +239,7 @@ class SQLiteBudgetLedger:
             isolation_level=None,
         )
         try:
-            self._configure(connection, wal=True)
+            self._configure(connection, wal=False)
             yield connection
         finally:
             connection.close()
@@ -256,17 +281,56 @@ class SQLiteBudgetLedger:
                 """
                 UPDATE reservations
                 SET state = 'failed',
-                    actual_search_api_calls = estimate_search_api_calls,
-                    actual_llm_calls = estimate_llm_calls,
-                    actual_input_tokens = estimate_input_tokens,
-                    actual_output_tokens = estimate_output_tokens,
-                    actual_elapsed_ms = estimate_elapsed_ms,
-                    actual_cost_micro_cny = estimate_cost_micro_cny,
+                    actual_search_api_calls = CASE checkpoint_present
+                        WHEN 1 THEN checkpoint_search_api_calls ELSE estimate_search_api_calls END,
+                    actual_llm_calls = CASE checkpoint_present
+                        WHEN 1 THEN checkpoint_llm_calls ELSE estimate_llm_calls END,
+                    actual_input_tokens = CASE checkpoint_present
+                        WHEN 1 THEN checkpoint_input_tokens ELSE estimate_input_tokens END,
+                    actual_output_tokens = CASE checkpoint_present
+                        WHEN 1 THEN checkpoint_output_tokens ELSE estimate_output_tokens END,
+                    actual_elapsed_ms = CASE checkpoint_present
+                        WHEN 1 THEN checkpoint_elapsed_ms ELSE estimate_elapsed_ms END,
+                    actual_cost_micro_cny = CASE checkpoint_present
+                        WHEN 1 THEN checkpoint_cost_micro_cny ELSE estimate_cost_micro_cny END,
                     terminal_at = ?
                 WHERE state = 'reserved' AND expires_at <= ?
                 """,
                 (now.isoformat(), now.isoformat()),
             )
+
+    def _initialize_locked(self, connection: sqlite3.Connection) -> None:
+        for statement in _SCHEMA.split(";"):
+            if statement.strip():
+                connection.execute(statement)
+        expected = (
+            _SCHEMA_VERSION,
+            _POLICY_VERSION,
+            _to_micro(REQUEST_HARD_CAP_CNY),
+            self._soft_micro,
+            self._hard_micro,
+        )
+        row = connection.execute(
+            """
+            SELECT schema_version, policy_version, request_cap_micro_cny,
+                   project_soft_stop_micro_cny, project_hard_cap_micro_cny
+            FROM ledger_metadata WHERE singleton_id = 1
+            """
+        ).fetchone()
+        if row is None:
+            connection.execute(
+                """
+                INSERT INTO ledger_metadata(
+                    singleton_id, schema_version, policy_version,
+                    request_cap_micro_cny, project_soft_stop_micro_cny,
+                    project_hard_cap_micro_cny
+                ) VALUES (1, ?, ?, ?, ?, ?)
+                """,
+                expected,
+            )
+        elif tuple(row) != expected:
+            raise LedgerReservationError("ledger metadata does not match configured policy")
+        self._recover_locked(connection)
 
     @staticmethod
     def _project_totals(connection: sqlite3.Connection) -> tuple[int, int, int]:
@@ -414,6 +478,67 @@ class SQLiteBudgetLedger:
                 ) from None
         return reservation
 
+    def checkpoint_actual(
+        self,
+        reservation: LedgerReservation,
+        actual: UsageActual,
+    ) -> None:
+        """Durably checkpoint controller-final usage before ledger terminalization."""
+
+        if reservation.state != "reserved":
+            raise LedgerReservationError("reservation is already terminal")
+        actual = UsageActual.model_validate(actual.model_dump(mode="python"))
+        now = self._clock()
+        if now.tzinfo is None:
+            raise ValueError("ledger clock must return a timezone-aware datetime")
+        checkpoint = (
+            UsageActual(cost_cny=Decimal("0")) if self._replay else actual
+        )
+        values = _usage_values(checkpoint)
+        with self._immediate() as connection:
+            row = connection.execute(
+                "SELECT * FROM reservations WHERE reservation_id = ?",
+                (reservation.reservation_id,),
+            ).fetchone()
+            if row is None:
+                raise LedgerReservationError("reservation is unknown")
+            stored = LedgerReservation(
+                reservation_id=row["reservation_id"],
+                run_id=row["run_id"],
+                query_id=row["query_id"],
+                estimate=_usage_from_row(row, prefix="estimate", actual=False),
+                state="reserved",
+            )
+            if stored != reservation:
+                raise LedgerReservationError("reservation does not match stored state")
+            if row["checkpoint_present"]:
+                previous = UsageActual.model_validate(
+                    _usage_from_row(row, prefix="checkpoint", actual=True).model_dump()
+                )
+                if previous != checkpoint:
+                    raise LedgerReservationError("actual checkpoint does not match")
+            elif row["state"] != "reserved":
+                terminal = UsageActual.model_validate(
+                    _usage_from_row(row, prefix="actual", actual=True).model_dump()
+                )
+                if terminal != checkpoint:
+                    raise LedgerReservationError("reservation is already terminal")
+                return
+            else:
+                connection.execute(
+                    """
+                    UPDATE reservations
+                    SET checkpoint_present = 1,
+                        checkpoint_search_api_calls = ?, checkpoint_llm_calls = ?,
+                        checkpoint_input_tokens = ?, checkpoint_output_tokens = ?,
+                        checkpoint_elapsed_ms = ?, checkpoint_cost_micro_cny = ?,
+                        checkpointed_at = ?
+                    WHERE reservation_id = ? AND state = 'reserved'
+                    """,
+                    (*values, now.isoformat(), reservation.reservation_id),
+                )
+            self._recover_locked(connection)
+
     def _terminal(
         self,
         reservation: LedgerReservation,
@@ -451,6 +576,18 @@ class SQLiteBudgetLedger:
             if self._replay:
                 values = _usage_values(UsageActual(cost_cny=Decimal("0")))
             else:
+                if row["checkpoint_present"]:
+                    checkpoint = UsageActual.model_validate(
+                        _usage_from_row(
+                            row,
+                            prefix="checkpoint",
+                            actual=True,
+                        ).model_dump()
+                    )
+                    if checkpoint != actual:
+                        raise LedgerReservationError(
+                            "terminal actual does not match checkpoint"
+                        )
                 values = _usage_values(actual)
             connection.execute(
                 """

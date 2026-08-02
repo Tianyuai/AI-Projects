@@ -73,3 +73,61 @@ def test_either_does_not_unconditionally_fan_out_to_both_providers() -> None:
 def test_routing_rejects_out_of_contract_bounds(kwargs: dict[str, int]) -> None:
     with pytest.raises(ValueError):
         route_baseline_subqueries(_plan("either", "either", "either"), **kwargs)
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_routing_rejects_plan_below_openalex_minimum(count: int) -> None:
+    with pytest.raises(ValueError, match="OpenAlex minimum"):
+        route_baseline_subqueries(_plan(*(["openalex"] * count)))
+
+
+@pytest.mark.parametrize(("count", "expected"), [(3, 3), (6, 6), (7, 6)])
+def test_routing_default_openalex_boundary_cardinalities(
+    count: int,
+    expected: int,
+) -> None:
+    routed = route_baseline_subqueries(_plan(*(["openalex"] * count)))
+    assert len(routed) == expected
+
+
+def test_routing_rejects_duplicate_query_ids() -> None:
+    plan = _plan("semantic_scholar", "semantic_scholar", "semantic_scholar")
+    duplicate = plan.model_copy(
+        update={
+            "subqueries": [
+                item.model_copy(update={"query_id": "duplicate"})
+                for item in plan.subqueries
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="unique"):
+        route_baseline_subqueries(duplicate)
+
+
+def test_priority_ties_use_query_id_as_stable_tiebreaker() -> None:
+    plan = _plan("openalex", "openalex", "openalex")
+    tied = plan.model_copy(
+        update={
+            "subqueries": [
+                plan.subqueries[0].model_copy(update={"query_id": "q-c", "priority": 1}),
+                plan.subqueries[1].model_copy(update={"query_id": "q-a", "priority": 1}),
+                plan.subqueries[2].model_copy(update={"query_id": "q-b", "priority": 1}),
+            ]
+        }
+    )
+    assert [item.subquery_id for item in route_baseline_subqueries(tied)] == [
+        "q-a",
+        "q-b",
+        "q-c",
+    ]
+
+
+@pytest.mark.parametrize("maximum", [0, 1, 2])
+def test_semantic_scholar_supplements_respect_each_supported_maximum(
+    maximum: int,
+) -> None:
+    routed = route_baseline_subqueries(
+        _plan("semantic_scholar", "semantic_scholar", "semantic_scholar"),
+        max_semantic_scholar_calls=maximum,
+    )
+    assert sum("semantic_scholar" in item.providers for item in routed) == maximum

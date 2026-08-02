@@ -3058,10 +3058,13 @@ def test_hard_filter_loss_is_derived_from_decoded_candidates(
     )
 
 
-@pytest.mark.parametrize("bind_llm_snapshot", [False, True])
+@pytest.mark.parametrize(
+    "llm_request_binding",
+    ["absent", "exact", "wrong_safe_model", "unrelated_query"],
+)
 def test_business_query_analysis_requires_bound_llm_snapshot(
     tmp_path: Path,
-    bind_llm_snapshot: bool,
+    llm_request_binding: str,
 ) -> None:
     store = DependencyCaptureStore(tmp_path / "snapshots")
     identity = DependencyRequestIdentity.from_canonical_request(
@@ -3088,16 +3091,22 @@ def test_business_query_analysis_requires_bound_llm_snapshot(
             search_plan=QueryPlanner().finalize(mutated_spec, None),
         )
     llm_refs = []
-    if bind_llm_snapshot:
+    if llm_request_binding != "absent":
+        model_id = (
+            "safe-but-unlocked"
+            if llm_request_binding == "wrong_safe_model"
+            else "qwen3.7-plus"
+        )
+        request_query = "other" if llm_request_binding == "unrelated_query" else "one"
         llm_identity = DependencyRequestIdentity.from_canonical_request(
             dependency="llm",
             operation="generate_json",
             method="POST",
             endpoint="/chat/completions",
-            model_or_adapter="qwen3.7-plus",
+            model_or_adapter=model_id,
             canonical_request={
-                "payload": "sha256:" + "c" * 64,
-                "prompt_name": "query-analyze",
+                "payload": {"query": request_query},
+                "prompt_name": "query_analyze",
                 "prompt_version": "query-analyze-v1",
             },
         )
@@ -3204,17 +3213,20 @@ def test_business_query_analysis_requires_bound_llm_snapshot(
         snapshot_manifest=manifest,
         snapshot_reader=reader,
         prompt_version="query-analyze-v1",
+        prompt_name="query_analyze",
+        llm_model_allowlist=frozenset({"qwen3.7-plus", "qwen3.6-flash"}),
     )
 
+    request_is_bound = llm_request_binding == "exact"
     assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
-        numerator=1 if bind_llm_snapshot else 0,
+        numerator=1 if request_is_bound else 0,
         denominator=1,
-        value=1 if bind_llm_snapshot else 0,
+        value=1 if request_is_bound else 0,
     )
     assert measures["provenance_failures"] == MeasureValue(
-        numerator=0 if bind_llm_snapshot else 1,
+        numerator=0 if request_is_bound else 1,
         denominator=1,
-        value=0 if bind_llm_snapshot else 1,
+        value=0 if request_is_bound else 1,
     )
 
 

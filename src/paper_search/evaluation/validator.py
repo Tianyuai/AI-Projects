@@ -548,6 +548,13 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
                 snapshot_manifest=snapshot,
                 snapshot_reader=reader,
                 prompt_version=lock.baseline.prompt_version,
+                prompt_name=Path(lock.baseline.planner.prompt_config.path).stem,
+                llm_model_allowlist=frozenset(
+                    {
+                        lock.baseline.primary_model,
+                        lock.baseline.fallback_model,
+                    }
+                ),
             ),
             policy=gate_policy,
             split=manifest.split,

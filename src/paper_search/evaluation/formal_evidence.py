@@ -40,6 +40,7 @@ from paper_search.retrieval.semantic_scholar import (
     decode_semantic_scholar_search,
 )
 from paper_search.storage.dependency_snapshot import (
+    DependencyRequestIdentity,
     DependencySnapshotManifestV2,
     DependencySnapshotReader,
     SnapshotEntryV2,
@@ -272,11 +273,15 @@ def _bound_llm_query_specs(
     *,
     query: EvaluationQuery,
     prompt_version: str | None,
+    prompt_name: str | None,
+    llm_model_allowlist: frozenset[str] | None,
     snapshot_manifest: DependencySnapshotManifestV2 | None,
     snapshot_reader: DependencySnapshotReader | None,
 ) -> tuple[QuerySpec, ...]:
     if (
         prompt_version is None
+        or prompt_name is None
+        or not llm_model_allowlist
         or snapshot_manifest is None
         or snapshot_reader is None
     ):
@@ -296,7 +301,22 @@ def _bound_llm_query_specs(
                 entry is None
                 or entry.request.dependency != "llm"
                 or entry.request.operation != "generate_json"
+                or entry.request.model_or_adapter not in llm_model_allowlist
             ):
+                continue
+            expected_request = DependencyRequestIdentity.from_canonical_request(
+                dependency="llm",
+                operation="generate_json",
+                method="POST",
+                endpoint="/chat/completions",
+                model_or_adapter=entry.request.model_or_adapter,
+                canonical_request={
+                    "prompt_name": prompt_name,
+                    "payload": {"query": query.query},
+                    "prompt_version": prompt_version,
+                },
+            )
+            if entry.request != expected_request:
                 continue
             try:
                 snapshot = snapshot_reader.read(entry.request)
@@ -331,6 +351,8 @@ def _filter_query_spec(
     record: BusinessResultRecord | None,
     execution: EvaluationExecutionRecord,
     prompt_version: str | None,
+    prompt_name: str | None,
+    llm_model_allowlist: frozenset[str] | None,
     snapshot_manifest: DependencySnapshotManifestV2 | None,
     snapshot_reader: DependencySnapshotReader | None,
 ) -> tuple[QuerySpec, bool]:
@@ -342,6 +364,8 @@ def _filter_query_spec(
         execution,
         query=query,
         prompt_version=prompt_version,
+        prompt_name=prompt_name,
+        llm_model_allowlist=llm_model_allowlist,
         snapshot_manifest=snapshot_manifest,
         snapshot_reader=snapshot_reader,
     )
@@ -367,6 +391,8 @@ def formal_audit_measures(
     snapshot_manifest: DependencySnapshotManifestV2 | None = None,
     snapshot_reader: DependencySnapshotReader | None = None,
     prompt_version: str | None = None,
+    prompt_name: str | None = None,
+    llm_model_allowlist: frozenset[str] | None = None,
 ) -> dict[str, MeasureValue]:
     """Derive all applicable enforced and core reporting measures."""
     count = len(frozen_queries)
@@ -413,6 +439,8 @@ def formal_audit_measures(
             record=record,
             execution=execution,
             prompt_version=prompt_version,
+            prompt_name=prompt_name,
+            llm_model_allowlist=llm_model_allowlist,
             snapshot_manifest=snapshot_manifest,
             snapshot_reader=snapshot_reader,
         )

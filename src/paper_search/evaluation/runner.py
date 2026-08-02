@@ -1395,6 +1395,15 @@ async def _run_formal_evaluation(
                 snapshot_manifest=snapshot_manifest,
                 snapshot_reader=snapshot_reader,
                 prompt_version=inputs.lock.baseline.prompt_version,
+                prompt_name=Path(
+                    inputs.lock.baseline.planner.prompt_config.path
+                ).stem,
+                llm_model_allowlist=frozenset(
+                    {
+                        inputs.lock.baseline.primary_model,
+                        inputs.lock.baseline.fallback_model,
+                    }
+                ),
             ),
             policy=inputs.gate_policy,
             split=request.split,

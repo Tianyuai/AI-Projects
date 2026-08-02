@@ -359,7 +359,7 @@ def test_replay_copies_exact_verified_lock_and_manifest_bytes(tmp_path: Path) ->
 
     assert (destination / "replay.lock.yaml").read_bytes() == input_lock_bytes
     assert (destination / "snapshot-manifest.json").read_bytes() == snapshot_bytes
-    assert not (destination / "snapshots" / "unbound-secret.txt").exists()
+    assert not (destination / "snapshots").exists()
 
 
 def test_finalize_rejects_cross_file_query_order_and_coverage(tmp_path: Path) -> None:

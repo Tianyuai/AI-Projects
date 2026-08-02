@@ -265,14 +265,6 @@ class FormalRunWorkspace:
                     reader.read(entry.request)
             except (OSError, ValueError) as error:
                 raise ValueError("replay snapshot evidence is invalid") from error
-            snapshot_root = self._work_dir / "snapshots"
-            snapshot_root.mkdir(exist_ok=False)
-            self._write(snapshot_root / "snapshot-manifest.json", snapshot_bytes)
-            for entry in snapshot_manifest.entries:
-                snapshot_read = reader.read(entry.request)
-                response_path = snapshot_root / entry.response_path
-                response_path.parent.mkdir(parents=True, exist_ok=True)
-                self._write(response_path, snapshot_read.response_bytes)
             self._replay_snapshot_manifest = snapshot_manifest
             self._replay_snapshot_bytes = snapshot_bytes
 
@@ -473,13 +465,14 @@ class FormalRunWorkspace:
             if replay_lock.source_capture_run_id != self._manifest.run_id:
                 raise ValueError("capture replay lock does not bind the formal run")
             replay_bytes = _replay_lock_bytes(replay_lock)
-        reader = DependencySnapshotReader(
-            self._work_dir / "snapshots" / "snapshot-manifest.json",
-            snapshot_manifest_sha256=replay_lock.snapshot_manifest_sha256,
-            snapshot_set_id=replay_lock.snapshot_set_id,
-        )
-        for entry in snapshot_manifest.entries:
-            reader.read(entry.request)
+        if not isinstance(self._input_lock, ReplayLock):
+            reader = DependencySnapshotReader(
+                self._work_dir / "snapshots" / "snapshot-manifest.json",
+                snapshot_manifest_sha256=replay_lock.snapshot_manifest_sha256,
+                snapshot_set_id=replay_lock.snapshot_set_id,
+            )
+            for entry in snapshot_manifest.entries:
+                reader.read(entry.request)
         if self._complete_dir.exists():
             raise FileExistsError("formal run destination already exists")
         self._write(self._work_dir / "replay.lock.yaml", replay_bytes)

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import hashlib
+import json
+from collections.abc import Mapping, Sequence
 from decimal import Decimal
 
 from paper_search.control.ledger import LedgerReport
@@ -20,6 +22,11 @@ from paper_search.evaluation.execution_adapter import (
 )
 from paper_search.evaluation.gates import MeasureValue
 from paper_search.evaluation.metrics import EvaluationResult, evaluate
+from paper_search.storage.dependency_snapshot import (
+    DependencySnapshotManifestV2,
+    DependencySnapshotReader,
+    SnapshotEntryV2,
+)
 
 
 def _measure(numerator: int | Decimal, denominator: int | Decimal) -> MeasureValue:
@@ -34,15 +41,125 @@ def _measure(numerator: int | Decimal, denominator: int | Decimal) -> MeasureVal
     )
 
 
-def _has_parseable_retrieval_response(
+def configured_retrieval_endpoints(config: object) -> dict[str, str]:
+    """Derive configured providers from immutable retrieval endpoint fields."""
+    payload = config.model_dump() if hasattr(config, "model_dump") else config
+    if not isinstance(payload, Mapping):
+        raise TypeError("retrieval configuration must be a mapping or model")
+    suffix = "_endpoint"
+    return {
+        str(name)[: -len(suffix)]: str(endpoint)
+        for name, endpoint in payload.items()
+        if str(name).endswith(suffix) and isinstance(endpoint, str) and endpoint
+    }
+
+
+def _canonical_response_id(value: object, *, kind: str) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return normalize_paper_id(value, kind=kind)
+    except ValueError:
+        return None
+
+
+def _source_edge_hash(provider: str, citing: str, cited: str) -> str:
+    return "sha256:" + hashlib.sha256(
+        f"{provider}|{citing}|{cited}".encode("utf-8")
+    ).hexdigest()
+
+
+def _decoded_response_ids(entry: SnapshotEntryV2, response_bytes: bytes) -> set[str] | None:
+    try:
+        payload = json.loads(response_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    dependency = entry.request.dependency
+    operation = entry.request.operation
+    if dependency == "openalex" and operation == "search":
+        records = payload.get("results") if isinstance(payload, Mapping) else None
+        if not isinstance(records, list):
+            return None
+        return {
+            identifier
+            for record in records
+            if isinstance(record, Mapping)
+            if (identifier := _canonical_response_id(record.get("id"), kind="openalex"))
+            is not None
+        }
+    if dependency == "semantic_scholar":
+        records = payload.get("data") if isinstance(payload, Mapping) else None
+        if operation == "batch" and isinstance(payload, list):
+            records = payload
+        if not isinstance(records, list):
+            return None
+        item_key = "citedPaper" if operation == "references" else "citingPaper"
+        paper_records = (
+            [
+                record.get(item_key) if isinstance(record, Mapping) else None
+                for record in records
+            ]
+            if operation in {"references", "citations"}
+            else records
+        )
+        identifiers: set[str] = set()
+        for record in paper_records:
+            if not isinstance(record, Mapping):
+                continue
+            external_ids = record.get("externalIds")
+            if isinstance(external_ids, Mapping):
+                for field, kind in (("DOI", "doi"), ("OpenAlex", "openalex")):
+                    identifier = _canonical_response_id(external_ids.get(field), kind=kind)
+                    if identifier is not None:
+                        identifiers.add(identifier)
+            identifier = _canonical_response_id(
+                record.get("paperId"), kind="semantic_scholar"
+            )
+            if identifier is not None:
+                identifiers.add(identifier)
+        return identifiers
+    return None
+
+
+def _snapshot_retrieval_evidence(
     execution: EvaluationExecutionRecord,
     *,
-    dependencies: frozenset[str] = frozenset({"openalex", "semantic_scholar"}),
-) -> bool:
-    return any(
-        item.dependency in dependencies and not item.errors
-        for item in execution.diagnostics
-    )
+    configured_endpoints: Mapping[str, str],
+    snapshot_manifest: DependencySnapshotManifestV2 | None,
+    snapshot_reader: DependencySnapshotReader | None,
+) -> tuple[bool, set[str]]:
+    if snapshot_manifest is None or snapshot_reader is None:
+        return False, set()
+    entries = {
+        (entry.request.dependency, entry.cache_key): entry
+        for entry in snapshot_manifest.entries
+    }
+    parseable_search = False
+    response_ids: set[str] = set()
+    for diagnostic in execution.diagnostics:
+        configured_endpoint = configured_endpoints.get(diagnostic.dependency)
+        if configured_endpoint is None or diagnostic.errors:
+            continue
+        for ref in diagnostic.snapshot_refs:
+            entry = entries.get((ref.dependency, ref.cache_key))
+            if (
+                entry is None
+                or entry.request.dependency != diagnostic.dependency
+                or not configured_endpoint.endswith(entry.request.endpoint)
+            ):
+                continue
+            try:
+                snapshot = snapshot_reader.read(entry.request)
+            except (KeyError, OSError, ValueError):
+                continue
+            if snapshot.ref != ref:
+                continue
+            decoded_ids = _decoded_response_ids(entry, snapshot.response_bytes)
+            if decoded_ids is None:
+                continue
+            response_ids.update(decoded_ids)
+            parseable_search |= entry.request.operation == "search"
+    return parseable_search, response_ids
 
 
 def formal_audit_measures(
@@ -54,6 +171,9 @@ def formal_audit_measures(
     ledger_report: LedgerReport,
     identifier_map: IdentifierMap | None = None,
     metrics: EvaluationResult | None = None,
+    configured_endpoints: Mapping[str, str] | None = None,
+    snapshot_manifest: DependencySnapshotManifestV2 | None = None,
+    snapshot_reader: DependencySnapshotReader | None = None,
 ) -> dict[str, MeasureValue]:
     """Derive all applicable enforced and core reporting measures."""
     count = len(frozen_queries)
@@ -66,21 +186,35 @@ def formal_audit_measures(
     retrieved_relevant_count = 0
     post_filter_relevant_count = 0
     parseable_retrieval_query_count = 0
+    response_ids_by_query: dict[str, set[str]] = {}
+    configured = configured_endpoints or {}
     for query in frozen_queries:
         relevant = {resolve(identifier) for identifier in query.relevant_paper_ids}
         relevant_count += len(relevant)
         execution = execution_by_query.get(query.query_id)
         if execution is None:
             continue
-        parseable = _has_parseable_retrieval_response(execution)
+        parseable, response_ids = _snapshot_retrieval_evidence(
+            execution,
+            configured_endpoints=configured,
+            snapshot_manifest=snapshot_manifest,
+            snapshot_reader=snapshot_reader,
+        )
+        response_ids_by_query[query.query_id] = {resolve(value) for value in response_ids}
         parseable_retrieval_query_count += parseable
         retrieved = (
-            {resolve(identifier) for identifier in execution.retrieved_paper_ids}
+            {
+                resolve(identifier) for identifier in execution.retrieved_paper_ids
+            }
+            & response_ids_by_query[query.query_id]
             if parseable
             else set()
         )
         post_filter = (
-            {resolve(identifier) for identifier in execution.post_filter_paper_ids}
+            {
+                resolve(identifier) for identifier in execution.post_filter_paper_ids
+            }
+            & response_ids_by_query[query.query_id]
             if parseable
             else set()
         )
@@ -151,18 +285,30 @@ def formal_audit_measures(
         links_valid = all(canonical_id(identifier) for identifier in linked_ids)
         valid_link_queries += links_valid
         reason_complete_queries += set(record.selected_paper_ids) <= ranked_ids
-        edges_valid = all(
+        trusted_ids = {
+            resolve(identifier) for identifier in query.relevant_paper_ids
+        } | response_ids_by_query.get(query.query_id, set())
+        bound_edges = [
             canonical_id(edge.citing_canonical_id)
             and canonical_id(edge.cited_canonical_id)
-            and bool(edge.source_edge_hash)
+            and resolve(edge.citing_canonical_id) in trusted_ids
+            and resolve(edge.cited_canonical_id) in trusted_ids
+            and edge.source_edge_hash
+            == _source_edge_hash(
+                edge.provider,
+                edge.citing_canonical_id,
+                edge.cited_canonical_id,
+            )
             for edge in record.citation_edges
-        )
+        ]
+        edges_valid = all(bound_edges)
         verifiable_edge_queries += edges_valid
-        post_filter_ids = set(execution.post_filter_paper_ids) if execution else set()
+        published_paper_ids = set(record.selected_paper_ids) | ranked_ids
         fabricated_count += sum(
-            not canonical_id(identifier) or identifier not in post_filter_ids
-            for identifier in record.selected_paper_ids
+            not canonical_id(identifier) or resolve(identifier) not in trusted_ids
+            for identifier in published_paper_ids
         )
+        fabricated_count += sum(not bound for bound in bound_edges)
     measures = {
         "integrity_failures": _measure(
             sum(failure.error_code == "integrity_failure" for failure in failures),
@@ -228,10 +374,16 @@ def formal_audit_measures(
                 predicted_paper_ids=(
                     execution_by_query[query.query_id].retrieved_paper_ids
                     if query.query_id in execution_by_query
-                    and _has_parseable_retrieval_response(
+                    and _snapshot_retrieval_evidence(
                         execution_by_query[query.query_id],
-                        dependencies=frozenset({"openalex"}),
-                    )
+                        configured_endpoints={
+                            dependency: endpoint
+                            for dependency, endpoint in configured.items()
+                            if dependency == "openalex"
+                        },
+                        snapshot_manifest=snapshot_manifest,
+                        snapshot_reader=snapshot_reader,
+                    )[0]
                     else []
                 ),
             )
@@ -263,4 +415,8 @@ def complete_policy_measures(
     return completed
 
 
-__all__ = ["complete_policy_measures", "formal_audit_measures"]
+__all__ = [
+    "complete_policy_measures",
+    "configured_retrieval_endpoints",
+    "formal_audit_measures",
+]

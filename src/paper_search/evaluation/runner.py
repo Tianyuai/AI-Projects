@@ -53,6 +53,7 @@ from paper_search.control.pricing import (
 from paper_search.evaluation.freeze_schema import FreezeManifestV2
 from paper_search.evaluation.formal_evidence import (
     complete_policy_measures,
+    configured_retrieval_endpoints,
     formal_audit_measures,
 )
 from paper_search.evaluation.gates import MeasureValue, evaluate_gates
@@ -102,7 +103,10 @@ from paper_search.ranking import (
 from paper_search.retrieval import OpenAlexProvider
 from paper_search.storage import SQLiteResponseCache, validate_snapshot_manifest
 from paper_search.storage.cache import PreparedSnapshot
-from paper_search.storage.dependency_snapshot import DependencySnapshotManifestV2
+from paper_search.storage.dependency_snapshot import (
+    DependencySnapshotManifestV2,
+    DependencySnapshotReader,
+)
 
 
 _formal_audit_measures = formal_audit_measures
@@ -1340,37 +1344,25 @@ async def _run_formal_evaluation(
         report = ledger.report(run_id)
         failures = [record.failure for record in adapted if record.failure is not None]
         business_results = [record.business_result for record in adapted]
-        audit_measures = complete_policy_measures(
-            formal_audit_measures(
-                frozen_queries=inputs.gold,
-                executions=[record.execution for record in adapted],
-                business_results=business_results,
-                failures=failures,
-                ledger_report=report,
-                identifier_map=inputs.identifier_map,
-                metrics=metrics,
-            ),
-            policy=inputs.gate_policy,
-            split=request.split,
-        )
-        _stop_on_formal_evidence_failure(audit_measures)
-        gate = evaluate_gates(
-            frozen_queries=inputs.gold,
-            predictions=predictions,
-            failures=failures,
-            metrics=metrics,
-            audit_measures=audit_measures,
-            ledger_report=report,
-            policy=inputs.gate_policy,
-        )
-        workspace.write_metrics(metrics)
-        workspace.bind_ledger_checkpoint(report)
-        workspace.write_usage(report)
-        if not isinstance(inputs.lock, ReplayLock):
+        if isinstance(inputs.lock, ReplayLock):
+            if inputs.snapshot_root is None:
+                raise ValueError("replay snapshot root is unavailable")
+            replay_lock = inputs.lock
+            snapshot_reader = DependencySnapshotReader(
+                inputs.snapshot_root / "snapshot-manifest.json",
+                snapshot_manifest_sha256=snapshot_sha256,
+                snapshot_set_id=snapshot_set_id,
+            )
+        else:
             sealed = workspace.seal_snapshots()
             snapshot_manifest = sealed
             snapshot_set_id = sealed.snapshot_set_id
             snapshot_sha256 = workspace.snapshot_store.manifest_sha256
+            snapshot_reader = DependencySnapshotReader(
+                workspace.snapshot_store.manifest_path,
+                snapshot_manifest_sha256=snapshot_sha256,
+                snapshot_set_id=snapshot_set_id,
+            )
             replay_lock = ReplayLock(
                 schema_version=inputs.lock.schema_version,
                 lock_kind="replay",
@@ -1388,8 +1380,37 @@ async def _run_formal_evaluation(
                 snapshot_set_id=snapshot_set_id,
                 snapshot_manifest_sha256=snapshot_sha256,
             )
-        else:
-            replay_lock = inputs.lock
+        audit_measures = complete_policy_measures(
+            formal_audit_measures(
+                frozen_queries=inputs.gold,
+                executions=[record.execution for record in adapted],
+                business_results=business_results,
+                failures=failures,
+                ledger_report=report,
+                identifier_map=inputs.identifier_map,
+                metrics=metrics,
+                configured_endpoints=configured_retrieval_endpoints(
+                    inputs.lock.baseline.retrieval
+                ),
+                snapshot_manifest=snapshot_manifest,
+                snapshot_reader=snapshot_reader,
+            ),
+            policy=inputs.gate_policy,
+            split=request.split,
+        )
+        _stop_on_formal_evidence_failure(audit_measures)
+        gate = evaluate_gates(
+            frozen_queries=inputs.gold,
+            predictions=predictions,
+            failures=failures,
+            metrics=metrics,
+            audit_measures=audit_measures,
+            ledger_report=report,
+            policy=inputs.gate_policy,
+        )
+        workspace.write_metrics(metrics)
+        workspace.bind_ledger_checkpoint(report)
+        workspace.write_usage(report)
         run_path = workspace.finalize(
             gate_evaluation=gate,
             replay_lock=replay_lock,

@@ -32,8 +32,10 @@ from paper_search.domain.models import (
     Paper,
     ProviderResult,
     QuerySpec,
+    ResolvedCitationEdge,
     UsageActual,
 )
+from paper_search.evaluation.business_results import BusinessResultRecord
 from paper_search.evaluation.dataset import EvaluationQuery, PredictionRecord
 from paper_search.evaluation.execution_adapter import EvaluationExecutionRecord
 from paper_search.evaluation.metrics import CONTRACT_VERSION
@@ -58,7 +60,11 @@ from paper_search.ranking import (
 )
 from paper_search.storage import SQLiteResponseCache
 from paper_search.storage.cache import validate_snapshot_manifest
-from paper_search.storage.dependency_snapshot import DependencyCaptureStore
+from paper_search.storage.dependency_snapshot import (
+    DependencyCaptureStore,
+    DependencyRequestIdentity,
+    DependencySnapshotReader,
+)
 
 
 CONFIG = Path(__file__).parents[2] / "configs" / "base.yaml"
@@ -2771,7 +2777,7 @@ def test_missing_reporting_measures_are_not_fabricated_as_zero() -> None:
     assert "dev_macro_f1" not in measures
 
 
-def test_retrieval_and_filter_gates_use_frozen_relevant_ids() -> None:
+def test_retrieval_response_without_snapshot_refs_is_not_parseable() -> None:
     gold = [
         EvaluationQuery(
             query_id="q1",
@@ -2840,12 +2846,189 @@ def test_retrieval_and_filter_gates_use_frozen_relevant_ids() -> None:
     )
 
     assert measures["parseable_configured_retrieval_response_rate"] == MeasureValue(
-        numerator=1, denominator=1, value=1
+        numerator=0, denominator=1, value=0
     )
     assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
-        numerator=1, denominator=2, value=Decimal("0.5")
+        numerator=0, denominator=2, value=0
     )
     assert "cached_repeat_latency_p50_ms" not in measures
+
+
+@pytest.mark.parametrize(
+    ("response_bytes", "configured_endpoint", "expected"),
+    [
+        (b'{"results":[{"id":"W1"}]}', "/works", 1),
+        (b'{"results":[{"id":"W1"}]}', "/different", 0),
+        (b"not-json", "/works", 0),
+    ],
+)
+def test_retrieval_response_requires_bound_decodable_configured_snapshot(
+    tmp_path: Path,
+    response_bytes: bytes,
+    configured_endpoint: str,
+    expected: int,
+) -> None:
+    store = DependencyCaptureStore(tmp_path / "snapshots")
+    identity = DependencyRequestIdentity.from_canonical_request(
+        dependency="openalex",
+        operation="search",
+        method="GET",
+        endpoint="/works",
+        model_or_adapter="openalex-v1",
+        canonical_request={"query": "one"},
+    )
+    ref = store.stage_success(
+        identity,
+        response_bytes=response_bytes,
+        safe_headers={"content-type": "application/json"},
+        captured_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    manifest = store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+    execution = EvaluationExecutionRecord(
+        query_id="q1",
+        run_id="formal-1",
+        outcome_kind="success",
+        business_result_sha256="sha256:" + "a" * 64,
+        usage=UsageActual(cost_cny=Decimal("0")),
+        diagnostics=[
+            DependencyDiagnostic(
+                dependency="openalex",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=1,
+                cache_hit=False,
+                snapshot_refs=[ref],
+                errors=[],
+            ),
+            DependencyDiagnostic(
+                dependency="openalex",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=2,
+                cache_hit=False,
+                snapshot_refs=[],
+                errors=[
+                    ErrorDetail(
+                        code="invalid_response",
+                        message="safe",
+                        retryable=False,
+                        provider="openalex",
+                    )
+                ],
+            ),
+        ],
+        retrieved_paper_ids=["openalex:W1"],
+        post_filter_paper_ids=["openalex:W1"],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        stop_reason="completed",
+    )
+    measures = runner_module.formal_audit_measures(
+        frozen_queries=[
+            EvaluationQuery(
+                query_id="q1",
+                query="one",
+                relevant_paper_ids=["openalex:W1"],
+                metadata={"split": "dev"},
+            )
+        ],
+        executions=[execution],
+        business_results=[],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("3"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+        configured_endpoints={"openalex": configured_endpoint},
+        snapshot_manifest=manifest,
+        snapshot_reader=reader,
+    )
+
+    assert measures["parseable_configured_retrieval_response_rate"] == MeasureValue(
+        numerator=expected, denominator=1, value=expected
+    )
+
+
+def test_unbound_canonical_looking_citation_relation_is_fabricated() -> None:
+    business = BusinessResultRecord(
+        query_id="q1",
+        query_analysis=None,
+        selected_paper_ids=["openalex:W1"],
+        high_relevance=[],
+        partial_relevance=[],
+        citation_edges=[
+            ResolvedCitationEdge(
+                provider="openalex",
+                citing_canonical_id="openalex:W1",
+                cited_canonical_id="openalex:W999",
+                source_edge_hash="sha256:"
+                + hashlib.sha256(
+                    b"openalex|openalex:W1|openalex:W999"
+                ).hexdigest(),
+            )
+        ],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        warnings=[],
+        stop_reason="completed",
+        hard_failure_code=None,
+    )
+    execution = EvaluationExecutionRecord(
+        query_id="q1",
+        run_id="formal-1",
+        outcome_kind="success",
+        business_result_sha256="sha256:" + "a" * 64,
+        usage=UsageActual(cost_cny=Decimal("0")),
+        diagnostics=[],
+        retrieved_paper_ids=["openalex:W1"],
+        post_filter_paper_ids=["openalex:W1"],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        stop_reason="completed",
+    )
+    measures = runner_module.formal_audit_measures(
+        frozen_queries=[
+            EvaluationQuery(
+                query_id="q1",
+                query="one",
+                relevant_paper_ids=["openalex:W1"],
+                metadata={"split": "dev"},
+            )
+        ],
+        executions=[execution],
+        business_results=[business],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("3"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+    )
+
+    assert measures["fabricated_paper_or_relation_count"] == MeasureValue(
+        numerator=1, denominator=1, value=1
+    )
 
 
 def test_invalid_openalex_response_cannot_self_report_retrieval_hits() -> None:

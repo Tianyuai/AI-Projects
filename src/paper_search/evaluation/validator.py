@@ -41,6 +41,7 @@ from paper_search.evaluation.execution_adapter import (
 from paper_search.evaluation.freeze_schema import FreezeManifestV2
 from paper_search.evaluation.formal_evidence import (
     complete_policy_measures,
+    configured_retrieval_endpoints,
     formal_audit_measures,
 )
 from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap
@@ -541,6 +542,11 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
                 ledger_report=usage,
                 identifier_map=identifier_map,
                 metrics=recomputed_metrics,
+                configured_endpoints=configured_retrieval_endpoints(
+                    lock.baseline.retrieval
+                ),
+                snapshot_manifest=snapshot,
+                snapshot_reader=reader,
             ),
             policy=gate_policy,
             split=manifest.split,

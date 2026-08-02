@@ -17,15 +17,15 @@ from paper_search.application.contracts import ReadyHealthResponse
 from paper_search.application.locks import (
     InputLock,
     ReplayLock,
-    load_input_lock,
-    load_input_lock_bytes,
+    load_verified_input_lock,
+    load_verified_input_lock_bytes,
     lock_sha256,
 )
 from paper_search.application.modes import ModeBinding
 from paper_search.application.service import SearchApplicationService, SearchOrchestrator
-from paper_search.config import load_budget, validate_mode_authorization
+from paper_search.config import parse_budget_bytes, validate_mode_authorization
 from paper_search.control.budget import HardBudgetController
-from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
+from paper_search.control.pricing import ActualCostPricer, parse_pricing_policy_bytes
 from paper_search.domain.models import (
     BudgetReservation,
     DependencyName,
@@ -465,11 +465,15 @@ class CompositionRoot:
         environ: Mapping[str, str] | None = None,
         lock_bytes: bytes | None = None,
     ) -> ApplicationBundle:
-        lock = (
-            load_input_lock(lock_path, artifact_root=artifact_root)
+        verified = (
+            load_verified_input_lock(lock_path, artifact_root=artifact_root)
             if lock_bytes is None
-            else load_input_lock_bytes(lock_bytes, artifact_root=artifact_root)
+            else load_verified_input_lock_bytes(
+                lock_bytes,
+                artifact_root=artifact_root,
+            )
         )
+        lock = verified.lock
         validate_mode_authorization(
             mode=mode,
             runtime_allow_live=lock.runtime_allow_live,
@@ -478,7 +482,9 @@ class CompositionRoot:
         config_hash = lock_sha256(lock)
         budget_profile = _locked_budget_profile(lock.budget_config.path)
         budgets: dict[str, SearchBudget] = {
-            budget_profile: load_budget(artifact_root / lock.budget_config.path),
+            budget_profile: parse_budget_bytes(
+                verified.artifact_bytes[lock.budget_config.path]
+            ),
         }
         artifact_factory = ArtifactFactory(output_root=output_root.resolve())
         binding: ModeBinding
@@ -519,8 +525,8 @@ class CompositionRoot:
             llm_api_key = resolved_environ.get("LLM_API_KEY")
             if not llm_api_key:
                 raise ValueError("LLM_API_KEY is required for live execution")
-            pricing_policy = load_pricing_policy(
-                artifact_root / lock.pricing_policy.path
+            pricing_policy = parse_pricing_policy_bytes(
+                verified.artifact_bytes[lock.pricing_policy.path]
             )
             pricer = ActualCostPricer(pricing_policy)
             credentials = _LiveCredentials(

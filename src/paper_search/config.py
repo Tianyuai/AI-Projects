@@ -198,10 +198,18 @@ def load_budget(path: str | Path) -> SearchBudget:
     """Load and validate one YAML budget profile."""
 
     budget_path = Path(path)
-    with budget_path.open("r", encoding="utf-8") as file:
-        raw = yaml.safe_load(file)
+    return parse_budget_bytes(budget_path.read_bytes())
+
+
+def parse_budget_bytes(content: bytes) -> SearchBudget:
+    """Parse one exact budget byte snapshot without reopening a path."""
+
+    try:
+        raw = yaml.safe_load(content)
+    except yaml.YAMLError as error:
+        raise ValueError("invalid budget YAML") from error
     if not isinstance(raw, dict):
-        raise ValueError(f"budget file must contain a mapping: {budget_path}")
+        raise ValueError("budget file must contain a mapping")
     return SearchBudget.model_validate(raw)
 
 

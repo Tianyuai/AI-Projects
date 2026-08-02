@@ -373,9 +373,10 @@ class ArtifactFactory:
     _session_lock: Lock = field(default_factory=Lock, repr=False, compare=False)
 
     def _release_session(self, run_id: str, session: CaptureSession) -> None:
+        session_key = run_id.casefold()
         with self._session_lock:
-            if self._sessions.get(run_id) is session:
-                del self._sessions[run_id]
+            if self._sessions.get(session_key) is session:
+                del self._sessions[session_key]
 
     def start_capture(
         self,
@@ -383,8 +384,9 @@ class ArtifactFactory:
         run_id: str,
         input_lock_bytes: bytes,
     ) -> CaptureSession:
+        session_key = run_id.casefold()
         with self._session_lock:
-            if run_id in self._sessions:
+            if session_key in self._sessions:
                 raise ValueError("capture run_id is already active")
         session = CaptureSession(
             output_root=self.output_root,
@@ -393,19 +395,22 @@ class ArtifactFactory:
             on_terminal=self._release_session,
         )
         with self._session_lock:
-            if run_id in self._sessions:
+            if session_key in self._sessions:
                 raise ValueError("capture run_id is already active")
-            self._sessions[run_id] = session
+            self._sessions[session_key] = session
         return session
 
     def has_capture_session(self, *, run_id: str) -> bool:
         with self._session_lock:
-            return run_id in self._sessions
+            session = self._sessions.get(run_id.casefold())
+            return session is not None and session.run_id == run_id
 
     def start_dependency_capture(self, *, run_id: str) -> DependencyCaptureStore:
         with self._session_lock:
-            session = self._sessions.get(run_id)
+            session = self._sessions.get(run_id.casefold())
             if session is not None:
+                if session.run_id != run_id:
+                    raise RuntimeError("capture session does not match execution run_id")
                 return session.claim_snapshot_store()
             if self._sessions:
                 raise RuntimeError("capture session does not match execution run_id")

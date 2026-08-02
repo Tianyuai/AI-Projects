@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
 from pathlib import Path
+from types import MappingProxyType
 from typing import Annotated, Literal
 
 import yaml
@@ -162,6 +165,14 @@ InputLock = Annotated[
     CandidateLock | ValidationLock | ReplayLock,
     Field(discriminator="lock_kind"),
 ]
+
+
+@dataclass(frozen=True)
+class VerifiedInputLock:
+    """One parsed lock plus the exact artifact bytes verified with it."""
+
+    lock: CandidateLock | ValidationLock | ReplayLock
+    artifact_bytes: Mapping[SafeRelativePath, bytes]
 
 _INPUT_LOCK_ADAPTER: TypeAdapter[CandidateLock | ValidationLock | ReplayLock] = TypeAdapter(
     InputLock
@@ -325,7 +336,10 @@ def _read_confined_bytes(artifact_root: Path, relative_path: SafeRelativePath) -
         raise ValueError(f"could not safely read lock artifact: {relative_path}") from error
 
 
-def _verify_artifact_bindings(lock: InputLock, artifact_root: Path) -> None:
+def _verify_artifact_bindings(
+    lock: InputLock,
+    artifact_root: Path,
+) -> dict[SafeRelativePath, bytes]:
     bytes_by_path: dict[SafeRelativePath, bytes] = {}
     for binding in _artifact_bindings(lock):
         payload = bytes_by_path.get(binding.path)
@@ -335,20 +349,41 @@ def _verify_artifact_bindings(lock: InputLock, artifact_root: Path) -> None:
         actual_sha256 = f"sha256:{hashlib.sha256(payload).hexdigest()}"
         if actual_sha256 != binding.sha256:
             raise ValueError(f"lock artifact hash mismatch: {binding.path}")
+    return bytes_by_path
 
 
 def load_input_lock(path: Path, *, artifact_root: Path) -> InputLock:
     """Load one exact lock and verify each referenced artifact from one byte read."""
 
+    return load_verified_input_lock(path, artifact_root=artifact_root).lock
+
+
+def load_verified_input_lock(
+    path: Path,
+    *,
+    artifact_root: Path,
+) -> VerifiedInputLock:
+    """Read one lock and retain the exact bytes of every verified dependency."""
+
     try:
         payload = path.read_bytes()
     except OSError as error:
         raise ValueError(f"could not read input lock: {path}") from error
-    return load_input_lock_bytes(payload, artifact_root=artifact_root)
+    return load_verified_input_lock_bytes(payload, artifact_root=artifact_root)
 
 
 def load_input_lock_bytes(payload: bytes, *, artifact_root: Path) -> InputLock:
     """Validate already-read lock bytes and every content-addressed dependency."""
+
+    return load_verified_input_lock_bytes(payload, artifact_root=artifact_root).lock
+
+
+def load_verified_input_lock_bytes(
+    payload: bytes,
+    *,
+    artifact_root: Path,
+) -> VerifiedInputLock:
+    """Validate one byte snapshot and retain its verified dependency snapshots."""
 
     try:
         raw = yaml.safe_load(payload)
@@ -357,8 +392,11 @@ def load_input_lock_bytes(payload: bytes, *, artifact_root: Path) -> InputLock:
     if not isinstance(raw, dict):
         raise ValueError("lock file must contain a mapping")
     lock = _INPUT_LOCK_ADAPTER.validate_python(raw)
-    _verify_artifact_bindings(lock, artifact_root)
-    return lock
+    artifact_bytes = _verify_artifact_bindings(lock, artifact_root)
+    return VerifiedInputLock(
+        lock=lock,
+        artifact_bytes=MappingProxyType(artifact_bytes),
+    )
 
 
 def canonical_lock_bytes(lock: InputLock) -> bytes:

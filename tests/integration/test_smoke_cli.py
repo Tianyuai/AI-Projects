@@ -389,6 +389,20 @@ def test_capture_store_claims_are_bound_to_exact_run_ids_under_concurrency(
     assert second_store is second.snapshot_store
 
 
+def test_capture_run_ids_are_unique_under_windows_casefolding(tmp_path: Path) -> None:
+    factory = ArtifactFactory(output_root=tmp_path)
+    factory.start_capture(
+        run_id="Smoke-Case-A",
+        input_lock_bytes=_candidate_lock_bytes(),
+    )
+
+    with pytest.raises(ValueError, match="capture run_id is already active"):
+        factory.start_capture(
+            run_id="smoke-case-a",
+            input_lock_bytes=_candidate_lock_bytes(),
+        )
+
+
 def test_failed_capture_is_diagnostic_and_never_emits_replay_lock(tmp_path: Path) -> None:
     session = ArtifactFactory(output_root=tmp_path).start_capture(
         run_id="smoke-failed-1",
@@ -792,6 +806,57 @@ def test_live_smoke_binds_execution_to_the_single_archived_lock_read(
 
     assert (run_path / "config.lock.yaml").read_bytes() == archived_lock_bytes
     assert execution["config_hash"] == lock_sha256(archived_lock)
+
+
+@pytest.mark.parametrize("binding_name", ["budget_config", "pricing_policy"])
+def test_live_smoke_uses_the_budget_and_pricing_bytes_verified_with_the_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    binding_name: str,
+) -> None:
+    fixture = _smoke_fixture(tmp_path)
+    client_factory = _fake_live_client_factory(fixture)
+    lock_raw = yaml.safe_load(fixture["candidate_lock"].read_bytes())
+    artifact_path = fixture["root"] / lock_raw[binding_name]["path"]
+    artifact_raw = yaml.safe_load(artifact_path.read_bytes())
+    if binding_name == "budget_config":
+        artifact_raw["max_cost_cny"] = 0.000001
+    else:
+        for rate in artifact_raw["rates"]:
+            rate["price_cny_per_unit"] = "1.000000"
+    replacement_bytes = yaml.safe_dump(artifact_raw, sort_keys=False).encode("utf-8")
+    real_authorize = composition_module.validate_mode_authorization
+
+    def replace_after_lock_validation(**kwargs: object) -> None:
+        real_authorize(**kwargs)  # type: ignore[arg-type]
+        artifact_path.write_bytes(replacement_bytes)
+
+    monkeypatch.chdir(fixture["root"])
+    monkeypatch.setenv("LLM_API_KEY", "fake-live-secret-must-not-leak")
+    monkeypatch.setattr(composition_module.httpx, "AsyncClient", client_factory)
+    monkeypatch.setattr(
+        composition_module,
+        "validate_mode_authorization",
+        replace_after_lock_validation,
+    )
+
+    assert (
+        main(
+            [
+                "smoke",
+                "--lock",
+                str(fixture["candidate_lock"]),
+                "--output-root",
+                str(fixture["root"] / "p"),
+                "--mode",
+                "live",
+                "--allow-network",
+            ]
+        )
+        == 0
+    )
+    assert json.loads(capsys.readouterr().out)["status"] == "complete"
 
 
 def test_overlapping_live_executions_keep_capture_artifacts_bound_to_run_id(

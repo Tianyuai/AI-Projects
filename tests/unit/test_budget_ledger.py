@@ -22,9 +22,51 @@ from paper_search.control.ledger import (
     LedgerSoftStopError,
     SQLiteBudgetLedger,
 )
+from paper_search.evaluation.attempts import (
+    ValidationAttemptStore,
+    dispatch_with_validation_claim,
+)
 
 
 NOW = datetime(2026, 8, 2, 6, 0, tzinfo=UTC)
+VALIDATION_LOCK_SHA256 = "sha256:" + "a" * 64
+
+
+def test_validation_preflight_and_run_reserve_precede_claim_and_dispatch(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path / "ledger.sqlite3")
+    store = ValidationAttemptStore(tmp_path)
+    events: list[str] = []
+
+    def reserve() -> None:
+        ledger.reserve(
+            run_id="validation-order",
+            query_id="batch",
+            estimate=_estimate("0.10"),
+            run_cap_cny=Decimal("9.00"),
+        )
+        events.append("reserve")
+
+    def dispatch() -> str:
+        assert store.read(VALIDATION_LOCK_SHA256).state == "claimed"
+        events.append("dispatch")
+        return "sent"
+
+    result = dispatch_with_validation_claim(
+        execution_mode="live",
+        offline_preflight=lambda: events.append("preflight"),
+        reserve_run_budget=reserve,
+        store=store,
+        validation_lock_sha256=VALIDATION_LOCK_SHA256,
+        run_id="validation-order",
+        claimed_at=NOW,
+        dispatch=dispatch,
+        on_claim=lambda: events.append("claim"),
+    )
+
+    assert result == "sent"
+    assert events == ["preflight", "reserve", "claim", "dispatch"]
 
 
 def _ledger(

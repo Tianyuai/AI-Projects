@@ -9,7 +9,10 @@ import httpx
 import pytest
 
 from paper_search.domain.models import BudgetReservation, ProviderPaperId, UsageEstimate
-from paper_search.retrieval.semantic_scholar import SemanticScholarProvider
+from paper_search.retrieval.semantic_scholar import (
+    SemanticScholarProvider,
+    decode_semantic_scholar_search,
+)
 from paper_search.storage.cache import SQLiteResponseCache
 
 
@@ -216,3 +219,13 @@ def test_zero_call_reservation_prevents_transport(tmp_path: Path) -> None:
     result = asyncio.run(run())
     assert result.errors[0].code == "budget_exhausted"
     assert result.usage.search_api_calls == 0
+
+
+def test_semantic_scholar_decoder_is_pure_and_deterministic() -> None:
+    raw = _bytes("search.json")
+
+    first = decode_semantic_scholar_search(raw, limit=2)
+    second = decode_semantic_scholar_search(raw, limit=2)
+
+    assert first == second
+    assert [paper.semantic_scholar_id for paper in first.papers] == ["S2-001", "S2-002"]

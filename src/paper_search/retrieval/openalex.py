@@ -132,8 +132,59 @@ class _PageFetch:
     errors: list[ErrorDetail]
 
 
+@dataclass(frozen=True)
+class OpenAlexPageDecode:
+    """Pure normalized result of one OpenAlex response page."""
+
+    papers: list[Paper]
+    next_cursor: str | None
+    errors: list[ErrorDetail]
+    raw_count: int
+
+
 def _normalize_search_query(query: str) -> str:
     return " ".join(query.replace("?", " ").replace("*", " ").split())
+
+
+def decode_openalex_page(
+    raw_response: bytes,
+    *,
+    limit: int,
+) -> OpenAlexPageDecode:
+    """Decode one response without I/O, time, cache, or mutable state."""
+
+    raw_works, next_cursor = _parse_page(raw_response)
+    papers: list[Paper] = []
+    errors: list[ErrorDetail] = []
+    page_records = raw_works[:limit]
+    for raw_work in page_records:
+        if not isinstance(raw_work, Mapping):
+            errors.append(
+                ErrorDetail(
+                    code="invalid_work",
+                    message="OpenAlex work must be an object",
+                    retryable=False,
+                    provider="openalex",
+                )
+            )
+            continue
+        try:
+            papers.append(normalize_openalex_work(raw_work))
+        except ValueError as error:
+            errors.append(
+                ErrorDetail(
+                    code="invalid_work",
+                    message=str(error),
+                    retryable=False,
+                    provider="openalex",
+                )
+            )
+    return OpenAlexPageDecode(
+        papers=papers,
+        next_cursor=next_cursor,
+        errors=errors,
+        raw_count=len(page_records),
+    )
 
 
 class OpenAlexProvider:
@@ -349,37 +400,16 @@ class OpenAlexProvider:
             if fetched.from_cache:
                 cached_pages += 1
 
-            raw_works, next_cursor = _parse_page(raw_response)
+            decoded = decode_openalex_page(raw_response, limit=remaining)
             cache_keys.append(key)
             response_hashes.append(response_hash)
             successful_pages += 1
-            page_records = raw_works[:remaining]
-            raw_records_seen += len(page_records)
-            for raw_work in page_records:
-                if not isinstance(raw_work, Mapping):
-                    errors.append(
-                        ErrorDetail(
-                            code="invalid_work",
-                            message="OpenAlex work must be an object",
-                            retryable=False,
-                            provider="openalex",
-                        )
-                    )
-                    continue
-                try:
-                    papers.append(normalize_openalex_work(raw_work))
-                except ValueError as error:
-                    errors.append(
-                        ErrorDetail(
-                            code="invalid_work",
-                            message=str(error),
-                            retryable=False,
-                            provider="openalex",
-                        )
-                    )
-            if not raw_works or next_cursor is None or raw_records_seen >= limit:
+            raw_records_seen += decoded.raw_count
+            papers.extend(decoded.papers)
+            errors.extend(decoded.errors)
+            if decoded.raw_count == 0 or decoded.next_cursor is None or raw_records_seen >= limit:
                 break
-            cursor = next_cursor
+            cursor = decoded.next_cursor
 
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
         return ProviderResult[list[Paper]](

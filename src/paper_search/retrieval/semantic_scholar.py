@@ -129,6 +129,172 @@ class _RawResult:
     requested_at: datetime
 
 
+@dataclass(frozen=True)
+class SemanticScholarPaperDecode:
+    """Pure normalized paper response used by live and replay modes."""
+
+    papers: list[Paper]
+    errors: list[ErrorDetail]
+
+
+@dataclass(frozen=True)
+class SemanticScholarExpansionDecode:
+    """Pure normalized citation expansion used by live and replay modes."""
+
+    expansion: CitationExpansion
+    errors: list[ErrorDetail]
+
+
+def _decode_json(content: bytes) -> object:
+    try:
+        return json.loads(content)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def decode_semantic_scholar_search(
+    content: bytes,
+    *,
+    limit: int,
+) -> SemanticScholarPaperDecode:
+    """Decode a Graph API search response without performing I/O."""
+
+    payload = _decode_json(content)
+    records = payload.get("data") if isinstance(payload, Mapping) else None
+    errors: list[ErrorDetail] = []
+    papers: list[Paper] = []
+    if not isinstance(records, list):
+        errors.append(
+            _error(
+                "invalid_response",
+                "Search response requires a data list",
+                retryable=False,
+            )
+        )
+    else:
+        for record in records[:limit]:
+            if not isinstance(record, Mapping):
+                errors.append(
+                    _error(
+                        "invalid_record",
+                        "Search record must be an object",
+                        retryable=False,
+                    )
+                )
+                continue
+            try:
+                papers.append(_normalize_record(record))
+            except ValueError as error:
+                errors.append(_error("invalid_record", str(error), retryable=False))
+    return SemanticScholarPaperDecode(papers=papers, errors=errors)
+
+
+def decode_semantic_scholar_batch(content: bytes) -> SemanticScholarPaperDecode:
+    """Decode a Graph API batch response without performing I/O."""
+
+    payload = _decode_json(content)
+    errors: list[ErrorDetail] = []
+    papers: list[Paper] = []
+    if not isinstance(payload, list):
+        errors.append(
+            _error(
+                "invalid_response",
+                "Batch response requires a list",
+                retryable=False,
+            )
+        )
+    else:
+        for record in payload:
+            if record is None:
+                errors.append(
+                    _error(
+                        "missing_record",
+                        "Batch record was not found",
+                        retryable=False,
+                    )
+                )
+            elif isinstance(record, Mapping):
+                try:
+                    papers.append(_normalize_record(record))
+                except ValueError as error:
+                    errors.append(
+                        _error("invalid_record", str(error), retryable=False)
+                    )
+            else:
+                errors.append(
+                    _error(
+                        "invalid_record",
+                        "Batch record must be an object",
+                        retryable=False,
+                    )
+                )
+    return SemanticScholarPaperDecode(papers=papers, errors=errors)
+
+
+def decode_semantic_scholar_expansion(
+    content: bytes,
+    *,
+    direction: str,
+    paper_id: ProviderPaperId,
+    limit: int,
+) -> SemanticScholarExpansionDecode:
+    """Decode references or citations without performing I/O."""
+
+    if direction not in {"references", "citations"}:
+        raise ValueError("direction must be references or citations")
+    payload = _decode_json(content)
+    records = payload.get("data") if isinstance(payload, Mapping) else None
+    errors: list[ErrorDetail] = []
+    papers: list[Paper] = []
+    edges: list[CitationEdge] = []
+    item_key = "citedPaper" if direction == "references" else "citingPaper"
+    if not isinstance(records, list):
+        errors.append(
+            _error(
+                "invalid_response",
+                "Expansion response requires a data list",
+                retryable=False,
+            )
+        )
+    else:
+        for item in records[:limit]:
+            record = item.get(item_key) if isinstance(item, Mapping) else None
+            if not isinstance(record, Mapping):
+                errors.append(
+                    _error(
+                        "invalid_record",
+                        "Expansion record is invalid",
+                        retryable=False,
+                    )
+                )
+                continue
+            try:
+                paper = _normalize_record(record)
+            except ValueError as error:
+                errors.append(_error("invalid_record", str(error), retryable=False))
+                continue
+            neighbor = ProviderPaperId(
+                provider="semantic_scholar",
+                value=paper.semantic_scholar_id or "",
+            )
+            papers.append(paper)
+            if direction == "references":
+                citing, cited = paper_id, neighbor
+            else:
+                citing, cited = neighbor, paper_id
+            edges.append(
+                CitationEdge(
+                    provider="semantic_scholar",
+                    citing_provider_id=citing,
+                    cited_provider_id=cited,
+                )
+            )
+    return SemanticScholarExpansionDecode(
+        expansion=CitationExpansion(papers=papers, raw_edges=edges),
+        errors=errors,
+    )
+
+
 class SemanticScholarProvider:
     """Map bounded Graph API responses into existing domain models."""
 
@@ -289,15 +455,6 @@ class SemanticScholarProvider:
             errors=errors,
         )
 
-    @staticmethod
-    def _decode(content: bytes | None) -> object:
-        if content is None:
-            return None
-        try:
-            return json.loads(content)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            return None
-
     async def search(
         self,
         query: str,
@@ -329,27 +486,17 @@ class SemanticScholarProvider:
             params=params,
             reservation=reservation,
         )
-        payload = self._decode(raw.content)
-        errors: list[ErrorDetail] = []
-        papers: list[Paper] = []
-        records = payload.get("data") if isinstance(payload, Mapping) else None
-        if raw.content is not None and not isinstance(records, list):
-            errors.append(_error("invalid_response", "Search response requires a data list", retryable=False))
-        elif isinstance(records, list):
-            for record in records[:limit]:
-                if not isinstance(record, Mapping):
-                    errors.append(_error("invalid_record", "Search record must be an object", retryable=False))
-                    continue
-                try:
-                    papers.append(_normalize_record(record))
-                except ValueError as error:
-                    errors.append(_error("invalid_record", str(error), retryable=False))
+        decoded = (
+            decode_semantic_scholar_search(raw.content, limit=limit)
+            if raw.content is not None
+            else SemanticScholarPaperDecode(papers=[], errors=[])
+        )
         return self._result(
-            data=papers,
+            data=decoded.papers,
             raw=raw,
             endpoint=_SEARCH_ENDPOINT,
             started=started,
-            errors=errors,
+            errors=decoded.errors,
         )
 
     async def batch_details(
@@ -369,28 +516,17 @@ class SemanticScholarProvider:
             reservation=reservation,
             ttl=timedelta(days=30),
         )
-        payload = self._decode(raw.content)
-        errors: list[ErrorDetail] = []
-        papers: list[Paper] = []
-        if raw.content is not None and not isinstance(payload, list):
-            errors.append(_error("invalid_response", "Batch response requires a list", retryable=False))
-        elif isinstance(payload, list):
-            for record in payload:
-                if record is None:
-                    errors.append(_error("missing_record", "Batch record was not found", retryable=False))
-                elif isinstance(record, Mapping):
-                    try:
-                        papers.append(_normalize_record(record))
-                    except ValueError as error:
-                        errors.append(_error("invalid_record", str(error), retryable=False))
-                else:
-                    errors.append(_error("invalid_record", "Batch record must be an object", retryable=False))
+        decoded = (
+            decode_semantic_scholar_batch(raw.content)
+            if raw.content is not None
+            else SemanticScholarPaperDecode(papers=[], errors=[])
+        )
         return self._result(
-            data=papers,
+            data=decoded.papers,
             raw=raw,
             endpoint=_BATCH_ENDPOINT,
             started=started,
-            errors=errors,
+            errors=decoded.errors,
         )
 
     async def _expansion(
@@ -414,47 +550,25 @@ class SemanticScholarProvider:
             reservation=reservation,
             ttl=timedelta(days=30),
         )
-        payload = self._decode(raw.content)
-        records = payload.get("data") if isinstance(payload, Mapping) else None
-        errors: list[ErrorDetail] = []
-        papers: list[Paper] = []
-        edges: list[CitationEdge] = []
-        item_key = "citedPaper" if direction == "references" else "citingPaper"
-        if raw.content is not None and not isinstance(records, list):
-            errors.append(_error("invalid_response", "Expansion response requires a data list", retryable=False))
-        elif isinstance(records, list):
-            for item in records[:limit]:
-                record = item.get(item_key) if isinstance(item, Mapping) else None
-                if not isinstance(record, Mapping):
-                    errors.append(_error("invalid_record", "Expansion record is invalid", retryable=False))
-                    continue
-                try:
-                    paper = _normalize_record(record)
-                except ValueError as error:
-                    errors.append(_error("invalid_record", str(error), retryable=False))
-                    continue
-                neighbor = ProviderPaperId(
-                    provider="semantic_scholar",
-                    value=paper.semantic_scholar_id or "",
-                )
-                papers.append(paper)
-                if direction == "references":
-                    citing, cited = paper_id, neighbor
-                else:
-                    citing, cited = neighbor, paper_id
-                edges.append(
-                    CitationEdge(
-                        provider="semantic_scholar",
-                        citing_provider_id=citing,
-                        cited_provider_id=cited,
-                    )
-                )
+        decoded = (
+            decode_semantic_scholar_expansion(
+                raw.content,
+                direction=direction,
+                paper_id=paper_id,
+                limit=limit,
+            )
+            if raw.content is not None
+            else SemanticScholarExpansionDecode(
+                expansion=CitationExpansion(papers=[], raw_edges=[]),
+                errors=[],
+            )
+        )
         return self._result(
-            data=CitationExpansion(papers=papers, raw_edges=edges),
+            data=decoded.expansion,
             raw=raw,
             endpoint=endpoint,
             started=started,
-            errors=errors,
+            errors=decoded.errors,
         )
 
     async def references(

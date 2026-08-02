@@ -12,7 +12,11 @@ import httpx
 import pytest
 
 from paper_search.domain.models import BudgetReservation, ProviderResult, UsageEstimate
-from paper_search.retrieval.openalex import OPENALEX_SELECT_FIELDS, OpenAlexProvider
+from paper_search.retrieval.openalex import (
+    OPENALEX_SELECT_FIELDS,
+    OpenAlexProvider,
+    decode_openalex_page,
+)
 from paper_search.storage.cache import SQLiteResponseCache
 
 
@@ -498,3 +502,13 @@ def test_task3_public_api_exports() -> None:
     assert processing.normalize_openalex_work.__name__ == "normalize_openalex_work"
     assert storage.SQLiteResponseCache is SQLiteResponseCache
     assert storage.validate_snapshot_manifest.__name__ == "validate_snapshot_manifest"
+
+
+def test_openalex_decoder_is_pure_and_deterministic() -> None:
+    raw = fixture_bytes("works_page_1.json")
+
+    first = decode_openalex_page(raw, limit=2)
+    second = decode_openalex_page(raw, limit=2)
+
+    assert first == second
+    assert [paper.openalex_id for paper in first.papers] == ["W123", "W124"]

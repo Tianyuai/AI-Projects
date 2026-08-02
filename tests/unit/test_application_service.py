@@ -370,7 +370,7 @@ def test_service_replay_evidence_failure_is_hard_with_sibling_papers(
     assert execution.diagnostics == result.diagnostics
 
 
-def test_business_hash_includes_fusion_scores_and_source_ranks() -> None:
+def test_business_hash_uses_the_public_business_projection() -> None:
     original = _result()
     changed = original.model_copy(
         update={
@@ -385,7 +385,7 @@ def test_business_hash_includes_fusion_scores_and_source_ranks() -> None:
     first = asyncio.run(_service(original).execute(_request()))
     second = asyncio.run(_service(changed).execute(_request()))
 
-    assert first.business_result_sha256 != second.business_result_sha256
+    assert first.business_result_sha256 == second.business_result_sha256
 
 
 def test_service_suppresses_trace_without_changing_business_hash() -> None:

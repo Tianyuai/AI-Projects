@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Protocol
@@ -28,6 +26,11 @@ from paper_search.domain.models import (
 )
 from paper_search.pipeline.orchestrator import OrchestratorResult
 from paper_search.pipeline.response import to_structured_response
+from paper_search.evaluation.business_results import (
+    business_result_from_response,
+    business_result_sha256,
+    hard_failure_business_result,
+)
 
 
 class SearchOrchestrator(Protocol):
@@ -181,82 +184,6 @@ class SearchApplicationService:
         return None
 
     @staticmethod
-    def _business_payload(
-        *,
-        request: SearchRequest,
-        result: OrchestratorResult | None,
-        failure_code: SearchErrorCode | None,
-        warnings: list[str],
-    ) -> dict[str, object]:
-        if result is None or failure_code is not None:
-            return {
-                "schema_version": "business-result-v1",
-                "query_id": request.query_id,
-                "query_analysis": None,
-                "selected_paper_ids": [],
-                "high_relevance": [],
-                "partial_relevance": [],
-                "citation_edges": [],
-                "is_partial": False,
-                "planner_status": None,
-                "planner_fallback": False,
-                "warnings": [],
-                "stop_reason": result.stop_reason if result is not None else "internal_error",
-                "hard_failure_code": failure_code or "internal_error",
-            }
-        planner_fallback = result.planner_status == "rules_fallback"
-        return {
-            "schema_version": "business-result-v1",
-            "query_id": request.query_id,
-            "query_analysis": result.query_analysis.model_dump(mode="json"),
-            "selected_paper_ids": [paper.canonical_id for paper in result.papers],
-            "fused_papers": [
-                item.model_dump(mode="json") for item in result.fused_papers
-            ],
-            "high_relevance": [
-                item.model_dump(mode="json") for item in result.high_relevance
-            ],
-            "partial_relevance": [
-                item.model_dump(mode="json") for item in result.partial_relevance
-            ],
-            "citation_edges": [
-                item.model_dump(mode="json") for item in result.citation_edges
-            ],
-            "is_partial": result.is_partial or planner_fallback,
-            "planner_status": result.planner_status,
-            "planner_fallback": planner_fallback,
-            "warnings": warnings,
-            "stop_reason": result.stop_reason,
-            "hard_failure_code": None,
-        }
-
-    @classmethod
-    def _business_hash(
-        cls,
-        *,
-        request: SearchRequest,
-        result: OrchestratorResult | None,
-        failure_code: SearchErrorCode | None,
-        warnings: list[str],
-    ) -> str:
-        payload = cls._business_payload(
-            request=request,
-            result=result,
-            failure_code=failure_code,
-            warnings=warnings,
-        )
-        encoded = (
-            json.dumps(
-                payload,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            + b"\n"
-        )
-        return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
-
-    @staticmethod
     def _failure(
         *,
         request: SearchRequest,
@@ -282,11 +209,12 @@ class SearchApplicationService:
                 stop_reason=stop_reason,
             ),
             diagnostics=diagnostics,
-            business_result_sha256=SearchApplicationService._business_hash(
-                request=request,
-                result=result,
-                failure_code=code,
-                warnings=[],
+            business_result_sha256=business_result_sha256(
+                hard_failure_business_result(
+                    query_id=request.query_id,
+                    error_code=code,
+                    stop_reason=stop_reason,
+                )
             ),
         )
 
@@ -380,11 +308,8 @@ class SearchApplicationService:
         return SearchExecutionResult(
             outcome=SearchSuccess(response=response),
             diagnostics=result.diagnostics,
-            business_result_sha256=self._business_hash(
-                request=request,
-                result=result,
-                failure_code=None,
-                warnings=warnings,
+            business_result_sha256=business_result_sha256(
+                business_result_from_response(response)
             ),
         )
 

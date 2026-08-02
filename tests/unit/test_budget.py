@@ -599,6 +599,166 @@ def test_terminal_fail_closed_rejects_settled_or_released_reservation(
     assert controller.stop_status() == "continue"
 
 
+@pytest.mark.parametrize("observe_expiry", [False, True])
+def test_release_rejects_dispatched_reservation_without_erasing_authority(
+    observe_expiry: bool,
+) -> None:
+    controller_type, _, reservation_error = budget_api()
+    current = datetime(2026, 8, 2, tzinfo=UTC)
+    controller = controller_type(
+        make_budget(),
+        formal_live=True,
+        clock=lambda: current,
+        reservation_ttl_seconds=1,
+    )
+    reservation = controller.reserve(
+        "llm.marked-release",
+        UsageEstimate(llm_calls=1, cost_cny=0.5),
+    )
+    controller.mark_dispatched(reservation)
+    if observe_expiry:
+        current += timedelta(seconds=2)
+        assert controller.reserved_usage == UsageEstimate()
+
+    with pytest.raises(reservation_error, match="dispatched"):
+        controller.release(reservation)
+    controller.fail_closed(
+        reservation,
+        UsageActual(llm_calls=1, cost_cny=None),
+    )
+
+    assert controller.committed_usage.llm_calls == 1
+    assert controller.unknown_cost_actions == ["llm.marked-release"]
+
+
+def test_release_racing_dispatched_terminal_cannot_erase_authority() -> None:
+    controller_type, _, reservation_error = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+    reservation = controller.reserve(
+        "llm.release-race",
+        UsageEstimate(llm_calls=1, cost_cny=0.5),
+    )
+    controller.mark_dispatched(reservation)
+    barrier = threading.Barrier(3)
+    release_attempted = threading.Event()
+    outcomes: list[str] = []
+
+    def release() -> None:
+        barrier.wait()
+        try:
+            controller.release(reservation)
+        except reservation_error:
+            outcomes.append("release_rejected")
+        else:
+            outcomes.append("released")
+        release_attempted.set()
+
+    def finalize() -> None:
+        barrier.wait()
+        release_attempted.wait()
+        try:
+            controller.fail_closed(
+                reservation,
+                UsageActual(llm_calls=1, cost_cny=None),
+            )
+        except reservation_error:
+            outcomes.append("terminal_rejected")
+        else:
+            outcomes.append("committed")
+
+    threads = [threading.Thread(target=release), threading.Thread(target=finalize)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    assert sorted(outcomes) == ["committed", "release_rejected"]
+    assert controller.committed_usage.llm_calls == 1
+    assert controller.stop_status() == "hard_stop"
+
+
+@pytest.mark.parametrize(
+    "terminal_actual",
+    [
+        UsageActual(llm_calls=2, cost_cny=0.8),
+        UsageActual(llm_calls=1, input_tokens=101, cost_cny=0.8),
+        UsageActual(llm_calls=1, elapsed_ms=2_001, cost_cny=0.8),
+        UsageActual(llm_calls=1, cost_cny=1.1),
+        UsageActual(llm_calls=2, cost_cny=None),
+    ],
+)
+def test_fail_closed_over_hard_limit_state_round_trips(
+    terminal_actual: UsageActual,
+) -> None:
+    controller_type, _, reservation_error = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+    reservation = controller.reserve(
+        "llm.over-limit-terminal",
+        UsageEstimate(
+            llm_calls=1,
+            input_tokens=10,
+            cost_cny=0.5,
+            elapsed_ms=500,
+        ),
+    )
+    controller.mark_dispatched(reservation)
+    controller.fail_closed(reservation, terminal_actual)
+
+    restored = controller_type.from_state(make_budget(), controller.export_state())
+
+    assert restored.stop_status() == "hard_stop"
+    assert restored.committed_usage == terminal_actual
+    expected_known_cost = terminal_actual.cost_cny or Decimal("0")
+    assert restored.known_committed_cost_cny == expected_known_cost
+    expected_unknown = (
+        ["llm.over-limit-terminal"] if terminal_actual.cost_cny is None else []
+    )
+    assert restored.unknown_cost_actions == expected_unknown
+    with pytest.raises(reservation_error, match="reservation is unknown"):
+        restored.fail_closed(reservation, terminal_actual)
+
+
+def test_fail_closed_restore_rejects_tampered_over_limit_active_reservation() -> None:
+    controller_type, exceeded_error, _ = budget_api()
+    controller = controller_type(make_budget(), formal_live=True)
+    state = controller.export_state()
+    state["fail_closed"] = True
+    state["reservations"] = [
+        {
+            "reservation_id": "tampered-active",
+            "action": "llm.tampered",
+            "reserved": UsageEstimate(
+                llm_calls=2,
+                cost_cny=0.5,
+            ).model_dump(mode="json"),
+            "expires_at": (
+                datetime.now(UTC) + timedelta(minutes=5)
+            ).isoformat(),
+        }
+    ]
+
+    with pytest.raises(exceeded_error, match="hard limit"):
+        controller_type.from_state(make_budget(), state)
+
+
+def test_non_fail_closed_restore_rejects_over_limit_committed_usage() -> None:
+    controller_type, exceeded_error, _ = budget_api()
+    controller = controller_type(make_budget())
+    state = controller.export_state()
+    state["committed"] = [
+        {
+            "action": "llm.tampered",
+            "usage": UsageActual(llm_calls=2, cost_cny=0.8).model_dump(
+                mode="json"
+            ),
+        }
+    ]
+
+    with pytest.raises(exceeded_error, match="hard limit"):
+        controller_type.from_state(make_budget(), state)
+
+
 def test_terminal_fail_closed_is_concurrent_exact_once() -> None:
     controller_type, _, reservation_error = budget_api()
     controller = controller_type(make_budget(), formal_live=True)

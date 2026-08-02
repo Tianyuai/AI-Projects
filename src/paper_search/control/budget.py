@@ -177,6 +177,14 @@ class HardBudgetController:
         """Release an unused active reservation."""
         with self._lock:
             self._expire_locked()
+            if reservation.reservation_id in self._dispatched_reservations:
+                dispatched = self._reservations.get(
+                    reservation.reservation_id
+                ) or self._expired_reservations.get(reservation.reservation_id)
+                if dispatched == reservation:
+                    raise ReservationError(
+                        "dispatched reservation cannot be released"
+                    )
             active = self._reservations.get(reservation.reservation_id)
             if active != reservation:
                 raise ReservationError("reservation is unknown or does not match the active reservation")
@@ -409,9 +417,15 @@ class HardBudgetController:
                     raise ValueError("invalid committed usage state")
                 controller._committed_actions.append(raw["action"])
                 controller._committed.append(UsageActual.model_validate(raw.get("usage")))
-            controller._check_hard_limits(
-                [*controller._committed, *(item.reserved for item in controller._reservations.values())]
-            )
+            active_usage = [
+                item.reserved for item in controller._reservations.values()
+            ]
+            if fail_closed:
+                controller._check_hard_limits(active_usage)
+            else:
+                controller._check_hard_limits(
+                    [*controller._committed, *active_usage]
+                )
             controller._fail_closed = fail_closed
         except (TypeError, ValueError) as error:
             raise ValueError("invalid budget controller state") from error

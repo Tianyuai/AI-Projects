@@ -304,6 +304,62 @@ def test_unexpected_exception_after_dispatch_commits_conservative_usage(
     assert controller.unknown_cost_actions == ["query.analyze"]
 
 
+def test_usage_measurement_failure_after_response_commits_one_unknown_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _budget_controller()
+    settlement = HardBudgetSettlementAdapter(controller)
+    reservation = _controller_reservation(controller)
+
+    def fail_measurement(_: bytes) -> UsageActual:
+        raise RecursionError("sensitive nested response failure")
+
+    monkeypatch.setattr(
+        "paper_search.llm.snapshot_adapters.usage_from_response_bytes",
+        fail_measurement,
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=_response_bytes({"ok": True}), request=request
+                )
+            )
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://llm.example.test/v1",
+                    model="qwen-test-v1",
+                    api_key="unit-test-secret",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "measurement-failure"),
+                pricer=_pricer(),
+                controller=settlement,
+            )
+            with pytest.raises(LLMAdapterError) as error:
+                await analyzer.generate_json(
+                    prompt_name="query_analyze",
+                    payload={"query": "x"},
+                    reservation=reservation,
+                )
+            assert str(error.value) == "LLM live capture failed"
+            assert error.value.__cause__ is None
+            assert "sensitive" not in repr(error.value)
+
+    asyncio.run(run())
+
+    assert controller.stop_status() == "hard_stop"
+    assert controller.reserved_usage == UsageEstimate()
+    assert controller.committed_usage.llm_calls == 1
+    assert controller.committed_usage.cost_cny is None
+    assert controller.unknown_cost_actions == ["query.analyze"]
+    with pytest.raises(ReservationError, match="reservation is unknown"):
+        settlement.fail_closed(reservation, UsageActual(llm_calls=1))
+
+
 def test_live_capture_builds_safe_identity_and_stages_exact_success_bytes(
     tmp_path: Path,
 ) -> None:

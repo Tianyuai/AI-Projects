@@ -251,6 +251,7 @@ class LiveCaptureLLMAnalyzer:
         valued_attempts: list[UsageActual] = []
         terminal: ProviderResult[dict[str, Any]] | None = None
         in_flight_started: float | None = None
+        dispatch_unaccounted = False
 
         try:
             for attempt in range(3):
@@ -262,6 +263,7 @@ class LiveCaptureLLMAnalyzer:
                 if callable(mark_dispatched):
                     mark_dispatched(reservation)
                 in_flight_started = started
+                dispatch_unaccounted = True
                 try:
                     response = await self._client.request_response(
                         prompt_name=prompt_name,
@@ -289,13 +291,13 @@ class LiveCaptureLLMAnalyzer:
                         response.headers.get("x-request-id")
                     )
                     code, message, retryable = _status_error(response.status_code)
-                in_flight_started = None
-
                 elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
                 measured = usage_from_response_bytes(response_bytes).model_copy(
                     update={"elapsed_ms": elapsed_ms}
                 )
                 measured_attempts.append(measured)
+                dispatch_unaccounted = False
+                in_flight_started = None
                 valued_attempts.append(
                     self._pricer.value_actual(
                         dependency="llm",
@@ -367,7 +369,7 @@ class LiveCaptureLLMAnalyzer:
             self._controller.settle(reservation, terminal.usage)
             return terminal
         except asyncio.CancelledError as cancellation:
-            if in_flight_started is not None:
+            if dispatch_unaccounted and in_flight_started is not None:
                 measured_attempts.append(
                     UsageActual(
                         llm_calls=1,
@@ -390,7 +392,7 @@ class LiveCaptureLLMAnalyzer:
                 pass
             raise cancellation from None
         except Exception:
-            if in_flight_started is not None:
+            if dispatch_unaccounted and in_flight_started is not None:
                 measured_attempts.append(
                     UsageActual(
                         llm_calls=1,

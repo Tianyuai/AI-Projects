@@ -13,12 +13,14 @@ from typing import Iterator, Literal
 from uuid import uuid4
 
 from paper_search.domain.models import (
+    BudgetReservation,
     DomainModel,
     MoneyCny,
     NonEmptyStr,
     UsageActual,
     UsageEstimate,
 )
+from paper_search.control.budget import HardBudgetController, ReservationError
 
 
 Clock = Callable[[], datetime]
@@ -341,18 +343,32 @@ class SQLiteBudgetLedger:
                     WHEN state IN ('settled', 'failed')
                     THEN actual_cost_micro_cny ELSE 0 END), 0) AS actual_micro,
                 COALESCE(SUM(CASE
-                    WHEN state = 'reserved'
+                    WHEN state = 'reserved' AND checkpoint_present = 0
                     THEN estimate_cost_micro_cny ELSE 0 END), 0) AS reserved_micro,
                 COALESCE(SUM(CASE
                     WHEN state IN ('settled', 'failed')
                          AND actual_cost_micro_cny IS NULL
+                    THEN 1
+                    WHEN state = 'reserved' AND checkpoint_present = 1
+                         AND checkpoint_cost_micro_cny IS NULL
                     THEN 1 ELSE 0 END), 0) AS unknown_count
             FROM reservations
             """
         ).fetchone()
         if row is None:
             return 0, 0, 0
-        return row["actual_micro"], row["reserved_micro"], row["unknown_count"]
+        checkpointed = connection.execute(
+            """
+            SELECT COALESCE(SUM(checkpoint_cost_micro_cny), 0)
+            FROM reservations
+            WHERE state = 'reserved' AND checkpoint_present = 1
+            """
+        ).fetchone()[0]
+        return (
+            row["actual_micro"] + checkpointed,
+            row["reserved_micro"],
+            row["unknown_count"],
+        )
 
     @staticmethod
     def _run_totals(
@@ -366,11 +382,14 @@ class SQLiteBudgetLedger:
                     WHEN state IN ('settled', 'failed')
                     THEN actual_cost_micro_cny ELSE 0 END), 0) AS actual_micro,
                 COALESCE(SUM(CASE
-                    WHEN state = 'reserved'
+                    WHEN state = 'reserved' AND checkpoint_present = 0
                     THEN estimate_cost_micro_cny ELSE 0 END), 0) AS reserved_micro,
                 COALESCE(SUM(CASE
                     WHEN state IN ('settled', 'failed')
                          AND actual_cost_micro_cny IS NULL
+                    THEN 1
+                    WHEN state = 'reserved' AND checkpoint_present = 1
+                         AND checkpoint_cost_micro_cny IS NULL
                     THEN 1 ELSE 0 END), 0) AS unknown_count
             FROM reservations
             WHERE run_id = ?
@@ -379,7 +398,19 @@ class SQLiteBudgetLedger:
         ).fetchone()
         if row is None:
             return 0, 0, 0
-        return row["actual_micro"], row["reserved_micro"], row["unknown_count"]
+        checkpointed = connection.execute(
+            """
+            SELECT COALESCE(SUM(checkpoint_cost_micro_cny), 0)
+            FROM reservations
+            WHERE run_id = ? AND state = 'reserved' AND checkpoint_present = 1
+            """,
+            (run_id,),
+        ).fetchone()[0]
+        return (
+            row["actual_micro"] + checkpointed,
+            row["reserved_micro"],
+            row["unknown_count"],
+        )
 
     def reserve(
         self,
@@ -539,6 +570,79 @@ class SQLiteBudgetLedger:
                 )
             self._recover_locked(connection)
 
+    def _coordinated_actual_state(
+        self,
+        reservation: LedgerReservation,
+        actual: UsageActual,
+    ) -> Literal["reserved", "checkpointed", "terminal"]:
+        expected = UsageActual(cost_cny=Decimal("0")) if self._replay else actual
+        with self._immediate() as connection:
+            self._recover_locked(connection)
+            row = connection.execute(
+                "SELECT * FROM reservations WHERE reservation_id = ?",
+                (reservation.reservation_id,),
+            ).fetchone()
+            if row is None:
+                raise LedgerReservationError("reservation is unknown")
+            stored = LedgerReservation(
+                reservation_id=row["reservation_id"],
+                run_id=row["run_id"],
+                query_id=row["query_id"],
+                estimate=_usage_from_row(row, prefix="estimate", actual=False),
+                state="reserved",
+            )
+            if stored != reservation:
+                raise LedgerReservationError("reservation does not match stored state")
+            if row["state"] != "reserved":
+                terminal = UsageActual.model_validate(
+                    _usage_from_row(row, prefix="actual", actual=True).model_dump()
+                )
+                if terminal != expected:
+                    raise LedgerReservationError("terminal actual does not match")
+                return "terminal"
+            if not row["checkpoint_present"]:
+                return "reserved"
+            checkpoint = UsageActual.model_validate(
+                _usage_from_row(row, prefix="checkpoint", actual=True).model_dump()
+            )
+            if checkpoint != expected:
+                raise LedgerReservationError("actual checkpoint does not match")
+            return "checkpointed"
+
+    def finalize_controller_actual(
+        self,
+        *,
+        ledger_reservation: LedgerReservation,
+        controller: HardBudgetController,
+        request_reservation: BudgetReservation,
+        actual: UsageActual,
+        failed: bool = False,
+    ) -> None:
+        """Checkpoint first, then terminalize controller and ledger exactly once.
+
+        The durable checkpoint is the prepared outbox state. Therefore controller
+        finalization can never precede persistent actual usage, and a retry after
+        either later transition can safely finish the ledger from that checkpoint.
+        """
+
+        actual = UsageActual.model_validate(actual.model_dump(mode="python"))
+        prior = self._coordinated_actual_state(ledger_reservation, actual)
+        if prior == "terminal":
+            return
+        self.checkpoint_actual(ledger_reservation, actual)
+        try:
+            if failed:
+                controller.fail_closed(request_reservation, actual)
+            else:
+                controller.settle(request_reservation, actual)
+        except ReservationError:
+            if prior != "checkpointed":
+                raise
+        if failed:
+            self.fail(ledger_reservation, actual)
+        else:
+            self.settle(ledger_reservation, actual)
+
     def _terminal(
         self,
         reservation: LedgerReservation,
@@ -626,23 +730,54 @@ class SQLiteBudgetLedger:
         connection: sqlite3.Connection,
         *,
         run_id: str,
-        state: str,
         actual: bool,
     ) -> UsageEstimate:
-        prefix = "actual" if actual else "estimate"
+        if actual:
+            expressions = {
+                field: (
+                    f"CASE WHEN state = 'reserved' THEN checkpoint_{field} "
+                    f"ELSE actual_{field} END"
+                )
+                for field in (
+                    "search_api_calls",
+                    "llm_calls",
+                    "input_tokens",
+                    "output_tokens",
+                    "elapsed_ms",
+                    "cost_micro_cny",
+                )
+            }
+            predicate = (
+                "state IN ('settled', 'failed') OR "
+                "(state = 'reserved' AND checkpoint_present = 1)"
+            )
+        else:
+            expressions = {
+                field: f"estimate_{field}"
+                for field in (
+                    "search_api_calls",
+                    "llm_calls",
+                    "input_tokens",
+                    "output_tokens",
+                    "elapsed_ms",
+                    "cost_micro_cny",
+                )
+            }
+            predicate = "state = 'reserved' AND checkpoint_present = 0"
+        cost_expression = expressions["cost_micro_cny"]
         row = connection.execute(
             f"""
             SELECT
-                COALESCE(SUM({prefix}_search_api_calls), 0) AS search_api_calls,
-                COALESCE(SUM({prefix}_llm_calls), 0) AS llm_calls,
-                COALESCE(SUM({prefix}_input_tokens), 0) AS input_tokens,
-                COALESCE(SUM({prefix}_output_tokens), 0) AS output_tokens,
-                COALESCE(SUM({prefix}_elapsed_ms), 0) AS elapsed_ms,
-                COALESCE(SUM({prefix}_cost_micro_cny), 0) AS cost_micro,
-                COALESCE(SUM(CASE WHEN {prefix}_cost_micro_cny IS NULL THEN 1 ELSE 0 END), 0)
+                COALESCE(SUM({expressions['search_api_calls']}), 0) AS search_api_calls,
+                COALESCE(SUM({expressions['llm_calls']}), 0) AS llm_calls,
+                COALESCE(SUM({expressions['input_tokens']}), 0) AS input_tokens,
+                COALESCE(SUM({expressions['output_tokens']}), 0) AS output_tokens,
+                COALESCE(SUM({expressions['elapsed_ms']}), 0) AS elapsed_ms,
+                COALESCE(SUM({cost_expression}), 0) AS cost_micro,
+                COALESCE(SUM(CASE WHEN {cost_expression} IS NULL THEN 1 ELSE 0 END), 0)
                     AS unknown_count
             FROM reservations
-            WHERE run_id = ? AND state {state}
+            WHERE run_id = ? AND ({predicate})
             """,
             (run_id,),
         ).fetchone()
@@ -672,13 +807,11 @@ class SQLiteBudgetLedger:
             reserved = self._aggregate_usage(
                 connection,
                 run_id=run_id,
-                state="= 'reserved'",
                 actual=False,
             )
             actual = self._aggregate_usage(
                 connection,
                 run_id=run_id,
-                state="IN ('settled', 'failed')",
                 actual=True,
             )
             project_actual, project_reserved, project_unknown = (
@@ -688,10 +821,17 @@ class SQLiteBudgetLedger:
                 """
                 SELECT COUNT(*)
                 FROM reservations
-                WHERE run_id = ? AND state IN ('settled', 'failed')
-                  AND actual_cost_micro_cny > ?
+                WHERE run_id = ? AND (
+                    (state IN ('settled', 'failed') AND actual_cost_micro_cny > ?)
+                    OR (state = 'reserved' AND checkpoint_present = 1
+                        AND checkpoint_cost_micro_cny > ?)
+                )
                 """,
-                (run_id, _to_micro(REQUEST_HARD_CAP_CNY)),
+                (
+                    run_id,
+                    _to_micro(REQUEST_HARD_CAP_CNY),
+                    _to_micro(REQUEST_HARD_CAP_CNY),
+                ),
             ).fetchone()[0]
             run_cap_micro = run["run_cap_micro_cny"]
             run_known_cost = (

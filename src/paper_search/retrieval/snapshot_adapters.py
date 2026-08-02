@@ -1008,6 +1008,8 @@ class ReplaySearchProvider:
             if content is None or ref is None:
                 errors.append(self._miss())
                 break
+            refs.append(ref)
+            hashes.append(_sha256(content))
             try:
                 decoded = decode_openalex_page(content, limit=remaining)
             except ValueError:
@@ -1020,8 +1022,6 @@ class ReplaySearchProvider:
                     )
                 )
                 break
-            refs.append(ref)
-            hashes.append(_sha256(content))
             papers.extend(decoded.papers)
             errors.extend(decoded.errors)
             raw_seen += decoded.raw_count

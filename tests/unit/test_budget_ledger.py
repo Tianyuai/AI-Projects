@@ -402,3 +402,235 @@ def test_controller_final_actual_checkpoint_survives_crash_and_recovers_once(
     assert second == first
     with pytest.raises(LedgerReservationError, match="already terminal"):
         recovered.settle(ledger_reservation, final_actual)
+
+
+def test_checkpoint_actual_is_immediately_authoritative_for_caps_and_report(
+    tmp_path: Path,
+) -> None:
+    ledger = _ledger(tmp_path / "ledger.sqlite3")
+    reservation = ledger.reserve(
+        run_id="authoritative-run",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("0.30"),
+    )
+    final_actual = _actual("0.25")
+
+    ledger.checkpoint_actual(reservation, final_actual)
+
+    report = ledger.report("authoritative-run")
+    assert report.reserved == UsageEstimate(cost_cny=Decimal("0"))
+    assert report.actual == final_actual
+    assert report.project_actual_cny == Decimal("0.25")
+    with pytest.raises(LedgerBudgetExceededError, match="run"):
+        ledger.reserve(
+            run_id="authoritative-run",
+            query_id="q2",
+            estimate=_estimate("0.20"),
+            run_cap_cny=Decimal("0.30"),
+        )
+
+
+def test_checkpoint_actual_is_authoritative_after_reopen_before_ttl(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ledger = _ledger(path)
+    reservation = ledger.reserve(
+        run_id="reopen-before-ttl",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("0.30"),
+    )
+    ledger.checkpoint_actual(reservation, _actual("0.25"))
+
+    reopened = _ledger(path, clock=lambda: NOW + timedelta(seconds=1))
+    report = reopened.report("reopen-before-ttl")
+
+    assert report.reserved == UsageEstimate(cost_cny=Decimal("0"))
+    assert report.actual == _actual("0.25")
+    assert report.project_actual_cny == Decimal("0.25")
+
+
+def test_finalize_controller_does_not_commit_controller_before_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = _ledger(tmp_path / "ledger.sqlite3")
+    ledger_reservation = ledger.reserve(
+        run_id="crash-before-checkpoint",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    controller = HardBudgetController(
+        SearchBudget(
+            max_search_api_calls=2,
+            target_search_api_calls=1,
+            max_llm_calls=1,
+            target_llm_calls=0,
+            max_total_tokens=1,
+            max_cost_cny=1.0,
+            max_elapsed_seconds=10,
+            soft_deadline_seconds=9,
+        ),
+        formal_live=True,
+        clock=lambda: NOW,
+    )
+    request = controller.reserve(
+        "provider.search",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    controller.mark_dispatched(request)
+
+    def crash_before_checkpoint(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("crash before checkpoint")
+
+    monkeypatch.setattr(ledger, "checkpoint_actual", crash_before_checkpoint)
+    with pytest.raises(RuntimeError, match="before checkpoint"):
+        ledger.finalize_controller_actual(
+            ledger_reservation=ledger_reservation,
+            controller=controller,
+            request_reservation=request,
+            actual=_actual("0.25"),
+        )
+
+    assert controller.committed_usage == UsageActual()
+    assert controller.reserved_usage.search_api_calls == 1
+    report = ledger.report("crash-before-checkpoint")
+    assert report.reserved.cost_cny == Decimal("0.10")
+    assert report.actual == UsageActual(cost_cny=Decimal("0"))
+
+
+def test_finalize_controller_recovers_after_checkpoint_and_is_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "ledger.sqlite3"
+    ledger = _ledger(path)
+    ledger_reservation = ledger.reserve(
+        run_id="crash-after-checkpoint",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    controller = HardBudgetController(
+        SearchBudget(
+            max_search_api_calls=2,
+            target_search_api_calls=1,
+            max_llm_calls=1,
+            target_llm_calls=0,
+            max_total_tokens=1,
+            max_cost_cny=1.0,
+            max_elapsed_seconds=10,
+            soft_deadline_seconds=9,
+        ),
+        formal_live=True,
+        clock=lambda: NOW,
+    )
+    request = controller.reserve(
+        "provider.search",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    controller.mark_dispatched(request)
+    original_settle = controller.settle
+
+    def crash_after_checkpoint(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise RuntimeError("crash after checkpoint")
+
+    monkeypatch.setattr(controller, "settle", crash_after_checkpoint)
+    with pytest.raises(RuntimeError, match="after checkpoint"):
+        ledger.finalize_controller_actual(
+            ledger_reservation=ledger_reservation,
+            controller=controller,
+            request_reservation=request,
+            actual=_actual("0.25"),
+        )
+
+    reopened = _ledger(path, clock=lambda: NOW + timedelta(seconds=1))
+    assert reopened.report("crash-after-checkpoint").actual == _actual("0.25")
+    monkeypatch.setattr(controller, "settle", original_settle)
+    reopened.finalize_controller_actual(
+        ledger_reservation=ledger_reservation,
+        controller=controller,
+        request_reservation=request,
+        actual=_actual("0.25"),
+    )
+    reopened.finalize_controller_actual(
+        ledger_reservation=ledger_reservation,
+        controller=controller,
+        request_reservation=request,
+        actual=_actual("0.25"),
+    )
+
+    assert controller.committed_usage == _actual("0.25")
+    assert reopened.report("crash-after-checkpoint").actual == _actual("0.25")
+
+
+def test_finalize_controller_recovers_crash_after_controller_before_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = _ledger(tmp_path / "ledger.sqlite3")
+    ledger_reservation = ledger.reserve(
+        run_id="controller-final-gap",
+        query_id="q1",
+        estimate=_estimate("0.10"),
+        run_cap_cny=Decimal("1.00"),
+    )
+    controller = HardBudgetController(
+        SearchBudget(
+            max_search_api_calls=2,
+            target_search_api_calls=1,
+            max_llm_calls=1,
+            target_llm_calls=0,
+            max_total_tokens=1,
+            max_cost_cny=1.0,
+            max_elapsed_seconds=10,
+            soft_deadline_seconds=9,
+        ),
+        formal_live=True,
+        clock=lambda: NOW,
+    )
+    request = controller.reserve(
+        "provider.search",
+        UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.30")),
+    )
+    controller.mark_dispatched(request)
+    original_settle = ledger.settle
+    crashed = False
+
+    def crash_once(*args: object, **kwargs: object) -> None:
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            raise RuntimeError("crash after controller final")
+        original_settle(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "settle", crash_once)
+    with pytest.raises(RuntimeError, match="after controller final"):
+        ledger.finalize_controller_actual(
+            ledger_reservation=ledger_reservation,
+            controller=controller,
+            request_reservation=request,
+            actual=_actual("0.25"),
+        )
+
+    assert ledger.report("controller-final-gap").actual == _actual("0.25")
+    ledger.finalize_controller_actual(
+        ledger_reservation=ledger_reservation,
+        controller=controller,
+        request_reservation=request,
+        actual=_actual("0.25"),
+    )
+    ledger.finalize_controller_actual(
+        ledger_reservation=ledger_reservation,
+        controller=controller,
+        request_reservation=request,
+        actual=_actual("0.25"),
+    )
+
+    assert controller.committed_usage == _actual("0.25")
+    assert ledger.report("controller-final-gap").actual == _actual("0.25")

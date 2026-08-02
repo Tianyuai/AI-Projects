@@ -588,3 +588,11 @@ def test_http_200_invalid_bytes_are_captured_before_decode_and_replayed(
     assert captured.errors[-1].code == "invalid_response"
     assert replayed.errors[-1].code == "invalid_response"
     assert replayed.errors[-1].code != "snapshot_unavailable"
+    expected_hash = "sha256:" + hashlib.sha256(raw).hexdigest()
+    captured_refs = json.loads(captured.provenance["snapshot_refs"])
+    replayed_refs = json.loads(replayed.provenance["snapshot_refs"])
+    assert replayed.cache_hit is True
+    assert len(captured_refs) == len(replayed_refs) == 1
+    assert replayed_refs == captured_refs
+    assert captured.provenance["response_hash"] == expected_hash
+    assert replayed.provenance["response_hash"] == expected_hash

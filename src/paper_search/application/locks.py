@@ -90,6 +90,12 @@ class PlannerBinding(_LockModel):
     repair_attempts: Literal[1]
     rules_fallback_enabled: Literal[True]
 
+    @model_validator(mode="after")
+    def validate_prompt_config_sha256(self) -> PlannerBinding:
+        if self.prompt_config.sha256 == "sha256:" + "0" * 64:
+            raise ValueError("prompt config SHA-256 must be nonzero")
+        return self
+
 
 class RetrievalBinding(_LockModel):
     openalex_endpoint: Literal["/works"]

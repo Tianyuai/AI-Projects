@@ -193,6 +193,7 @@ class _FormalInputs:
     gold: list[EvaluationQuery]
     identifier_map: IdentifierMap
     gate_policy: QualityGatePolicy
+    prompt_artifact_sha256: str
     snapshot_manifest: DependencySnapshotManifestV2 | None
     snapshot_root: Path | None
 
@@ -256,6 +257,9 @@ def _load_formal_inputs(request: EvaluationRunRequest) -> _FormalInputs:
     gate_policy = parse_quality_gate_policy_bytes(
         verified.artifact_bytes[lock.quality_gates.path]
     )
+    prompt_artifact_sha256 = _sha256_bytes(
+        verified.artifact_bytes[lock.baseline.planner.prompt_config.path]
+    )
     snapshot_manifest: DependencySnapshotManifestV2 | None = None
     snapshot_root: Path | None = None
     if isinstance(lock, ReplayLock):
@@ -273,6 +277,7 @@ def _load_formal_inputs(request: EvaluationRunRequest) -> _FormalInputs:
         gold=gold,
         identifier_map=identifier_map,
         gate_policy=gate_policy,
+        prompt_artifact_sha256=prompt_artifact_sha256,
         snapshot_manifest=snapshot_manifest,
         snapshot_root=snapshot_root,
     )
@@ -1398,6 +1403,7 @@ async def _run_formal_evaluation(
                 prompt_name=Path(
                     inputs.lock.baseline.planner.prompt_config.path
                 ).stem,
+                prompt_artifact_sha256=inputs.prompt_artifact_sha256,
                 llm_model_allowlist=frozenset(
                     {
                         inputs.lock.baseline.primary_model,

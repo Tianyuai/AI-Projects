@@ -2292,6 +2292,7 @@ def test_formal_runner_closes_bundle_when_readiness_probe_raises(
         runner_module,
         "_load_formal_inputs",
         lambda request: runner_module._FormalInputs(
+            prompt_artifact_sha256=lock.baseline.planner.prompt_config.sha256,
             lock=lock,
             lock_bytes=lock_bytes,
             gold=[EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"})],
@@ -2450,6 +2451,7 @@ def test_partial_second_reservation_failure_closes_bundle_and_first_query(
         runner_module,
         "_load_formal_inputs",
         lambda request: runner_module._FormalInputs(
+            prompt_artifact_sha256=lock.baseline.planner.prompt_config.sha256,
             lock=lock,
             lock_bytes=lock_bytes,
             gold=[
@@ -2561,6 +2563,7 @@ def test_post_publication_attempt_transition_error_does_not_mark_run_failed(
         runner_module,
         "_load_formal_inputs",
         lambda request: runner_module._FormalInputs(
+            prompt_artifact_sha256=lock.baseline.planner.prompt_config.sha256,
             lock=lock,
             lock_bytes=lock_bytes,
             gold=[
@@ -2661,6 +2664,7 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
         runner_module,
         "_load_formal_inputs",
         lambda request: runner_module._FormalInputs(
+            prompt_artifact_sha256=lock.baseline.planner.prompt_config.sha256,
             lock=lock,
             lock_bytes=lock_bytes,
             gold=[EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"})],
@@ -3060,7 +3064,7 @@ def test_hard_filter_loss_is_derived_from_decoded_candidates(
 
 @pytest.mark.parametrize(
     "llm_request_binding",
-    ["absent", "exact", "wrong_safe_model", "unrelated_query"],
+    ["absent", "exact", "wrong_safe_model", "unrelated_query", "wrong_prompt"],
 )
 def test_business_query_analysis_requires_bound_llm_snapshot(
     tmp_path: Path,
@@ -3107,6 +3111,9 @@ def test_business_query_analysis_requires_bound_llm_snapshot(
             canonical_request={
                 "payload": {"query": request_query},
                 "prompt_name": "query_analyze",
+                "prompt_artifact_sha256": (
+                    "sha256:" + ("b" if llm_request_binding == "wrong_prompt" else "a") * 64
+                ),
                 "prompt_version": "query-analyze-v1",
             },
         )
@@ -3214,6 +3221,7 @@ def test_business_query_analysis_requires_bound_llm_snapshot(
         snapshot_reader=reader,
         prompt_version="query-analyze-v1",
         prompt_name="query_analyze",
+        prompt_artifact_sha256="sha256:" + "a" * 64,
         llm_model_allowlist=frozenset({"qwen3.7-plus", "qwen3.6-flash"}),
     )
 

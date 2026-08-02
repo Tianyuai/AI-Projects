@@ -47,6 +47,56 @@ def test_synthetic_capture_and_replay_are_valid() -> None:
     assert validate_run_directory(FIXTURE_ROOT / "replay").valid
 
 
+def test_prompt_config_sha256_must_not_be_zero() -> None:
+    payload = yaml.safe_load(
+        (FIXTURE_ROOT / "capture" / "config.lock.yaml").read_bytes()
+    )
+    payload["baseline"]["planner"]["prompt_config"]["sha256"] = (
+        "sha256:" + "0" * 64
+    )
+
+    with pytest.raises(ValueError, match="prompt config SHA-256 must be nonzero"):
+        runner_module.CandidateLock.model_validate(payload)
+
+
+def test_validator_rejects_self_consistent_forged_prompt_binding(
+    tmp_path: Path,
+) -> None:
+    run = tmp_path / "capture"
+    shutil.copytree(FIXTURE_ROOT / "capture", run)
+    forged_sha256 = "sha256:" + "b" * 64
+
+    config_path = run / "config.lock.yaml"
+    config_payload = yaml.safe_load(config_path.read_bytes())
+    config_payload["baseline"]["planner"]["prompt_config"]["sha256"] = (
+        forged_sha256
+    )
+    config_bytes = yaml.safe_dump(config_payload, sort_keys=False).encode("utf-8")
+    config_path.write_bytes(config_bytes)
+
+    replay_path = run / "replay.lock.yaml"
+    replay_payload = yaml.safe_load(replay_path.read_bytes())
+    replay_payload["baseline"]["planner"]["prompt_config"]["sha256"] = (
+        forged_sha256
+    )
+    replay_path.write_text(
+        yaml.safe_dump(replay_payload, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    manifest_path = run / "run.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    config_lock = runner_module.CandidateLock.model_validate(config_payload)
+    manifest["config_hash"] = runner_module.lock_sha256(config_lock)
+    manifest["input_lock_sha256"] = runner_module._sha256_bytes(config_bytes)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = validate_run_directory(run)
+
+    assert not result.valid
+    assert "artifact_invalid" in {issue.code for issue in result.issues}
+
+
 @pytest.mark.parametrize(
     ("mutation", "expected_code"),
     [

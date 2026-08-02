@@ -1,11 +1,11 @@
 {
   "entries": [
     {
-      "cache_key": "sha256:dfdd2374aa783048599b076402d1f88663f635a733a6aae747ff519ff65e6b35",
+      "cache_key": "sha256:0b0f7d3b0f58d3f42fe811529dce3ffe55da3a9b3ffc57eeb114fd7c25f1f30e",
       "captured_at": "2026-08-02T00:00:00Z",
-      "entry_id": "sha256:6ae6a7d9579d805f68fd51a7ed6507d5a14b3685dd2beb2f765a9dc6c05ae038",
+      "entry_id": "sha256:252fb4c111848d68ab731c1c9d0758ba79a8bb6dd7b4e22baa860e3250eceb99",
       "request": {
-        "canonical_request_sha256": "sha256:4e7d2da733a934cc57eab59325959eb0bca0fa8407c6b78f5b8440ef0c7ad542",
+        "canonical_request_sha256": "sha256:e47e0bc2ab86e2bd86fae6d7c18369d1aa4013794b7189163762b4c1fd0dc8d0",
         "dependency": "llm",
         "endpoint": "/chat/completions",
         "method": "POST",
@@ -13,7 +13,7 @@
         "operation": "generate_json",
         "schema_version": "dependency-request-v1"
       },
-      "response_path": "responses/llm/dfdd2374aa783048599b076402d1f88663f635a733a6aae747ff519ff65e6b35.bin",
+      "response_path": "responses/llm/0b0f7d3b0f58d3f42fe811529dce3ffe55da3a9b3ffc57eeb114fd7c25f1f30e.bin",
       "response_sha256": "sha256:1a9ea701ee445faddd2cc244e2345668084b88146700feac48c159d964913aad",
       "safe_headers": {
         "content-type": "application/json"
@@ -60,5 +60,5 @@
   ],
   "schema_version": "dependency-snapshot-v2",
   "sealed_at": "2026-08-02T00:00:00Z",
-  "snapshot_set_id": "sha256:1fe3cd1ac5bddeaa6e1bbc2d2460c0314b24661638045c3f0e5130fa6e865246"
+  "snapshot_set_id": "sha256:d379189926e89ea7c180f6505520712b17bf14b6ca84aea911949aba3f0d7980"
 }

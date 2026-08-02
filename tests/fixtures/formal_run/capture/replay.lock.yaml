@@ -22,7 +22,7 @@ baseline:
   planner:
     prompt_config:
       path: configs/prompts/query_analyze.yaml
-      sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      sha256: sha256:7bd54e4a9009c0a66b516b260b0324d841dc490f8c344f24716099c9c4e0e5e2
     normal_subqueries_min: 3
     normal_subqueries_max: 5
     configured_subqueries_max: 6
@@ -71,5 +71,5 @@ capture_policy:
 project_ledger:
   receipt_count: 0
   receipts_sha256: sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570
-snapshot_set_id: sha256:1fe3cd1ac5bddeaa6e1bbc2d2460c0314b24661638045c3f0e5130fa6e865246
-snapshot_manifest_sha256: sha256:0613f39f7dab4e33a75e3e81a411057ac9225ece0301932feabaf84397e30db6
+snapshot_set_id: sha256:d379189926e89ea7c180f6505520712b17bf14b6ca84aea911949aba3f0d7980
+snapshot_manifest_sha256: sha256:f2482b26a805d1685baa40073f668aa19b9ea6ac747abcc5c16f9b01e389da3d

@@ -20,7 +20,7 @@ baseline:
   planner:
     prompt_config:
       path: configs/prompts/query_analyze.yaml
-      sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000
+      sha256: sha256:7bd54e4a9009c0a66b516b260b0324d841dc490f8c344f24716099c9c4e0e5e2
     normal_subqueries_min: 3
     normal_subqueries_max: 5
     configured_subqueries_max: 6

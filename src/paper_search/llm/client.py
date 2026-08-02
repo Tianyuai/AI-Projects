@@ -24,6 +24,7 @@ from paper_search.domain.models import (
 Clock = Callable[[], datetime]
 _SAFE_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 _SAFE_PROMPT_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
+_SAFE_PROMPT_ARTIFACT_SHA256 = re.compile(r"sha256:[0-9a-f]{64}")
 _SECRET_SHAPE = re.compile(
     r"(?:\bsk-[A-Za-z0-9]|\bgh[pousr]_[A-Za-z0-9]|\bgithub_pat_"
     r"|\bxox[baprs]-|\bsecret\b|\bbearer\b)",
@@ -67,6 +68,16 @@ def validate_prompt_version(value: str) -> str:
         or _SECRET_SHAPE.search(normalized) is not None
     ):
         raise ValueError("LLM prompt version is not safe")
+    return normalized
+
+
+def validate_prompt_artifact_sha256(value: str) -> str:
+    normalized = value.strip()
+    if (
+        _SAFE_PROMPT_ARTIFACT_SHA256.fullmatch(normalized) is None
+        or normalized == "sha256:" + "0" * 64
+    ):
+        raise ValueError("LLM prompt artifact SHA-256 is invalid")
     return normalized
 
 
@@ -286,12 +297,19 @@ class OpenAICompatibleLLMClient:
         }
 
     def canonical_identity_request(
-        self, *, prompt_name: str, payload: dict[str, object]
+        self,
+        *,
+        prompt_name: str,
+        payload: dict[str, object],
+        prompt_artifact_sha256: str,
     ) -> dict[str, object]:
         """Return only approved identity fields, excluding transport metadata."""
         return {
             "prompt_name": prompt_name,
             "payload": payload,
+            "prompt_artifact_sha256": validate_prompt_artifact_sha256(
+                prompt_artifact_sha256
+            ),
             "prompt_version": self._prompt_version,
         }
 

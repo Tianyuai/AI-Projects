@@ -26,6 +26,7 @@ from paper_search.llm.client import (
     sanitize_request_id,
     usage_from_response_bytes,
     validate_model_id,
+    validate_prompt_artifact_sha256,
     validate_prompt_version,
 )
 from paper_search.storage.dependency_snapshot import (
@@ -95,6 +96,7 @@ def _identity(
     *,
     prompt_name: str,
     payload: dict[str, object],
+    prompt_artifact_sha256: str,
 ) -> DependencyRequestIdentity:
     return DependencyRequestIdentity.from_canonical_request(
         dependency="llm",
@@ -105,6 +107,7 @@ def _identity(
         canonical_request=client.canonical_identity_request(
             prompt_name=prompt_name,
             payload=payload,
+            prompt_artifact_sha256=prompt_artifact_sha256,
         ),
     )
 
@@ -114,11 +117,13 @@ def _replay_identity(
     model_id: str,
     prompt_name: str,
     payload: dict[str, object],
+    prompt_artifact_sha256: str,
     prompt_version: str,
 ) -> DependencyRequestIdentity:
     canonical_request = {
         "prompt_name": prompt_name,
         "payload": payload,
+        "prompt_artifact_sha256": prompt_artifact_sha256,
         "prompt_version": prompt_version,
     }
     return DependencyRequestIdentity.from_canonical_request(
@@ -224,6 +229,7 @@ class LiveCaptureLLMAnalyzer:
         capture_store: DependencyCaptureStore,
         pricer: ActualCostPricer,
         controller: RequestSettlementController,
+        prompt_artifact_sha256: str,
         decoder: LLMResponseDecoder | None = None,
         clock: Clock = _utc_now,
     ) -> None:
@@ -231,6 +237,9 @@ class LiveCaptureLLMAnalyzer:
         self._capture_store = capture_store
         self._pricer = pricer
         self._controller = controller
+        self._prompt_artifact_sha256 = validate_prompt_artifact_sha256(
+            prompt_artifact_sha256
+        )
         self._decoder = decoder or LLMResponseDecoder(
             prompt_version=client.prompt_version
         )
@@ -246,7 +255,12 @@ class LiveCaptureLLMAnalyzer:
         if reservation.reserved.llm_calls < 1:
             raise ValueError("reservation must include one LLM call")
         requested_at = self._clock()
-        identity = _identity(self._client, prompt_name=prompt_name, payload=payload)
+        identity = _identity(
+            self._client,
+            prompt_name=prompt_name,
+            payload=payload,
+            prompt_artifact_sha256=self._prompt_artifact_sha256,
+        )
         measured_attempts: list[UsageActual] = []
         valued_attempts: list[UsageActual] = []
         terminal: ProviderResult[dict[str, Any]] | None = None
@@ -424,12 +438,16 @@ class ReplayLLMAnalyzer:
         *,
         reader: DependencySnapshotReader,
         model_id: str,
+        prompt_artifact_sha256: str,
         prompt_version: str = "query-analyze-v1",
         decoder: LLMResponseDecoder | None = None,
         clock: Clock = _utc_now,
     ) -> None:
         self._reader = reader
         self._model_id = validate_model_id(model_id)
+        self._prompt_artifact_sha256 = validate_prompt_artifact_sha256(
+            prompt_artifact_sha256
+        )
         self._prompt_version = validate_prompt_version(prompt_version)
         self._decoder = decoder or LLMResponseDecoder(
             prompt_version=self._prompt_version
@@ -448,6 +466,7 @@ class ReplayLLMAnalyzer:
             model_id=self._model_id,
             prompt_name=prompt_name,
             payload=payload,
+            prompt_artifact_sha256=self._prompt_artifact_sha256,
             prompt_version=self._prompt_version,
         )
         try:

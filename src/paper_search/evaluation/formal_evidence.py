@@ -274,6 +274,7 @@ def _bound_llm_query_specs(
     query: EvaluationQuery,
     prompt_version: str | None,
     prompt_name: str | None,
+    prompt_artifact_sha256: str | None,
     llm_model_allowlist: frozenset[str] | None,
     snapshot_manifest: DependencySnapshotManifestV2 | None,
     snapshot_reader: DependencySnapshotReader | None,
@@ -281,6 +282,7 @@ def _bound_llm_query_specs(
     if (
         prompt_version is None
         or prompt_name is None
+        or prompt_artifact_sha256 is None
         or not llm_model_allowlist
         or snapshot_manifest is None
         or snapshot_reader is None
@@ -313,6 +315,7 @@ def _bound_llm_query_specs(
                 canonical_request={
                     "prompt_name": prompt_name,
                     "payload": {"query": query.query},
+                    "prompt_artifact_sha256": prompt_artifact_sha256,
                     "prompt_version": prompt_version,
                 },
             )
@@ -352,6 +355,7 @@ def _filter_query_spec(
     execution: EvaluationExecutionRecord,
     prompt_version: str | None,
     prompt_name: str | None,
+    prompt_artifact_sha256: str | None,
     llm_model_allowlist: frozenset[str] | None,
     snapshot_manifest: DependencySnapshotManifestV2 | None,
     snapshot_reader: DependencySnapshotReader | None,
@@ -365,6 +369,7 @@ def _filter_query_spec(
         query=query,
         prompt_version=prompt_version,
         prompt_name=prompt_name,
+        prompt_artifact_sha256=prompt_artifact_sha256,
         llm_model_allowlist=llm_model_allowlist,
         snapshot_manifest=snapshot_manifest,
         snapshot_reader=snapshot_reader,
@@ -392,6 +397,7 @@ def formal_audit_measures(
     snapshot_reader: DependencySnapshotReader | None = None,
     prompt_version: str | None = None,
     prompt_name: str | None = None,
+    prompt_artifact_sha256: str | None = None,
     llm_model_allowlist: frozenset[str] | None = None,
 ) -> dict[str, MeasureValue]:
     """Derive all applicable enforced and core reporting measures."""
@@ -440,6 +446,7 @@ def formal_audit_measures(
             execution=execution,
             prompt_version=prompt_version,
             prompt_name=prompt_name,
+            prompt_artifact_sha256=prompt_artifact_sha256,
             llm_model_allowlist=llm_model_allowlist,
             snapshot_manifest=snapshot_manifest,
             snapshot_reader=snapshot_reader,

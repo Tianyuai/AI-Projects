@@ -129,7 +129,7 @@ def _bound_path(relative: str, *, root: Path) -> Path:
 
 def _frozen_evidence(
     lock: InputLock,
-) -> tuple[list[EvaluationQuery], IdentifierMap, QualityGatePolicy]:
+) -> tuple[list[EvaluationQuery], IdentifierMap, QualityGatePolicy, str]:
     artifact_root = Path.cwd().resolve()
     manifest_path = _bound_path(lock.frozen_data.manifest.path, root=artifact_root)
     manifest_bytes = manifest_path.read_bytes()
@@ -160,7 +160,22 @@ def _frozen_evidence(
     gate_bytes = gate_path.read_bytes()
     if f"sha256:{hashlib.sha256(gate_bytes).hexdigest()}" != lock.quality_gates.sha256:
         raise ValueError("Gate policy hash mismatch")
-    return queries, IdentifierMap.from_bytes(identifier_bytes), parse_quality_gate_policy_bytes(gate_bytes)
+    prompt_path = _bound_path(
+        lock.baseline.planner.prompt_config.path,
+        root=artifact_root,
+    )
+    prompt_bytes = prompt_path.read_bytes()
+    prompt_artifact_sha256 = (
+        f"sha256:{hashlib.sha256(prompt_bytes).hexdigest()}"
+    )
+    if prompt_artifact_sha256 != lock.baseline.planner.prompt_config.sha256:
+        raise ValueError("prompt config hash mismatch")
+    return (
+        queries,
+        IdentifierMap.from_bytes(identifier_bytes),
+        parse_quality_gate_policy_bytes(gate_bytes),
+        prompt_artifact_sha256,
+    )
 
 
 def _replay_inherits_live_lock(
@@ -293,7 +308,12 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             or lock.baseline.prompt_version != manifest.prompt_version
         ):
             issues.append(_issue("lock_binding_invalid", "config.lock.yaml", "Input lock binding is invalid"))
-        frozen_queries, identifier_map, gate_policy = _frozen_evidence(lock)
+        (
+            frozen_queries,
+            identifier_map,
+            gate_policy,
+            prompt_artifact_sha256,
+        ) = _frozen_evidence(lock)
 
         replay_bytes = (root / "replay.lock.yaml").read_bytes()
         replay_lock = _LOCK_ADAPTER.validate_python(yaml.safe_load(replay_bytes))
@@ -549,6 +569,7 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
                 snapshot_reader=reader,
                 prompt_version=lock.baseline.prompt_version,
                 prompt_name=Path(lock.baseline.planner.prompt_config.path).stem,
+                prompt_artifact_sha256=prompt_artifact_sha256,
                 llm_model_allowlist=frozenset(
                     {
                         lock.baseline.primary_model,

@@ -17,6 +17,7 @@ from paper_search.storage.dependency_snapshot import (
 
 
 CAPTURED_AT = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+PROMPT_ARTIFACT_SHA256 = "sha256:" + "a" * 64
 
 
 def _sha256(value: bytes) -> str:
@@ -28,6 +29,7 @@ def _identity(dependency: str = "openalex") -> DependencyRequestIdentity:
         canonical_request: dict[str, object] = {
             "prompt_name": "query_analyze",
             "payload": {"query": "retrieval augmented generation", "limit": 2},
+            "prompt_artifact_sha256": PROMPT_ARTIFACT_SHA256,
             "prompt_version": "query-analyze-v1",
         }
     else:

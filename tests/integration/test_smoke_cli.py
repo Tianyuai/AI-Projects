@@ -120,6 +120,9 @@ rates:
         canonical_request={
             "prompt_name": "query_analyze",
             "payload": {"query": query},
+            "prompt_artifact_sha256": hashes[
+                "configs/prompts/query_analyze.yaml"
+            ],
             "prompt_version": "query-analyze-v1",
         },
     )
@@ -287,6 +290,7 @@ def _stage_response(session: object) -> bytes:
         canonical_request={
             "prompt_name": "query_analyze",
             "payload": {"query": "smoke"},
+            "prompt_artifact_sha256": "sha256:7bd54e4a9009c0a66b516b260b0324d841dc490f8c344f24716099c9c4e0e5e2",
             "prompt_version": "query-analyze-v1",
         },
     )
@@ -552,6 +556,7 @@ def test_capture_refuses_coordinated_manifest_and_replay_lock_replacement(
         canonical_request={
             "prompt_name": "query_analyze",
             "payload": {"query": "replacement"},
+            "prompt_artifact_sha256": "sha256:7bd54e4a9009c0a66b516b260b0324d841dc490f8c344f24716099c9c4e0e5e2",
             "prompt_version": "query-analyze-v1",
         },
     )

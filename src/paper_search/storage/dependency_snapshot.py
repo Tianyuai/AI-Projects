@@ -48,7 +48,12 @@ _SAFE_HEADER_NAMES = frozenset(
 _SAFE_MODEL_OR_ADAPTER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}")
 _CANONICAL_REQUEST_FIELDS: dict[tuple[str, str], frozenset[str]] = {
     ("llm", "generate_json"): frozenset(
-        {"payload", "prompt_name", "prompt_version"}
+        {
+            "payload",
+            "prompt_artifact_sha256",
+            "prompt_name",
+            "prompt_version",
+        }
     ),
     ("openalex", "search"): frozenset(
         {
@@ -171,6 +176,20 @@ class DependencyRequestIdentity(DomainModel):
             raise ValueError(
                 f"canonical request field is not allowlisted: {sorted(unknown_fields)}"
             )
+        if (dependency, operation) == ("llm", "generate_json"):
+            missing_fields = allowed_fields.difference(canonical_request)
+            if missing_fields:
+                raise ValueError(
+                    "canonical LLM request field is missing: "
+                    f"{sorted(missing_fields)}"
+                )
+            prompt_sha256 = canonical_request["prompt_artifact_sha256"]
+            if (
+                not isinstance(prompt_sha256, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", prompt_sha256) is None
+                or prompt_sha256 == "sha256:" + "0" * 64
+            ):
+                raise ValueError("canonical LLM prompt artifact SHA-256 is invalid")
         _reject_secret_keys(canonical_request)
         return cls(
             dependency=dependency,

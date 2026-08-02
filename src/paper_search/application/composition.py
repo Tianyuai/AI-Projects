@@ -257,6 +257,7 @@ def _replay_factory(
         analyzer = ReplayLLMAnalyzer(
             reader=reader,
             model_id=lock.baseline.primary_model,
+            prompt_artifact_sha256=lock.baseline.planner.prompt_config.sha256,
             prompt_version=lock.baseline.prompt_version,
         )
         providers = {
@@ -394,6 +395,9 @@ class _LiveOrchestratorFactory:
             capture_store=capture_store,
             pricer=self._pricer,
             controller=controller,
+            prompt_artifact_sha256=(
+                lock.baseline.planner.prompt_config.sha256
+            ),
         )
         providers = {
             "openalex": LiveCaptureSearchProvider(

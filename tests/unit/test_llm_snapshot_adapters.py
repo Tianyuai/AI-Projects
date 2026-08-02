@@ -32,6 +32,7 @@ from paper_search.storage.dependency_snapshot import (
 
 CAPTURED_AT = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
 PRICING_FIXTURE = Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")
+PROMPT_ARTIFACT_SHA256 = "sha256:" + "a" * 64
 
 
 def _reservation() -> BudgetReservation:
@@ -99,6 +100,7 @@ async def _live(
             clock=lambda: CAPTURED_AT,
         )
         analyzer = LiveCaptureLLMAnalyzer(
+            prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
             client=client,
             capture_store=store,
             pricer=_pricer(),
@@ -187,6 +189,7 @@ def test_real_budget_controller_terminal_failure_records_usage_and_hard_stops(
             )
         ) as http_client:
             analyzer = LiveCaptureLLMAnalyzer(
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
@@ -233,6 +236,7 @@ def test_cancellation_after_dispatch_fail_closes_then_reraises_cancelled_error(
             transport=httpx.MockTransport(handler)
         ) as http_client:
             analyzer = LiveCaptureLLMAnalyzer(
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
@@ -276,6 +280,7 @@ def test_unexpected_exception_after_dispatch_commits_conservative_usage(
             transport=httpx.MockTransport(handler)
         ) as http_client:
             analyzer = LiveCaptureLLMAnalyzer(
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
@@ -329,6 +334,7 @@ def test_usage_measurement_failure_after_response_commits_one_unknown_attempt(
             )
         ) as http_client:
             analyzer = LiveCaptureLLMAnalyzer(
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
@@ -405,6 +411,7 @@ def test_replay_uses_identical_decoder_zero_cost_and_snapshot_provenance(
         snapshot_set_id=manifest.snapshot_set_id,
     )
     replay = ReplayLLMAnalyzer(
+        prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
         reader=reader,
         model_id="qwen-test-v1",
         clock=lambda: CAPTURED_AT,
@@ -435,6 +442,7 @@ def test_replay_miss_is_snapshot_unavailable_without_network_fallback(
         snapshot_manifest_sha256=store.manifest_sha256,
     )
     replay = ReplayLLMAnalyzer(
+        prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
         reader=reader,
         model_id="qwen-test-v1",
         clock=lambda: CAPTURED_AT,
@@ -462,7 +470,11 @@ def test_replay_rejects_secret_shaped_model_identifier(tmp_path: Path) -> None:
     )
 
     with pytest.raises(ValueError, match="model identifier is not safe"):
-        ReplayLLMAnalyzer(reader=reader, model_id="sk-live-replay-secret")
+        ReplayLLMAnalyzer(
+            reader=reader,
+            model_id="sk-live-replay-secret",
+            prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
+        )
 
 
 def test_injected_decoder_cannot_bypass_replay_prompt_version_validation(
@@ -478,6 +490,7 @@ def test_injected_decoder_cannot_bypass_replay_prompt_version_validation(
 
     with pytest.raises(ValueError, match="prompt version is not safe") as error:
         ReplayLLMAnalyzer(
+            prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
             reader=reader,
             model_id="qwen-test-v1",
             prompt_version=secret_prompt_version,
@@ -604,6 +617,7 @@ def test_staging_failure_commits_all_valued_attempts_to_real_controller(
             transport=httpx.MockTransport(handler)
         ) as http_client:
             analyzer = LiveCaptureLLMAnalyzer(
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
@@ -672,6 +686,7 @@ def test_pricing_failure_preserves_prior_valued_attempts_in_real_controller(
             transport=httpx.MockTransport(handler)
         ) as http_client:
             analyzer = LiveCaptureLLMAnalyzer(
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
@@ -719,6 +734,7 @@ def test_terminal_internal_failure_records_accumulated_usage_fail_closed(
             )
         ) as http_client:
             analyzer = LiveCaptureLLMAnalyzer(
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
@@ -768,6 +784,7 @@ def test_terminal_settlement_failure_is_fixed_no_chain_adapter_error(
             )
         ) as http_client:
             analyzer = LiveCaptureLLMAnalyzer(
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
@@ -816,6 +833,7 @@ def test_cancellation_preserves_cancelled_error_when_terminal_settlement_fails(
             transport=httpx.MockTransport(handler)
         ) as http_client:
             analyzer = LiveCaptureLLMAnalyzer(
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",

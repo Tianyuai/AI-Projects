@@ -1,5 +1,5 @@
 {
-  "config_hash": "sha256:1548be6bdb432630dd150ce10885f896e79e3b3d39e9c0c246c4e5a6f3b4e0ec",
+  "config_hash": "sha256:d03eae34f8924d78cf94130bea88a4f26a07ec717f0b802bb1ca102ee7b42cf5",
   "ended_at": "2026-08-02T00:00:00Z",
   "execution_mode": "replay",
   "experiment_name": "main-baseline",
@@ -7,7 +7,7 @@
   "frozen_manifest_sha256": "sha256:3a92ca6448152e3bc3fed6d35605818a839044f9e5956404a4d5ab7db3327783",
   "gate_result": "failed",
   "identifier_map_sha256": "sha256:420728bdf408ac4607beeb99392c0fe23218a8e4b1681023b6a7d44349e37eb4",
-  "input_lock_sha256": "sha256:429fdc9fbda14c53c1da719aeacb23f748fc1d9003b4186a34f343de3850c02a",
+  "input_lock_sha256": "sha256:e654396f6cafde2ef1dbac4e10bd474be96c0014e0e8231e9075b5365166e416",
   "optional_modules": {
     "embedding": false
   },

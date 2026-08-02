@@ -16,7 +16,18 @@ from typing import Annotated, Literal
 import yaml
 from pydantic import ConfigDict, Field, PositiveInt, TypeAdapter, model_validator
 
-from paper_search.domain.models import DomainModel, NonEmptyStr, SafeRelativePath, Sha256
+from paper_search.domain.models import (
+    DomainModel,
+    NonEmptyStr,
+    NonNegativeInt,
+    SafeRelativePath,
+    Sha256,
+)
+
+
+_EMPTY_RECEIPTS_SHA256 = (
+    "sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+)
 
 
 class _LockModel(DomainModel):
@@ -41,6 +52,11 @@ class FrozenDataBinding(_LockModel):
 class CapturePolicyBinding(_LockModel):
     snapshot_schema: Literal["dependency-snapshot-v2"]
     capture_policy_sha256: Sha256
+
+
+class ProjectLedgerBinding(_LockModel):
+    receipt_count: NonNegativeInt = 0
+    receipts_sha256: Sha256 = _EMPTY_RECEIPTS_SHA256
 
 
 class TimeoutBinding(_LockModel):
@@ -118,6 +134,7 @@ class _LiveInputLockBase(_LockModel):
     pricing_policy: ArtifactBinding
     quality_gates: ArtifactBinding
     capture_policy: CapturePolicyBinding
+    project_ledger: ProjectLedgerBinding = ProjectLedgerBinding()
     approval_ref: NonEmptyStr
 
 
@@ -157,6 +174,7 @@ class ReplayLock(_LockModel):
     pricing_policy: ArtifactBinding
     quality_gates: ArtifactBinding
     capture_policy: CapturePolicyBinding
+    project_ledger: ProjectLedgerBinding = ProjectLedgerBinding()
     snapshot_set_id: NonEmptyStr
     snapshot_manifest_sha256: Sha256
 

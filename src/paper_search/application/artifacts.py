@@ -530,6 +530,10 @@ class FormalRunWorkspace:
             self._work_dir / "snapshot-manifest.json",
             snapshot_bytes,
         )
+        self._write(
+            self._work_dir / "gates.json",
+            _model_json_bytes(gate_evaluation),
+        )
         self._manifest = self._manifest.model_copy(
             update={
                 "status": "complete",

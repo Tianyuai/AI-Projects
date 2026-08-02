@@ -209,6 +209,10 @@ class SearchApplicationService:
                 stop_reason=stop_reason,
             ),
             diagnostics=diagnostics,
+            retrieved_paper_ids=(result.retrieved_paper_ids if result is not None else []),
+            post_filter_paper_ids=(
+                result.post_filter_paper_ids if result is not None else []
+            ),
             business_result_sha256=business_result_sha256(
                 hard_failure_business_result(
                     query_id=request.query_id,
@@ -308,6 +312,8 @@ class SearchApplicationService:
         return SearchExecutionResult(
             outcome=SearchSuccess(response=response),
             diagnostics=result.diagnostics,
+            retrieved_paper_ids=result.retrieved_paper_ids,
+            post_filter_paper_ids=result.post_filter_paper_ids,
             business_result_sha256=business_result_sha256(
                 business_result_from_response(response)
             ),

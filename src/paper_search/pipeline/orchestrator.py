@@ -18,6 +18,7 @@ from paper_search.domain.models import (
     DependencyName,
     DomainModel,
     ErrorDetail,
+    NonEmptyStr,
     Paper,
     PlannerStatus,
     ProviderResult,
@@ -67,6 +68,8 @@ class OrchestratorResult(DomainModel):
     partial_relevance: list[RankedPaper]
     citation_edges: list[ResolvedCitationEdge]
     provider_results: dict[DependencyName, ProviderResult[list[Paper]]]
+    retrieved_paper_ids: list[NonEmptyStr] = Field(default_factory=list)
+    post_filter_paper_ids: list[NonEmptyStr] = Field(default_factory=list)
     diagnostics: list[DependencyDiagnostic]
     planner_status: PlannerStatus
     trace: list[dict[str, object]]
@@ -621,6 +624,10 @@ class MockSearchOrchestrator:
             citation_edges=citation_edges,
             diagnostics=diagnostics,
             planner_status=analysis.planner_status,
+            retrieved_paper_ids=[paper.canonical_id for paper in merged.papers],
+            post_filter_paper_ids=[
+                item.paper.canonical_id for item in filtered.accepted
+            ],
         )
 
     def _result(
@@ -639,6 +646,8 @@ class MockSearchOrchestrator:
         citation_edges: list[ResolvedCitationEdge] | None = None,
         diagnostics: list[DependencyDiagnostic] | None = None,
         planner_status: PlannerStatus = "primary",
+        retrieved_paper_ids: list[str] | None = None,
+        post_filter_paper_ids: list[str] | None = None,
     ) -> OrchestratorResult:
         del papers
         return OrchestratorResult(
@@ -648,6 +657,8 @@ class MockSearchOrchestrator:
             partial_relevance=partial_relevance or [],
             citation_edges=citation_edges or [],
             provider_results=provider_results,
+            retrieved_paper_ids=retrieved_paper_ids or [],
+            post_filter_paper_ids=post_filter_paper_ids or [],
             diagnostics=diagnostics or [],
             planner_status=planner_status,
             trace=trace,

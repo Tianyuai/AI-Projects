@@ -1,5 +1,7 @@
+import hashlib
 import json
 import shutil
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -355,14 +357,44 @@ def test_validator_rejects_foreign_project_receipts(tmp_path: Path) -> None:
     )
     foreign["actual"] = dict(foreign["actual"])
     foreign["actual"]["cost_cny"] = "100"
+    foreign["estimate"] = dict(foreign["estimate"])
+    foreign["estimate"]["cost_cny"] = "100"
     payload["receipts"].append(foreign)
-    payload["project_actual_cny"] = "100"
+    payload["project_actual_cny"] = str(
+        sum(Decimal(item["actual"]["cost_cny"]) for item in payload["receipts"])
+    )
+    payload["project_receipt_count"] = len(payload["receipts"])
+    canonical = json.dumps(
+        payload["receipts"],
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    payload["project_receipts_sha256"] = (
+        f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+    )
     (run / "usage.json").write_text(json.dumps(payload), encoding="utf-8")
+    manifest = json.loads((run / "run.json").read_bytes())
+    manifest["project_receipt_count"] = payload["project_receipt_count"]
+    manifest["project_receipts_sha256"] = payload["project_receipts_sha256"]
+    (run / "run.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     result = validate_run_directory(run)
 
     assert not result.valid
     assert "ledger_invalid" in {issue.code for issue in result.issues}
+
+
+def test_canonical_formal_pair_publishes_every_gate_check() -> None:
+    policy = yaml.safe_load(Path("configs/quality_gates_v1.yaml").read_bytes())
+    expected = [
+        rule["rule_id"]
+        for rule in policy["rules"]
+        if "dev" in rule["applies_to"]
+    ]
+    payload = json.loads((FIXTURE_ROOT / "capture" / "gates.json").read_bytes())
+
+    assert [check["rule_id"] for check in payload["checks"] if check["applies"]] == expected
 
 
 def test_validator_rejects_symlink_run_root(tmp_path: Path) -> None:

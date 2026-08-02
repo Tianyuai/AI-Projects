@@ -1,0 +1,775 @@
+{
+  "checks": [
+    {
+      "applies": true,
+      "classification": "formal_validity",
+      "measure": {
+        "denominator": "2",
+        "numerator": "2",
+        "value": "1"
+      },
+      "operator": "eq",
+      "passed": true,
+      "rule_id": "prediction-cardinality",
+      "threshold": 1
+    },
+    {
+      "applies": true,
+      "classification": "formal_validity",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "eq",
+      "passed": true,
+      "rule_id": "hard-failure-cardinality",
+      "threshold": 1
+    },
+    {
+      "applies": true,
+      "classification": "formal_validity",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "eq",
+      "passed": true,
+      "rule_id": "integrity-failures",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "formal_validity",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "eq",
+      "passed": true,
+      "rule_id": "provenance-failures",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "formal_validity",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "eq",
+      "passed": true,
+      "rule_id": "sanitization-failures",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "formal_validity",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "eq",
+      "passed": true,
+      "rule_id": "unaccounted-usage-failures",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "formal_validity",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "eq",
+      "passed": true,
+      "rule_id": "budget-ledgers-within-cap",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "baseline_quality",
+      "measure": {
+        "denominator": "2",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "gte",
+      "passed": false,
+      "rule_id": "model-produced-analysis-rate",
+      "threshold": "0.99"
+    },
+    {
+      "applies": false,
+      "classification": "baseline_quality",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "strong-constraint-recall",
+      "threshold": "0.90"
+    },
+    {
+      "applies": true,
+      "classification": "baseline_quality",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": false,
+      "rule_id": "retrieval-response-rate",
+      "threshold": "0.95"
+    },
+    {
+      "applies": false,
+      "classification": "baseline_quality",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "fuzzy-merge-accuracy",
+      "threshold": "0.98"
+    },
+    {
+      "applies": false,
+      "classification": "formal_validity",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gt",
+      "passed": null,
+      "rule_id": "fuzzy-merge-audit-denominator",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "baseline_quality",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "lte",
+      "passed": false,
+      "rule_id": "hard-filter-recall-loss",
+      "threshold": "0.02"
+    },
+    {
+      "applies": true,
+      "classification": "baseline_quality",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gt",
+      "passed": false,
+      "rule_id": "macro-recall-positive",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "baseline_quality",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gt",
+      "passed": false,
+      "rule_id": "micro-recall-positive",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "report-macro-precision",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "report-micro-precision",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "report-macro-recall",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "report-micro-recall",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "report-macro-f1",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "report-micro-f1",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "report-recall-at-5",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "report-recall-at-10",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "report-recall-at-20",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "2",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "gte",
+      "passed": true,
+      "rule_id": "report-hard-failure-rate",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "2",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "gte",
+      "passed": true,
+      "rule_id": "report-partial-result-rate",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "2",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "gte",
+      "passed": true,
+      "rule_id": "report-planner-fallback-rate",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "gte",
+      "passed": true,
+      "rule_id": "report-latency-p50",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "gte",
+      "passed": true,
+      "rule_id": "report-latency-p95",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "gte",
+      "passed": true,
+      "rule_id": "report-external-calls",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "gte",
+      "passed": true,
+      "rule_id": "report-tokens",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "gte",
+      "passed": true,
+      "rule_id": "report-valued-cost",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "2",
+        "numerator": "2",
+        "value": "1"
+      },
+      "operator": "gte",
+      "passed": true,
+      "rule_id": "report-cache-hit-rate",
+      "threshold": 0
+    },
+    {
+      "applies": false,
+      "classification": "promotion",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "promotion-median-macro-f1-delta",
+      "threshold": "0.01"
+    },
+    {
+      "applies": false,
+      "classification": "promotion",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "promotion-bootstrap-lower-bound",
+      "threshold": "-0.005"
+    },
+    {
+      "applies": false,
+      "classification": "promotion",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "lte",
+      "passed": null,
+      "rule_id": "promotion-validation-macro-f1-drop",
+      "threshold": "0.01"
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "dev-macro-f1-min",
+      "threshold": "0.30"
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "dev-macro-f1-delta",
+      "threshold": "0.03"
+    },
+    {
+      "applies": false,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "validation-macro-f1-delta",
+      "threshold": "0.02"
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "eq",
+      "passed": null,
+      "rule_id": "structured-schema-valid-rate",
+      "threshold": 1
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "structured-valid-paper-link-rate",
+      "threshold": "0.99"
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "structured-reason-complete-rate",
+      "threshold": "0.95"
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "eq",
+      "passed": null,
+      "rule_id": "structured-verifiable-citation-edge-rate",
+      "threshold": 1
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "eq",
+      "passed": null,
+      "rule_id": "structured-fabrication-count",
+      "threshold": 0
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "lte",
+      "passed": true,
+      "rule_id": "latency-p50-target-ms",
+      "threshold": 30000
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "1",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "lte",
+      "passed": true,
+      "rule_id": "latency-p95-target-ms",
+      "threshold": 80000
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "2",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "lte",
+      "passed": true,
+      "rule_id": "batch-hard-failure-rate",
+      "threshold": "0.02"
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "2",
+        "numerator": "0",
+        "value": "0"
+      },
+      "operator": "lte",
+      "passed": true,
+      "rule_id": "batch-partial-result-rate",
+      "threshold": "0.05"
+    },
+    {
+      "applies": false,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "lte",
+      "passed": null,
+      "rule_id": "unseen-domain-macro-f1-drop",
+      "threshold": "0.05"
+    },
+    {
+      "applies": false,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "lte",
+      "passed": null,
+      "rule_id": "query-type-macro-f1-drop",
+      "threshold": "0.02"
+    },
+    {
+      "applies": false,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "eq",
+      "passed": null,
+      "rule_id": "doi-exact-merge-rate",
+      "threshold": 1
+    },
+    {
+      "applies": false,
+      "classification": "promotion",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "rerank-relevance-judgement-accuracy",
+      "threshold": "0.85"
+    },
+    {
+      "applies": true,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "lte",
+      "passed": null,
+      "rule_id": "cached-repeat-latency-p50-ms",
+      "threshold": 8000
+    },
+    {
+      "applies": false,
+      "classification": "promotion",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "adaptive-macro-f1-delta",
+      "threshold": "0.02"
+    },
+    {
+      "applies": false,
+      "classification": "promotion",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "gte",
+      "passed": null,
+      "rule_id": "adaptive-internal-score-delta",
+      "threshold": "0.02"
+    },
+    {
+      "applies": false,
+      "classification": "promotion",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "lte",
+      "passed": null,
+      "rule_id": "adaptive-f1-decline",
+      "threshold": "0.005"
+    },
+    {
+      "applies": false,
+      "classification": "promotion",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "lte",
+      "passed": null,
+      "rule_id": "adaptive-failure-rate-increase",
+      "threshold": "0.01"
+    },
+    {
+      "applies": false,
+      "classification": "reporting_only",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "lte",
+      "passed": null,
+      "rule_id": "bilingual-query-f1-drop",
+      "threshold": "0.05"
+    },
+    {
+      "applies": false,
+      "classification": "promotion",
+      "measure": {
+        "denominator": "0",
+        "numerator": "0",
+        "value": null
+      },
+      "operator": "eq",
+      "passed": null,
+      "rule_id": "promotion-bootstrap-samples",
+      "threshold": 1000
+    }
+  ],
+  "formal_valid": true,
+  "gate_result": "failed",
+  "quality_passed": false,
+  "split": "dev"
+}

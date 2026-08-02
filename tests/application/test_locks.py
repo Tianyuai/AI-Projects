@@ -109,6 +109,7 @@ def test_live_lock_models_have_exact_serialized_fields() -> None:
         "pricing_policy",
         "quality_gates",
         "capture_policy",
+        "project_ledger",
         "approval_ref",
     }
 
@@ -134,6 +135,7 @@ def test_replay_lock_has_exact_serialized_fields_and_no_approval_ref() -> None:
         "pricing_policy",
         "quality_gates",
         "capture_policy",
+        "project_ledger",
         "snapshot_set_id",
         "snapshot_manifest_sha256",
     }

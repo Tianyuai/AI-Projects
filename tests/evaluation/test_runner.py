@@ -34,6 +34,7 @@ from paper_search.domain.models import (
     UsageActual,
 )
 from paper_search.evaluation.dataset import EvaluationQuery, PredictionRecord
+from paper_search.evaluation.execution_adapter import EvaluationExecutionRecord
 from paper_search.evaluation.metrics import CONTRACT_VERSION
 from paper_search.evaluation.gates import MeasureValue
 from paper_search.evaluation.runner import (
@@ -2361,6 +2362,12 @@ def test_partial_second_reservation_failure_closes_bundle_and_first_query(
             del args, kwargs
             self.count = 0
 
+        def project_checkpoint(self) -> tuple[int, str]:
+            return (
+                lock.project_ledger.receipt_count,
+                lock.project_ledger.receipts_sha256,
+            )
+
         def reserve(self, **kwargs: object) -> runner_module.LedgerReservation:
             self.count += 1
             query_id = str(kwargs["query_id"])
@@ -2480,6 +2487,8 @@ def test_post_publication_attempt_transition_error_does_not_mark_run_failed(
         lock.model_dump(mode="python"), sort_keys=False
     ).encode()
     targets: list[str] = []
+    claims: list[dict[str, object]] = []
+    predecessor_hash = "sha256:" + "b" * 64
 
     class FakeService:
         async def execute(self, request: object, *, run_id: str | None = None):
@@ -2523,8 +2532,12 @@ def test_post_publication_attempt_transition_error_does_not_mark_run_failed(
             return FakeBundle()
 
     class FakeAttemptStore:
+        def replacement_binding(self, validation_lock_sha256: str) -> tuple[str, str]:
+            assert validation_lock_sha256 == runner_module.lock_sha256(lock)
+            return predecessor_hash, "INC-successor"
+
         def claim(self, **kwargs: object) -> None:
-            del kwargs
+            claims.append(kwargs)
 
         def transition(self, **kwargs: object) -> None:
             target = str(kwargs["target"])
@@ -2583,6 +2596,8 @@ def test_post_publication_attempt_transition_error_does_not_mark_run_failed(
     assert result.status == "complete"
     assert result.run_path.is_dir()
     assert targets == ["complete"]
+    assert claims[0]["supersedes_validation_lock_sha256"] == predecessor_hash
+    assert claims[0]["incident_ref"] == "INC-successor"
 
 
 def test_formal_integrity_guard_stops_unaccounted_usage() -> None:
@@ -2705,7 +2720,7 @@ def test_stale_prepublication_claim_is_reconciled_to_interrupted(
     assert claim.incident_ref == f"automatic-recovery:{run_id}"
 
 
-def test_all_applicable_reporting_measures_have_values() -> None:
+def test_missing_reporting_measures_are_not_fabricated_as_zero() -> None:
     policy = runner_module.parse_quality_gate_policy_bytes(
         Path("configs/quality_gates_v1.yaml").read_bytes()
     )
@@ -2713,8 +2728,53 @@ def test_all_applicable_reporting_measures_have_values() -> None:
         {}, policy=policy, split="dev"
     )
 
-    assert all(
-        measures[rule.measure].value is not None
-        for rule in policy.rules
-        if "dev" in rule.applies_to and rule.classification == "reporting_only"
+    assert measures["dev_macro_f1"].denominator == 0
+    assert measures["dev_macro_f1"].value is None
+
+
+def test_retrieval_and_filter_gates_use_frozen_relevant_ids() -> None:
+    gold = [
+        EvaluationQuery(
+            query_id="q1",
+            query="one",
+            relevant_paper_ids=["openalex:W1", "openalex:W2"],
+            metadata={"split": "dev"},
+        )
+    ]
+    execution = EvaluationExecutionRecord(
+        query_id="q1",
+        run_id="formal-1",
+        outcome_kind="success",
+        business_result_sha256="sha256:" + "a" * 64,
+        usage=UsageActual(cost_cny=Decimal("0")),
+        diagnostics=[],
+        retrieved_paper_ids=["openalex:W1", "openalex:W2"],
+        post_filter_paper_ids=["openalex:W1"],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        stop_reason="completed",
+    )
+    measures = runner_module.formal_audit_measures(
+        frozen_queries=gold,
+        executions=[execution],
+        business_results=[],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("3"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+    )
+
+    assert measures["parseable_configured_retrieval_response_rate"] == MeasureValue(
+        numerator=2, denominator=2, value=1
+    )
+    assert measures["hard_filter_absolute_recall_loss"] == MeasureValue(
+        numerator=1, denominator=2, value=Decimal("0.5")
     )

@@ -152,6 +152,27 @@ class ValidationAttemptStore:
             claims.append(self.read(expected))
         return claims
 
+    def replacement_binding(
+        self,
+        validation_lock_sha256: Sha256,
+    ) -> tuple[Sha256, NonEmptyStr] | None:
+        """Return the latest terminal incident a new lock must supersede."""
+        self._digest(validation_lock_sha256)
+        if not self._attempts_root.exists():
+            return None
+        existing = self._existing_claims()
+        if not existing:
+            return None
+        predecessor = max(
+            existing,
+            key=lambda item: (item.claimed_at, item.validation_lock_sha256),
+        )
+        if predecessor.state not in {"failed", "interrupted"}:
+            return None
+        if predecessor.incident_ref is None:
+            raise ValueError("terminal replacement predecessor has no incident")
+        return predecessor.validation_lock_sha256, predecessor.incident_ref
+
     def claim(
         self,
         *,

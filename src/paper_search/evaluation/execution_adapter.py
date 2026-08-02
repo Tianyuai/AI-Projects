@@ -6,6 +6,8 @@ import hashlib
 import json
 from typing import Literal, cast
 
+from pydantic import Field, model_validator
+
 from paper_search.application.contracts import (
     DependencyDiagnostic,
     SearchErrorCode,
@@ -75,10 +77,18 @@ class EvaluationExecutionRecord(DomainModel):
     business_result_sha256: Sha256
     usage: UsageActual
     diagnostics: list[DependencyDiagnostic]
+    retrieved_paper_ids: list[NonEmptyStr] = Field(default_factory=list)
+    post_filter_paper_ids: list[NonEmptyStr] = Field(default_factory=list)
     is_partial: bool
     planner_status: PlannerStatus | None
     planner_fallback: bool
     stop_reason: NonEmptyStr
+
+    @model_validator(mode="after")
+    def validate_filter_evidence(self) -> EvaluationExecutionRecord:
+        if not set(self.post_filter_paper_ids) <= set(self.retrieved_paper_ids):
+            raise ValueError("post-filter IDs must be a subset of retrieved IDs")
+        return self
 
 
 class AdaptedExecution(DomainModel):
@@ -193,6 +203,8 @@ def adapt_execution(
                 business_result_sha256=digest,
                 usage=outcome.usage,
                 diagnostics=diagnostics,
+                retrieved_paper_ids=result.retrieved_paper_ids,
+                post_filter_paper_ids=result.post_filter_paper_ids,
                 is_partial=False,
                 planner_status=None,
                 planner_fallback=False,
@@ -218,6 +230,8 @@ def adapt_execution(
             business_result_sha256=digest,
             usage=response.usage,
             diagnostics=diagnostics,
+            retrieved_paper_ids=result.retrieved_paper_ids,
+            post_filter_paper_ids=result.post_filter_paper_ids,
             is_partial=response.is_partial,
             planner_status=response.planner_status,
             planner_fallback=response.planner_fallback,

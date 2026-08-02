@@ -92,6 +92,8 @@ class SearchExecutionResult(DomainModel):
     outcome: SearchOutcome
     diagnostics: list[DependencyDiagnostic]
     business_result_sha256: Sha256 | None
+    retrieved_paper_ids: list[NonEmptyStr] = Field(default_factory=list)
+    post_filter_paper_ids: list[NonEmptyStr] = Field(default_factory=list)
 
 
 class ReadyHealthResponse(DomainModel):

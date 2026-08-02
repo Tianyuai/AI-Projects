@@ -8,7 +8,7 @@ from decimal import Decimal
 from paper_search.control.ledger import LedgerReport
 from paper_search.control.pricing import QualityGatePolicy
 from paper_search.evaluation.business_results import BusinessResultRecord
-from paper_search.evaluation.dataset import EvaluationQuery
+from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap
 from paper_search.evaluation.execution_adapter import (
     EvaluationExecutionRecord,
     EvaluationFailureRecord,
@@ -35,12 +35,30 @@ def formal_audit_measures(
     business_results: Sequence[BusinessResultRecord],
     failures: Sequence[EvaluationFailureRecord],
     ledger_report: LedgerReport,
+    identifier_map: IdentifierMap | None = None,
 ) -> dict[str, MeasureValue]:
     """Derive all applicable enforced and core reporting measures."""
     count = len(frozen_queries)
     diagnostics = [item for execution in executions for item in execution.diagnostics]
     error_codes = [error.code for item in diagnostics for error in item.errors]
     hard_failure_count = len(failures)
+    resolve = identifier_map.resolve if identifier_map is not None else lambda value: value
+    execution_by_query = {execution.query_id: execution for execution in executions}
+    relevant_count = 0
+    retrieved_relevant_count = 0
+    post_filter_relevant_count = 0
+    for query in frozen_queries:
+        relevant = {resolve(identifier) for identifier in query.relevant_paper_ids}
+        relevant_count += len(relevant)
+        execution = execution_by_query.get(query.query_id)
+        if execution is None:
+            continue
+        retrieved = {resolve(identifier) for identifier in execution.retrieved_paper_ids}
+        post_filter = {
+            resolve(identifier) for identifier in execution.post_filter_paper_ids
+        }
+        retrieved_relevant_count += len(relevant & retrieved)
+        post_filter_relevant_count += len(relevant & post_filter)
     actual_matches = all(
         getattr(ledger_report.actual, field)
         == sum(getattr(execution.usage, field) for execution in executions)
@@ -91,15 +109,12 @@ def formal_audit_measures(
             count,
         ),
         "parseable_configured_retrieval_response_rate": _measure(
-            sum(not item.errors for item in diagnostics),
-            len(diagnostics),
+            retrieved_relevant_count,
+            relevant_count,
         ),
         "hard_filter_absolute_recall_loss": _measure(
-            sum(
-                any(warning.startswith("hard_filter_recall_loss") for warning in record.warnings)
-                for record in business_results
-            ),
-            count,
+            retrieved_relevant_count - post_filter_relevant_count,
+            relevant_count,
         ),
         "hard_failure_rate": _measure(hard_failure_count, count),
         "partial_result_rate": _measure(
@@ -137,14 +152,11 @@ def complete_policy_measures(
     """Represent every applicable policy measure, explicitly marking unavailable data."""
     completed = measures.copy()
     unavailable = MeasureValue(numerator=Decimal(0), denominator=Decimal(0), value=None)
-    reported_zero = MeasureValue(
-        numerator=Decimal(0), denominator=Decimal(1), value=Decimal(0)
-    )
     for rule in policy.rules:
         if split in rule.applies_to:
             completed.setdefault(
                 rule.measure,
-                reported_zero if rule.classification == "reporting_only" else unavailable,
+                unavailable,
             )
     return completed
 

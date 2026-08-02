@@ -916,31 +916,7 @@ class SQLiteBudgetLedger:
             receipt_rows = connection.execute(
                 "SELECT * FROM reservations ORDER BY rowid",
             ).fetchall()
-            receipts = [
-                LedgerReceipt(
-                    reservation_id=row["reservation_id"],
-                    run_id=row["run_id"],
-                    query_id=row["query_id"],
-                    estimate=_usage_from_row(row, prefix="estimate", actual=False),
-                    state=row["state"],
-                    actual=(
-                        None
-                        if row["state"] == "reserved" and not row["checkpoint_present"]
-                        else UsageActual.model_validate(
-                            _usage_from_row(
-                                row,
-                                prefix=(
-                                    "checkpoint"
-                                    if row["state"] == "reserved"
-                                    else "actual"
-                                ),
-                                actual=True,
-                            ).model_dump()
-                        )
-                    ),
-                )
-                for row in receipt_rows
-            ]
+            receipts = [self._receipt_from_row(row) for row in receipt_rows]
             receipt_bytes = (
                 json.dumps(
                     [receipt.model_dump(mode="json") for receipt in receipts],
@@ -967,6 +943,51 @@ class SQLiteBudgetLedger:
                     f"sha256:{hashlib.sha256(receipt_bytes).hexdigest()}"
                 ),
             )
+
+    def project_checkpoint(self) -> tuple[int, Sha256]:
+        """Return the append-only receipt count and canonical history root."""
+        with self._immediate() as connection:
+            self._recover_locked(connection)
+            rows = connection.execute(
+                "SELECT * FROM reservations ORDER BY rowid"
+            ).fetchall()
+            receipts = [self._receipt_from_row(row) for row in rows]
+            receipt_bytes = (
+                json.dumps(
+                    [receipt.model_dump(mode="json") for receipt in receipts],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            return (
+                len(receipts),
+                f"sha256:{hashlib.sha256(receipt_bytes).hexdigest()}",
+            )
+
+    @staticmethod
+    def _receipt_from_row(row: sqlite3.Row) -> LedgerReceipt:
+        return LedgerReceipt(
+            reservation_id=row["reservation_id"],
+            run_id=row["run_id"],
+            query_id=row["query_id"],
+            estimate=_usage_from_row(row, prefix="estimate", actual=False),
+            state=row["state"],
+            actual=(
+                None
+                if row["state"] == "reserved" and not row["checkpoint_present"]
+                else UsageActual.model_validate(
+                    _usage_from_row(
+                        row,
+                        prefix=(
+                            "checkpoint" if row["state"] == "reserved" else "actual"
+                        ),
+                        actual=True,
+                    ).model_dump()
+                )
+            ),
+        )
 
     def close(self) -> None:
         if self._memory is not None:

@@ -44,7 +44,7 @@ from paper_search.evaluation.formal_evidence import (
     formal_audit_measures,
 )
 from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap
-from paper_search.evaluation.gates import evaluate_gates
+from paper_search.evaluation.gates import GateEvaluation, evaluate_gates
 from paper_search.evaluation.metrics import EvaluationResult, evaluate
 from paper_search.evaluation.official_adapter import (
     InternalPredictionRecord,
@@ -63,6 +63,7 @@ _REQUIRED_FILES = frozenset(
         "config.lock.yaml",
         "executions.jsonl",
         "failures.jsonl",
+        "gates.json",
         "metrics.json",
         "predictions.jsonl",
         "replay.lock.yaml",
@@ -377,6 +378,9 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
         business = _jsonl(root / "business-results.jsonl", BusinessResultRecord)
         failures = _jsonl(root / "failures.jsonl", EvaluationFailureRecord)
         metrics = EvaluationResult.model_validate_json((root / "metrics.json").read_bytes())
+        published_gate = GateEvaluation.model_validate_json(
+            (root / "gates.json").read_bytes()
+        )
         usage = LedgerReport.model_validate_json((root / "usage.json").read_bytes())
         query_ids = [getattr(record, "query_id") for record in predictions]
         frozen_ids = [query.query_id for query in frozen_queries]
@@ -468,6 +472,9 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             and Decimal(expected_usage["cost_cny"] or 0) <= expected_run_cap
             and project_actual + project_reserved <= PROJECT_HARD_CAP_CNY
         )
+        prior_receipt_count = lock.project_ledger.receipt_count
+        prior_receipts = usage.receipts[:prior_receipt_count]
+        current_receipts = usage.receipts[prior_receipt_count:]
         ledger_valid = (
             usage.run_id == manifest.run_id
             and usage.reserved == type(usage.reserved)(cost_cny=Decimal("0"))
@@ -482,6 +489,12 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
             )
             and manifest.project_receipt_count == usage.project_receipt_count
             and manifest.project_receipts_sha256 == usage.project_receipts_sha256
+            and prior_receipt_count <= len(usage.receipts)
+            and _receipts_sha256(
+                [receipt.model_dump(mode="json") for receipt in prior_receipts]
+            )
+            == lock.project_ledger.receipts_sha256
+            and current_receipts == run_receipts
             and usage.within_caps == recomputed_within_caps
             and usage.within_caps
             and [receipt.query_id for receipt in run_receipts] == query_ids
@@ -518,6 +531,7 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
                 ],
                 failures=failure_records,
                 ledger_report=usage,
+                identifier_map=identifier_map,
             ),
             policy=gate_policy,
             split=manifest.split,
@@ -533,6 +547,14 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
         )
         if recomputed_gate.gate_result != manifest.gate_result:
             issues.append(_issue("gate_invalid", "run.json", "Stored Gate result does not match policy"))
+        if published_gate != recomputed_gate:
+            issues.append(
+                _issue(
+                    "gate_invalid",
+                    "gates.json",
+                    "Published Gate checks do not match frozen evidence",
+                )
+            )
         if manifest.failure_count != failure_count:
             issues.append(_issue("failure_coverage_invalid", "run.json", "Failure count is invalid"))
         failure_by_query = {record.query_id: record for record in failure_records}

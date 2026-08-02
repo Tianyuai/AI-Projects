@@ -68,5 +68,8 @@ quality_gates:
 capture_policy:
   snapshot_schema: dependency-snapshot-v2
   capture_policy_sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000
+project_ledger:
+  receipt_count: 0
+  receipts_sha256: sha256:37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570
 snapshot_set_id: sha256:719ae63efb62865e219fd272bd8b113e627c46453a13b4ef7a0c7af3b4c06c83
 snapshot_manifest_sha256: sha256:145d5e6b44a109a30485ea8f02e6e95d1f6a241eace7dfc2c017579a9f2508f3

@@ -1150,6 +1150,7 @@ async def _run_formal_evaluation(
     )
     attempt_store: ValidationAttemptStore | None = None
     attempt_hash: str | None = None
+    replacement_binding: tuple[str, str] | None = None
     if request.mode == "live" and isinstance(inputs.lock, ValidationLock):
         attempt_store = attempt_store_factory(request.output_root)
         attempt_hash = lock_sha256(inputs.lock)
@@ -1158,6 +1159,7 @@ async def _run_formal_evaluation(
             validation_lock_sha256=attempt_hash,
             output_root=request.output_root,
         )
+        replacement_binding = attempt_store.replacement_binding(attempt_hash)
     bundle = composition_root.compose(
         lock_path=request.lock_path,
         mode=request.mode,
@@ -1234,6 +1236,12 @@ async def _run_formal_evaluation(
             clock=clock,
             replay=request.mode == "replay",
         )
+        checkpoint_count, checkpoint_sha256 = ledger.project_checkpoint()
+        if (
+            checkpoint_count != inputs.lock.project_ledger.receipt_count
+            or checkpoint_sha256 != inputs.lock.project_ledger.receipts_sha256
+        ):
+            raise ValueError("project ledger checkpoint does not match input lock")
     except BaseException:
         await bundle.aclose()
         raise
@@ -1274,6 +1282,12 @@ async def _run_formal_evaluation(
                 validation_lock_sha256=attempt_hash,
                 run_id=run_id,
                 claimed_at=started_at,
+                supersedes_validation_lock_sha256=(
+                    replacement_binding[0] if replacement_binding is not None else None
+                ),
+                incident_ref=(
+                    replacement_binding[1] if replacement_binding is not None else None
+                ),
             )
             claim_created = True
 
@@ -1321,6 +1335,7 @@ async def _run_formal_evaluation(
                 business_results=business_results,
                 failures=failures,
                 ledger_report=report,
+                identifier_map=inputs.identifier_map,
             ),
             policy=inputs.gate_policy,
             split=request.split,
@@ -1356,6 +1371,7 @@ async def _run_formal_evaluation(
                 pricing_policy=inputs.lock.pricing_policy,
                 quality_gates=inputs.lock.quality_gates,
                 capture_policy=inputs.lock.capture_policy,
+                project_ledger=inputs.lock.project_ledger,
                 snapshot_set_id=snapshot_set_id,
                 snapshot_manifest_sha256=snapshot_sha256,
             )

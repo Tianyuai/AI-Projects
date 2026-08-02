@@ -307,7 +307,7 @@ def test_complete_status_is_independent_from_failed_gate(tmp_path: Path) -> None
     assert set(path.name for path in destination.iterdir()) == {
         "run.json", "config.lock.yaml", "replay.lock.yaml", "snapshot-manifest.json",
         "predictions.jsonl", "executions.jsonl", "business-results.jsonl",
-        "metrics.json", "usage.json", "failures.jsonl", "snapshots",
+        "metrics.json", "usage.json", "gates.json", "failures.jsonl", "snapshots",
     }
 
 

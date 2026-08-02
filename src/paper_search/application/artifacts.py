@@ -284,7 +284,16 @@ class FormalRunWorkspace:
         self._ensure_active()
         if self._snapshot_store is None:
             raise RuntimeError("snapshot capture is available only for live workspaces")
-        return self._snapshot_store.seal()
+        manifest = self._snapshot_store.seal()
+        manifest_bytes = self._snapshot_store.manifest_path.read_bytes()
+        self._manifest = self._manifest.model_copy(
+            update={
+                "snapshot_set_id": manifest.snapshot_set_id,
+                "snapshot_manifest_sha256": _sha256(manifest_bytes),
+            }
+        )
+        self._write_manifest()
+        return manifest
 
     def _ensure_active(self) -> None:
         if self._terminal:

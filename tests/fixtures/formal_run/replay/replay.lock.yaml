@@ -6,14 +6,14 @@ source_git_sha: task2-fixture-commit
 runtime_allow_live: true
 frozen_data:
   manifest:
-    path: data/manifest.json
-    sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    path: tests/fixtures/formal_run/inputs/manifest.json
+    sha256: sha256:14d561274749db7a9a34aaff18a5e5ed22af31cf7bd46257dfb41895ce6df6ee
   identifier_map:
-    path: data/identifier-map.json
-    sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    path: tests/fixtures/formal_run/inputs/identifier-map.json
+    sha256: sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
   split: dev
   query_count: 2
-  partition_sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  partition_sha256: sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5
 baseline:
   primary_model: qwen3.7-plus
   fallback_model: qwen3.6-flash

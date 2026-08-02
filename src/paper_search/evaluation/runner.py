@@ -24,22 +24,23 @@ from pydantic import BaseModel, ValidationError
 from paper_search.config import RuntimeConfig, load_runtime_config
 from paper_search.application.composition import CompositionRoot
 from paper_search.application.contracts import (
-    SearchErrorResponse,
     SearchExecutionResult,
-    SearchFailure,
     SearchRequest,
 )
-from paper_search.evaluation.attempts import ValidationAttemptStore
+from paper_search.evaluation.attempts import (
+    ValidationAttemptConflictError,
+    ValidationAttemptStore,
+)
 from paper_search.evaluation.execution_adapter import AdaptedExecution, adapt_execution
 from paper_search.application.artifacts import FormalRunWorkspace, RunManifest
 from paper_search.application.locks import (
     CandidateLock,
     ReplayLock,
     ValidationLock,
-    load_verified_input_lock,
+    load_verified_input_lock_bytes,
     lock_sha256,
 )
-from paper_search.control.ledger import SQLiteBudgetLedger
+from paper_search.control.ledger import LedgerReservation, SQLiteBudgetLedger
 from paper_search.control.pricing import (
     QualityGatePolicy,
     parse_quality_gate_policy_bytes,
@@ -183,8 +184,19 @@ class _FormalInputs:
 def _load_formal_inputs(request: EvaluationRunRequest) -> _FormalInputs:
     artifact_root = Path.cwd().resolve()
     lock_bytes = request.lock_path.read_bytes()
-    verified = load_verified_input_lock(request.lock_path, artifact_root=artifact_root)
+    verified = load_verified_input_lock_bytes(lock_bytes, artifact_root=artifact_root)
     lock = verified.lock
+    if _current_git_sha() != lock.source_git_sha:
+        raise ValueError("current source SHA does not match input lock")
+    tracked = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=5,
+    )
+    if tracked.returncode != 0 or tracked.stdout:
+        raise ValueError("tracked source must be clean for formal evaluation")
     if request.split != lock.frozen_data.split:
         raise ValueError("evaluation split does not match input lock")
     if request.mode == "replay" and not isinstance(lock, ReplayLock):
@@ -213,9 +225,15 @@ def _load_formal_inputs(request: EvaluationRunRequest) -> _FormalInputs:
     partition_bytes = partition_path.read_bytes()
     if _sha256_bytes(partition_bytes) != partition.sha256:
         raise ValueError("frozen partition hash mismatch")
-    gold = read_jsonl(partition_path, EvaluationQuery)
+    gold = [
+        EvaluationQuery.model_validate_json(line)
+        for line in partition_bytes.splitlines()
+        if line
+    ]
     if len(gold) != partition.query_count:
         raise ValueError("frozen partition count mismatch")
+    if len({query.query_id for query in gold}) != len(gold):
+        raise ValueError("frozen partition query IDs are duplicated")
     identifier_map = IdentifierMap.from_bytes(
         verified.artifact_bytes[lock.frozen_data.identifier_map.path]
     )
@@ -263,6 +281,15 @@ class _ApplicationService(Protocol):
         *,
         run_id: str | None = None,
     ) -> SearchExecutionResult: ...
+
+
+@dataclass
+class _FormalCaptureBinding:
+    run_id: str
+    store: object
+
+    def claim_snapshot_store(self) -> object:
+        return self.store
 
 
 class _CliInputError(ValueError):
@@ -956,9 +983,13 @@ async def _execute_service_batch(
     service: _ApplicationService,
     run_id: str,
     mode: SearchMode,
+    on_start: Callable[[int], None] | None = None,
+    on_record: Callable[[int, AdaptedExecution], None] | None = None,
 ) -> list[AdaptedExecution]:
     records: list[AdaptedExecution] = []
-    for query in gold:
+    for index, query in enumerate(gold):
+        if on_start is not None:
+            on_start(index)
         request = SearchRequest(
             query_id=query.query_id,
             query=query.query,
@@ -968,25 +999,72 @@ async def _execute_service_batch(
             result = await service.execute(request, run_id=run_id)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
-            result = SearchExecutionResult(
-                outcome=SearchFailure(
-                    query_id=query.query_id,
-                    run_id=run_id,
-                    error=SearchErrorResponse(
-                        code="internal_error",
-                        detail="The search could not be completed",
-                        retryable=False,
-                        run_id=run_id,
-                    ),
-                    usage=UsageActual(),
-                    stop_reason="internal_error",
-                ),
-                diagnostics=[],
-                business_result_sha256=None,
-            )
-        records.append(adapt_execution(expected_query_id=query.query_id, result=result))
+        adapted = adapt_execution(expected_query_id=query.query_id, result=result)
+        records.append(adapted)
+        if on_record is not None:
+            on_record(index, adapted)
+        if adapted.failure is not None and adapted.failure.error_code == "integrity_failure":
+            raise ValueError("formal evaluation stopped on integrity failure")
     return records
+
+
+def _close_outstanding_reservations(
+    *,
+    ledger: SQLiteBudgetLedger,
+    reservations: Sequence[LedgerReservation],
+    estimates: Sequence[UsageEstimate],
+    settled: set[int],
+    current_index: int | None,
+) -> None:
+    """Fail every open reservation, conservatively charging the active query."""
+    for index, reservation in enumerate(reservations):
+        if index in settled:
+            continue
+        estimate = (
+            estimates[index]
+            if index == current_index
+            else UsageEstimate(cost_cny=Decimal("0"))
+        )
+        ledger.fail(reservation, UsageActual.model_validate(estimate.model_dump()))
+
+
+def _reject_or_recover_existing_attempt(
+    *,
+    store: ValidationAttemptStore,
+    validation_lock_sha256: str,
+    output_root: Path,
+) -> None:
+    """Recover a published run's claim, then reject every consumed lock hash."""
+    digest = validation_lock_sha256.removeprefix("sha256:")
+    attempts_root = output_root / "validation-attempts"
+    if not (
+        (attempts_root / f"{digest}.claim").exists()
+        or (attempts_root / f".{digest}.terminal").exists()
+    ):
+        return
+    claim = store.read(validation_lock_sha256)
+    if claim.state == "claimed":
+        try:
+            manifest = RunManifest.model_validate_json(
+                (output_root / claim.run_id / "run.json").read_bytes()
+            )
+        except (OSError, ValueError):
+            manifest = None
+        if (
+            manifest is not None
+            and manifest.run_id == claim.run_id
+            and manifest.status == "complete"
+            and manifest.config_hash == validation_lock_sha256
+            and manifest.ended_at is not None
+        ):
+            store.transition(
+                validation_lock_sha256=validation_lock_sha256,
+                target="complete",
+                completed_at=manifest.ended_at,
+            )
+    raise ValidationAttemptConflictError(
+        "validation lock already has an irrevocable attempt"
+    )
 
 
 async def _run_formal_evaluation(
@@ -1004,6 +1082,16 @@ async def _run_formal_evaluation(
         f"{request.split}-{started_at.astimezone(UTC):%Y%m%dT%H%M%SZ}-"
         f"{lock_sha256(inputs.lock).removeprefix('sha256:')[:12]}"
     )
+    attempt_store: ValidationAttemptStore | None = None
+    attempt_hash: str | None = None
+    if request.mode == "live" and isinstance(inputs.lock, ValidationLock):
+        attempt_store = attempt_store_factory(request.output_root)
+        attempt_hash = lock_sha256(inputs.lock)
+        _reject_or_recover_existing_attempt(
+            store=attempt_store,
+            validation_lock_sha256=attempt_hash,
+            output_root=request.output_root,
+        )
     bundle = composition_root.compose(
         lock_path=request.lock_path,
         mode=request.mode,
@@ -1061,47 +1149,80 @@ async def _run_formal_evaluation(
         manifest=manifest,
         input_lock_bytes=inputs.lock_bytes,
         nonce_factory=lambda: hashlib.sha256(run_id.encode()).hexdigest()[:12],
-        clock=lambda: started_at,
+        clock=clock,
         replay_snapshot_root=inputs.snapshot_root,
     )
+    if request.mode == "live":
+        bundle.artifact_factory._sessions[run_id.casefold()] = _FormalCaptureBinding(  # type: ignore[assignment]  # noqa: SLF001
+            run_id=run_id,
+            store=workspace.snapshot_store,
+        )
     ledger = SQLiteBudgetLedger(
         request.output_root / ".ledger" / "formal.sqlite3",
-        clock=lambda: started_at,
+        clock=clock,
         replay=request.mode == "replay",
     )
+    per_query_cost = (
+        Decimal("0")
+        if request.mode == "replay"
+        else min(Decimal("8"), Decimal("18") / Decimal(len(inputs.gold)))
+    )
+    estimates = [
+        UsageEstimate(
+            search_api_calls=(
+                inputs.lock.baseline.retrieval.openalex_calls_max
+                + inputs.lock.baseline.retrieval.semantic_scholar_calls_max
+            ),
+            llm_calls=inputs.lock.baseline.retry.max_attempts,
+            input_tokens=inputs.lock.baseline.retrieval.max_raw_candidates,
+            output_tokens=inputs.lock.baseline.retrieval.max_output_papers,
+            cost_cny=per_query_cost,
+            elapsed_ms=inputs.lock.baseline.timeout.read_seconds * 1_000,
+        )
+        for _ in inputs.gold
+    ]
     reservations = [
         ledger.reserve(
             run_id=run_id,
             query_id=query.query_id,
-            estimate=UsageEstimate(cost_cny=Decimal("0")),
+            estimate=estimate,
             run_cap_cny=Decimal("18"),
         )
-        for query in inputs.gold
+        for query, estimate in zip(inputs.gold, estimates, strict=True)
     ]
-    attempt_store: ValidationAttemptStore | None = None
-    attempt_hash: str | None = None
-    if request.mode == "live" and isinstance(inputs.lock, ValidationLock):
-        attempt_store = attempt_store_factory(request.output_root)
-        attempt_hash = lock_sha256(inputs.lock)
-        attempt_store.claim(
-            validation_lock_sha256=attempt_hash,
-            run_id=run_id,
-            claimed_at=started_at,
-        )
+    settled: set[int] = set()
+    current_index: int | None = None
+    claim_created = False
     try:
-        adapted = await _execute_service_batch(
-            inputs.gold,
-            service=bundle.service,
-            run_id=run_id,
-            mode=request.mode,
-        )
-        for reservation, record in zip(reservations, adapted, strict=True):
-            ledger.settle(reservation, record.execution.usage)
+        if attempt_store is not None and attempt_hash is not None:
+            attempt_store.claim(
+                validation_lock_sha256=attempt_hash,
+                run_id=run_id,
+                claimed_at=started_at,
+            )
+            claim_created = True
+
+        def on_start(index: int) -> None:
+            nonlocal current_index
+            current_index = index
+
+        def settle_and_append(index: int, record: AdaptedExecution) -> None:
+            ledger.settle(reservations[index], record.execution.usage)
+            settled.add(index)
             workspace.write_prediction(record.prediction)
             workspace.write_execution(record.execution)
             workspace.write_business_result(record.business_result)
             if record.failure is not None:
                 workspace.write_failure(record.failure)
+
+        adapted = await _execute_service_batch(
+            inputs.gold,
+            service=bundle.service,
+            run_id=run_id,
+            mode=request.mode,
+            on_start=on_start,
+            on_record=settle_and_append,
+        )
         predictions = [adapt_prediction_record(record.prediction) for record in adapted]
         metrics = evaluate(inputs.gold, predictions, id_map=inputs.identifier_map)
         report = ledger.report(run_id)
@@ -1134,8 +1255,9 @@ async def _run_formal_evaluation(
         workspace.write_usage(report)
         if not isinstance(inputs.lock, ReplayLock):
             sealed = workspace.seal_snapshots()
-            if sealed != snapshot_manifest:
-                raise ValueError("live snapshot seal changed unexpectedly")
+            snapshot_manifest = sealed
+            snapshot_set_id = sealed.snapshot_set_id
+            snapshot_sha256 = workspace.snapshot_store.manifest_sha256
             replay_lock = ReplayLock(
                 schema_version=inputs.lock.schema_version,
                 lock_kind="replay",
@@ -1159,11 +1281,11 @@ async def _run_formal_evaluation(
             replay_lock=replay_lock,
             snapshot_manifest=snapshot_manifest,
         )
-        if attempt_store is not None and attempt_hash is not None:
+        if claim_created and attempt_store is not None and attempt_hash is not None:
             attempt_store.transition(
                 validation_lock_sha256=attempt_hash,
                 target="complete",
-                completed_at=started_at,
+                completed_at=clock(),
             )
         return EvaluationRunResult(
             run_id=run_id,
@@ -1172,24 +1294,46 @@ async def _run_formal_evaluation(
             gate_result=gate.gate_result,
         )
     except (asyncio.CancelledError, KeyboardInterrupt):
-        if attempt_store is not None and attempt_hash is not None:
-            attempt_store.transition(
-                validation_lock_sha256=attempt_hash,
-                target="interrupted",
-                completed_at=started_at,
-                incident_ref=f"automatic-interruption:{run_id}",
-            )
-        workspace.interrupt()
+        _close_outstanding_reservations(
+            ledger=ledger,
+            reservations=reservations,
+            estimates=estimates,
+            settled=settled,
+            current_index=current_index,
+        )
+        if claim_created and attempt_store is not None and attempt_hash is not None:
+            try:
+                attempt_store.transition(
+                    validation_lock_sha256=attempt_hash,
+                    target="interrupted",
+                    completed_at=clock(),
+                    incident_ref=f"automatic-interruption:{run_id}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if workspace.work_dir.exists():
+            workspace.interrupt()
         raise
     except Exception:
-        if attempt_store is not None and attempt_hash is not None:
-            attempt_store.transition(
-                validation_lock_sha256=attempt_hash,
-                target="failed",
-                completed_at=started_at,
-                incident_ref=f"automatic-failure:{run_id}",
-            )
-        workspace.fail("internal_error")
+        _close_outstanding_reservations(
+            ledger=ledger,
+            reservations=reservations,
+            estimates=estimates,
+            settled=settled,
+            current_index=current_index,
+        )
+        if claim_created and attempt_store is not None and attempt_hash is not None:
+            try:
+                attempt_store.transition(
+                    validation_lock_sha256=attempt_hash,
+                    target="failed",
+                    completed_at=clock(),
+                    incident_ref=f"automatic-failure:{run_id}",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+        if workspace.work_dir.exists():
+            workspace.fail("internal_error")
         raise
     finally:
         await bundle.aclose()

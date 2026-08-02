@@ -6,13 +6,16 @@ import hashlib
 import inspect
 import importlib
 import json
+import shutil
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, IO
 
 import pytest
+import yaml
 
 import paper_search.evaluation.runner as runner_module
 from paper_search.application.contracts import (
@@ -51,6 +54,7 @@ from paper_search.ranking import (
 )
 from paper_search.storage import SQLiteResponseCache
 from paper_search.storage.cache import validate_snapshot_manifest
+from paper_search.storage.dependency_snapshot import DependencyCaptureStore
 
 
 CONFIG = Path(__file__).parents[2] / "configs" / "base.yaml"
@@ -1986,7 +1990,22 @@ def test_ordered_service_batch_continues_after_query_scoped_exception() -> None:
             query_id = getattr(request, "query_id")
             calls.append(query_id)
             if query_id == "q1":
-                raise RuntimeError("provider detail must be sanitized")
+                return SearchExecutionResult(
+                    outcome=SearchFailure(
+                        query_id=query_id,
+                        run_id=run_id or "formal-1",
+                        error=SearchErrorResponse(
+                            code="internal_error",
+                            detail="safe",
+                            retryable=False,
+                            run_id=run_id,
+                        ),
+                        usage=UsageActual(),
+                        stop_reason="internal_error",
+                    ),
+                    diagnostics=[],
+                    business_result_sha256=None,
+                )
             return SearchExecutionResult(
                 outcome=SearchFailure(
                     query_id=query_id,
@@ -2022,3 +2041,214 @@ def test_ordered_service_batch_continues_after_query_scoped_exception() -> None:
         "internal_error",
         "dependency_failure",
     ]
+
+
+def test_ordered_service_batch_stops_on_unexpected_integrity_exception() -> None:
+    class BrokenService:
+        async def execute(self, request: object, *, run_id: str | None = None):
+            del request, run_id
+            raise ValueError("business hash mismatch")
+
+    with pytest.raises(ValueError, match="business hash mismatch"):
+        asyncio.run(
+            runner_module._execute_service_batch(
+                [EvaluationQuery(query_id="q1", query="one")],
+                service=BrokenService(),
+                run_id="formal-1",
+                mode="replay",
+            )
+        )
+
+
+def test_formal_capture_binding_reuses_exact_workspace_store(tmp_path: Path) -> None:
+    store = DependencyCaptureStore(tmp_path / "snapshots")
+    binding = runner_module._FormalCaptureBinding(run_id="formal-1", store=store)
+
+    assert binding.claim_snapshot_store() is store
+    assert binding.claim_snapshot_store() is store
+
+
+def test_service_batch_settles_and_appends_before_starting_next_query() -> None:
+    events: list[str] = []
+
+    class FakeService:
+        async def execute(self, request: object, *, run_id: str | None = None):
+            query_id = getattr(request, "query_id")
+            events.append(f"execute:{query_id}")
+            return SearchExecutionResult(
+                outcome=SearchFailure(
+                    query_id=query_id,
+                    run_id=run_id or "formal-1",
+                    error=SearchErrorResponse(
+                        code="dependency_failure",
+                        detail="safe",
+                        retryable=True,
+                        run_id=run_id,
+                    ),
+                    usage=UsageActual(search_api_calls=1),
+                    stop_reason="dependency_failure",
+                ),
+                diagnostics=[],
+                business_result_sha256=None,
+            )
+
+    records = asyncio.run(
+        runner_module._execute_service_batch(
+            [
+                EvaluationQuery(query_id="q1", query="one"),
+                EvaluationQuery(query_id="q2", query="two"),
+            ],
+            service=FakeService(),
+            run_id="formal-1",
+            mode="replay",
+            on_start=lambda index: events.append(f"reserve:q{index + 1}"),
+            on_record=lambda index, record: events.append(
+                f"settle-and-append:{record.execution.query_id}"
+            ),
+        )
+    )
+
+    assert [record.execution.usage.search_api_calls for record in records] == [1, 1]
+    assert events == [
+        "reserve:q1",
+        "execute:q1",
+        "settle-and-append:q1",
+        "reserve:q2",
+        "execute:q2",
+        "settle-and-append:q2",
+    ]
+
+
+def test_cancellation_closes_every_outstanding_reservation(tmp_path: Path) -> None:
+    ledger = runner_module.SQLiteBudgetLedger(tmp_path / "ledger.sqlite3")
+    estimates = [
+        runner_module.UsageEstimate(
+            search_api_calls=value,
+            cost_cny=Decimal(value) / Decimal("10"),
+        )
+        for value in (1, 2, 3)
+    ]
+    reservations = [
+        ledger.reserve(
+            run_id="formal-1",
+            query_id=f"q{index}",
+            estimate=estimate,
+            run_cap_cny=Decimal("18"),
+        )
+        for index, estimate in enumerate(estimates, start=1)
+    ]
+    ledger.settle(
+        reservations[0],
+        UsageActual(search_api_calls=1, cost_cny=Decimal("0.1")),
+    )
+
+    runner_module._close_outstanding_reservations(
+        ledger=ledger,
+        reservations=reservations,
+        estimates=estimates,
+        settled={0},
+        current_index=1,
+    )
+
+    report = ledger.report("formal-1")
+    assert report.actual.search_api_calls == 3
+    assert report.actual.cost_cny == Decimal("0.3")
+
+
+def test_formal_inputs_reject_current_source_sha_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_bytes = Path("tests/fixtures/application/candidate.lock.yaml").read_bytes()
+    lock = runner_module.CandidateLock.model_validate(yaml.safe_load(lock_bytes))
+    lock_path = tmp_path / "candidate.lock.yaml"
+    lock_path.write_bytes(lock_bytes)
+    monkeypatch.setattr(
+        runner_module,
+        "load_verified_input_lock_bytes",
+        lambda content, *, artifact_root: SimpleNamespace(
+            lock=lock,
+            artifact_bytes={},
+        ),
+    )
+    monkeypatch.setattr(runner_module, "_current_git_sha", lambda: "different")
+
+    with pytest.raises(ValueError, match="current source SHA"):
+        runner_module._load_formal_inputs(
+            EvaluationRunRequest(
+                split="dev",
+                mode="live",
+                lock_path=lock_path,
+                output_root=tmp_path / "runs",
+                snapshot_manifest_path=None,
+                network_authorized=True,
+            )
+        )
+
+
+def test_formal_inputs_reject_dirty_tracked_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lock_bytes = Path("tests/fixtures/application/candidate.lock.yaml").read_bytes()
+    lock = runner_module.CandidateLock.model_validate(yaml.safe_load(lock_bytes))
+    lock_path = tmp_path / "candidate.lock.yaml"
+    lock_path.write_bytes(lock_bytes)
+    monkeypatch.setattr(
+        runner_module,
+        "load_verified_input_lock_bytes",
+        lambda content, *, artifact_root: SimpleNamespace(
+            lock=lock,
+            artifact_bytes={},
+        ),
+    )
+    monkeypatch.setattr(runner_module, "_current_git_sha", lambda: lock.source_git_sha)
+    monkeypatch.setattr(
+        runner_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=" M tracked.py\n"),
+    )
+
+    with pytest.raises(ValueError, match="tracked source must be clean"):
+        runner_module._load_formal_inputs(
+            EvaluationRunRequest(
+                split="dev",
+                mode="live",
+                lock_path=lock_path,
+                output_root=tmp_path / "runs",
+                snapshot_manifest_path=None,
+                network_authorized=True,
+            )
+        )
+
+
+def test_existing_claim_recovers_complete_published_run_then_rejects_reuse(
+    tmp_path: Path,
+) -> None:
+    validation_hash = "sha256:" + "a" * 64
+    shutil.copytree(
+        Path("tests/fixtures/formal_run/capture"),
+        tmp_path / "capture",
+    )
+    manifest_path = tmp_path / "capture" / "run.json"
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest["config_hash"] = validation_hash
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    store = runner_module.ValidationAttemptStore(tmp_path)
+    store.claim(
+        validation_lock_sha256=validation_hash,
+        run_id="capture",
+        claimed_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    with pytest.raises(
+        runner_module.ValidationAttemptConflictError,
+        match="irrevocable attempt",
+    ):
+        runner_module._reject_or_recover_existing_attempt(
+            store=store,
+            validation_lock_sha256=validation_hash,
+            output_root=tmp_path,
+        )
+
+    assert store.read(validation_hash).state == "complete"

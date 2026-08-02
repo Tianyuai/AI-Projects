@@ -80,3 +80,32 @@ def test_evaluate_complete_gate_failure_returns_five(
         "run_id",
         "status",
     }
+
+
+def test_evaluate_runtime_failure_maps_to_stable_invalid_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fail(request: object) -> EvaluationRunResult:
+        del request
+        raise RuntimeError("private path and provider detail")
+
+    monkeypatch.setattr(cli_module, "run_evaluation", fail)
+
+    exit_code = cli_module.main(
+        [
+            "evaluate",
+            "--lock",
+            "replay.lock.yaml",
+            "--split",
+            "dev",
+            "--output-root",
+            str(tmp_path / "runs"),
+            "--snapshot-manifest",
+            "snapshot-manifest.json",
+        ]
+    )
+
+    assert exit_code == 2
+    assert capsys.readouterr().err == "evaluation failed: invalid input\n"

@@ -170,7 +170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 raise TypeError("formal runner returned a legacy result")
         except (KeyboardInterrupt, asyncio.CancelledError):
             return 130
-        except (OSError, TypeError, ValueError):
+        except (OSError, RuntimeError, TypeError, ValueError):
             print("evaluation failed: invalid input", file=sys.stderr)
             return 2
         print(

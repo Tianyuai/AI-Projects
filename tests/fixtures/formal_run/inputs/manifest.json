@@ -1,0 +1,11 @@
+{
+  "partitions": [
+    {
+      "name": "dev",
+      "path": "dev.jsonl",
+      "query_count": 2,
+      "sha256": "sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5"
+    }
+  ],
+  "schema_version": "evaluation-manifest-v2"
+}

@@ -1,17 +1,17 @@
 {
-  "config_hash": "sha256:f639995adf2f73f2ac1b19dea0b36c69f146eda2f4129e646334f0317fe183eb",
+  "config_hash": "sha256:7075672740f5b6255d5479958c06c5fef56c104982ae8a66938a4b3356dc963a",
   "ended_at": "2026-08-02T00:00:00Z",
   "execution_mode": "replay",
   "experiment_name": "main-baseline",
   "failure_count": 0,
-  "frozen_manifest_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-  "gate_result": "passed",
-  "identifier_map_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-  "input_lock_sha256": "sha256:b7a1d8d187d4b8109617e54008915950eb1f0b4ac83efa7d6fc6f8380b2e2cd9",
+  "frozen_manifest_sha256": "sha256:14d561274749db7a9a34aaff18a5e5ed22af31cf7bd46257dfb41895ce6df6ee",
+  "gate_result": "failed",
+  "identifier_map_sha256": "sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+  "input_lock_sha256": "sha256:437d995467f88d2cc4e94be5acd87654d5f8f81585752af7e27a8f7853b8acb5",
   "optional_modules": {
     "embedding": false
   },
-  "partition_sha256": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "partition_sha256": "sha256:6c73678500ef2fa972712c9c315d81c1f1a36e0fe1bcb65b879fcb2d6d4adca5",
   "prompt_version": "query-analyze-v1",
   "readiness_summary": [
     {

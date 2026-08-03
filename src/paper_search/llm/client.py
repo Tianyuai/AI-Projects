@@ -259,6 +259,7 @@ class OpenAICompatibleLLMClient:
             raise ValueError("LLM model and API key must not be empty")
         self._client = client
         self._transport_endpoint = f"{normalized_url}/chat/completions"
+        self._dashscope_compatible = "dashscope.aliyuncs.com" in normalized_url
         self._model = validate_model_id(model)
         self._api_key = api_key
         self._prompt_version = validate_prompt_version(prompt_version)
@@ -280,9 +281,13 @@ class OpenAICompatibleLLMClient:
     def canonical_request(
         self, *, prompt_name: str, payload: dict[str, object]
     ) -> dict[str, object]:
-        return {
+        request: dict[str, object] = {
             "model": self._model,
             "messages": [
+                {
+                    "role": "system",
+                    "content": "Respond with a JSON object.",
+                },
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -295,6 +300,9 @@ class OpenAICompatibleLLMClient:
             "response_format": {"type": "json_object"},
             "temperature": 0,
         }
+        if self._dashscope_compatible:
+            request["enable_thinking"] = False
+        return request
 
     def canonical_identity_request(
         self,

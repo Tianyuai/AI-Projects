@@ -59,6 +59,10 @@ if TYPE_CHECKING:
         bootstrap_mean_interval,
         compare_macro_f1,
     )
+    from paper_search.evaluation.promotion import (
+        PromotionEvidence,
+        evaluate_promotion_evidence,
+    )
     from paper_search.evaluation.synthetic_baseline import (
         SYNTHETIC_QUERIES,
         run_synthetic_baseline,
@@ -101,6 +105,12 @@ _STATISTICS_EXPORTS = frozenset(
         "MacroF1Comparison",
         "bootstrap_mean_interval",
         "compare_macro_f1",
+    }
+)
+_PROMOTION_EXPORTS = frozenset(
+    {
+        "PromotionEvidence",
+        "evaluate_promotion_evidence",
     }
 )
 _SYNTHETIC_BASELINE_EXPORTS = frozenset(
@@ -181,6 +191,16 @@ def __getattr__(name: str) -> object:
             "bootstrap_mean_interval": bootstrap_mean_interval,
             "compare_macro_f1": compare_macro_f1,
         }
+    elif name in _PROMOTION_EXPORTS:
+        from paper_search.evaluation.promotion import (
+            PromotionEvidence,
+            evaluate_promotion_evidence,
+        )
+
+        exports = {
+            "PromotionEvidence": PromotionEvidence,
+            "evaluate_promotion_evidence": evaluate_promotion_evidence,
+        }
     elif name in _SYNTHETIC_BASELINE_EXPORTS:
         from paper_search.evaluation.synthetic_baseline import (
             SYNTHETIC_QUERIES,
@@ -215,6 +235,7 @@ __all__ = [
     "MetricSummary",
     "PaSaRecord",
     "PredictionRecord",
+    "PromotionEvidence",
     "QueryMetrics",
     "TypeDomainAnnotationRecord",
     "adapt_pasa_record",
@@ -225,6 +246,7 @@ __all__ = [
     "compare_macro_f1",
     "deduplicate_ranked",
     "evaluate",
+    "evaluate_promotion_evidence",
     "bootstrap_mean_interval",
     "build_experiment_record",
     "normalize_paper_id",

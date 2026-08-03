@@ -1,0 +1,31 @@
+{
+  "blocking_reasons": [],
+  "generated_at": "2026-08-03T12:58:27.551838Z",
+  "identifier_map": {
+    "count": 223,
+    "identity": "identifier-map-v1",
+    "sha256": "sha256:6ea6dbcd20a3f572d9f0dd0a0eef938ff01773db792401adf7fde1e489396e82"
+  },
+  "manifest": {
+    "count": null,
+    "identity": "paper-search-freeze-v2",
+    "sha256": "sha256:1426653afe56a0771a034b28cf8b15e26c164026b32e6abe6aeac929c3043aa3"
+  },
+  "partitions": [
+    {
+      "count": 60,
+      "identity": "dev",
+      "sha256": "sha256:24009cf03ad069131793b9a190024e239082277bd0e48149a1efbbbb7978e215"
+    },
+    {
+      "count": 30,
+      "identity": "validation",
+      "sha256": "sha256:1b31fb49e62081f48b5b00a96259e00c33e66dc53126792106c1490f9dc6d4fe"
+    }
+  ],
+  "passed": true,
+  "pricing_policy_sha256": "sha256:52e5d536d6756f98ebbd10437384dd53257213d29102b2dd24c63544a909c3f2",
+  "quality_gates_sha256": "sha256:0e135d194b46de30cd89bdcd4d66ebda0d27f7f01056b4f1ba5b4fed851fb058",
+  "readiness_report_sha256": "sha256:4ce582ba01ecd7e9361b0a42e3d2fb8fb6e5a907dedc6221817dc7a094a53776",
+  "schema_version": "gate0-report-v1"
+}

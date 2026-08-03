@@ -777,7 +777,7 @@ Streamlit 前端包含：
 **协作者文件：** `data/README.md`、开发集样例  
 **测试文件：** `tests/evaluation/test_metrics.py`、`tests/evaluation/test_dataset.py`
 
-**当前状态：** `waiting_for_human_label_freeze`。固定 revision、prepared manifest、60/30/50 分区 ID 清单及 90/40/20 标注工作包 ID 已准备并完成独立核对；真人标签、gold 与正式冻结仍待完成。
+**当前状态：** V2 `frozen`（Gate 0 r5 passed，2026-08-03）。固定 revision、dev 60/validation 30 分区 gold 与 223 条 identifier-map 已核准；`data/manifest.json` 与 `data/gate0_evidence.json` 已发布安全投影。正式 dev/validation 实时指标与晋升证据仍待授权运行。
 
 - [x] 定义包含 `query_id`、`query`、`relevant_paper_ids` 和元数据的 JSONL 格式。
 - [x] 实现 DOI、OpenAlex ID、Semantic Scholar ID 和标题的答案归一化。

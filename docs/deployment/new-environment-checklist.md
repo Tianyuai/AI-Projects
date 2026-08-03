@@ -1,23 +1,23 @@
-# New Environment Deployment and Acceptance Checklist
+# 新环境部署与验收清单
 
-Use a fresh clone or worktree. Keep engineering verification, replay acceptance, and authorized live evidence as separate gates.
+使用 fresh clone 或全新 worktree。将工程验证、replay 验收与授权 live 证据保持为独立门禁。
 
-## Runtime and dependencies
+## 运行时与依赖
 
-- [ ] Confirm Python 3.11.x; the project supports `>=3.11,<3.12`.
-- [ ] Confirm `uv` is available.
-- [ ] Install exactly one profile: `uv sync --locked --extra cpu`, or the separately approved CUDA profile.
-- [ ] Treat bare `uv sync` as core-only and insufficient for complete acceptance.
-- [ ] Record command outcomes and the repository revision without machine-specific paths or package-index credentials.
+- [ ] 确认 Python 3.11.x；项目支持 `>=3.11,<3.12`。
+- [ ] 确认 `uv` 可用。
+- [ ] 安装且仅安装一个 profile：`uv sync --locked --extra cpu`，或单独批准的 CUDA profile。
+- [ ] 将裸 `uv sync` 视为仅 core 依赖，不足以完成完整验收。
+- [ ] 记录命令结果与仓库修订，不记录机器特定路径或包索引凭据。
 
-## Secret boundary
+## 凭据边界
 
-- [ ] Verify only the required variable names through the approved secret manager: `OPENALEX_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL_PRIMARY`, `LLM_MODEL_FALLBACK`, and `HF_TOKEN`.
-- [ ] Never print, copy, log, commit, screenshot, or paste values.
-- [ ] Keep offline commands on `--no-env-file`; remember this does not clear inherited variables or enforce network isolation.
-- [ ] Never inspect `.env` as part of acceptance.
+- [ ] 仅通过批准的密钥管理器核对所需变量名：`OPENALEX_API_KEY`、`SEMANTIC_SCHOLAR_API_KEY`、`LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL_PRIMARY`、`LLM_MODEL_FALLBACK` 与 `HF_TOKEN`。
+- [ ] 绝不打印、复制、记录、提交、截图或粘贴其值。
+- [ ] 离线命令保持 `--no-env-file`；这不会清除继承变量，也不强制网络隔离。
+- [ ] 验收中绝不检查 `.env` 内容。
 
-## Engineering gate
+## 工程门禁
 
 ```powershell
 uv run --no-sync --no-env-file python -m paper_search.health
@@ -27,66 +27,66 @@ uv run --no-sync --no-env-file mypy src
 uv run --no-sync --no-env-file paper-search --help
 ```
 
-- [ ] All commands exit 0.
-- [ ] Credential-gated online tests without credentials remain explicit skips, not successful provider checks.
+- [ ] 所有命令退出 0。
+- [ ] 无凭据时，凭据门控的 online 测试保持显式 skip，而非成功的 provider 检查。
 
-## Gate 0 and data state
+## Gate 0 与数据状态
 
-- [ ] Read the current safe Gate 0 report and confirm `passed: true` before any real provider or formal-data claim.
-- [ ] Require a V2 frozen manifest, exact partition and identifier-map hashes, approved production pricing policy, quality-gate policy, and safe readiness evidence.
-- [ ] If Gate 0 is blocked, stop the real evidence path and report the named blocking reasons. Do not manually change `data/manifest.json`.
-- [ ] Keep raw data, gold, label files, real queries, and per-query evidence outside Git and ordinary logs.
+- [ ] 读取当前安全 Gate 0 报告并确认 `passed: true`，之后才可做真实 provider 或正式数据声明。
+- [ ] 要求 V2 冻结 manifest、精确分区与标识符映射哈希、批准的生成定价策略、质量门策略与安全就绪证据。
+- [ ] 若 Gate 0 为 blocked，停止真实证据路径并报告具体阻塞原因；不要手动修改 `data/manifest.json`。
+- [ ] 将原始数据、gold、标签文件、真实查询与逐查询证据保留在 Git 与普通日志之外。
 
-The current repository state is intentionally blocked at this gate; synthetic fixtures may still exercise all engineering paths.
+当前仓库 Gate 0 已通过（2026-08-03 r5，`data/gate0_evidence.json`）；合成夹具仍覆盖工程路径，但正式 dev/validation 与晋升仍需显式授权。
 
-## Replay service gate
+## Replay 服务门禁
 
-- [ ] Verify the selected capture and replay artifacts with `paper-search verify-run`.
-- [ ] Verify the pair with `paper-search compare-replay`.
-- [ ] Start `paper-search serve` with the verified replay lock and snapshot manifest, without `--allow-live`.
-- [ ] Bind only loopback unless a separate deployment security review approves another interface.
-- [ ] Check `/health/live`, `/health/ready`, the browser UI, and one direct `/v1/search` request.
-- [ ] Confirm repeated replay preserves canonical business results and stable provenance.
-- [ ] Confirm replay performs no external name resolution or socket connection.
-- [ ] Stop cleanly and check for incomplete artifacts or held locks.
+- [ ] 用 `paper-search verify-run` 验证所选 capture 与 replay 制品。
+- [ ] 用 `paper-search compare-replay` 验证对等价。
+- [ ] 用验证的 replay lock 与 snapshot manifest 启动 `paper-search serve`，不加 `--allow-live`。
+- [ ] 除非单独部署安全审查批准其他接口，否则仅绑定 loopback。
+- [ ] 检查 `/health/live`、`/health/ready`、浏览器 UI 与一次直接 `/v1/search` 请求。
+- [ ] 确认重复 replay 保持规范化业务结果与稳定来源。
+- [ ] 确认 replay 不发起外部名称解析或 socket 连接。
+- [ ] 干净停止并检查不完整制品或持有的锁。
 
-## Live authorization gate
+## Live 授权门禁
 
-All three technical authorization predicates are mandatory; they are not credentials and do not replace the operator's governance approval:
+三项技术授权谓词均强制；它们不是凭据，也不替代操作员的治理批准：
 
-- [ ] the verified lineage lock has `runtime_allow_live: true`;
-- [ ] the operator explicitly starts the server with `--allow-live`;
-- [ ] the individual request explicitly sets `mode: live`.
+- [ ] 验证血缘 lock 有 `runtime_allow_live: true`；
+- [ ] 操作员显式以 `--allow-live` 启动服务；
+- [ ] 单次请求显式设置 `mode: live`。
 
-- [ ] Obtain separate approval for providers, credential scope, query class, hard budget, capture root, and retention policy.
-- [ ] Confirm one request receives an isolated live service, clients, budget, and capture session.
-- [ ] Confirm a successful capture is sealed, verified, and atomically published before HTTP 200.
-- [ ] Confirm failed or cancelled work cannot appear complete.
-- [ ] Run `paper-search verify-run` on every published live capture.
-- [ ] Record only safe hashes, run IDs, aggregate usage/cost, and sanitized error codes.
+- [ ] 为 provider、凭据范围、查询类别、硬预算、捕获根目录与保留策略取得单独批准。
+- [ ] 确认一次请求获得隔离的 live 服务、客户端、预算与捕获会话。
+- [ ] 确认成功捕获在 HTTP 200 前封存、验证并原子发布。
+- [ ] 确认失败或取消的工作不可能呈现为 complete。
+- [ ] 服务端 live 捕获为 smoke 型目录：检查 `run.json` 的 `status: complete`、`snapshot-manifest.json` 与 `replay.lock.yaml`，并用该捕获启动 replay 服务验证可回放；`verify-run` 只适用于 `paper-search evaluate` 产出的正式运行目录。
+- [ ] 只记录安全哈希、run ID、聚合用量/成本与脱敏错误码。
 
-## Formal dev and validation gates
+## 正式 dev 与 validation 门禁
 
-- [ ] Run authorized dev capture under a frozen run cap.
-- [ ] Verify the capture, generate replay from the same snapshot set, verify replay, and compare canonical business results.
-- [ ] Promote a validation lock only from complete passing dev evidence.
-- [ ] Treat the validation lock hash as a single irreversible attempt identity.
-- [ ] Run one authorized live validation attempt; interruption or failure does not authorize a replacement attempt.
-- [ ] Verify and compare validation capture/replay before reporting aggregate results.
-- [ ] Keep predictions, failures, business results, snapshots, gold labels, and validation claims access-controlled.
+- [ ] 在冻结运行上限内运行授权 dev 捕获。
+- [ ] 验证捕获，从同一快照集生成 replay，验证 replay，并比较规范化业务结果。
+- [ ] 仅从完整通过的 dev 证据晋升 validation lock。
+- [ ] 将 validation lock 哈希视为单一不可撤销尝试身份。
+- [ ] 运行一次授权 live validation 尝试；中断或失败不授权替代尝试。
+- [ ] 报告聚合结果前验证并比较 validation capture/replay。
+- [ ] 将预测、失败、业务结果、快照、gold 标签与验证声明保持访问受控。
 
-## Optional-module promotion gate
+## 可选模块晋升门禁
 
-- [ ] Keep `configs/base.yaml` on `main-baseline` throughout evidence generation.
-- [ ] Require Gates 0–5 before optional ablations.
-- [ ] Run three same-configuration dev comparisons with identical frozen inputs, snapshots, budgets, and measurement policy.
-- [ ] Use 1,000 bootstrap samples and the committed promotion thresholds.
-- [ ] Run only the approved selection-only validation comparison.
-- [ ] Keep the module default-off if evidence is incomplete or any threshold fails.
-- [ ] Request a separate promotion decision before changing baseline defaults or a validation lock.
+- [ ] 整个证据生成期间保持 `configs/base.yaml` 为 `main-baseline`。
+- [ ] 可选消融前要求 Gates 0–5。
+- [ ] 在相同冻结输入、快照、预算与测量策略下运行三次同配置 dev 比较。
+- [ ] 使用 1,000 次 bootstrap 与已提交的晋升阈值。
+- [ ] 只运行批准的 selection-only validation 比较。
+- [ ] 证据不完整或任一阈值不通过时保持模块 default-off。
+- [ ] 改变 baseline 默认或 validation lock 前请求单独晋升决定。
 
-## Handoff record
+## 交接记录
 
-- [ ] State separately which gates are passed, blocked, failed, or not run.
-- [ ] Link only to access-appropriate evidence.
-- [ ] Do not convert fixture success into real-data, real-provider, quality, cost, or production-readiness claims.
+- [ ] 分别说明各门禁为 passed、blocked、failed 或 not run。
+- [ ] 只链接访问适当的证据。
+- [ ] 不把夹具成功转化为真实数据、真实 provider、质量、成本或生产就绪声明。

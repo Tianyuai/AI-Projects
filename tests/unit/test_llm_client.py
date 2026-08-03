@@ -91,6 +91,140 @@ def test_generate_json_returns_data_usage_and_safe_provenance() -> None:
     assert API_KEY not in result.model_dump_json()
 
 
+def test_json_object_request_contains_json_hint_in_messages() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model": "fixture-model",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps({"query_spec": {"ok": True}}),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+            request=request,
+        )
+
+    async def run() -> object:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLMClient(
+                client=client,
+                base_url="https://llm.example.test/v1",
+                model="fixture-model",
+                api_key=API_KEY,
+                prompt_version="query-analyze-v1",
+            )
+            return await llm.generate_json(
+                prompt_name="query_analyze",
+                payload={"query": "graph retrieval"},
+                reservation=_reservation(),
+            )
+
+    asyncio.run(run())
+
+    body = json.loads(seen[0].content)
+    assert body["response_format"] == {"type": "json_object"}
+    messages_text = " ".join(
+        str(message.get("content", "")) for message in body["messages"]
+    )
+    assert "json" in messages_text.casefold()
+
+
+def test_dashscope_json_request_disables_thinking_and_stays_bounded() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model": "fixture-model",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps({"query_spec": {"ok": True}}),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+            request=request,
+        )
+
+    async def run() -> object:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLMClient(
+                client=client,
+                base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+                model="fixture-model",
+                api_key=API_KEY,
+                prompt_version="query-analyze-v1",
+            )
+            return await llm.generate_json(
+                prompt_name="query_analyze",
+                payload={"query": "graph retrieval"},
+                reservation=_reservation(),
+            )
+
+    asyncio.run(run())
+
+    body = json.loads(seen[0].content)
+    assert body["enable_thinking"] is False
+    assert "max_tokens" not in body or body["max_tokens"] > 0
+
+
+def test_non_dashscope_json_request_omits_dashscope_specific_fields() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model": "fixture-model",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps({"query_spec": {"ok": True}}),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+            request=request,
+        )
+
+    async def run() -> object:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLMClient(
+                client=client,
+                base_url="https://llm.example.test/v1",
+                model="fixture-model",
+                api_key=API_KEY,
+                prompt_version="query-analyze-v1",
+            )
+            return await llm.generate_json(
+                prompt_name="query_analyze",
+                payload={"query": "graph retrieval"},
+                reservation=_reservation(),
+            )
+
+    asyncio.run(run())
+
+    body = json.loads(seen[0].content)
+    assert "enable_thinking" not in body
+
+
 def test_invalid_json_is_a_structured_error_without_credential_leakage() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

@@ -18,18 +18,18 @@
 ### 当前应打开的 Codex 工作区
 
 ```text
-D:\AI Projects\.worktrees\task2-evaluation
+<task2-worktree>
 ```
 
 这是链接 Git worktree，当前分支为 `codex/task2-evaluation`。
 
-不要从 `E:\文档\AI` 继续开发。该目录只曾用于 Codex 跨盘写入的临时 staging，目前没有项目文件。
+不要从 `<scratch-root>` 继续开发。该目录只曾用于 Codex 跨盘写入的临时 staging，目前没有项目文件。
 
 ### 其他目录
 
-- `D:\AI Projects\Projects`：Git 主检出目录，分支为 `main`；共用虚拟环境和 `.env` 位于这里。
-- `D:\AI Projects\赛题指南`：保存赛题说明等原始资料。
-- `D:\Dev\uv\uv.exe`：项目使用的 uv 可执行文件。
+- `<projects-root>`：Git 主检出目录，分支为 `main`；共用虚拟环境和 `.env` 位于这里。
+- `<competition-guides-root>`：保存赛题说明等原始资料。
+- `<uv-executable>`：项目使用的 uv 可执行文件。
 
 ## 3. Git 与远端
 
@@ -51,9 +51,9 @@ f701565 feat: add evaluation models and identifier normalization
 ## 4. 环境与密钥状态
 
 - Python 3.11、uv、项目虚拟环境和依赖已经配置。
-- PyTorch 位于 `D:\AI Projects\Projects\.venv`；依赖由 `pyproject.toml` 和 `uv.lock` 锁定。
+- PyTorch 位于 `<projects-root>\.venv`；依赖由 `pyproject.toml` 和 `uv.lock` 锁定。
 - 已配置或申请 DashScope、OpenAlex、Semantic Scholar 和 Hugging Face。
-- `.env` 位于 `D:\AI Projects\Projects`，不得读取、输出或提交其中的密钥值。
+- `.env` 位于 `<projects-root>`，不得读取、输出或提交其中的密钥值。
 - 安全提醒：全局 Codex 配置中曾有一个 `ANTHROPIC_AUTH_TOKEN` 在诊断输出中暴露。必须在服务商侧撤销并重新生成；本文档不记录其值。
 
 ## 5. 已完成工作
@@ -106,10 +106,10 @@ mypy: passed (10 source files)
 ```powershell
 git branch --show-current
 git status -sb
-$env:UV_PROJECT_ENVIRONMENT='D:\AI Projects\Projects\.venv'
-& 'D:\Dev\uv\uv.exe' run --no-sync pytest -q
-& 'D:\Dev\uv\uv.exe' run --no-sync ruff check .
-& 'D:\Dev\uv\uv.exe' run --no-sync mypy src
+$env:UV_PROJECT_ENVIRONMENT='<projects-root>\.venv'
+& '<uv-executable>' run --no-sync pytest -q
+& '<uv-executable>' run --no-sync ruff check .
+& '<uv-executable>' run --no-sync mypy src
 ```
 
 预期分支为 `codex/task2-evaluation`，pytest 为 97 项通过，Ruff 和 mypy 无错误。
@@ -180,7 +180,7 @@ evaluate(
 
 ## 9. 新 Codex 任务的首条提示词
 
-在打开 `D:\AI Projects\.worktrees\task2-evaluation` 后，可直接发送：
+在打开 `<task2-worktree>` 后，可直接发送：
 
 ```text
 请先阅读 docs/PROJECT_HANDOFF_TASK4.md、PRD.md、

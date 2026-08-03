@@ -1,10 +1,10 @@
 # AI Projects — Paper Search
 
-本仓库实现一套 offline-first、可审计的学术论文检索系统。当前代码已经提供统一的 replay/live 组合、FastAPI 服务与浏览器 UI、依赖快照、正式评测工作区、运行验证和 capture/replay 等价比较；默认实验仍是 `main-baseline`，所有可选模块默认关闭。
+本仓库实现一套 offline-first、可审计的学术论文检索系统。当前代码提供统一的 replay/live 组合、FastAPI 服务与浏览器 UI、依赖快照、正式评测工作区、运行验证及 capture/replay 等价比较；默认实验身份为 `main-baseline`，所有可选模块默认关闭。
 
-当前公开数据状态仍为 `waiting_for_human_label_freeze`，仓库内 Gate 0 报告为 blocked。工程测试、合成 capture/replay 和 replay 浏览器验收通过，不等同于真实数据冻结、真实 provider 运行、正式 dev/validation 指标或可选模块晋升完成。
+当前公开数据状态已更新为 V2 frozen（`data/manifest.json`；Gate 0 r5 于 2026-08-03 通过，安全报告见 `data/gate0_evidence.json`；dev 60、validation 30，identifier-map 223 条）。工程测试、合成 capture/replay、replay 浏览器验收及一次真实 live 浏览器捕获通过，但正式 dev/validation capture/replay、真实 provider 稳定性与可选模块晋升仍未运行，需要各自显式授权。
 
-## CPU-first quickstart
+## CPU 优先快速开始
 
 第三方验收应从 fresh clone 或全新 worktree 开始，并使用 Python 3.11：
 
@@ -33,7 +33,7 @@ uv sync --locked --extra cuda
 uv run --no-sync --no-env-file python -m paper_search.health --require-accelerator cuda
 ```
 
-## Unified replay service
+## 统一 replay 服务
 
 `paper-search serve` 是唯一正式服务入口。它始终绑定一个经验证的 replay lock 与 snapshot manifest；replay 请求不构造 live client，也不访问外部依赖。
 
@@ -53,7 +53,7 @@ Live 请求只有同时满足三项条件才会执行：输入 lock 的 `runtime
 
 真实 live 会产生网络和成本，必须另行获得针对目标环境、硬预算和凭据的明确授权。默认命令和 UI 选择均为 replay。
 
-## Formal evaluation and replay verification
+## 正式评测与 replay 验证
 
 正式运行使用同一生产应用服务，不存在独立评测检索管线：
 
@@ -76,7 +76,7 @@ paper-search compare-replay tests/fixtures/formal_run/capture tests/fixtures/for
 
 这些夹具证明格式和验证器行为，不代表真实数据集效果。
 
-## Experiments and optional modules
+## 实验身份与可选模块
 
 `configs/base.yaml` 固定 `experiment: main-baseline`。可选身份为 `embedding`、`citation-expansion`、`llm-rerank`、`fixed-two-round` 和 `adaptive-evolution`；每个身份只构造其声明组件，baseline 不加载可选依赖。
 
@@ -88,13 +88,13 @@ Embedding 的离线聚焦验证命令为：
 uv run --no-sync --no-env-file pytest tests/unit/test_embedding.py tests/unit/test_sentence_transformer.py tests/evaluation/test_embedding_benchmark.py tests/integration/test_orchestrator.py -q
 ```
 
-The ablation framework is offline and injected by default. It does not call APIs or load `.env`. Selection notes remain `owner_only_provisional` until the formal evidence and promotion gates pass.
+消融框架默认离线并注入依赖，不调用 API 或加载 `.env`。在正式证据与晋升门禁通过前，选择记录保持 `owner_only_provisional`。
 
-## Evidence checkpoint
+## 证据检查点
 
-截至 2026-08-03，集成源码检查点 `fcc0ff0` 的完整离线套件为 `1744 passed, 36 skipped`；Task 4 与 Task 5 的独立范围审查均为 C0/I0。可复核入口包括 [正式运行夹具](tests/fixtures/formal_run)、[双模式 E2E](tests/e2e/test_dual_mode_serve.py) 和 [统一服务进程测试](tests/integration/test_serve_process.py)。浏览器截图与无敏感信息的验收记录按策略保存在源码树外，因此 fresh clone 不应把该记录视为可独立取得的仓库制品。
+截至 2026-08-03，集成源码检查点 `fcc0ff0` 的 Task 4/5 完整范围复核为 C0/I0，Phase 4 Task 6 的真实浏览器 replay 与 real live 验收已完成（真实 provider、单次有界请求，成本 0.001181 CNY；验收记录保存在源码树外）。浏览器验收同时暴露并修复了两个真实 LLM 兼容性缺陷：DashScope `json_object` 要求 messages 含 “json” 提示，以及 `qwen3.7-plus` thinking 模式超过 20s 读超时（已对 DashScope 端点发送 `enable_thinking=False`）。本机聚焦验证为 `experiments/orchestrator/evolution/application-service` 155 passed，`composition/artifacts/runner/serve/smoke` 238 passed/3 skipped，`dual-mode E2E` 5 passed，`API/UI/packaging/config` 143 passed。全量 pytest 未作为完整门禁运行。可复核入口包括 [正式运行夹具](tests/fixtures/formal_run)、[双模式 E2E](tests/e2e/test_dual_mode_serve.py) 和 [统一服务进程测试](tests/integration/test_serve_process.py)。浏览器截图与无敏感信息的验收记录按策略保存在源码树外，因此 fresh clone 不应把该记录视为可独立取得的仓库制品。
 
-## Data and access boundaries
+## 数据与访问边界
 
 数据契约与人工标注流程见 `data/README.md`。真实查询、gold、原始数据、人工标签、逐查询预测和 provider 原始响应不得进入 Git。快照、正式运行和验证声明也必须保存在访问受控位置，只共享经批准的安全聚合、哈希和 run ID。
 

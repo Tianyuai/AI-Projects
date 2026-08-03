@@ -293,6 +293,6 @@ def test_yaml_matrix_lists_required_cases_and_safe_public_booleans() -> None:
 def test_readme_documents_offline_injected_owner_only_ablation_policy() -> None:
     readme = Path("README.md").read_text(encoding="utf-8")
 
-    assert "offline and injected by default" in readme
-    assert "does not call APIs or load `.env`" in readme
+    assert "消融框架默认离线并注入依赖" in readme
+    assert "不调用 API 或加载 `.env`" in readme
     assert "owner_only_provisional" in readme

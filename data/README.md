@@ -1,6 +1,6 @@
 # Task 2 数据与协作者工作流
 
-当前状态：`waiting_for_human_label_freeze`
+当前状态：`frozen`（V2 冻结已核准；Gate 0 r5 `passed: true`，安全报告见 `data/gate0_evidence.json`）
 
 本目录保存 Task 2 可复现评测所需的安全元数据、固定 ID 清单、标注指南和项目原创压力查询。PaSa 原始数据、真实查询、金标准与人工标注受访问条件约束，不进入 Git。
 
@@ -52,7 +52,7 @@ uv run python -m paper_search.evaluation.metrics `
 
 ## 已发布的标注输入与预冻结校验
 
-“Task 2 标注工作包 v1 已冻结（仅标注输入）”通知已经发布。它只固定标注输入，当前 manifest 仍必须保持 `waiting_for_human_label_freeze`，不代表 gold、人工标签或正式数据冻结已经完成。
+“Task 2 标注工作包 v1 已冻结（仅标注输入）”通知已经发布。它只固定标注输入；在正式冻结完成前 manifest 必须保持 `waiting_for_human_label_freeze`。当前仓库已于 2026-08-03 由 Gate 0 r5 核准为 V2 frozen。
 
 协作者可在不运行正式 freeze audit 的情况下分别校验 90 条类型/领域和 40 条约束文件；主负责人用相同入口校验独立 20 条 overlap 文件：
 

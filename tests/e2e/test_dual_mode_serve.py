@@ -16,6 +16,11 @@ from paper_search.application.artifacts import CaptureSession
 from paper_search.application.composition import CompositionRoot
 from paper_search.application.contracts import SearchRequest
 from paper_search.cli import main
+from paper_search.domain.models import StructuredSearchResponse
+from paper_search.evaluation.business_results import (
+    business_result_from_response,
+    canonical_business_result_bytes,
+)
 from paper_search.storage.dependency_snapshot import DependencySnapshotManifestV2
 from tests.integration.test_serve_process import (
     _serve_process,
@@ -28,20 +33,25 @@ from tests.integration.test_serve_process import (
 QUERY = "resource-aware scholarly paper search"
 
 
-def _business_projection(payload: dict[str, Any]) -> bytes:
+def _canonical_business_projection(payload: dict[str, Any]) -> bytes:
+    response = StructuredSearchResponse.model_validate(payload)
+    return canonical_business_result_bytes(business_result_from_response(response))
+
+
+def _visible_provenance_projection(payload: dict[str, Any]) -> bytes:
     fields = (
-        "selected_paper_ids",
-        "fused_papers",
-        "high_relevance",
-        "partial_relevance",
-        "citation_edges",
-        "is_partial",
-        "planner_status",
-        "planner_fallback",
-        "warnings",
-        "stop_reason",
-        "config_hash",
+        "execution_mode",
         "snapshot_set_id",
+        "snapshot_captured_at",
+        "usage",
+        "stop_reason",
+        "is_partial",
+        "planner_fallback",
+        "planner_status",
+        "dependency_status",
+        "prompt_version",
+        "config_hash",
+        "git_sha",
     )
     return json.dumps(
         {name: payload.get(name) for name in fields},
@@ -62,12 +72,19 @@ from pathlib import Path
 
 _original_create_connection = socket.create_connection
 _original_getaddrinfo = socket.getaddrinfo
+_original_connect = socket.socket.connect
+_original_connect_ex = socket.socket.connect_ex
+_original_sendto = socket.socket.sendto
+_original_sendmsg = getattr(socket.socket, "sendmsg", None)
 _loopback = {"127.0.0.1", "::1", "localhost"}
 
-def _guarded_create_connection(address, *args, **kwargs):
-    host = str(address[0])
+def _guard_address(address):
+    host = str(address[0] if isinstance(address, tuple) else address)
     if host not in _loopback:
         raise RuntimeError("outbound network denied")
+
+def _guarded_create_connection(address, *args, **kwargs):
+    _guard_address(address)
     return _original_create_connection(address, *args, **kwargs)
 
 def _guarded_getaddrinfo(host, *args, **kwargs):
@@ -75,9 +92,43 @@ def _guarded_getaddrinfo(host, *args, **kwargs):
         raise RuntimeError("outbound name resolution denied")
     return _original_getaddrinfo(host, *args, **kwargs)
 
+def _guarded_connect(self, address):
+    _guard_address(address)
+    return _original_connect(self, address)
+
+def _guarded_connect_ex(self, address):
+    _guard_address(address)
+    return _original_connect_ex(self, address)
+
+def _guarded_sendto(self, data, *args):
+    _guard_address(args[-1])
+    return _original_sendto(self, data, *args)
+
+def _guarded_sendmsg(self, buffers, *args):
+    if args and isinstance(args[-1], tuple):
+        _guard_address(args[-1])
+    return _original_sendmsg(self, buffers, *args)
+
 socket.create_connection = _guarded_create_connection
 socket.getaddrinfo = _guarded_getaddrinfo
-Path(os.environ["PAPER_SEARCH_TRIPWIRE_MARKER"]).write_text("loaded", encoding="utf-8")
+socket.socket.connect = _guarded_connect
+socket.socket.connect_ex = _guarded_connect_ex
+socket.socket.sendto = _guarded_sendto
+if _original_sendmsg is not None:
+    socket.socket.sendmsg = _guarded_sendmsg
+
+def _assert_blocked(attempt):
+    try:
+        attempt()
+    except RuntimeError:
+        return
+    raise AssertionError("outbound tripwire is incomplete")
+
+_assert_blocked(lambda: socket.create_connection(("192.0.2.1", 9)))
+_assert_blocked(lambda: socket.socket().connect(("192.0.2.1", 9)))
+_assert_blocked(lambda: socket.socket().connect_ex(("192.0.2.1", 9)))
+_assert_blocked(lambda: socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("192.0.2.1", 9)))
+Path(os.environ["PAPER_SEARCH_TRIPWIRE_MARKER"]).write_text("verified", encoding="utf-8")
 """,
         encoding="utf-8",
     )
@@ -103,7 +154,7 @@ def test_replay_process_is_offline_and_ui_matches_canonical_api(tmp_path: Path) 
             direct = client.post(
                 f"{base_url}/v1/search",
                 json={
-                    "query_id": "direct-replay",
+                    "query_id": "browser-e2e-replay",
                     "query": QUERY,
                     "mode": "replay",
                     "include_trace": False,
@@ -112,7 +163,7 @@ def test_replay_process_is_offline_and_ui_matches_canonical_api(tmp_path: Path) 
             ui = client.post(
                 f"{base_url}/v1/search",
                 json={
-                    "query_id": "ui-replay",
+                    "query_id": "browser-e2e-replay",
                     "query": QUERY,
                     "budget_profile": "balanced",
                     "mode": "replay",
@@ -122,22 +173,29 @@ def test_replay_process_is_offline_and_ui_matches_canonical_api(tmp_path: Path) 
             repeated = client.post(
                 f"{base_url}/v1/search",
                 json={
-                    "query_id": "repeat-replay",
+                    "query_id": "browser-e2e-replay",
                     "query": QUERY,
                     "mode": "replay",
                     "include_trace": False,
                 },
             )
 
-    assert marker.read_text(encoding="utf-8") == "loaded"
+    assert marker.read_text(encoding="utf-8") == "verified"
     assert page.status_code == script.status_code == 200
     assert 'id="provenance"' in page.text
     for label in ("Selected paper IDs", "Snapshot set", "Config hash", "Run ID"):
         assert label in script.text
     assert direct.status_code == ui.status_code == repeated.status_code == 200
     assert direct.json()["selected_paper_ids"] == ui.json()["selected_paper_ids"]
-    assert _business_projection(direct.json()) == _business_projection(ui.json())
-    assert _business_projection(direct.json()) == _business_projection(repeated.json())
+    assert _canonical_business_projection(direct.json()) == _canonical_business_projection(
+        ui.json()
+    )
+    assert _canonical_business_projection(
+        direct.json()
+    ) == _canonical_business_projection(repeated.json())
+    assert _visible_provenance_projection(
+        direct.json()
+    ) == _visible_provenance_projection(ui.json())
 
 
 def _smoke_helpers() -> dict[str, Any]:
@@ -228,6 +286,16 @@ def test_live_authorization_matrix_and_replay_request_isolation(tmp_path: Path) 
 
     asyncio.run(scenario())
 
+    with pytest.raises(ValueError, match="does not allow live execution"):
+        CompositionRoot.compose_server(
+            replay_lock_path=no_live_lock,
+            snapshot_manifest_path=fixture["manifest"],
+            artifact_root=fixture["root"],
+            capture_output_root=fixture["root"] / "captures-forbidden",
+            live_authorized=True,
+            environ={},
+        )
+
 
 def test_authorized_fake_live_publishes_one_capture_before_http_200(
     tmp_path_factory: pytest.TempPathFactory,
@@ -242,7 +310,7 @@ def test_authorized_fake_live_publishes_one_capture_before_http_200(
             replay = await _post(
                 server,
                 real_client,
-                {"query_id": "replay-on-live-http", "query": QUERY, "mode": "replay"},
+                {"query_id": "replay-on-live-http", "query": QUERY},
             )
             after_replay = {path.name for path in capture_root.iterdir()}
             live = await _post(

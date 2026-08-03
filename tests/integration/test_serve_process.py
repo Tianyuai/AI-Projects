@@ -7,7 +7,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -23,16 +23,32 @@ def _reserve_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def _environment() -> dict[str, str]:
-    result = {"PYTHONPATH": str(Path("src").resolve()), "PYTHONUTF8": "1"}
+def _environment(
+    *,
+    extra_pythonpath: Sequence[Path] = (),
+    overrides: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    pythonpath = os.pathsep.join(
+        [*(str(path.resolve()) for path in extra_pythonpath), str(Path("src").resolve())]
+    )
+    result = {"PYTHONPATH": pythonpath, "PYTHONUTF8": "1"}
     for name in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP"):
         if value := os.environ.get(name):
             result[name] = value
+    if overrides is not None:
+        result.update(overrides)
     return result
 
 
 class _ServeProcess:
-    def __init__(self, fixture: dict[str, Path], port: int) -> None:
+    def __init__(
+        self,
+        fixture: dict[str, Path],
+        port: int,
+        *,
+        extra_pythonpath: Sequence[Path] = (),
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
         self.process = subprocess.Popen(
             [
                 sys.executable,
@@ -51,7 +67,10 @@ class _ServeProcess:
                 str(port),
             ],
             cwd=fixture["root"],
-            env=_environment(),
+            env=_environment(
+                extra_pythonpath=extra_pythonpath,
+                overrides=environment,
+            ),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -84,8 +103,19 @@ class _ServeProcess:
 
 
 @contextmanager
-def _serve_process(fixture: dict[str, Path], port: int) -> Iterator[_ServeProcess]:
-    process = _ServeProcess(fixture, port)
+def _serve_process(
+    fixture: dict[str, Path],
+    port: int,
+    *,
+    extra_pythonpath: Sequence[Path] = (),
+    environment: Mapping[str, str] | None = None,
+) -> Iterator[_ServeProcess]:
+    process = _ServeProcess(
+        fixture,
+        port,
+        extra_pythonpath=extra_pythonpath,
+        environment=environment,
+    )
     try:
         yield process
     finally:

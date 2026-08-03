@@ -24,6 +24,8 @@ from paper_search.errors import ProtectedExecutionError
 class BudgetExceededError(ProtectedExecutionError):
     """Raised before an operation that would exceed a hard limit."""
 
+    search_error_code = "budget_exhausted"
+
 
 class ReservationError(ProtectedExecutionError):
     """Raised when a reservation is invalid or cannot be settled safely."""

@@ -604,6 +604,7 @@ class CaptureSession:
         output_root: Path,
         run_id: str,
         input_lock_bytes: bytes,
+        expected_config_hash: Sha256 | None = None,
         on_terminal: Callable[[str, CaptureSession], None] | None = None,
     ) -> None:
         if not _is_valid_run_id(run_id):
@@ -613,6 +614,7 @@ class CaptureSession:
         self._run_id = run_id
         self._input_lock_bytes = bytes(input_lock_bytes)
         self._input_lock = _parse_lock(self._input_lock_bytes)
+        self._expected_config_hash = expected_config_hash or lock_sha256(self._input_lock)
         staging_key = hashlib.sha256(run_id.encode("utf-8")).hexdigest()[:16]
         self._work_dir = self._output_root / f".{staging_key}.incomplete"
         self._final_dir = self._output_root / run_id
@@ -728,7 +730,7 @@ class CaptureSession:
             raise ValueError("execution run_id does not match capture session")
         if (
             isinstance(result.outcome, SearchSuccess)
-            and result.outcome.response.config_hash != lock_sha256(self._input_lock)
+            and result.outcome.response.config_hash != self._expected_config_hash
         ):
             raise ValueError("execution config does not match captured input lock")
         self._execution = result
@@ -887,6 +889,7 @@ class ArtifactFactory:
         *,
         run_id: str,
         input_lock_bytes: bytes,
+        expected_config_hash: Sha256 | None = None,
     ) -> CaptureSession:
         session_key = run_id.casefold()
         with self._session_lock:
@@ -896,6 +899,7 @@ class ArtifactFactory:
             output_root=self.output_root,
             run_id=run_id,
             input_lock_bytes=input_lock_bytes,
+            expected_config_hash=expected_config_hash,
             on_terminal=self._release_session,
         )
         with self._session_lock:

@@ -1,3 +1,5 @@
+"""Legacy synthetic mock-server compatibility coverage; Task5 targets ``serve``."""
+
 from __future__ import annotations
 
 import os
@@ -141,7 +143,8 @@ def test_mock_server_process_survives_invalid_request_and_unknown_route() -> Non
             missing = client.get(f"{base_url}/missing")
             live_after_failures = client.get(f"{base_url}/health/live")
 
-    assert invalid.status_code == 422
+    # The legacy server now shares the canonical typed API contract (400).
+    assert invalid.status_code == 400
     assert missing.status_code == 404
     assert live_after_failures.status_code == 200
 

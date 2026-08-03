@@ -330,6 +330,7 @@ class _RequestLiveCaptureService:
             session = self._bundle.artifact_factory.start_capture(
                 run_id=run_id,
                 input_lock_bytes=self._input_lock_bytes,
+                expected_config_hash=getattr(self._bundle, "config_hash", None),
             )
             execution = await self._bundle.service.execute(request, run_id=run_id)
             session.record_execution(execution)

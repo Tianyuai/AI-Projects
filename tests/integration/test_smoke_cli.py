@@ -314,6 +314,48 @@ def test_parser_exposes_stable_smoke_contract_and_defaults_to_replay(tmp_path: P
     assert args.mode == "replay"
     assert args.snapshot_manifest is None
     assert args.allow_network is False
+    assert args.config is None
+
+
+def test_smoke_explicit_config_reaches_production_composition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _smoke_fixture(tmp_path)
+    observed: dict[str, object] = {}
+    original_compose = composition_module.CompositionRoot.compose
+    project_config = Path(__file__).parents[2] / "configs" / "base.yaml"
+
+    def recording_compose(**kwargs: object) -> object:
+        observed["runtime_config"] = kwargs["runtime_config"]
+        try:
+            return original_compose(**kwargs)  # type: ignore[arg-type]
+        except Exception as error:
+            observed["compose_error"] = repr(error)
+            raise
+
+    monkeypatch.chdir(fixture["root"])
+    monkeypatch.setattr(
+        composition_module.CompositionRoot,
+        "compose",
+        classmethod(lambda cls, **kwargs: recording_compose(**kwargs)),
+    )
+
+    result = main(
+            [
+                "smoke",
+                "--lock",
+                str(fixture["replay_lock"]),
+                "--output-root",
+                str(fixture["root"] / "configured"),
+                "--snapshot-manifest",
+                str(fixture["manifest"]),
+                "--config",
+                str(project_config),
+            ]
+        )
+    assert result == 0, observed
+    assert getattr(observed["runtime_config"], "experiment") == "main-baseline"
 
 
 @pytest.mark.parametrize(

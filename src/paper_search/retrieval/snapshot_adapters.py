@@ -105,6 +105,8 @@ class ProviderSettlementController(Protocol):
 class ProviderAdapterError(ProtectedExecutionError):
     """A fixed, credential-safe terminal adapter failure."""
 
+    search_error_code = "dependency_failure"
+
 
 @dataclass(frozen=True)
 class _RequestOutcome:

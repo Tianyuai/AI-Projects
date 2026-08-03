@@ -4,5 +4,7 @@
 class ProtectedExecutionError(RuntimeError):
     """A typed execution failure that must propagate without reinterpretation."""
 
+    search_error_code = "integrity_failure"
+
 
 __all__ = ["ProtectedExecutionError"]

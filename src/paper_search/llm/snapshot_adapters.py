@@ -59,6 +59,8 @@ class RequestSettlementController(Protocol):
 class LLMAdapterError(ProtectedExecutionError):
     """A fixed, credential-safe terminal adapter failure."""
 
+    search_error_code = "dependency_failure"
+
 
 class HardBudgetSettlementAdapter:
     """Expose the analyzer settlement contract over one authoritative controller."""

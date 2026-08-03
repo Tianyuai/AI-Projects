@@ -218,6 +218,8 @@ class EvolutionCoordinator:
             estimate = _snapshot(
                 self._estimator.estimate(_snapshot(plan), len(rounds))
             )
+        except ProtectedExecutionError:
+            raise
         except Exception:
             return _failure(
                 stage="estimate",
@@ -233,6 +235,8 @@ class EvolutionCoordinator:
             )
         try:
             budget_available = self._budget.can_reserve(_snapshot(estimate))
+        except ProtectedExecutionError:
+            raise
         except Exception:
             return _failure(
                 stage="preflight",
@@ -275,7 +279,7 @@ class EvolutionCoordinator:
                     raise ValueError("execution round number does not match its plan")
                 execution = _snapshot(execution)
                 _validate_incoming_observations(execution.observations)
-            except (ProtectedExecutionError, ValueError):
+            except ProtectedExecutionError:
                 raise
             except Exception:
                 return _failure(
@@ -404,6 +408,8 @@ class EvolutionCoordinator:
                 estimate = _snapshot(
                     self._estimator.estimate(_snapshot(next_plan), len(rounds))
                 )
+            except ProtectedExecutionError:
+                raise
             except Exception:
                 return _failure(
                     stage="estimate",
@@ -419,6 +425,8 @@ class EvolutionCoordinator:
                 )
             try:
                 budget_available = self._budget.can_reserve(_snapshot(estimate))
+            except ProtectedExecutionError:
+                raise
             except Exception:
                 return _failure(
                     stage="preflight",

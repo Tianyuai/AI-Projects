@@ -175,6 +175,8 @@ class EvaluationRunRequest(DomainModel):
     output_root: Path
     snapshot_manifest_path: Path | None
     network_authorized: bool
+    runtime_config: RuntimeConfig | None = None
+    ablation_config_path: Path | None = None
 
 
 class EvaluationRunResult(DomainModel):
@@ -1177,6 +1179,8 @@ async def _run_formal_evaluation(
         snapshot_manifest_path=request.snapshot_manifest_path,
         network_authorized=request.network_authorized,
         lock_bytes=inputs.lock_bytes,
+        runtime_config=request.runtime_config,
+        ablation_config=request.ablation_config_path or Path("configs/ablations.yaml"),
     )
     try:
         readiness = bundle.readiness_probe()

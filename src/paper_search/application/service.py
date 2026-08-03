@@ -31,6 +31,7 @@ from paper_search.evaluation.business_results import (
     business_result_sha256,
     hard_failure_business_result,
 )
+from paper_search.errors import ProtectedExecutionError
 
 
 class SearchOrchestrator(Protocol):
@@ -272,6 +273,20 @@ class SearchApplicationService:
             )
         except asyncio.CancelledError:
             raise
+        except ProtectedExecutionError as error:
+            candidate = error.search_error_code
+            protected_code: SearchErrorCode = (
+                candidate if candidate in _SAFE_ERROR_DETAILS else "integrity_failure"
+            )
+            return self._failure(
+                request=request,
+                run_id=run_id,
+                code=protected_code,
+                usage=controller.committed_usage,
+                stop_reason=protected_code,
+                diagnostics=[],
+                result=None,
+            )
         except Exception:  # noqa: BLE001
             return self._failure(
                 request=request,

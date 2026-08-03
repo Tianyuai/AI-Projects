@@ -17,6 +17,7 @@ from paper_search.application.service import (
     SearchApplicationError,
     SearchApplicationService,
 )
+from paper_search.control.budget import BudgetExceededError
 from paper_search.domain.models import (
     ErrorDetail,
     Paper,
@@ -28,8 +29,11 @@ from paper_search.domain.models import (
     SubQuery,
     UsageActual,
 )
+from paper_search.errors import ProtectedExecutionError
 from paper_search.pipeline.orchestrator import OrchestratorResult
 from paper_search.ranking.fusion import FusedPaper
+from paper_search.llm.snapshot_adapters import LLMAdapterError
+from paper_search.retrieval.snapshot_adapters import ProviderAdapterError
 
 
 NOW = datetime(2026, 8, 2, tzinfo=UTC)
@@ -179,6 +183,19 @@ class StubOrchestrator:
         assert query == "graph retrieval"
         assert max_provider_results == 50
         return self.result
+
+
+class _RaisingOrchestrator:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def run(self, query: str, *, max_provider_results: int) -> OrchestratorResult:
+        del query, max_provider_results
+        raise self.error
+
+
+class _TypedDependencyFailure(ProtectedExecutionError):
+    search_error_code = "dependency_failure"
 
 
 def _service(
@@ -476,3 +493,35 @@ def test_execute_maps_factory_failure_to_safe_typed_outcome() -> None:
     assert execution.outcome.error.code == "internal_error"
     assert execution.outcome.error.detail == "The search could not be completed"
     assert "/secret/query" not in execution.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [
+        (_TypedDependencyFailure("provider authentication failed"), "dependency_failure"),
+        (ProtectedExecutionError("reservation integrity failed"), "integrity_failure"),
+        (BudgetExceededError("request budget exhausted"), "budget_exhausted"),
+        (ProviderAdapterError("provider authentication failed"), "dependency_failure"),
+        (LLMAdapterError("llm authentication failed"), "dependency_failure"),
+    ],
+)
+def test_execute_preserves_protected_typed_failures(
+    error: ProtectedExecutionError,
+    expected_code: str,
+) -> None:
+    service = SearchApplicationService(
+        orchestrator_factory=lambda controller, run_id: _RaisingOrchestrator(error),
+        budgets={"low": _budget(), "balanced": _budget()},
+        mode="replay",
+        snapshot_set_id="snapshot-set-1",
+        snapshot_captured_at=NOW,
+        git_sha="abc1234",
+        max_provider_results=50,
+        run_id_factory=lambda: "run-protected",
+    )
+
+    execution = asyncio.run(service.execute(_request()))
+
+    assert isinstance(execution.outcome, SearchFailure)
+    assert execution.outcome.error.code == expected_code
+    assert execution.outcome.stop_reason == expected_code

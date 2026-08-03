@@ -18,6 +18,7 @@ from paper_search.application.contracts import (
     SearchFailure,
     SearchRequest,
 )
+from paper_search.config import RuntimeConfig, load_runtime_config
 from paper_search.evaluation.runner import (
     EvaluationRunRequest,
     EvaluationRunResult,
@@ -31,6 +32,28 @@ from paper_search.evaluation.validator import (
 
 _SMOKE_QUERY = "resource-aware scholarly paper search"
 _SMOKE_QUERY_ID = "smoke-query-1"
+_PROJECT_CONFIG_ROOT = Path(__file__).resolve().parents[2] / "configs"
+
+
+def _resolve_project_config(path: Path) -> Path:
+    if path.exists():
+        return path
+    fallback = _PROJECT_CONFIG_ROOT / path.name
+    return fallback if fallback.exists() else path
+
+
+def _load_optional_runtime_config(path: Path | None) -> RuntimeConfig | None:
+    if path is None:
+        return None
+    return load_runtime_config(_resolve_project_config(path))
+
+
+def _resolve_ablation_config(config_path: Path | None) -> Path:
+    if config_path is not None:
+        sibling = config_path.parent / "ablations.yaml"
+        if sibling.exists():
+            return sibling
+    return _PROJECT_CONFIG_ROOT / "ablations.yaml"
 
 
 class _SmokeFailure(RuntimeError):
@@ -54,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--mode", choices=("replay", "live"), default="replay")
     smoke.add_argument("--snapshot-manifest", type=Path)
     smoke.add_argument("--allow-network", action="store_true")
+    smoke.add_argument("--config", type=Path)
     evaluate = commands.add_parser("evaluate", help="run one formal evaluation")
     evaluate.add_argument("--lock", type=Path, required=True)
     evaluate.add_argument("--split", choices=("dev", "validation"), required=True)
@@ -61,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--output-root", type=Path, required=True)
     evaluate.add_argument("--snapshot-manifest", type=Path)
     evaluate.add_argument("--allow-network", action="store_true")
+    evaluate.add_argument("--config", type=Path)
     verify = commands.add_parser("verify-run", help="verify a formal run")
     verify.add_argument("run_directory", type=Path)
     compare = commands.add_parser("compare-replay", help="compare capture and replay")
@@ -72,6 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--snapshot-manifest", type=Path, required=True)
     serve.add_argument("--capture-output-root", type=Path, required=True)
     serve.add_argument("--allow-live", action="store_true")
+    serve.add_argument("--config", type=Path)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
     return parser
@@ -99,6 +125,8 @@ async def _run_smoke(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
     bundle: ApplicationBundle | None = None
     session = None
     try:
+        config_path = getattr(args, "config", None)
+        runtime_config = _load_optional_runtime_config(config_path)
         bundle = CompositionRoot.compose(
             lock_path=lock_path,
             mode=args.mode,
@@ -107,11 +135,14 @@ async def _run_smoke(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
             snapshot_manifest_path=args.snapshot_manifest,
             network_authorized=bool(args.allow_network),
             lock_bytes=input_lock_bytes,
+            runtime_config=runtime_config,
+            ablation_config=_resolve_ablation_config(config_path),
         )
         run_id = f"smoke-{uuid4()}"
         session = bundle.artifact_factory.start_capture(
             run_id=run_id,
             input_lock_bytes=input_lock_bytes,
+            expected_config_hash=bundle.config_hash,
         )
         budget_profile = next(iter(bundle.service._budgets))  # noqa: SLF001
         execution = await bundle.service.execute(
@@ -168,6 +199,8 @@ def _run_serve(args: argparse.Namespace) -> int:
         artifact_root=Path.cwd(),
         capture_output_root=Path(args.capture_output_root),
         live_authorized=bool(args.allow_live),
+        runtime_config=_load_optional_runtime_config(getattr(args, "config", None)),
+        ablation_config=_resolve_ablation_config(getattr(args, "config", None)),
     )
 
     @asynccontextmanager
@@ -248,6 +281,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
     if args.command == "evaluate":
         try:
+            runtime_config = _load_optional_runtime_config(args.config)
             result = asyncio.run(
                 run_evaluation(
                     EvaluationRunRequest(
@@ -257,6 +291,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         output_root=args.output_root,
                         snapshot_manifest_path=args.snapshot_manifest,
                         network_authorized=bool(args.allow_network),
+                        runtime_config=runtime_config,
+                        ablation_config_path=_resolve_ablation_config(args.config),
                     )
                 )
             )

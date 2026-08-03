@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from paper_search.control.budget import BudgetExceededError, ReservationError
+from paper_search.errors import ProtectedExecutionError
 from paper_search.domain.models import Paper, QuerySpec, UsageActual, UsageEstimate
 from paper_search.evolution import (
     CandidateConstraintObservation,
@@ -226,6 +227,18 @@ class FakeEstimator:
         return UsageEstimate(search_api_calls=1, elapsed_ms=10)
 
 
+class ProtectedEstimator(FakeEstimator):
+    def __init__(self, *, fail_on_call: int = 1) -> None:
+        super().__init__()
+        self._protected_fail_on_call = fail_on_call
+
+    def estimate(self, plan: RoundPlan, completed_round_count: int) -> UsageEstimate:
+        self.calls.append((plan, completed_round_count))
+        if len(self.calls) == self._protected_fail_on_call:
+            raise ProtectedExecutionError("protected estimate failure")
+        return UsageEstimate(search_api_calls=1, elapsed_ms=10)
+
+
 class FakeGainEvaluator:
     def __init__(self, *, fail_on_call: int | None = None, score: float = 1.0) -> None:
         self._fail_on_call = fail_on_call
@@ -282,6 +295,18 @@ class FakeBudget:
         if len(self.calls) == self._fail_on_call:
             raise RuntimeError("secret budget state")
         return self._availability[len(self.calls) - 1]
+
+
+class ProtectedBudget(FakeBudget):
+    def __init__(self, *, fail_on_call: int = 1) -> None:
+        super().__init__()
+        self._protected_fail_on_call = fail_on_call
+
+    def can_reserve(self, estimate: UsageEstimate) -> bool:
+        self.calls.append(estimate)
+        if len(self.calls) == self._protected_fail_on_call:
+            raise ReservationError("protected preflight failure")
+        return True
 
 
 class MutatingEstimator(FakeEstimator):
@@ -603,49 +628,21 @@ def test_later_executor_failure_preserves_committed_first_seen_state() -> None:
 
 
 @pytest.mark.parametrize(
-    ("rejection", "reason", "failed_round", "warnings", "failed_stage"),
+    "rejection",
     [
-        (BudgetExceededError("reservation lost"), "budget_insufficient", None, [], None),
-        (
-            ReservationError("reservation invalid"),
-            "round_failed",
-            2,
-            ["execution: dependency failure"],
-            "execution",
-        ),
+        BudgetExceededError("reservation lost"),
+        ReservationError("reservation invalid"),
     ],
 )
-def test_execution_rejection_preserves_prior_state_with_its_typed_outcome(
-    rejection: Exception,
-    reason: str,
-    failed_round: int | None,
-    warnings: list[str],
-    failed_stage: str | None,
-) -> None:
-    first_execution = execution(1)
-    first_before = first_execution.model_dump(mode="json")
+def test_execution_rejection_propagates_protected_failure(rejection: Exception) -> None:
     executor = RejectingExecutor(
-        [first_execution, execution(2)],
+        [execution(1), execution(2)],
         rejection=rejection,
         reject_on_call=2,
     )
 
-    result = run(
-        coordinator(executor=executor),
-        strategy="fixed_two_round",
-    )
-
-    assert [item.model_dump(mode="json") for item in result.rounds] == [first_before]
-    assert [item.model_dump(mode="json") for item in result.candidates] == first_before[
-        "candidates"
-    ]
-    assert result.stop_reason == reason
-    assert result.failed_round == failed_round
-    assert result.warnings == warnings
-    assert result.decisions[-1].failed_stage == failed_stage
-    assert result.decisions[-1].checks["budget_insufficient"] is (
-        reason == "budget_insufficient"
-    )
+    with pytest.raises(type(rejection)):
+        run(coordinator(executor=executor), strategy="fixed_two_round")
 
 
 def test_executor_cannot_mutate_retained_committed_output_on_later_failure() -> None:
@@ -716,6 +713,22 @@ def test_postcommit_dependency_failure_preserves_first_seen_state(
     assert result.warnings == [f"{stage}: dependency failure"]
     assert result.decisions[-1].failed_stage == stage
     assert "secret" not in " ".join(result.warnings)
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"estimator": ProtectedEstimator()},
+        {"budget": ProtectedBudget()},
+        {"estimator": ProtectedEstimator(fail_on_call=2)},
+        {"budget": ProtectedBudget(fail_on_call=2)},
+    ],
+)
+def test_protected_estimate_and_preflight_failures_propagate(
+    updates: dict[str, object],
+) -> None:
+    with pytest.raises(ProtectedExecutionError):
+        run(coordinator(**updates), strategy="fixed_two_round")  # type: ignore[arg-type]
 
 
 def test_next_round_budget_rejection_preserves_committed_round() -> None:

@@ -51,6 +51,7 @@ def test_serve_parser_is_replay_only_and_loopback_by_default() -> None:
     assert args.host == "127.0.0.1"
     assert args.port == 8000
     assert args.mode == "replay"
+    assert args.config is None
 
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(

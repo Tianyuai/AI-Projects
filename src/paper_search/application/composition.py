@@ -748,6 +748,11 @@ class _LiveOrchestratorFactory:
             analysis_estimate=analysis_estimate,
             provider_estimate=provider_estimates["openalex"],
             provider_estimates=provider_estimates,
+            pricer=self._pricer,
+            provider_adapter_names={
+                "openalex": "openalex-works-v1",
+                "semantic_scholar": "semantic-graph-v1",
+            },
             routing_limits=(
                 lock.baseline.retrieval.openalex_calls_min,
                 lock.baseline.retrieval.openalex_calls_max,

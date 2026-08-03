@@ -14,6 +14,7 @@ from pydantic import Field, model_validator
 from paper_search.application.contracts import DependencyDiagnostic, SnapshotRef
 from paper_search.application.experiments import OptionalStageUnavailableError
 from paper_search.control.budget import BudgetExceededError, HardBudgetController, ReservationError
+from paper_search.control.pricing import ActualCostPricer
 from paper_search.domain.models import (
     BudgetReservation,
     CandidateEvidence,
@@ -386,6 +387,8 @@ class MockSearchOrchestrator:
         embedding_ranker: EmbeddingRankingStage | None = None,
         citation_expander: AsyncCitationExpansionStage | None = None,
         constraint_reranker: AsyncConstraintRerankingStage | None = None,
+        pricer: ActualCostPricer | None = None,
+        provider_adapter_names: Mapping[DependencyName, str] | None = None,
     ) -> None:
         self._controller = controller
         self._analyzer = analyzer
@@ -406,6 +409,8 @@ class MockSearchOrchestrator:
         self._embedding_ranker = embedding_ranker
         self._citation_expander = citation_expander
         self._constraint_reranker = constraint_reranker
+        self._pricer = pricer
+        self._provider_adapter_names = dict(provider_adapter_names or {})
         self._parser = QueryParser(QueryPlanner())
 
     def _fallback(self, query: str) -> QueryAnalysisResult:
@@ -706,20 +711,34 @@ class MockSearchOrchestrator:
                             )
                         )
                     elif self._controller.terminal_outcome(reservation) is None:
-                        try:
-                            if self._controller.formal_live:
-                                self._controller.fail_closed(
-                                    reservation,
-                                    UsageActual(search_api_calls=1),
-                                )
-                            else:
-                                self._controller.settle(
-                                    reservation,
-                                    UsageActual(search_api_calls=1),
-                                )
-                        except ReservationError:
-                            self._fail_closed_if_active(reservation)
-                            raise
+                        if (
+                            self._controller.formal_live
+                            and self._pricer is not None
+                            and name in self._provider_adapter_names
+                        ):
+                            valued = self._pricer.value_actual(
+                                dependency=name,
+                                model_or_adapter=(
+                                    self._provider_adapter_names[name]
+                                ),
+                                usage=UsageActual(search_api_calls=1),
+                            )
+                            self._controller.fail_closed(reservation, valued)
+                        else:
+                            try:
+                                if self._controller.formal_live:
+                                    self._controller.fail_closed(
+                                        reservation,
+                                        UsageActual(search_api_calls=1),
+                                    )
+                                else:
+                                    self._controller.settle(
+                                        reservation,
+                                        UsageActual(search_api_calls=1),
+                                    )
+                            except ReservationError:
+                                self._fail_closed_if_active(reservation)
+                                raise
                     warnings.append(f"{name}: provider exception")
                     if (
                         self._execution_mode != "replay"

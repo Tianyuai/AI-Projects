@@ -1436,6 +1436,16 @@ def test_replay_integrity_failure_records_zero_external_spend() -> None:
 
 
 def test_formal_live_provider_exception_fails_closed_without_integrity_abort() -> None:
+    from pathlib import Path
+
+    from paper_search.control.pricing import (
+        ActualCostPricer,
+        parse_pricing_policy_bytes,
+    )
+
+    policy = parse_pricing_policy_bytes(
+        Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml").read_bytes()
+    )
     events: list[str] = []
     controller = HardBudgetController(_budget(), formal_live=True)
     orchestrator = MockSearchOrchestrator(
@@ -1447,12 +1457,15 @@ def test_formal_live_provider_exception_fails_closed_without_integrity_abort() -
         analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
         provider_estimate=UsageEstimate(search_api_calls=1),
         execution_mode="live",
+        pricer=ActualCostPricer(policy),
+        provider_adapter_names={"openalex": "openalex-works-v1"},
     )
 
     result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
     assert controller.stop_status() == "hard_stop"
     assert controller.committed_usage.search_api_calls == 1
+    assert controller.committed_usage.cost_cny is not None
     assert result.diagnostics[-1].errors[0].code == "provider_error"
     assert "openalex: provider exception" in result.warnings
 

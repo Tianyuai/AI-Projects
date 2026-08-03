@@ -85,6 +85,19 @@ _SECRET_MARKERS = (
     b"private_key",
     b"access_token",
 )
+
+
+def _secret_scan_failure(content: bytes, *, raw_response: bool) -> bool:
+    """Return whether an artifact carries a prohibited secret or private path."""
+
+    if _PRIVATE_PATH.search(content) is not None:
+        return True
+    if raw_response:
+        return False
+    lowered = content.lower()
+    return any(marker in lowered for marker in _SECRET_MARKERS)
+
+
 _RUN_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$")
 _PRIVATE_PATH = re.compile(
     rb"(?i)(?:[a-z]:(?:\\+|/)(?:users|documents and settings)(?:\\+|/)|/(?:home|users)/[^/\s]+/|https?://[^/\s:@]+:[^/\s@]+@)"
@@ -670,9 +683,9 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
         ):
             issues.append(_issue("sanitization_invalid", "executions.jsonl", "Diagnostics are not sanitized"))
         for child in root.rglob("*"):
-            if child.is_file() and (
-                any(marker in child.read_bytes().lower() for marker in _SECRET_MARKERS)
-                or _PRIVATE_PATH.search(child.read_bytes()) is not None
+            if child.is_file() and _secret_scan_failure(
+                child.read_bytes(),
+                raw_response=child.suffix == ".bin",
             ):
                 issues.append(_issue("sanitization_invalid", child.name, "Artifact contains prohibited private fields"))
                 break

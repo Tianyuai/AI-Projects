@@ -138,6 +138,36 @@ def test_json_object_request_contains_json_hint_in_messages() -> None:
     assert "json" in messages_text.casefold()
 
 
+def test_llm_decoder_records_snapshot_refs_in_provenance() -> None:
+    from paper_search.application.contracts import SnapshotRef
+
+    decoder = LLMResponseDecoder(prompt_version="query-analyze-v1")
+    ref = SnapshotRef(
+        entry_id="entry-1",
+        dependency="llm",
+        cache_key="sha256:" + "a" * 64,
+        response_sha256="sha256:" + "b" * 64,
+        captured_at=datetime(2026, 8, 3, tzinfo=UTC),
+        snapshot_path="responses/llm/entry-1.bin",
+    )
+    response = (
+        b'{"choices":[{"message":{"content":"{\\"query_spec\\":{}}"}}],'
+        b'"usage":{"prompt_tokens":1,"completion_tokens":1}}'
+    )
+
+    result = decoder.decode(
+        response,
+        model_id="qwen3.7-plus",
+        captured_at=datetime(2026, 8, 3, tzinfo=UTC),
+        cache_hit=False,
+        snapshot_ref=ref,
+    )
+
+    assert json.loads(result.provenance["snapshot_refs"]) == [
+        ref.model_dump(mode="json")
+    ]
+
+
 def test_dashscope_json_request_disables_thinking_and_stays_bounded() -> None:
     seen: list[httpx.Request] = []
 

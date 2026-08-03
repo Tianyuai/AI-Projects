@@ -190,6 +190,10 @@ class LLMResponseDecoder:
                     "snapshot_cache_key": snapshot_ref.cache_key,
                     "snapshot_response_sha256": snapshot_ref.response_sha256,
                     "snapshot_path": snapshot_ref.snapshot_path,
+                    "snapshot_refs": json.dumps(
+                        [snapshot_ref.model_dump(mode="json")],
+                        separators=(",", ":"),
+                    ),
                 }
             )
         return ProviderResult[dict[str, Any]](

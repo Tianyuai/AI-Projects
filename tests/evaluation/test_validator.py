@@ -149,6 +149,24 @@ def test_capture_rejects_unbound_nested_snapshot_file(tmp_path: Path) -> None:
     assert "snapshot_tree_invalid" in {issue.code for issue in result.issues}
 
 
+def test_secret_scan_ignores_legitimate_words_in_raw_responses() -> None:
+    assert not validator_module._secret_scan_failure(
+        b'{"abstract":"password managers and authorization studies"}',
+        raw_response=True,
+    )
+
+
+def test_secret_scan_flags_metadata_secret_markers() -> None:
+    assert validator_module._secret_scan_failure(
+        b'{"authorization":"Bearer secret"}',
+        raw_response=False,
+    )
+    assert validator_module._secret_scan_failure(
+        b'{"password":"hunter2"}',
+        raw_response=False,
+    )
+
+
 def test_validator_recomputes_metrics_from_frozen_evidence(tmp_path: Path) -> None:
     run = tmp_path / "capture"
     shutil.copytree(FIXTURE_ROOT / "capture", run)

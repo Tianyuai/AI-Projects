@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
+import runpy
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +18,8 @@ from paper_search.application.composition import CompositionRoot
 from paper_search.application.contracts import SearchRequest
 from paper_search.application.contracts import SearchExecutionResult, SearchFailure, SearchSuccess
 from paper_search.application.locks import CandidateLock, ReplayLock
+from paper_search.cli import main
+from paper_search.storage.dependency_snapshot import DependencySnapshotManifestV2
 
 
 def test_serve_parser_requires_bound_replay_inputs() -> None:
@@ -466,6 +470,61 @@ def test_live_request_failure_or_cancellation_closes_without_publication(
         if cancelled
         else ["execute", "record", "fail", "close"]
     )
+
+
+def test_server_router_publishes_each_fake_live_capture_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helpers = runpy.run_path("tests/integration/test_smoke_cli.py")
+    fixture = helpers["_smoke_fixture"](tmp_path)
+    fake_client = helpers["_fake_live_client_factory"](fixture)
+    monkeypatch.chdir(fixture["root"])
+    monkeypatch.setenv("LLM_API_KEY", "fake-live-key")
+    monkeypatch.setattr(composition_module.httpx, "AsyncClient", fake_client)
+    source_root = fixture["root"] / "server-captures"
+    assert main([
+        "smoke", "--lock", str(fixture["candidate_lock"]), "--output-root", str(source_root),
+        "--mode", "live", "--allow-network",
+    ]) == 0
+    source = next(source_root.glob("smoke-*"))
+    server = CompositionRoot.compose_server(
+        replay_lock_path=source / "replay.lock.yaml",
+        snapshot_manifest_path=source / "snapshot-manifest.json",
+        artifact_root=fixture["root"],
+        capture_output_root=source_root,
+        live_authorized=True,
+        environ={"LLM_API_KEY": "fake-live-key"},
+    )
+
+    async def run() -> list[SearchExecutionResult]:
+        return await asyncio.gather(
+            server.service_router.execute(SearchRequest(query_id="live-a", query="resource-aware scholarly paper search", mode="live")),
+            server.service_router.execute(SearchRequest(query_id="live-b", query="resource-aware scholarly paper search", mode="live")),
+        )
+
+    results = asyncio.run(run())
+    asyncio.run(server.aclose())
+    run_ids: set[str] = set()
+    for result in results:
+        assert isinstance(result.outcome, SearchSuccess)
+        response = result.outcome.response
+        run_ids.add(response.run_id)
+        published = source_root / response.run_id
+        manifest = DependencySnapshotManifestV2.model_validate_json(
+            (published / "snapshot-manifest.json").read_bytes()
+        )
+        replay = ReplayLock.model_validate(
+            yaml.safe_load((published / "replay.lock.yaml").read_bytes())
+        )
+        assert published.is_dir()
+        assert response.snapshot_set_id == manifest.snapshot_set_id == replay.snapshot_set_id
+        assert response.snapshot_captured_at == manifest.sealed_at
+        assert not server.capture_artifact_factory.has_capture_session(run_id=response.run_id)
+    assert len(run_ids) == 2
+    assert not list(source_root.glob(".*.incomplete"))
+    assert server.capture_artifact_factory._clients == []  # noqa: SLF001
+
 
 
 def _replay_lock(*, runtime_allow_live: bool) -> ReplayLock:

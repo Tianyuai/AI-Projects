@@ -158,7 +158,20 @@ class _RequestLiveCaptureService:
                 return execution
             if not isinstance(execution.outcome, SearchSuccess):
                 raise RuntimeError("live execution has an invalid outcome")
-            session.seal()
+            manifest, _ = session.seal()
+            response = execution.outcome.response.model_copy(
+                update={
+                    "snapshot_set_id": manifest.snapshot_set_id,
+                    "snapshot_captured_at": manifest.sealed_at,
+                }
+            )
+            execution = execution.model_copy(
+                update={
+                    "outcome": execution.outcome.model_copy(
+                        update={"response": response}
+                    )
+                }
+            )
             session.publish()
             return execution
         except BaseException:

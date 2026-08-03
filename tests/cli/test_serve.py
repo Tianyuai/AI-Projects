@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -384,9 +385,12 @@ def test_live_request_records_seals_and_publishes_before_success(
         run_id_factory=lambda: "live-1",
     )
 
-    asyncio.run(service.execute_and_publish(request))
+    result = asyncio.run(service.execute_and_publish(request))
 
     assert events == ["execute", "record", "seal", "publish", "close"]
+    assert isinstance(result.outcome, SearchSuccess)
+    assert result.outcome.response.snapshot_set_id == "sealed-snapshot"
+    assert result.outcome.response.snapshot_captured_at == datetime(2026, 8, 3, tzinfo=UTC)
 
 
 @pytest.mark.parametrize("cancelled", [False, True])
@@ -444,7 +448,11 @@ def _live_success(events: list[str]) -> object:
     async def execute(_: SearchRequest, *, run_id: str) -> SearchExecutionResult:
         events.append("execute")
         return SearchExecutionResult.model_construct(
-            outcome=SearchSuccess.model_construct(response=SimpleNamespace()),
+            outcome=SearchSuccess.model_construct(
+                response=SimpleNamespace(
+                    model_copy=lambda *, update: SimpleNamespace(**update),
+                )
+            ),
         )
 
     return execute
@@ -469,8 +477,15 @@ def _live_bundle(events: list[str], execution: object) -> object:
         def record_execution(self, _: object) -> None:
             events.append("record")
 
-        def seal(self) -> None:
+        def seal(self) -> tuple[object, object]:
             events.append("seal")
+            return (
+                SimpleNamespace(
+                    snapshot_set_id="sealed-snapshot",
+                    sealed_at=datetime(2026, 8, 3, tzinfo=UTC),
+                ),
+                object(),
+            )
 
         def publish(self) -> None:
             events.append("publish")

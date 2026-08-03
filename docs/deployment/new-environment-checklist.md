@@ -1,104 +1,92 @@
 # New Environment Deployment and Acceptance Checklist
 
-Use a fresh clone or worktree. This checklist separates evidence that can be
-collected with the repository's offline, synthetic setup from later actions
-that require an authorized operator, credentials, and a fresh provider cache.
+Use a fresh clone or worktree. Keep engineering verification, replay acceptance, and authorized live evidence as separate gates.
 
-## Python 3.11 and uv
+## Runtime and dependencies
 
-- [ ] Confirm that the selected interpreter is Python 3.11.x. The project
-  supports `>=3.11,<3.12`.
-- [ ] Confirm that `uv` is available before provisioning the environment.
-- [ ] Select one accelerator profile: CPU is the required portable acceptance
-  profile; CUDA is opt-in. Do not install both extras together.
+- [ ] Confirm Python 3.11.x; the project supports `>=3.11,<3.12`.
+- [ ] Confirm `uv` is available.
+- [ ] Install exactly one profile: `uv sync --locked --extra cpu`, or the separately approved CUDA profile.
+- [ ] Treat bare `uv sync` as core-only and insufficient for complete acceptance.
+- [ ] Record command outcomes and the repository revision without machine-specific paths or package-index credentials.
 
-## Dependency Installation
+## Secret boundary
 
-- [ ] From the repository root, install the selected profile with
-  `uv sync --locked --extra cpu` (or the explicitly approved CUDA profile).
-- [ ] Treat a bare `uv sync` as core-only; it is insufficient for complete
-  retrieval, health, and test acceptance.
-- [ ] Record only the command outcome and lockfile revision. Do not include
-  machine-specific paths, credentials, or package-index authentication in the
-  handoff.
+- [ ] Verify only the required variable names through the approved secret manager: `OPENALEX_API_KEY`, `SEMANTIC_SCHOLAR_API_KEY`, `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL_PRIMARY`, `LLM_MODEL_FALLBACK`, and `HF_TOKEN`.
+- [ ] Never print, copy, log, commit, screenshot, or paste values.
+- [ ] Keep offline commands on `--no-env-file`; remember this does not clear inherited variables or enforce network isolation.
+- [ ] Never inspect `.env` as part of acceptance.
 
-## Environment Variable Names
+## Engineering gate
 
-- [ ] Verify only the presence and intended use of these names: `OPENALEX_API_KEY`,
-  `SEMANTIC_SCHOLAR_API_KEY`, `LLM_API_KEY`, `LLM_BASE_URL`,
-  `LLM_MODEL_PRIMARY`, `LLM_MODEL_FALLBACK`, and `HF_TOKEN`.
-- [ ] Check names through the operator's approved secret-management mechanism;
-  never print, copy, log, commit, or paste their values.
-- [ ] Keep offline commands on `--no-env-file`. This prevents automatic `.env`
-  loading, but does not clear inherited process variables or create network
-  isolation.
+```powershell
+uv run --no-sync --no-env-file python -m paper_search.health
+uv run --no-sync --no-env-file pytest -q
+uv run --no-sync --no-env-file ruff check .
+uv run --no-sync --no-env-file mypy src
+uv run --no-sync --no-env-file paper-search --help
+```
 
-## Offline Test Gate
+- [ ] All commands exit 0.
+- [ ] Credential-gated online tests without credentials remain explicit skips, not successful provider checks.
 
-These checks can run now after the selected locked environment is prepared;
-they require no credential or external-provider authorization.
+## Gate 0 and data state
 
-- [ ] Run `D:\Dev\uv\uv.exe run --no-sync --no-env-file python -m paper_search.health`.
-- [ ] Run `D:\Dev\uv\uv.exe run --no-sync --no-env-file pytest -q`.
-- [ ] Run `D:\Dev\uv\uv.exe run --no-sync --no-env-file ruff check .`.
-- [ ] Run `D:\Dev\uv\uv.exe run --no-sync --no-env-file mypy src`.
-- [ ] Preserve any skipped credential-gated online test as a skip, not as a
-  successful provider check.
+- [ ] Read the current safe Gate 0 report and confirm `passed: true` before any real provider or formal-data claim.
+- [ ] Require a V2 frozen manifest, exact partition and identifier-map hashes, approved production pricing policy, quality-gate policy, and safe readiness evidence.
+- [ ] If Gate 0 is blocked, stop the real evidence path and report the named blocking reasons. Do not manually change `data/manifest.json`.
+- [ ] Keep raw data, gold, label files, real queries, and per-query evidence outside Git and ordinary logs.
 
-## Mock Server Gate
+The current repository state is intentionally blocked at this gate; synthetic fixtures may still exercise all engineering paths.
 
-This gate can run now and exercises only the synthetic, loopback-only service.
+## Replay service gate
 
-- [ ] Start `D:\Dev\uv\uv.exe run --no-sync --no-env-file python -m paper_search.api.mock_server --host 127.0.0.1 --port 8000`.
-- [ ] Check `http://127.0.0.1:8000/health/live` and
-  `http://127.0.0.1:8000/health/ready` from a second local terminal.
-- [ ] Submit one synthetic `POST /v1/search` request and confirm its response
-  is identified as mock-composition evidence, not a provider-backed result.
-- [ ] Stop the mock service cleanly. Do not expose it beyond loopback.
+- [ ] Verify the selected capture and replay artifacts with `paper-search verify-run`.
+- [ ] Verify the pair with `paper-search compare-replay`.
+- [ ] Start `paper-search serve` with the verified replay lock and snapshot manifest, without `--allow-live`.
+- [ ] Bind only loopback unless a separate deployment security review approves another interface.
+- [ ] Check `/health/live`, `/health/ready`, the browser UI, and one direct `/v1/search` request.
+- [ ] Confirm repeated replay preserves canonical business results and stable provenance.
+- [ ] Confirm replay performs no external name resolution or socket connection.
+- [ ] Stop cleanly and check for incomplete artifacts or held locks.
 
-## API Readiness
+## Live authorization gate
 
-This is a later, authorized gate. The default API is deliberately uncomposed,
-and mock readiness is not production readiness.
+All three technical authorization predicates are mandatory; they are not credentials and do not replace the operator's governance approval:
 
-- [ ] Obtain operator approval for the target environment and real-provider
-  readiness check.
-- [ ] Confirm the required credential names are available to the approved child
-  process without revealing values.
-- [ ] Verify injected real-provider composition, provider status, budget
-  limits, and degraded behavior under the approved runbook.
-- [ ] Record sanitized status, timestamps, configuration hash, and failure
-  category only; exclude request headers, credential-bearing URLs, and raw
-  provider responses unless separately approved for protected storage.
+- [ ] the verified lineage lock has `runtime_allow_live: true`;
+- [ ] the operator explicitly starts the server with `--allow-live`;
+- [ ] the individual request explicitly sets `mode: live`.
 
-## Fresh-Cache Run Gate
+- [ ] Obtain separate approval for providers, credential scope, query class, hard budget, capture root, and retention policy.
+- [ ] Confirm one request receives an isolated live service, clients, budget, and capture session.
+- [ ] Confirm a successful capture is sealed, verified, and atomically published before HTTP 200.
+- [ ] Confirm failed or cancelled work cannot appear complete.
+- [ ] Run `paper-search verify-run` on every published live capture.
+- [ ] Record only safe hashes, run IDs, aggregate usage/cost, and sanitized error codes.
 
-This is a later, authorized credential and external-service gate.
+## Formal dev and validation gates
 
-- [ ] Receive explicit authorization for provider calls, dataset access, and
-  cache creation before starting a fresh-cache run.
-- [ ] Freeze and record the authorized input revision, split/ID manifest,
-  configuration hash, random seed, and budget before execution.
-- [ ] Create the fresh cache through the approved workflow and preserve its
-  manifest and response hashes without storing secrets.
-- [ ] Do not interpret R2 diagnostics or a fresh-cache smoke run as R3 formal
-  evaluation evidence.
+- [ ] Run authorized dev capture under a frozen run cap.
+- [ ] Verify the capture, generate replay from the same snapshot set, verify replay, and compare canonical business results.
+- [ ] Promote a validation lock only from complete passing dev evidence.
+- [ ] Treat the validation lock hash as a single irreversible attempt identity.
+- [ ] Run one authorized live validation attempt; interruption or failure does not authorize a replacement attempt.
+- [ ] Verify and compare validation capture/replay before reporting aggregate results.
+- [ ] Keep predictions, failures, business results, snapshots, gold labels, and validation claims access-controlled.
 
-## Artifact Verification
+## Optional-module promotion gate
 
-- [ ] Verify snapshot and cache-manifest hashes against their recorded
-  artifacts.
-- [ ] Verify that configuration hash and git SHA identify the run revision.
-- [ ] Verify frozen inputs and ID manifests before later comparison work.
-- [ ] Keep future metric, cost, and ablation artifacts separate from this
-  checklist until R3 authorizes formal evaluation.
+- [ ] Keep `configs/base.yaml` on `main-baseline` throughout evidence generation.
+- [ ] Require Gates 0–5 before optional ablations.
+- [ ] Run three same-configuration dev comparisons with identical frozen inputs, snapshots, budgets, and measurement policy.
+- [ ] Use 1,000 bootstrap samples and the committed promotion thresholds.
+- [ ] Run only the approved selection-only validation comparison.
+- [ ] Keep the module default-off if evidence is incomplete or any threshold fails.
+- [ ] Request a separate promotion decision before changing baseline defaults or a validation lock.
 
-## Secret-Handling Rules
+## Handoff record
 
-- [ ] Never print or store secret values in terminal output, Markdown, test
-  data, commits, reports, screenshots, issue trackers, or provider URLs.
-- [ ] Never read, parse, copy, or commit `.env` content for this checklist.
-- [ ] Use variable names only in documentation and diagnostics; a variable name
-  must never be followed by a secret value.
-- [ ] Redact credential-bearing headers and identifiers before sharing any
-  operational evidence.
+- [ ] State separately which gates are passed, blocked, failed, or not run.
+- [ ] Link only to access-appropriate evidence.
+- [ ] Do not convert fixture success into real-data, real-provider, quality, cost, or production-readiness claims.

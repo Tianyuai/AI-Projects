@@ -1,57 +1,71 @@
 # Current System Architecture
 
-## Scope and Revision
+## Scope and evidence boundary
 
-This document describes the current source revision's offline, dependency-injected search composition. It is an implementation map and not a statement of retrieval quality, production readiness, or formal evaluation results. The runnable API described here is the loopback-only mock server; the default `paper_search.api.app:app` has no search service injected and therefore reports degraded readiness.
+This document describes the integrated runtime now present in source. It distinguishes verified offline behavior from real-data and real-network evidence that remains blocked or not run. It makes no retrieval-quality, cost, or production-readiness claim.
 
-## QuerySpec and QueryPlanner
+## One application boundary
 
-`QuerySpec` is the validated representation of the user query, its research goal, constraints, optional year range, venues, exclusions, and ambiguities. The injected analyzer returns a combined query-analysis payload. `QueryParser` validates that payload, normalizes the original query, and passes its plan to `QueryPlanner`.
+`CompositionRoot` builds the canonical `SearchApplicationService`. The same service boundary is used by smoke runs, formal evaluation, FastAPI, and the browser UI. There is no second evaluation-only or UI-only search pipeline.
 
-`QueryPlanner` canonicalizes order, whitespace, duplicate subqueries, priorities, target constraints, and inherited hard filters. It keeps three to five distinct subqueries; if no usable model plan is available, it constructs a deterministic rules-only plan. The rules fallback extracts only explicit years, known venues, and a `without` exclusion before `QueryPlanner` produces the fallback plan.
+A request flows through query analysis and planning, bounded multi-source retrieval, deduplication, hard filtering, reciprocal-rank fusion, optional named stages, response conversion, and canonical business-result projection. Every request owns a `HardBudgetController`; reservations occur before dependency work and are settled against actual safe usage.
 
-## Provider Boundary
+## Replay and live isolation
 
-The orchestrator receives a mapping of `SearchProvider` implementations and works with their `ProviderResult` envelopes, including provenance, usage, cache status, latency, and sanitized error details. The repository contains provider adapters behind that boundary, but the executable mock server does not compose them.
+The server is always composed around a verified replay lock and immutable dependency snapshot manifest. Its replay service is process-bound and has no live dependency client. A replay request reads only content-addressed snapshot bytes and verifies request identity, response hash, manifest hash, and snapshot-set identity.
 
-`paper_search.api.mock_server` builds a synthetic, loopback-only service. Its fixed readiness probe names OpenAlex and Semantic Scholar as ready for the mock API contract. The synthetic orchestrator factory itself injects one deterministic OpenAlex-style provider and a deterministic analyzer; it has no real provider, environment, or network boundary. The mock-server audit hook rejects non-loopback socket and name-resolution targets.
+Live is request-scoped. It requires all three authorization keys:
 
-## Cache and Budget Accounting
+1. the replay lineage lock permits live execution;
+2. the operator starts `paper-search serve` with `--allow-live`;
+3. the request explicitly sets `mode: live`.
 
-`SQLiteResponseCache` stores successful raw provider responses with a canonical non-secret request identity, response hash, expiry, safe response headers, and cooldown records. It can prepare and write immutable snapshot files with a manifest and verifies their hashes when validating a snapshot. The current synthetic mock composition does not inject this cache.
+If any authorization predicate is missing, live is rejected. A forbidden lock cannot start a live-capable server. Each authorized live request constructs isolated clients, budget state, capture store, and application service. A successful response is exposed only after the capture is recorded, snapshots are sealed, replay lineage is written, evidence is validated, and the directory is atomically published. Failure or cancellation publishes only failed evidence and never a complete capture.
 
-For every mock API request, `MockApiSearchService` creates a fresh `MockSearchOrchestrator` and its `HardBudgetController` from the requested budget profile. The controller reserves estimated usage before analysis and provider work, settles actual usage afterward, enforces hard limits, records committed usage, and can fail closed. The returned usage is the controller's committed usage for that request.
+## Providers, snapshots, and credentials
 
-## Deduplication, Filtering, Fusion, and Ranking
+OpenAlex, Semantic Scholar, and the configured LLM are accessed through typed adapters returning data, safe provenance, usage, latency, cache state, snapshot references, and sanitized error codes. Live adapters receive credentials only from the authorized child process environment. Replay adapters receive a `DependencySnapshotReader` and cannot fall back to network.
 
-After retrieval, `MockSearchOrchestrator` combines results by provider, deduplicates papers, applies hard filters, and fuses provider results with reciprocal-rank fusion. Only fused papers whose canonical IDs were accepted by filtering are returned. On a completed, trace-enabled retrieval path, the public trace records the analysis, retrieval, deduplication, filtering, and fusion stages. An unavailable analysis budget or an analyzer exception returns before the analysis trace entry, and `include_trace=false` clears the public trace.
+Snapshot manifests contain canonical non-secret request identities and exact response hashes. Raw response bytes and per-query artifacts remain access-controlled. Public API errors never expose exception text, headers, credentials, local paths, or raw dependency payloads.
 
-Embedding ranking, citation expansion, and constraint reranking are optional injected stages. When provided, they run after fusion in that order and add trace or safe warning information. The synthetic mock factory does not inject any of those optional stages, so the demo path ends with the fused, filtered result set.
+## API and browser UI
 
-## Evaluation, Snapshots, and Reproducibility
+`paper-search serve` exposes:
 
-Evaluation utilities and snapshot support are present as offline tooling. Provider snapshots preserve exact cached bytes plus a manifest. `StructuredSearchResponse` carries `config_hash` and `git_sha` as top-level fields. `prompt_version` is not a top-level response field: it appears in the successful `analyze` trace entry and is visible publicly only when tracing is enabled. These mechanisms make inputs and outputs inspectable, but this document does not report a formal evaluation.
+- `GET /health/live` for process liveness;
+- `GET /health/ready` for cached safe mode/snapshot/dependency state;
+- `POST /v1/search` for the canonical typed request;
+- `/` and packaged static assets for the browser UI.
 
-R2 is retrieval diagnostic evidence only. It is not a relevance-performance conclusion, and no relevance metrics are included here. R3 is the later point at which formal evaluation artifacts may be considered; they are outside this document's scope.
+The UI posts only to `/v1/search`. It does not accept filesystem paths, arbitrary snapshot selection, credentials, or provider URLs. It renders selected papers, evidence fields, safe diagnostics, usage, partial/fallback state, snapshot time, configuration hash, and run ID from the canonical response.
 
-## Single-Run Pipeline
+## Formal evaluation and evidence
 
-1. The mock API accepts `POST /v1/search` with a query ID, query text, budget profile, and optional trace flag.
-2. `MockApiSearchService` selects a fresh synthetic orchestrator for the profile.
-3. On the normal completed path, the orchestrator reserves analysis budget, invokes the injected analyzer, parses and finalizes the plan, then reserves and invokes each eligible injected provider.
-4. It then deduplicates, filters, fuses, and optionally applies the injected post-retrieval stages before returning a minimal result with trace, usage, stop reason, partial flag, and warnings. Analysis-budget and analyzer-failure paths instead return early with an empty trace.
-5. The response converter produces the public structured response. If `include_trace` is false, the API clears only the public trace; the other response fields remain available.
+`paper-search evaluate` adapts the canonical service result into ordered execution, prediction, failure, business-result, usage, metric, and gate records. `FormalRunWorkspace` writes incomplete evidence first, validates canonical bytes and bindings, then publishes complete or failed state atomically.
 
-The API also exposes `GET /health/live` and `GET /health/ready`. Liveness is independent of dependencies. Readiness requires both an injected search service and a nonempty all-ready provider map.
+`paper-search verify-run` is the machine predicate for a formal run. It validates the exact input lock, experiment identity, optional-module flags, dataset and policy bindings, snapshot evidence, record ordering/cardinality, aggregate metrics, and terminal publication state. `paper-search compare-replay` compares canonical `BusinessResultRecord` bytes between capture and replay.
 
-## Offline Adaptive Evolution Boundary
+Validation attempts are content-addressed and irrevocable. Recovery must match the archived lock bytes and full manifest binding; interruption does not authorize another attempt.
 
-The adaptive `EvolutionCoordinator` is an offline component that wraps an injected single-round executor. It coordinates an initial round plan with injected coverage analysis, next-round generation, cost estimation, marginal-gain evaluation, and budget preflight. It returns copied round records, candidates, stopping decisions, warnings, and any failed round without mutating injected input objects.
+## Experiment registry
 
-The coordinator does not replace `MockSearchOrchestrator`. It is not enabled in API composition or in the runnable mock-server configuration. Its preflight budget check is advisory for prospective rounds; it does not take the orchestrator's reservation and settlement role.
+The registry accepts only these exact identities:
 
-## Components Not Enabled in Main Configuration
+| Identity | Constructed optional behavior |
+|---|---|
+| `main-baseline` | none; fixed one round |
+| `embedding` | embedding ranking only |
+| `citation-expansion` | citation expansion only |
+| `llm-rerank` | constraint/LLM reranking only |
+| `fixed-two-round` | fixed two-round coordinator only |
+| `adaptive-evolution` | adaptive evolution coordinator only |
 
-The runnable main demonstration configuration is the fixed synthetic mock composition, not a real-provider deployment. It does not enable the adaptive coordinator, real provider adapters, SQLite caching, embedding ranking, citation expansion, or constraint reranking. The default API module is likewise deliberately uncomposed.
+Baseline planning and bounded multi-source routing are mandatory composition behavior, not optional ablation flags. Optional Provider/LLM stages share the request budget and preserve capture/replay references. Protected execution and integrity failures are never degraded into ordinary optional-stage warnings.
 
-Those boundaries are intentional deferred work. Adaptive behavior remains offline and injected until it is explicitly wired through a future runtime composition and supported by the required evaluation evidence.
+`configs/base.yaml` keeps `main-baseline`; no optional identity is promoted by implementation alone.
+
+## Verified and deferred states
+
+Offline unit/integration/E2E coverage, synthetic formal capture/replay verification, and real-browser replay acceptance are complete. The current public Gate 0 report remains blocked, so production Gate 0, real provider capture, formal dev/validation evidence, live-browser acceptance, measured quality/cost claims, and Gate 6 promotion evidence remain deferred pending their explicit authority and prerequisites.
+
+The source evidence checkpoint is `fcc0ff0` on 2026-08-03. Reproducible repository evidence is implemented in `tests/e2e/test_dual_mode_serve.py`, `tests/integration/test_serve_process.py`, and `tests/fixtures/formal_run/`. The browser acceptance record is intentionally stored outside source control; it is not available from a fresh clone.

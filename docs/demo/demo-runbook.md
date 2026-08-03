@@ -1,100 +1,115 @@
 # Demonstration Runbook
 
-## Preconditions
+## Evidence choice
 
-Run these commands from the repository root with the project's normal, prepared `uv` environment already available (including the installed package and its core dependencies). This runbook intentionally does not provision that environment, because provisioning may require dependency installation. It uses only the fixed, loopback-only synthetic mock service and does not require provider credentials, a real provider, a real LLM, a dataset, or an external network connection. Keep the `--no-env-file` flag on every `uv` command so the command does not load a `.env` file.
+Use a capture whose `replay.lock.yaml` and snapshot manifest have already passed the applicable verifier. The commands below are replay-only and do not load `.env`, contact providers, or incur provider cost.
 
-Use two PowerShell terminals: start the service in the first and issue the requests in the second.
-
-## Start the Mock API
-
-In the first terminal, start the mock entry point on its fixed loopback host:
+For repository-only engineering acceptance, first verify the synthetic formal pair:
 
 ```powershell
-D:\Dev\uv\uv.exe run --no-sync --no-env-file python -m paper_search.api.mock_server --host 127.0.0.1 --port 8000
+uv run --no-sync --no-env-file paper-search verify-run tests/fixtures/formal_run/capture
+uv run --no-sync --no-env-file paper-search verify-run tests/fixtures/formal_run/replay
+uv run --no-sync --no-env-file paper-search compare-replay tests/fixtures/formal_run/capture tests/fixtures/formal_run/replay
 ```
 
-Leave this terminal running. The mock server installs a loopback-only network guard and composes the fixed synthetic search service.
+Expected result: both runs are valid and the pair is equivalent. This validates the evidence machinery, not real retrieval quality.
 
-## Health Check
+A fresh clone does not contain an interactive service-ready capture. Before following the interactive sections, an authorized operator must supply one verified capture directory and an access-controlled runs root. For a fully repository-contained replay/service acceptance, run:
 
-In the second terminal, check liveness and then readiness:
+```powershell
+uv run --no-sync --no-env-file pytest tests/e2e/test_dual_mode_serve.py tests/integration/test_serve_process.py -q
+```
+
+The E2E test installs socket and name-resolution tripwires, proves they reject non-loopback targets, and then exercises the real `paper-search serve` subprocess.
+
+## Start the unified replay service
+
+From the artifact root expected by the selected lock, start the canonical service on loopback:
+
+```powershell
+uv run --no-sync --no-env-file paper-search serve `
+  --lock <capture>/replay.lock.yaml `
+  --mode replay `
+  --snapshot-manifest <capture>/snapshot-manifest.json `
+  --capture-output-root <runs-root> `
+  --host 127.0.0.1 `
+  --port 8000
+```
+
+Do not add `--allow-live` for a replay demonstration. Keep this terminal open.
+
+## Check health
+
+In a second terminal:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/health/live
 Invoke-RestMethod http://127.0.0.1:8000/health/ready
 ```
 
-Liveness shows that the process is serving. Readiness checks the injected synthetic service and its fixed mock provider-status map.
+Liveness should report `live`. Readiness should report `ready` or `degraded`, `execution_mode: replay`, the bound snapshot-set identity, and dependency states drawn from `ready`, `replayed`, `degraded`, or `failed`. It must not make a live dependency probe.
 
-## Run a Demonstration Query
+## Browser demonstration
 
-Submit a request with the trace enabled:
+Open `http://127.0.0.1:8000/`, retain the default Replay mode, and submit one representative query approved for the selected snapshot. Verify that the UI displays:
+
+- selected paper IDs and ranked result evidence;
+- execution mode and snapshot set/time;
+- configuration hash and per-request run ID;
+- usage, stop reason, partial state, planner state, and fallback state;
+- dependency statuses, safe warnings, and citation edges.
+
+Submit the same request a second time. The per-request run ID may change; canonical business content and stable provenance must not.
+
+Inspect the browser console and network panel. There should be no JavaScript error, one `/v1/search` POST for each submit action, and no browser request to OpenAlex, Semantic Scholar, an LLM endpoint, or a local filesystem path.
+
+## Direct API demonstration
+
+The UI and direct API share the same boundary:
 
 ```powershell
+$body = @{
+  query_id = "demo-replay-1"
+  query = "<approved replay query>"
+  budget_profile = "balanced"
+  mode = "replay"
+  include_trace = $true
+} | ConvertTo-Json
+
 $response = Invoke-RestMethod `
   -Method Post `
   -Uri http://127.0.0.1:8000/v1/search `
-  -ContentType 'application/json' `
-  -Body '{"query_id":"demo-q1","query":"graph retrieval","budget_profile":"balanced","include_trace":true}'
+  -ContentType application/json `
+  -Body $body
 
-$response | ConvertTo-Json -Depth 10
+$response | ConvertTo-Json -Depth 12
 ```
 
-The request body matches the mock API contract. The response is synthetic evidence of this composition only; it is not a provider-backed search result.
+Do not place a private query in committed documentation, screenshots, or ordinary logs.
 
-## Inspect Trace and Usage
+## Authorized live demonstration
 
-Inspect the response object from the preceding command without inferring a quality result:
+Live is optional and remains blocked until the operator separately authorizes the target providers, credentials, query class, hard budget, capture location, and disclosure boundary. A prior replay authorization is not live authorization.
+
+When those prerequisites are satisfied, verify that the lineage lock permits live, start the same server with `--allow-live`, and explicitly select `mode: live` for one bounded request. The server flag alone does not make omitted-mode requests live. After HTTP 200, verify the newly published capture:
 
 ```powershell
-$response.search_trace | ConvertTo-Json -Depth 10
-$response.usage | ConvertTo-Json -Depth 10
-$response.stop_reason
-$response.is_partial
-$response.warnings
+uv run --no-sync --no-env-file paper-search verify-run <live-capture-directory>
 ```
 
-The trace documents the stages executed by this request. Usage is the mock orchestrator's committed accounting for the request; it is not a measured cost or timing report.
+Record only the safe run ID, aggregate status, hashes, bounded degradation codes, and verifier outcome. Do not record credentials, query text, raw snapshots, predictions, gold labels, or private paths.
 
-## Demonstrate Provider Degradation
+## Stop and clean up
 
-Do not simulate degradation by taking down, blocking, or contacting a real provider. Instead, run the following isolated fake-readiness demonstration. It reuses the mock server's synthetic composition and injects a false value into its readiness map; the ASGI transport keeps the check in-process rather than making a network call.
+Return to the service terminal and press `Ctrl+C`. On Windows, confirm the port is closed and inspect only the chosen runs root for incomplete/lock markers:
 
 ```powershell
-@'
-import asyncio
-from unittest.mock import patch
-
-import httpx
-
-from paper_search.api import mock_server
-
-
-async def main() -> None:
-    with patch.object(
-        mock_server,
-        "mock_readiness",
-        return_value={"openalex": True, "semantic_scholar": False},
-    ):
-        app = mock_server.create_mock_app()
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://mock") as client:
-            response = await client.get("/health/ready")
-    print(response.status_code)
-    print(response.json())
-
-
-asyncio.run(main())
-'@ | D:\Dev\uv\uv.exe run --no-sync --no-env-file python -
+Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue
+Get-ChildItem -LiteralPath <runs-root> -Force | Where-Object { $_.Name -match 'incomplete|\.lock$|\.lck$' }
 ```
 
-This demonstrates the documented readiness behavior for an injected fake: a non-ready provider makes `/health/ready` report degraded. It does not modify the running mock server in the first terminal.
+Expected result: both commands produce no matching record. Store approved screenshots and safe acceptance records outside source control unless a documentation-assets review explicitly authorizes committing them.
 
-## Stop the Service
+## Current project status
 
-Return to the first terminal and press `Ctrl+C`. The mock server then stops; no provider shutdown action is needed because the service has no real provider connections.
-
-## Outputs Deferred Until R3
-
-This runbook intentionally records no formal metrics, costs, screenshots, or timing measurements. R2 is retrieval diagnostic evidence only, and no relevance metrics are presented here. R3 is the later boundary for formal evaluation artifacts and any measured conclusions.
+Replay browser acceptance and dual-mode fake-live lifecycle E2E are verified. Real live browser acceptance, real dev/validation captures, metric claims, cost claims, and optional-module promotion remain not run because the current public Gate 0 is blocked and no separate live hard-budget authorization is recorded here.

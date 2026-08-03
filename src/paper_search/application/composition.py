@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -71,14 +72,55 @@ _DEPENDENCIES: tuple[DependencyName, ...] = (
 
 
 def _read_confined_source_capture_file(source_root: Path, name: str) -> tuple[Path, bytes]:
-    """Resolve, confine, and snapshot one source-capture file exactly once."""
+    """Return one stable, regular source-capture file snapshot and its provenance."""
+    unavailable = "source live capture lock is unavailable"
+
+    def identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+        return (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        )
+
     try:
-        path = (source_root / name).resolve(strict=True)
-        if not path.is_file() or path.parent != source_root:
-            raise ValueError("source live capture lock is unavailable")
-        return path, path.read_bytes()
+        root = source_root.resolve(strict=True)
+        candidate = root / name
+        resolved_before = candidate.resolve(strict=True)
+        before = os.lstat(candidate)
+        if (
+            resolved_before.parent != root
+            or not stat.S_ISREG(before.st_mode)
+        ):
+            raise ValueError(unavailable)
+
+        flags = os.O_RDONLY
+        if os.name != "nt":
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(candidate, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode) or identity(opened) != identity(before):
+                raise ValueError(unavailable)
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                payload = handle.read()
+            after_read = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+
+        resolved_after = candidate.resolve(strict=True)
+        after = os.lstat(candidate)
+        if (
+            resolved_after != resolved_before
+            or resolved_after.parent != root
+            or not stat.S_ISREG(after.st_mode)
+            or identity(after_read) != identity(before)
+            or identity(after) != identity(before)
+        ):
+            raise ValueError(unavailable)
+        return resolved_before, payload
     except OSError as error:
-        raise ValueError("source live capture lock is unavailable") from error
+        raise ValueError(unavailable) from error
 
 
 class _AnalyzerAdapter(Protocol):

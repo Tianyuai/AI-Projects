@@ -4,11 +4,13 @@ import asyncio
 import importlib
 import os
 import runpy
+import signal
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import yaml
 
@@ -456,6 +458,175 @@ def test_server_rejects_source_lock_symlink_escape(
         )
 
 
+def test_server_rejects_source_lock_replaced_between_lstat_and_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "config.lock.yaml"
+    replacement = tmp_path / "replacement.lock.yaml"
+    source.write_bytes(b"original")
+    replacement.write_bytes(b"replacement")
+    real_open = os.open
+
+    def replace_before_open(path: object, flags: int, *args: object) -> int:
+        if Path(path) == source:
+            os.replace(replacement, source)
+        return real_open(path, flags, *args)
+
+    monkeypatch.setattr(composition_module.os, "open", replace_before_open)
+
+    with pytest.raises(ValueError, match="source live capture lock is unavailable"):
+        composition_module._read_confined_source_capture_file(  # noqa: SLF001
+            source_root,
+            "config.lock.yaml",
+        )
+
+
+def test_server_router_real_live_failure_records_failed_capture_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture, server, real_client = _live_server_fixture(tmp_path, monkeypatch)
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, content=b'{"error":"rejected"}', request=request)
+
+    monkeypatch.setattr(
+        composition_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(reject), **kwargs),
+    )
+    monkeypatch.setattr(composition_module, "uuid4", lambda: "failure")
+    request = SearchRequest(
+        query_id="failure-live",
+        query="resource-aware scholarly paper search",
+        mode="live",
+    )
+
+    try:
+        result = asyncio.run(server.service_router.execute(request))
+    finally:
+        asyncio.run(server.aclose())
+
+    assert isinstance(result.outcome, SearchFailure)
+    assert result.outcome.error.code == "dependency_failure"
+    assert (fixture["capture_root"] / "serve-failure.failed").is_dir()
+    assert not (fixture["capture_root"] / "serve-failure").exists()
+    assert not list(fixture["capture_root"].glob(".*.incomplete"))
+    assert not server.capture_artifact_factory.has_capture_session(run_id="serve-failure")
+    assert server.capture_artifact_factory._clients == []  # noqa: SLF001
+
+
+def test_server_router_real_live_cancellation_records_failed_capture_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture, server, real_client = _live_server_fixture(tmp_path, monkeypatch)
+    dispatched = asyncio.Event()
+
+    async def block(request: httpx.Request) -> httpx.Response:
+        dispatched.set()
+        await asyncio.Event().wait()
+        raise AssertionError(f"unexpected completed request: {request.url}")
+
+    monkeypatch.setattr(
+        composition_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(block), **kwargs),
+    )
+    monkeypatch.setattr(composition_module, "uuid4", lambda: "cancelled")
+    request = SearchRequest(
+        query_id="cancel-live",
+        query="resource-aware scholarly paper search",
+        mode="live",
+    )
+
+    async def cancel_after_dispatch() -> None:
+        task = asyncio.create_task(server.service_router.execute(request))
+        await asyncio.wait_for(dispatched.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(cancel_after_dispatch())
+    finally:
+        asyncio.run(server.aclose())
+
+    assert (fixture["capture_root"] / "serve-cancelled.failed").is_dir()
+    assert not (fixture["capture_root"] / "serve-cancelled").exists()
+    assert not list(fixture["capture_root"].glob(".*.incomplete"))
+    assert not server.capture_artifact_factory.has_capture_session(run_id="serve-cancelled")
+    assert server.capture_artifact_factory._clients == []  # noqa: SLF001
+
+
+def test_serve_sigterm_handler_is_registered_and_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old_int, old_term = object(), object()
+    handlers: dict[int, object] = {}
+    registrations: list[tuple[int, object]] = []
+    received: dict[str, object] = {}
+
+    class Bundle:
+        service_router = object()
+
+        async def aclose(self) -> None:
+            return None
+
+    class Server:
+        started = True
+        should_exit = False
+
+        def __init__(self, _: object) -> None:
+            received["server"] = self
+
+        def run(self) -> None:
+            handler = handlers[signal.SIGTERM]
+            assert callable(handler)
+            handler(signal.SIGTERM, None)
+
+    def get_signal(signum: int) -> object:
+        return old_int if signum == signal.SIGINT else old_term
+
+    def set_signal(signum: int, handler: object) -> None:
+        registrations.append((signum, handler))
+        handlers[signum] = handler
+
+    monkeypatch.setattr(
+        CompositionRoot,
+        "compose_server",
+        classmethod(lambda cls, **kwargs: Bundle()),
+    )
+    api_app = importlib.import_module("paper_search.api.app")
+    monkeypatch.setattr(api_app, "create_app", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(cli.signal, "getsignal", get_signal)
+    monkeypatch.setattr(cli.signal, "signal", set_signal)
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        SimpleNamespace(Config=lambda app, **kwargs: received.update(kwargs) or app, Server=Server),
+    )
+
+    assert cli._run_serve(  # noqa: SLF001
+        SimpleNamespace(
+            lock="replay.lock.yaml",
+            snapshot_manifest="snapshot-manifest.json",
+            capture_output_root="captures",
+            allow_live=False,
+            host="0.0.0.0",
+            port=8000,
+        )
+    ) == 130
+
+    assert received["host"] == "0.0.0.0"
+    assert received["server"].should_exit is True
+    assert (signal.SIGINT, old_int) in registrations
+    assert (signal.SIGTERM, old_term) in registrations
+
+
 def test_live_request_records_seals_and_publishes_before_success(
 ) -> None:
     events: list[str] = []
@@ -572,6 +743,35 @@ def _candidate_lock() -> CandidateLock:
     return CandidateLock.model_validate(
         yaml.safe_load(Path("tests/fixtures/application/candidate.lock.yaml").read_bytes())
     )
+
+
+def _live_server_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[dict[str, Path], object, type[httpx.AsyncClient]]:
+    helpers = runpy.run_path("tests/integration/test_smoke_cli.py")
+    fixture = helpers["_smoke_fixture"](tmp_path)
+    real_client = httpx.AsyncClient
+    fake_client = helpers["_fake_live_client_factory"](fixture)
+    capture_root = fixture["root"] / "server-captures"
+    monkeypatch.chdir(fixture["root"])
+    monkeypatch.setenv("LLM_API_KEY", "fake-live-key")
+    monkeypatch.setattr(composition_module.httpx, "AsyncClient", fake_client)
+    assert main([
+        "smoke", "--lock", str(fixture["candidate_lock"]), "--output-root", str(capture_root),
+        "--mode", "live", "--allow-network",
+    ]) == 0
+    source = next(capture_root.glob("smoke-*"))
+    server = CompositionRoot.compose_server(
+        replay_lock_path=source / "replay.lock.yaml",
+        snapshot_manifest_path=source / "snapshot-manifest.json",
+        artifact_root=fixture["root"],
+        capture_output_root=capture_root,
+        live_authorized=True,
+        environ={"LLM_API_KEY": "fake-live-key"},
+    )
+    fixture["capture_root"] = capture_root
+    return fixture, server, real_client
 
 
 def _fake_replay_bundle() -> object:

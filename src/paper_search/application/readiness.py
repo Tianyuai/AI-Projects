@@ -7,7 +7,7 @@ import asyncio
 import json
 import os
 import tempfile
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -234,13 +234,23 @@ async def probe_live_readiness(
 def build_live_readiness(
     evidence: AuthorizedReadinessEvidence,
     now: datetime,
+    *,
+    required_dependencies: Sequence[str] = _EXPECTED_DEPENDENCIES,
 ) -> ReadyHealthResponse:
     """Map the latest authorized probe evidence to a non-billable health state."""
 
     states = {capability.name: capability.state for capability in evidence.capabilities}
+    required = tuple(required_dependencies)
+    unknown = set(required).difference(_EXPECTED_DEPENDENCIES)
+    if unknown:
+        raise ValueError(
+            f"unknown readiness dependency: {sorted(unknown)}"
+        )
     elapsed = now - evidence.generated_at
     fresh = timedelta(0) <= elapsed < FRESHNESS
-    ready = fresh and all(state == "ready" for state in states.values())
+    ready = fresh and all(
+        states[requirement] == "ready" for requirement in required
+    )
     return ReadyHealthResponse(
         status="ready" if ready else "degraded",
         execution_mode="live",

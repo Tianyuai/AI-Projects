@@ -67,6 +67,33 @@ def test_build_degraded_capability_is_degraded() -> None:
     assert response.status == "degraded"
 
 
+def test_build_ignores_unused_degraded_capability() -> None:
+    evidence = _evidence("ready", "ready", "degraded")
+    response = build_live_readiness(
+        evidence,
+        _NOW + timedelta(minutes=1),
+        required_dependencies=("llm", "openalex"),
+    )
+
+    assert response.status == "ready"
+    assert [status.state for status in response.dependencies] == [
+        "ready",
+        "ready",
+        "degraded",
+    ]
+
+
+def test_build_requires_each_used_capability() -> None:
+    evidence = _evidence("ready", "ready", "degraded")
+    response = build_live_readiness(
+        evidence,
+        _NOW + timedelta(minutes=1),
+        required_dependencies=("llm", "openalex", "semantic_scholar"),
+    )
+
+    assert response.status == "degraded"
+
+
 def test_probe_maps_mock_provider_responses() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.host == "dashscope.aliyuncs.com":

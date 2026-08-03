@@ -491,6 +491,8 @@ def _replay_readiness(binding: ModeBinding) -> Callable[[], ReadyHealthResponse]
 def _live_readiness(
     binding: ModeBinding,
     artifact_root: Path,
+    *,
+    required_dependencies: tuple[str, ...],
 ) -> Callable[[], ReadyHealthResponse]:
     evidence = load_live_readiness(artifact_root)
 
@@ -511,7 +513,11 @@ def _live_readiness(
                 ],
                 last_authorized_probe_at=None,
             )
-        return build_live_readiness(evidence, datetime.now(UTC))
+        return build_live_readiness(
+            evidence,
+            datetime.now(UTC),
+            required_dependencies=required_dependencies,
+        )
 
     return probe
 
@@ -1087,7 +1093,19 @@ class CompositionRoot:
                 snapshot_set_id=None,
                 snapshot_manifest_sha256=None,
             )
-            readiness_probe = _live_readiness(binding, artifact_root)
+            readiness_probe = _live_readiness(
+                binding,
+                artifact_root,
+                required_dependencies=(
+                    "llm",
+                    "openalex",
+                    *(
+                        ("semantic_scholar",)
+                        if lock.baseline.retrieval.semantic_scholar_calls_max > 0
+                        else ()
+                    ),
+                ),
+            )
 
         service = SearchApplicationService(
             orchestrator_factory=orchestrator_factory,

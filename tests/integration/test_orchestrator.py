@@ -1435,6 +1435,28 @@ def test_replay_integrity_failure_records_zero_external_spend() -> None:
     assert result.diagnostics[-1].errors[0].code == "integrity_failure"
 
 
+def test_formal_live_provider_exception_fails_closed_without_integrity_abort() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget(), formal_live=True)
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": IntegrityProvider("openalex", events)},
+        config_hash="sha256:" + "4" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        execution_mode="live",
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert controller.stop_status() == "hard_stop"
+    assert controller.committed_usage.search_api_calls == 1
+    assert result.diagnostics[-1].errors[0].code == "provider_error"
+    assert "openalex: provider exception" in result.warnings
+
+
 def test_orchestrator_keeps_order_when_optional_stage_degrades() -> None:
     events: list[str] = []
 

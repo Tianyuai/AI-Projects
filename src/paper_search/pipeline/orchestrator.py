@@ -707,10 +707,16 @@ class MockSearchOrchestrator:
                         )
                     elif self._controller.terminal_outcome(reservation) is None:
                         try:
-                            self._controller.settle(
-                                reservation,
-                                UsageActual(search_api_calls=1),
-                            )
+                            if self._controller.formal_live:
+                                self._controller.fail_closed(
+                                    reservation,
+                                    UsageActual(search_api_calls=1),
+                                )
+                            else:
+                                self._controller.settle(
+                                    reservation,
+                                    UsageActual(search_api_calls=1),
+                                )
                         except ReservationError:
                             self._fail_closed_if_active(reservation)
                             raise

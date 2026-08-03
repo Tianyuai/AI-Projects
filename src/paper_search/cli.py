@@ -198,6 +198,8 @@ def _run_serve(args: argparse.Namespace) -> int:
             server.should_exit = True
 
         signal.signal(signal.SIGINT, request_shutdown)
+        previous_term_handler = signal.getsignal(signal.SIGTERM)
+        signal.signal(signal.SIGTERM, request_shutdown)
         break_signal = getattr(signal, "SIGBREAK", None)
         previous_break_handler = None
         if break_signal is not None:
@@ -213,6 +215,7 @@ def _run_serve(args: argparse.Namespace) -> int:
                 raise
         finally:
             signal.signal(signal.SIGINT, previous_handler)
+            signal.signal(signal.SIGTERM, previous_term_handler)
             if break_signal is not None and previous_break_handler is not None:
                 signal.signal(break_signal, previous_break_handler)
         if interrupted:

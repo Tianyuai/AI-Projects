@@ -70,6 +70,17 @@ _DEPENDENCIES: tuple[DependencyName, ...] = (
 )
 
 
+def _read_confined_source_capture_file(source_root: Path, name: str) -> tuple[Path, bytes]:
+    """Resolve, confine, and snapshot one source-capture file exactly once."""
+    try:
+        path = (source_root / name).resolve(strict=True)
+        if not path.is_file() or path.parent != source_root:
+            raise ValueError("source live capture lock is unavailable")
+        return path, path.read_bytes()
+    except OSError as error:
+        raise ValueError("source live capture lock is unavailable") from error
+
+
 class _AnalyzerAdapter(Protocol):
     async def generate_json(
         self,
@@ -582,20 +593,12 @@ class CompositionRoot:
                 raise ValueError("source live capture lock is unavailable") from error
             if source_root.parent != capture_root or source_root.name != replay_lock.source_capture_run_id:
                 raise ValueError("source capture run id escapes capture output root")
-            source_lock_path = (source_root / "config.lock.yaml").resolve(strict=True)
-            source_replay_path = (source_root / "replay.lock.yaml").resolve(strict=True)
-            if (
-                not source_lock_path.is_file()
-                or not source_replay_path.is_file()
-                or source_lock_path.parent != source_root
-                or source_replay_path.parent != source_root
-            ):
-                raise ValueError("source live capture lock is unavailable")
-            try:
-                source_replay_bytes = source_replay_path.read_bytes()
-                source_lock_bytes = source_lock_path.read_bytes()
-            except OSError as error:
-                raise ValueError("source live capture lock is unavailable") from error
+            source_lock_path, source_lock_bytes = _read_confined_source_capture_file(
+                source_root, "config.lock.yaml"
+            )
+            _, source_replay_bytes = _read_confined_source_capture_file(
+                source_root, "replay.lock.yaml"
+            )
             if source_replay_bytes != replay_lock_bytes:
                 raise ValueError("source capture lineage does not match replay lock")
             source_verified = load_verified_input_lock_bytes(

@@ -5,6 +5,11 @@ from collections.abc import Sequence
 
 import pytest
 
+from paper_search.application.experiments import (
+    ExperimentDefinition,
+    ExperimentFlags,
+    build_experiment_components,
+)
 from paper_search.control.budget import HardBudgetController
 from paper_search.domain.models import Paper, QuerySpec, SearchBudget, UsageActual
 from paper_search.evolution import (
@@ -218,3 +223,62 @@ def test_fixed_two_round_reuses_initial_plan_when_complete_coverage_has_no_targe
     assert result.warnings == []
     assert executor.plans[1].round_number == 2
     assert executor.plans[1].subqueries == initial_plan.subqueries
+
+
+@pytest.mark.parametrize(
+    ("definition", "expected_rounds"),
+    [
+        (
+            ExperimentDefinition(
+                name="fixed-two-round",
+                flags=ExperimentFlags(fixed_two_round=True),
+                strategy="fixed-two-round",
+            ),
+            2,
+        ),
+        (
+            ExperimentDefinition(
+                name="adaptive-evolution",
+                flags=ExperimentFlags(adaptive_evolution=True),
+                strategy="adaptive-evolution",
+            ),
+            2,
+        ),
+    ],
+)
+def test_multi_round_experiments_wrap_the_same_single_round_executor(
+    definition: ExperimentDefinition,
+    expected_rounds: int,
+) -> None:
+    class NoOptionalDependencies:
+        def build_embedding_ranker(self) -> object:
+            raise AssertionError("not enabled")
+
+        def build_citation_expander(self) -> object:
+            raise AssertionError("not enabled")
+
+        def build_constraint_reranker(self) -> object:
+            raise AssertionError("not enabled")
+
+    executor = FakeExecutor()
+    coordinator = build_fake_coordinator(executor=executor)
+    components = build_experiment_components(
+        definition,
+        dependencies=NoOptionalDependencies(),
+    )
+
+    result = asyncio.run(
+        coordinator.run(
+            spec=query_spec(),
+            initial_plan=round_plan(1),
+            strategy=components.evolution_strategy,
+            max_rounds=expected_rounds,
+            max_subqueries=2,
+            marginal_gain_threshold=0.0,
+        )
+    )
+
+    assert len(result.rounds) == expected_rounds
+    assert executor.plans == [
+        round_plan(index) for index in range(1, expected_rounds + 1)
+    ]

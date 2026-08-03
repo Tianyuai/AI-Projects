@@ -42,7 +42,7 @@ citation-expansion:
   query_planning: false
   multi_source: false
   embedding: false
-  citation_expansion: false
+  citation_expansion: true
   llm_rerank: false
   fixed_two_round: false
   adaptive_evolution: false
@@ -53,7 +53,7 @@ llm-rerank:
   multi_source: false
   embedding: false
   citation_expansion: false
-  llm_rerank: false
+  llm_rerank: true
   fixed_two_round: false
   adaptive_evolution: false
   low_budget: false

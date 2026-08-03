@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import Field, model_validator
 
@@ -39,22 +39,17 @@ from paper_search.ranking.embedding import (
     sanitize_embedding_model_id,
     sanitize_embedding_warnings,
 )
-from paper_search.graph.citation_expand import CitationExpansionResult
 from paper_search.ranking.fusion import FusedPaper, fuse_provider_results
-from paper_search.ranking.rerank import ConstraintRerankResult, ConstraintScoredPaper
+from paper_search.ranking.rerank import ConstraintScoredPaper
 from paper_search.retrieval.base import SearchProvider
 from paper_search.retrieval.routing import route_baseline_subqueries
 
+if TYPE_CHECKING:
+    from paper_search.graph.provider_stage import AsyncCitationExpansionStage
+    from paper_search.ranking.llm_stage import AsyncConstraintRerankingStage
+
 
 Analyzer = Callable[[str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]]
-
-
-class CitationExpansionStage(Protocol):
-    def expand(self, seeds: list[Paper]) -> CitationExpansionResult: ...
-
-
-class ConstraintRerankingStage(Protocol):
-    def rerank(self, papers: list[Paper], constraints: list[str]) -> ConstraintRerankResult: ...
 
 
 _SAFE_CITATION_WARNINGS = frozenset({"unresolved_citation_edge"})
@@ -140,8 +135,8 @@ class MockSearchOrchestrator:
         routing_limits: tuple[int, int, int] | None = None,
         execution_mode: SearchMode = "live",
         embedding_ranker: EmbeddingRankingStage | None = None,
-        citation_expander: CitationExpansionStage | None = None,
-        constraint_reranker: ConstraintRerankingStage | None = None,
+        citation_expander: AsyncCitationExpansionStage | None = None,
+        constraint_reranker: AsyncConstraintRerankingStage | None = None,
     ) -> None:
         self._controller = controller
         self._analyzer = analyzer
@@ -532,7 +527,12 @@ class MockSearchOrchestrator:
         if self._citation_expander is not None and papers:
             prior_ids = {paper.canonical_id for paper in papers}
             try:
-                citation = self._citation_expander.expand([papers[0]])
+                citation = await self._citation_expander.expand(
+                    [papers[0]],
+                    controller=self._controller,
+                )
+            except ReservationError:
+                raise
             except Exception:  # noqa: BLE001
                 warnings.append("citation: expansion_unavailable")
                 trace.append(
@@ -570,7 +570,13 @@ class MockSearchOrchestrator:
                 *analysis.query_spec.exclusions,
             ]
             try:
-                rerank = self._constraint_reranker.rerank(papers, constraints)
+                rerank = await self._constraint_reranker.rerank(
+                    papers,
+                    constraints,
+                    controller=self._controller,
+                )
+            except ReservationError:
+                raise
             except Exception:  # noqa: BLE001
                 warnings.append("rerank: rerank_unavailable")
                 trace.append(

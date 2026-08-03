@@ -1,3 +1,5 @@
+experiment: main-baseline
+
 embedding:
   enabled: false
   model_id: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2

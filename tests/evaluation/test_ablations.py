@@ -280,14 +280,14 @@ def test_yaml_matrix_lists_required_cases_and_safe_public_booleans() -> None:
 
     assert matrix["baseline"]["embedding"] is False
     assert matrix["embedding"]["embedding"] is True
-    assert matrix["citation-expansion"]["citation_expansion"] is False
-    assert matrix["llm-rerank"]["llm_rerank"] is False
+    assert matrix["citation-expansion"]["citation_expansion"] is True
+    assert matrix["llm-rerank"]["llm_rerank"] is True
 
     for case_name, modules in matrix.items():
         if case_name != "embedding":
             assert modules["embedding"] is False
-        assert modules["citation_expansion"] is False
-        assert modules["llm_rerank"] is False
+        assert modules["citation_expansion"] is (case_name == "citation-expansion")
+        assert modules["llm_rerank"] is (case_name == "llm-rerank")
 
 
 def test_readme_documents_offline_injected_owner_only_ablation_policy() -> None:

@@ -6,24 +6,31 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-from paper_search.control.budget import HardBudgetController
+import pytest
+
+from paper_search.control.budget import HardBudgetController, ReservationError
 from paper_search.application.contracts import SnapshotRef
 from paper_search.domain.models import (
     BudgetReservation,
+    CitationEdge,
+    CitationExpansion,
     ErrorDetail,
     Paper,
+    ProviderPaperId,
     ProviderResult,
     SearchBudget,
     UsageActual,
     UsageEstimate,
 )
 from paper_search.graph.citation_expand import CitationExpansionResult
+from paper_search.graph.provider_stage import ProviderCitationExpansionStage
 from paper_search.pipeline.orchestrator import MockSearchOrchestrator
 from paper_search.ranking.embedding import EmbeddingRankingResult, EmbeddingScore
 from paper_search.ranking.rerank import (
     ConstraintRerankResult,
     ConstraintScoredPaper,
 )
+from paper_search.ranking.llm_stage import LLMConstraintRerankingStage
 
 
 def _budget(**updates: object) -> SearchBudget:
@@ -329,7 +336,13 @@ class FakeCitationExpander:
         self.extra = extra
         self.calls: list[list[str]] = []
 
-    def expand(self, seeds: Sequence[Paper]) -> CitationExpansionResult:
+    async def expand(
+        self,
+        seeds: list[Paper],
+        *,
+        controller: HardBudgetController,
+    ) -> CitationExpansionResult:
+        assert controller is not None
         self.calls.append([paper.canonical_id for paper in seeds])
         return CitationExpansionResult(
             papers=[*seeds, self.extra],
@@ -344,11 +357,14 @@ class FakeConstraintReranker:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], list[str]]] = []
 
-    def rerank(
+    async def rerank(
         self,
-        papers: Sequence[Paper],
-        constraints: Sequence[str],
+        papers: list[Paper],
+        constraints: list[str],
+        *,
+        controller: HardBudgetController,
     ) -> ConstraintRerankResult:
+        assert controller is not None
         self.calls.append(
             ([paper.canonical_id for paper in papers], list(constraints))
         )
@@ -373,6 +389,332 @@ class FakeConstraintReranker:
             batch_count=1 if ranked else 0,
             warnings=[],
         )
+
+
+class CitationProvider:
+    def __init__(self, *, failed: bool = False) -> None:
+        self.failed = failed
+        self.calls: list[tuple[str, str, BudgetReservation]] = []
+
+    def _expansion_result(
+        self,
+        direction: str,
+        paper_id: ProviderPaperId,
+        reservation: BudgetReservation,
+    ) -> ProviderResult[CitationExpansion]:
+        self.calls.append((direction, paper_id.value, reservation))
+        index = len(self.calls)
+        expanded_id = "S2" if direction == "references" else "S3"
+        expanded = Paper(
+            canonical_id=f"s2:{expanded_id}",
+            title=f"Expanded {expanded_id}",
+            semantic_scholar_id=expanded_id,
+        )
+        if direction == "references":
+            citing, cited = paper_id, ProviderPaperId(
+                provider="semantic_scholar",
+                value=expanded_id,
+            )
+        else:
+            citing, cited = (
+                ProviderPaperId(provider="semantic_scholar", value=expanded_id),
+                paper_id,
+            )
+        ref = SnapshotRef(
+            entry_id=f"citation-{index}",
+            dependency="semantic_scholar",
+            cache_key="sha256:" + f"{index:x}" * 64,
+            response_sha256="sha256:" + f"{index:x}" * 64,
+            captured_at=datetime(2026, 7, 23, tzinfo=UTC),
+            snapshot_path=f"responses/semantic_scholar/{index}.bin",
+        )
+        result = _result(
+            "semantic_scholar",
+            CitationExpansion(
+                papers=[expanded],
+                raw_edges=[
+                    CitationEdge(
+                        provider="semantic_scholar",
+                        citing_provider_id=citing,
+                        cited_provider_id=cited,
+                    )
+                ],
+            ),
+            UsageActual(search_api_calls=1),
+            failed=self.failed,
+        )
+        return result.model_copy(
+            update={
+                "cache_hit": direction == "citations",
+                "provenance": {
+                    **result.provenance,
+                    "snapshot_refs": json.dumps(
+                        [ref.model_dump(mode="json")],
+                        separators=(",", ":"),
+                    ),
+                },
+            }
+        )
+
+    async def references(
+        self,
+        paper_id: ProviderPaperId,
+        limit: int,
+        reservation: BudgetReservation,
+    ) -> ProviderResult[CitationExpansion]:
+        assert limit == 2
+        return self._expansion_result("references", paper_id, reservation)
+
+    async def citations(
+        self,
+        paper_id: ProviderPaperId,
+        limit: int,
+        reservation: BudgetReservation,
+    ) -> ProviderResult[CitationExpansion]:
+        assert limit == 2
+        return self._expansion_result("citations", paper_id, reservation)
+
+
+class RerankAnalyzer:
+    def __init__(self, *, failed: bool = False) -> None:
+        self.failed = failed
+        self.calls: list[tuple[dict[str, object], BudgetReservation]] = []
+
+    async def generate_json(
+        self,
+        *,
+        prompt_name: str,
+        payload: dict[str, object],
+        reservation: BudgetReservation,
+    ) -> ProviderResult[dict[str, Any]]:
+        assert prompt_name == "constraint_rerank"
+        self.calls.append((payload, reservation))
+        papers = payload["papers"]
+        assert isinstance(papers, list)
+        constraints = payload["constraints"]
+        assert isinstance(constraints, list)
+        data = {
+            "assessments": [
+                {
+                    "paper_id": paper["canonical_id"],
+                    "matched_constraint_count": len(constraints),
+                    "unmatched_constraint_count": 0,
+                    "relevance_score": 1.0 if index == 1 else 0.5,
+                }
+                for index, paper in enumerate(papers)
+            ]
+        }
+        result = _result(
+            "llm",
+            data,
+            UsageActual(llm_calls=1, input_tokens=10, output_tokens=10, cost_cny=0.1),
+            failed=self.failed,
+        )
+        ref = SnapshotRef(
+            entry_id="rerank-1",
+            dependency="llm",
+            cache_key="sha256:" + "a" * 64,
+            response_sha256="sha256:" + "b" * 64,
+            captured_at=datetime(2026, 7, 23, tzinfo=UTC),
+            snapshot_path="responses/llm/rerank.bin",
+        )
+        return result.model_copy(
+            update={
+                "cache_hit": True,
+                "provenance": {
+                    **result.provenance,
+                    "snapshot_entry_id": ref.entry_id,
+                    "snapshot_cache_key": ref.cache_key,
+                    "snapshot_response_sha256": ref.response_sha256,
+                    "snapshot_path": ref.snapshot_path,
+                },
+            }
+        )
+
+
+class OverrunRerankAnalyzer(RerankAnalyzer):
+    async def generate_json(
+        self,
+        *,
+        prompt_name: str,
+        payload: dict[str, object],
+        reservation: BudgetReservation,
+    ) -> ProviderResult[dict[str, Any]]:
+        result = await super().generate_json(
+            prompt_name=prompt_name,
+            payload=payload,
+            reservation=reservation,
+        )
+        return result.model_copy(
+            update={
+                "usage": result.usage.model_copy(update={"llm_calls": 2}),
+            }
+        )
+
+
+def test_provider_citation_stage_awaits_budgeted_calls_and_retains_snapshot_refs() -> None:
+    provider = CitationProvider()
+    controller = HardBudgetController(_budget(max_citation_seeds=1))
+    stage = ProviderCitationExpansionStage(
+        provider=provider,
+        call_estimate=UsageEstimate(search_api_calls=1),
+        per_direction_limit=2,
+        max_expanded=2,
+    )
+    seed = Paper(
+        canonical_id="s2:S1",
+        title="Seed",
+        semantic_scholar_id="S1",
+    )
+
+    result = asyncio.run(stage.expand([seed], controller=controller))
+
+    assert [(direction, paper_id) for direction, paper_id, _ in provider.calls] == [
+        ("references", "S1"),
+        ("citations", "S1"),
+    ]
+    assert [paper.canonical_id for paper in result.papers] == [
+        "s2:S1",
+        "s2:S2",
+        "s2:S3",
+    ]
+    assert [ref.entry_id for ref in result.snapshot_refs] == [
+        "citation-1",
+        "citation-2",
+    ]
+    assert controller.committed_usage.search_api_calls == 2
+
+
+def test_structured_provider_citation_failure_degrades_in_orchestrator() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget(max_citation_seeds=1))
+    stage = ProviderCitationExpansionStage(
+        provider=CitationProvider(failed=True),
+        call_estimate=UsageEstimate(search_api_calls=1),
+        per_direction_limit=2,
+        max_expanded=2,
+    )
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "c" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        citation_expander=stage,
+    )
+
+    result = asyncio.run(
+        orchestrator.run("graph retrieval", max_provider_results=5)
+    )
+
+    assert [paper.canonical_id for paper in result.papers] == ["s2:S1"]
+    assert result.warnings[-1] == "citation: expansion_unavailable"
+    assert result.trace[-1] == {
+        "step": "citation",
+        "status": "degraded",
+        "count": 1,
+    }
+    assert controller.committed_usage.search_api_calls == 3
+
+
+def test_llm_rerank_stage_awaits_same_controller_without_nested_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    analyzer = RerankAnalyzer()
+    controller = HardBudgetController(_budget(max_rerank_candidates=2))
+    stage = LLMConstraintRerankingStage(
+        analyzer=analyzer,
+        call_estimate=UsageEstimate(
+            llm_calls=1,
+            input_tokens=10,
+            output_tokens=10,
+            cost_cny=0.1,
+        ),
+    )
+    papers = [
+        Paper(canonical_id="paper:1", title="One"),
+        Paper(canonical_id="paper:2", title="Two"),
+    ]
+
+    async def scenario() -> ConstraintRerankResult:
+        def forbidden(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            raise AssertionError("production code must not call asyncio.run")
+
+        monkeypatch.setattr(asyncio, "run", forbidden)
+        return await stage.rerank(
+            papers,
+            ["graph retrieval"],
+            controller=controller,
+        )
+
+    result = asyncio.run(scenario())
+
+    assert [item.paper.canonical_id for item in result.ranked] == [
+        "paper:2",
+        "paper:1",
+    ]
+    assert [ref.entry_id for ref in result.snapshot_refs] == ["rerank-1"]
+    assert controller.committed_usage.llm_calls == 1
+
+
+def test_llm_rerank_stage_degrades_on_structured_dependency_failure() -> None:
+    analyzer = RerankAnalyzer(failed=True)
+    controller = HardBudgetController(_budget(max_rerank_candidates=2))
+    stage = LLMConstraintRerankingStage(
+        analyzer=analyzer,
+        call_estimate=UsageEstimate(
+            llm_calls=1,
+            input_tokens=10,
+            output_tokens=10,
+            cost_cny=0.1,
+        ),
+    )
+    papers = [Paper(canonical_id="paper:1", title="One")]
+
+    result = asyncio.run(
+        stage.rerank(papers, ["constraint"], controller=controller)
+    )
+
+    assert result.status == "degraded"
+    assert [item.paper for item in result.ranked] == papers
+    assert result.warnings == ["rerank_unavailable"]
+    assert controller.committed_usage.llm_calls == 1
+
+
+def test_optional_stage_reservation_mismatch_hard_stops_instead_of_degrading() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget(max_llm_calls=3))
+    stage = LLMConstraintRerankingStage(
+        analyzer=OverrunRerankAnalyzer(),
+        call_estimate=UsageEstimate(
+            llm_calls=1,
+            input_tokens=10,
+            output_tokens=10,
+            cost_cny=0.1,
+        ),
+    )
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": FakeProvider("openalex", events)},
+        config_hash="sha256:" + "d" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        constraint_reranker=stage,
+    )
+
+    with pytest.raises(ReservationError, match="exceeds its reservation"):
+        asyncio.run(
+            orchestrator.run("graph retrieval", max_provider_results=5)
+        )
+
+    assert controller.stop_status() == "hard_stop"
 
 
 def test_orchestrator_runs_optional_citation_then_rerank_stages() -> None:
@@ -487,7 +829,13 @@ def test_orchestrator_keeps_order_when_optional_stage_degrades() -> None:
     events: list[str] = []
 
     class BrokenCitation:
-        def expand(self, seeds: Sequence[Paper]) -> CitationExpansionResult:
+        async def expand(
+            self,
+            seeds: list[Paper],
+            *,
+            controller: HardBudgetController,
+        ) -> CitationExpansionResult:
+            del seeds, controller
             raise RuntimeError("private fixture failure")
 
     orchestrator = MockSearchOrchestrator(

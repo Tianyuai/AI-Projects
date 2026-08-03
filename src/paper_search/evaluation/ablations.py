@@ -32,7 +32,11 @@ _PUBLIC_MODULE_SET = frozenset(PUBLIC_MODULES)
 def evolution_strategy_for_modules(
     modules: Mapping[str, bool],
 ) -> EvolutionStrategy:
-    """Map public evolution flags to an offline evolution strategy."""
+    """Map only evolution flags; baseline planning and routing stay mandatory.
+
+    ``query_planning`` and ``multi_source`` are retained as legacy report fields.
+    They are deliberately not runtime capability switches.
+    """
 
     fixed_two = modules.get("fixed_two_round")
     adaptive = modules.get("adaptive_evolution")

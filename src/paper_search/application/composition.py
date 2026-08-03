@@ -8,13 +8,19 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, NoReturn, Protocol
 from uuid import uuid4
 
 import httpx
 from pydantic import SecretStr
 
 from paper_search.application.artifacts import ArtifactFactory
+from paper_search.application.experiments import (
+    ExperimentComponents,
+    ExperimentDefinition,
+    ExperimentFlags,
+    build_experiment_components,
+)
 from paper_search.application.contracts import (
     ReadyHealthResponse,
     SearchExecutionResult,
@@ -68,6 +74,27 @@ _DEPENDENCIES: tuple[DependencyName, ...] = (
     "llm",
     "openalex",
     "semantic_scholar",
+)
+
+
+class _BaselineDependencyTrap:
+    def build_embedding_ranker(self) -> NoReturn:
+        raise AssertionError("main baseline cannot construct embedding")
+
+    def build_citation_expander(self) -> NoReturn:
+        raise AssertionError("main baseline cannot construct citation expansion")
+
+    def build_constraint_reranker(self) -> NoReturn:
+        raise AssertionError("main baseline cannot construct LLM reranking")
+
+
+_MAIN_BASELINE_COMPONENTS: ExperimentComponents = build_experiment_components(
+    ExperimentDefinition(
+        name="main-baseline",
+        flags=ExperimentFlags(),
+        strategy="fixed-one-round",
+    ),
+    dependencies=_BaselineDependencyTrap(),
 )
 
 
@@ -420,9 +447,9 @@ def _replay_factory(
                 lock.baseline.retrieval.semantic_scholar_calls_max,
             ),
             execution_mode="replay",
-            embedding_ranker=None,
-            citation_expander=None,
-            constraint_reranker=None,
+            embedding_ranker=_MAIN_BASELINE_COMPONENTS.embedding_ranker,
+            citation_expander=_MAIN_BASELINE_COMPONENTS.citation_expander,
+            constraint_reranker=_MAIN_BASELINE_COMPONENTS.constraint_reranker,
         )
 
     return create
@@ -578,9 +605,9 @@ class _LiveOrchestratorFactory:
                 lock.baseline.retrieval.semantic_scholar_calls_max,
             ),
             execution_mode="live",
-            embedding_ranker=None,
-            citation_expander=None,
-            constraint_reranker=None,
+            embedding_ranker=_MAIN_BASELINE_COMPONENTS.embedding_ranker,
+            citation_expander=_MAIN_BASELINE_COMPONENTS.citation_expander,
+            constraint_reranker=_MAIN_BASELINE_COMPONENTS.constraint_reranker,
         )
         return _LiveRunOrchestrator(
             orchestrator=orchestrator,

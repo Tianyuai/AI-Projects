@@ -18,6 +18,7 @@ from pydantic import (
     SecretStr,
 )
 
+from paper_search.application.experiments import ExperimentName
 from paper_search.domain.models import SafeRelativePath, SearchBudget, SearchMode
 
 
@@ -126,6 +127,7 @@ class RuntimeConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    experiment: ExperimentName = "main-baseline"
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     runtime: RuntimeSettings = Field(
         default_factory=lambda: RuntimeSettings(artifact_root=Path("artifacts"))

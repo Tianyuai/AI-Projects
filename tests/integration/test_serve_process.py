@@ -57,13 +57,23 @@ class _ServeProcess:
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            creationflags=(
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                if os.name == "nt" and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP")
+                else 0
+            ),
         )
         self.stderr = ""
 
     def reap(self) -> None:
         if self.process.poll() is None:
-            self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            if os.name == "nt" and hasattr(signal, "CTRL_BREAK_EVENT"):
+                self.process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                try:
+                    self.process.send_signal(signal.SIGINT)
+                except (AttributeError, OSError, ValueError):
+                    self.process.terminate()
             try:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:

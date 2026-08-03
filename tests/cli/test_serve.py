@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
-import json
+import os
 import runpy
 import sys
 from datetime import UTC, datetime
@@ -411,6 +411,41 @@ def test_server_rejects_source_config_with_mismatched_common_lock_field(
     monkeypatch.setattr(composition_module, "load_verified_input_lock_bytes", load_bytes)
 
     with pytest.raises(ValueError, match="does not match replay lineage"):
+        CompositionRoot.compose_server(
+            replay_lock_path=tmp_path / "replay.lock.yaml",
+            snapshot_manifest_path=tmp_path / "snapshot-manifest.json",
+            artifact_root=tmp_path,
+            capture_output_root=tmp_path / "captures",
+            live_authorized=True,
+            environ={},
+        )
+
+
+@pytest.mark.parametrize("filename", ["config.lock.yaml", "replay.lock.yaml"])
+def test_server_rejects_source_lock_symlink_escape(
+    filename: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay_lock = _replay_lock(runtime_allow_live=True)
+    source_root = tmp_path / "captures" / replay_lock.source_capture_run_id
+    source_root.mkdir(parents=True)
+    outside = tmp_path / f"outside-{filename}"
+    outside.write_bytes(b"outside")
+    (tmp_path / "replay.lock.yaml").write_bytes(b"operator-replay")
+    safe = source_root / ("replay.lock.yaml" if filename == "config.lock.yaml" else "config.lock.yaml")
+    safe.write_bytes(b"operator-replay" if safe.name == "replay.lock.yaml" else b"source")
+    try:
+        os.symlink(outside, source_root / filename)
+    except (NotImplementedError, OSError) as error:
+        pytest.skip(f"symlinks unavailable: {error}")
+    monkeypatch.setattr(
+        composition_module,
+        "load_verified_input_lock_bytes",
+        lambda *_args, **_kwargs: SimpleNamespace(lock=replay_lock),
+    )
+
+    with pytest.raises(ValueError, match="source live capture lock is unavailable"):
         CompositionRoot.compose_server(
             replay_lock_path=tmp_path / "replay.lock.yaml",
             snapshot_manifest_path=tmp_path / "snapshot-manifest.json",

@@ -6,7 +6,7 @@
 ## 封面信息
 
 - 项目名称：离线优先、可复现、可审计的学术论文检索与评测系统
-- 版本号码：Week 1–4 integrated baseline / Phase 4 Task 4 WIP
+- 版本号码：Week 1–4 integrated baseline / Phase 4 Task 4 review-fix pending acceptance
 - 文档日期：2026.08.03
 - 团队名称：待补充
 - 参赛组别：待补充
@@ -19,7 +19,8 @@
 | 2 | Phase 4 Task 1 API/router 完成 | d125da8 + c029f5c | Codex | 2026.08.03 | typed errors、readiness、三重 live authorization、atomic publication |
 | 3 | Phase 4 Task 2 UI/API 与发行包完成 | a8b2108 + 8f59777 | Codex | 2026.08.03 | 浏览器 UI 走 `/v1/search`；wheel/sdist 含 Python source 与 UI assets |
 | 4 | Phase 4 Task 3 serve 生命周期完成 | a5928bc..d663da0 | Codex | 2026.08.03 | lineage、TOCTOU、SIGTERM、真实 fake-live cleanup；C0/I0/M0 |
-| 5 | Phase 4 Task 4 实验模块初版 | 8ce02a8 | Codex | 2026.08.03 | registry/async stages/evolution 初版；复核发现 C1/I3，当前 WIP 修复 |
+| 5 | Phase 4 Task 4 实验模块初版 | 8ce02a8 | Codex | 2026.08.03 | registry/async stages/evolution 初版；复核发现 C1/I3 |
+| 6 | Phase 4 Task 4 review-fix 实现提交 | ddf9972 | Codex | 2026.08.03 | production composition、typed failure、snapshot provenance、取消清理已补齐；待同一审查者完整范围复核 |
 
 ## 1 项目概况
 
@@ -58,7 +59,7 @@
 4. 让 citation expansion、LLM rerank、embedding 和多轮 evolution 以明确 experiment identity、default-off 和预算约束接入；
 5. 在真实 Gate 未授权或证据不完整时保持 replay/default-off，不虚构线上结果。
 
-当前工程状态：Phase 3-C 已通过；Phase 4 Task 1–3 已通过；Phase 4 Task 4 初版已提交但复核未通过，正在修复。
+当前工程状态：Phase 3-C 已通过；Phase 4 Task 1–3 已通过；Phase 4 Task 4 的 review-fix 已提交并完成本地 focused/adjacent/static 验证，但尚未获得同一审查者对完整 commit range 的最终 C0/I0 复核。
 
 ### 2.2 技术创新点
 
@@ -88,12 +89,13 @@
 - **Evidence**：CaptureSession、atomic artifact publication、usage ledger、formal audit measures、verify-run/compare-replay；
 - **Delivery**：typed FastAPI routing、cached readiness、browser static assets、`paper-search serve`。
 
-当前 Task 4 的未完成修复：
+Task 4 review-fix 已覆盖以下问题，但验收边界仍需复核：
 
-1. `RuntimeConfig.experiment` 必须真正驱动 production composition 和 evolution，而不是只存在于 registry/test；
-2. Budget/Config/Snapshot/Integrity/Adapter 等 typed errors 不能被 optional stage 的 broad catch 降级为普通 degradation；
-3. `asyncio.CancelledError` 必须关闭/失败 stage reservations；
-4. optional citation/rerank snapshot refs 必须进入 orchestrator result/diagnostics/SearchExecutionResult，不能在边界丢失。
+1. `RuntimeConfig.experiment` 已接入 validated registry、CompositionRoot、request-scoped service/orchestrator，并为 fixed-two/adaptive 接入共享 `EvolutionCoordinator`；
+2. optional stage 仅将明确的 availability failure 降级，Budget/Config/Snapshot/Integrity/Adapter 等受保护错误继续传播或 fail-closed；
+3. `asyncio.CancelledError` 路径会终止 active reservation 并清理客户端；
+4. citation/rerank snapshot refs 已进入 diagnostics、`OrchestratorResult`、`SearchExecutionResult` 和 evaluation adapter；
+5. 本地证据：249 个 focused/adjacent 测试通过，10 个 smoke/serve/formal-path 测试通过，Ruff、mypy、diff-check 通过；这些不等同于同一审查者的最终 C0/I0。
 
 ### 3.3 计划和分工
 
@@ -104,7 +106,7 @@
 | Phase 4 Task 1 | 完成 | typed API errors/readiness/router、三重 live authorization |
 | Phase 4 Task 2 | 完成 | canonical browser UI、`/v1/search`、wheel/sdist assets |
 | Phase 4 Task 3 | 完成 | serve lifecycle、lineage、TOCTOU、SIGTERM、capture cleanup |
-| Phase 4 Task 4 | 进行中 | experiment registry、async optional stages、evolution wiring、typed failure/cancellation/provenance 修复 |
+| Phase 4 Task 4 | 实现已提交，待最终复核 | experiment registry、async optional stages、production/evolution wiring、typed failure/cancellation/provenance 修复；下一步是同一审查者完整范围 C0/I0 复核 |
 | Phase 4 Task 5–8 | 待开始/需授权 | dual-mode E2E、浏览器 Gate 5、文档收敛、Gate 6 ablations/promotion |
 
 团队分工建议：实现者负责代码与定向测试；复核者按完整 commit range 检查 C/I/M；项目负责人确认授权、真实 Gate、文本事实和最终提交范围。
@@ -115,7 +117,7 @@
 - 项目 Phase 4 计划：`docs/superpowers/plans/2026-07-30-week1-4-phase4-api-ui-experiments.md`。
 - Phase 3-C 最终复核：`.superpowers/sdd/p3c-review-05824ad..e076c8f.md`。
 - Phase 4 Task 1/2/3 报告：`.superpowers/sdd/phase4-task-1-report.md`、`.superpowers/sdd/phase4-task-2-report.md`、`.superpowers/sdd/phase4-task-3-review-package-final.md`。
-- 关键提交：`e076c8f`、`d125da8`、`c029f5c`、`a8b2108`、`8f59777`、`d663da0`、`8ce02a8`。
+- 关键提交：`e076c8f`、`d125da8`、`c029f5c`、`a8b2108`、`8f59777`、`d663da0`、`8ce02a8`、`ddf9972`。
 
 ## 当前写作边界
 

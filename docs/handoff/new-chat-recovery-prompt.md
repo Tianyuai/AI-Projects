@@ -8,8 +8,9 @@
 【项目与分支】
 - 工作树：D:\AI Projects\.worktrees\week3
 - 当前分支：codex/project-document-handoff
-- 当前基线 HEAD：8ce02a8（Phase 4 Task 4 初版提交）
-- 当前工作树包含未提交的 Phase 4 Task 4 review-fix WIP；不要 reset、checkout、clean 或删除这些修改。
+- 当前 HEAD：ddf9972（文档交接后已提交 Phase 4 Task 4 review-fix）
+- 文档交接提交：48d3aa8；Task 4 初版基线：8ce02a8。
+- 当前没有应被覆盖的 Task 4 源码 WIP；但用户已有未跟踪文件必须保留，不要 reset、checkout、clean 或删除任何现有修改。
 - 用户已有未跟踪文件也必须保留：.gate0-report.json、.sheet-build/、outputs/、docs/superpowers/plans/ 等。
 
 【用户当前目标】
@@ -25,34 +26,30 @@
 - Phase 4 Task 1：d125da8 + c029f5c；typed FastAPI errors、validation 400、readiness、三重 live authorization、publication-before-200、mode consistency；复核 C0/I0/M0。
 - Phase 4 Task 2：a8b2108 + 8f59777；浏览器 UI 通过 `/v1/search`，移除独立 evaluation UI pipeline；wheel/sdist 同时含 Python source 与 3 个 UI assets；复核 C0/I0/M0。
 - Phase 4 Task 3：a5928bc..d663da0；serve、replay/live composition、source lineage、TOCTOU、SIGTERM、真实 fake-live success/failure/cancellation cleanup、sealed response provenance；focused 31 passed/2 skipped，smoke 34；复核 C0/I0/M0。
-- Phase 4 Task 4 初版：8ce02a8；registry、flags、Provider/LLM async stages、evolution scaffolding、reservation fail-closed、baseline default-off 初版；尚未通过最终复核。
+- Phase 4 Task 4 初版：8ce02a8；registry、flags、Provider/LLM async stages、evolution scaffolding、reservation fail-closed、baseline default-off 初版。
+- Phase 4 Task 4 review-fix：ddf9972；已接通 RuntimeConfig→validated registry→production CompositionRoot/service/orchestrator/evolution，保护 typed failures，保留 optional snapshot refs，并处理 CancelledError reservation cleanup；本地 249 个 focused/adjacent 测试、10 个 smoke/serve/formal-path 测试、Ruff、mypy、diff-check 通过，但尚未完成同一审查者的完整范围最终复核。
 
-【Task 4 当前未关闭问题（必须先写 RED 再修生产）】
-最终复核报告指出 C1/I3：
-1. C1：`RuntimeConfig.experiment` 仍未真正驱动 production composition/evolution；composition 仍主要硬编码 baseline，named optional identities 不能通过 shared smoke/evaluate/API 正式运行。
-2. I1：optional stage 的 typed Budget/Config/Snapshot/Integrity/Adapter failures 可能被 broad catch 降级为普通 degradation，必须原样传播或明确 fail-closed。
-3. I2：optional citation/rerank snapshot refs 在 orchestrator 边界被解析后丢弃，未进入 OrchestratorResult diagnostics/SearchExecutionResult/formal evidence。
-4. I3：`asyncio.CancelledError` 可能留下 active stage reservations；必须 finally close/fail reservations and clients。
+【Task 4 当前边界（实现已提交，验收未闭合）】
+`ddf9972` 已针对先前 C1/I3 复核意见完成实现修复；当前唯一剩余门槛是由同一审查者对 `8ce02a8..ddf9972` 做完整范围复核并确认 C0/I0。不要仅凭本地测试把 Task 4 标记为最终通过，也不要进入 Task 5–8。
 
 【必须遵守的边界】
-- Phase 4 Task 4 仍未验收，不要标记完成，不要进入 Task 5–8，直到同一审查者完整范围复核 C0/I0。
+- Phase 4 Task 4 尚未最终验收，不要标记完成，不要进入 Task 5–8，直到同一审查者完整范围复核 C0/I0。
 - main-baseline 必须保持 default-off、fixed-one-round、无 optional module construction；不要做 promotion。
 - optional stages 必须 async、共享同一 request budget/controller/snapshot/evaluation path；禁止 `asyncio.run()` 嵌套。
 - typed budget/config/snapshot/integrity/adapter errors 不得被吞掉；CancelledError 必须清理 reservation/client/artifact。
 - 不做真实网络、真实 provider、真实成本、真实 Gate、浏览器 live 验收或公开状态更新；这些仍是 deferred/Cannot verify，除非用户单独授权。
 - 保留所有现有用户未跟踪文件和未提交 WIP；不要 reset/checkout/clean。
-- 所有实现先 RED→GREEN，再跑 focused/static，提交后由同一审查者复核完整 commit range。
+- 所有后续实现先 RED→GREEN，再跑 focused/static；当前优先做完整范围复核，不要重复实现已经提交的四项修复。
 
 【下一步严格顺序】
-1. 读取并理解 `docs/superpowers/plans/2026-07-30-week1-4-phase4-api-ui-experiments.md` 的 Task 4。
-2. 检查当前 `git status` 和未提交 WIP，确认不覆盖用户修改。
-3. 为上述四个问题补 directed RED tests。
-4. 修复 production：RuntimeConfig→validated experiment registry→CompositionRoot/orchestrator；typed error propagation；optional refs→diagnostics；CancelledError reservation cleanup。
-5. 跑 Task 4 focused、adjacent config/composition、Ruff、mypy、diff-check，并提交新 commit。
-6. 用同一审查者对 `8ce02a8..新提交` 做完整范围复核，直到 C0/I0；复核通过后才继续 Phase 4 Task 5–8。
+1. 先根据模板章节检查/完善 `docs/handoff/project-summary-for-competition-template.md`，这是下一步文本工作；只写有证据支持的内容。
+2. 检查当前 `git status`，保留 `.gate0-report.json`、`.sheet-build/`、`outputs/`、`docs/superpowers/plans/` 等未跟踪文件。
+3. 阅读 Task 4 计划和 `.superpowers/sdd/phase4-task-4-report.md`，确认 `ddf9972` 的变更范围与本地证据。
+4. 由同一审查者对 `8ce02a8..ddf9972` 做完整范围复核；若发现问题，再为问题补 directed RED→GREEN，并更新提交。
+5. 只有 C0/I0 复核通过后，才继续 Phase 4 Task 5–8。
 
 【文本工作要求】
-请先根据模板章节检查/完善 `docs/handoff/project-summary-for-competition-template.md`，只写有工程证据支持的内容；不要把 Cannot verify 写成已完成。文本完成后再回到 Task 4 工程修复。
+请先根据模板章节检查/完善 `docs/handoff/project-summary-for-competition-template.md`，只写有工程证据支持的内容；不要把 Cannot verify 写成已完成。文本完成后再回到 Task 4 的完整范围复核，不要重复已完成的修复。
 
-收到本提示后，先用中文简短回报：当前 HEAD、工作树是否有 WIP、Phase 3/Phase 4 已完成边界、Task 4 四项未关闭问题；然后按上述顺序继续。
+收到本提示后，先用中文简短回报：当前 HEAD、是否存在用户未跟踪文件、Phase 3/Phase 4 已完成边界、Task 4 当前“实现已提交但待最终复核”的状态；然后按上述顺序继续。
 ```

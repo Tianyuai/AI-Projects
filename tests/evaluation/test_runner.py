@@ -2431,6 +2431,11 @@ def test_partial_second_reservation_failure_closes_bundle_and_first_query(
         def __init__(self) -> None:
             self.service = FakeService()
             self.artifact_factory = ArtifactFactory()
+            self.config_hash = runner_module.lock_sha256(lock)
+            self.experiment_id = "main-baseline"
+            self.optional_modules = lock.baseline.optional_modules.model_dump(
+                mode="python"
+            )
 
         def readiness_probe(self) -> object:
             return SimpleNamespace(status="ready", dependencies=[])
@@ -2532,6 +2537,11 @@ def test_post_publication_attempt_transition_error_does_not_mark_run_failed(
         def __init__(self) -> None:
             self.service = FakeService()
             self.artifact_factory = ArtifactFactory()
+            self.config_hash = runner_module.lock_sha256(lock)
+            self.experiment_id = "main-baseline"
+            self.optional_modules = lock.baseline.optional_modules.model_dump(
+                mode="python"
+            )
 
         def readiness_probe(self) -> object:
             return SimpleNamespace(status="ready", dependencies=[])
@@ -2646,6 +2656,11 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
     class FakeBundle:
         def __init__(self) -> None:
             self.artifact_factory = ArtifactFactory()
+            self.config_hash = runner_module.lock_sha256(lock)
+            self.experiment_id = "main-baseline"
+            self.optional_modules = lock.baseline.optional_modules.model_dump(
+                mode="python"
+            )
 
         def readiness_probe(self) -> object:
             return SimpleNamespace(status="ready", dependencies=[])

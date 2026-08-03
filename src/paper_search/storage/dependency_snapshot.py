@@ -410,6 +410,9 @@ class DependencySnapshotReader:
         if snapshot_set_id is not None and manifest.snapshot_set_id != snapshot_set_id:
             raise ValueError("snapshot set identity does not match lock")
         self._root = self._manifest_path.parent.resolve()
+        published_root = self._root / "snapshots"
+        if published_root.is_dir():
+            self._root = published_root.resolve()
         self._snapshot_set_id = manifest.snapshot_set_id
         self._entries = {entry.cache_key: entry for entry in entries}
 

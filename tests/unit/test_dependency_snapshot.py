@@ -310,6 +310,39 @@ def test_reader_rejects_symlink_response_path(
         reader.read(identity)
 
 
+def test_reader_resolves_published_manifest_under_snapshots_subdir(
+    tmp_path: Path,
+) -> None:
+    store = DependencyCaptureStore(
+        tmp_path / "capture" / "snapshots",
+        clock=lambda: CAPTURED_AT,
+    )
+    identity = _identity()
+    ref = store.stage_success(
+        identity,
+        response_bytes=b'{"kind":"llm"}',
+        safe_headers={},
+        captured_at=CAPTURED_AT,
+    )
+    manifest = store.seal()
+    published = tmp_path / "capture"
+    target = published / "snapshots" / ref.snapshot_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes((store.root / ref.snapshot_path).read_bytes())
+    (published / "snapshot-manifest.json").write_bytes(
+        store.manifest_path.read_bytes()
+    )
+
+    reader = DependencySnapshotReader(
+        published / "snapshot-manifest.json",
+        snapshot_manifest_sha256=store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+    result = reader.read(identity)
+
+    assert result.ref == ref
+
+
 @pytest.mark.parametrize(
     ("name", "value"),
     [("authorization", "redacted"), ("x-request-id", "Bearer secret-token")],

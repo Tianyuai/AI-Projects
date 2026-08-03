@@ -571,13 +571,26 @@ class CompositionRoot:
         source_lock_bytes: bytes | None = None
         if live_authorized:
             capture_root = capture_output_root.resolve()
-            source_root = (
-                capture_root / replay_lock.source_capture_run_id
-            ).resolve()
-            if not source_root.is_relative_to(capture_root):
+            source_id_path = Path(replay_lock.source_capture_run_id)
+            if source_id_path.name != replay_lock.source_capture_run_id or source_id_path.parent != Path("."):
                 raise ValueError("source capture run id escapes capture output root")
-            source_lock_path = source_root / "config.lock.yaml"
-            source_replay_path = source_root / "replay.lock.yaml"
+            try:
+                source_root = (capture_root / replay_lock.source_capture_run_id).resolve(
+                    strict=True
+                )
+            except OSError as error:
+                raise ValueError("source live capture lock is unavailable") from error
+            if source_root.parent != capture_root or source_root.name != replay_lock.source_capture_run_id:
+                raise ValueError("source capture run id escapes capture output root")
+            source_lock_path = (source_root / "config.lock.yaml").resolve(strict=True)
+            source_replay_path = (source_root / "replay.lock.yaml").resolve(strict=True)
+            if (
+                not source_lock_path.is_file()
+                or not source_replay_path.is_file()
+                or source_lock_path.parent != source_root
+                or source_replay_path.parent != source_root
+            ):
+                raise ValueError("source live capture lock is unavailable")
             try:
                 source_replay_bytes = source_replay_path.read_bytes()
                 source_lock_bytes = source_lock_path.read_bytes()
@@ -591,6 +604,22 @@ class CompositionRoot:
             )
             if isinstance(source_verified.lock, ReplayLock):
                 raise ValueError("source capture must use a live input lock")
+            for field_name in (
+                "schema_version",
+                "source_git_sha",
+                "runtime_allow_live",
+                "frozen_data",
+                "baseline",
+                "budget_config",
+                "pricing_policy",
+                "quality_gates",
+                "capture_policy",
+                "project_ledger",
+            ):
+                if getattr(source_verified.lock, field_name) != getattr(
+                    replay_lock, field_name
+                ):
+                    raise ValueError("source capture lock does not match replay lineage")
 
         replay = cls.compose(
             lock_path=replay_lock_path,

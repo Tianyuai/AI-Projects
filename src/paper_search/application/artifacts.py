@@ -766,6 +766,7 @@ class CaptureSession:
             pricing_policy=self._input_lock.pricing_policy,
             quality_gates=self._input_lock.quality_gates,
             capture_policy=self._input_lock.capture_policy,
+            project_ledger=self._input_lock.project_ledger,
             snapshot_set_id=manifest.snapshot_set_id,
             snapshot_manifest_sha256=self._snapshot_store.manifest_sha256,
         )

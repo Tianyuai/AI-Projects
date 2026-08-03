@@ -15,7 +15,7 @@ import paper_search.application.composition as composition_module
 from paper_search.application.composition import CompositionRoot
 from paper_search.application.contracts import SearchRequest
 from paper_search.application.contracts import SearchExecutionResult, SearchFailure, SearchSuccess
-from paper_search.application.locks import ReplayLock
+from paper_search.application.locks import CandidateLock, ReplayLock
 
 
 def test_serve_parser_requires_bound_replay_inputs() -> None:
@@ -266,7 +266,19 @@ def test_server_live_factory_returns_an_isolated_bundle_for_each_request(
     def load_bytes(*_args: object, **_kwargs: object) -> object:
         nonlocal load_calls
         load_calls += 1
-        return SimpleNamespace(lock=replay_lock if load_calls == 1 else object())
+        source = _candidate_lock().model_copy(
+            update={
+                field: getattr(replay_lock, field)
+                for field in (
+                    "schema_version", "source_git_sha", "runtime_allow_live", "frozen_data",
+                    "baseline", "budget_config", "pricing_policy", "quality_gates",
+                    "capture_policy", "project_ledger",
+                )
+            }
+        )
+        return SimpleNamespace(
+            lock=(replay_lock if load_calls == 1 else source)
+        )
 
     monkeypatch.setattr(composition_module, "load_verified_input_lock_bytes", load_bytes)
     monkeypatch.setattr(
@@ -374,6 +386,37 @@ def test_server_rejects_live_source_without_matching_replay_lineage(
         )
 
 
+def test_server_rejects_source_config_with_mismatched_common_lock_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay_lock = _replay_lock(runtime_allow_live=True)
+    source_root = tmp_path / "captures" / replay_lock.source_capture_run_id
+    source_root.mkdir(parents=True)
+    (tmp_path / "replay.lock.yaml").write_bytes(b"same-replay-lock")
+    (source_root / "replay.lock.yaml").write_bytes(b"same-replay-lock")
+    (source_root / "config.lock.yaml").write_bytes(b"source-live-lock")
+    source_lock = _candidate_lock().model_copy(update={"source_git_sha": "different"})
+    calls = 0
+
+    def load_bytes(*_args: object, **_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(lock=replay_lock if calls == 1 else source_lock)
+
+    monkeypatch.setattr(composition_module, "load_verified_input_lock_bytes", load_bytes)
+
+    with pytest.raises(ValueError, match="does not match replay lineage"):
+        CompositionRoot.compose_server(
+            replay_lock_path=tmp_path / "replay.lock.yaml",
+            snapshot_manifest_path=tmp_path / "snapshot-manifest.json",
+            artifact_root=tmp_path,
+            capture_output_root=tmp_path / "captures",
+            live_authorized=True,
+            environ={},
+        )
+
+
 def test_live_request_records_seals_and_publishes_before_success(
 ) -> None:
     events: list[str] = []
@@ -429,6 +472,12 @@ def _replay_lock(*, runtime_allow_live: bool) -> ReplayLock:
     raw = yaml.safe_load(Path("tests/fixtures/application/replay.lock.yaml").read_bytes())
     raw["runtime_allow_live"] = runtime_allow_live
     return ReplayLock.model_validate(raw)
+
+
+def _candidate_lock() -> CandidateLock:
+    return CandidateLock.model_validate(
+        yaml.safe_load(Path("tests/fixtures/application/candidate.lock.yaml").read_bytes())
+    )
 
 
 def _fake_replay_bundle() -> object:

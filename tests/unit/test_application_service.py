@@ -246,6 +246,23 @@ def test_service_creates_fresh_request_scope_and_success_outcome() -> None:
     assert controllers[0] is not controllers[1]
 
 
+def test_replay_usage_cost_is_normalized_to_zero() -> None:
+    result = _result().model_copy(
+        update={
+            "usage": UsageActual(
+                search_api_calls=1,
+                llm_calls=1,
+                cost_cny=None,
+            )
+        }
+    )
+
+    execution = asyncio.run(_service(result).execute(_request()))
+
+    assert isinstance(execution.outcome, SearchSuccess)
+    assert execution.outcome.response.usage.cost_cny == Decimal("0")
+
+
 def test_service_one_provider_degradation_is_partial_success() -> None:
     error = ErrorDetail(
         code="server_error",

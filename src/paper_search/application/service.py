@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime
+from decimal import Decimal
 from typing import Protocol
 from uuid import uuid4
 
@@ -271,6 +272,14 @@ class SearchApplicationService:
                 request.query,
                 max_provider_results=self._max_provider_results,
             )
+            if self._mode == "replay" and result.usage.cost_cny is None:
+                result = result.model_copy(
+                    update={
+                        "usage": result.usage.model_copy(
+                            update={"cost_cny": Decimal("0")}
+                        )
+                    }
+                )
         except asyncio.CancelledError:
             raise
         except ProtectedExecutionError as error:

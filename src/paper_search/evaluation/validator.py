@@ -12,13 +12,15 @@ from pathlib import Path
 import yaml
 from pydantic import TypeAdapter
 
-from paper_search.application.artifacts import RunManifest
+from paper_search.application.artifacts import (
+    RunManifest,
+    experiment_manifest_matches_lock,
+)
 from paper_search.application.locks import (
     CandidateLock,
     InputLock,
     ReplayLock,
     ValidationLock,
-    lock_sha256,
 )
 from paper_search.control.ledger import (
     DEV_RUN_CAP_CNY,
@@ -299,7 +301,7 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
         exact_lock_sha = f"sha256:{hashlib.sha256(lock_bytes).hexdigest()}"
         if (
             exact_lock_sha != manifest.input_lock_sha256
-            or lock_sha256(lock) != manifest.config_hash
+            or not experiment_manifest_matches_lock(manifest, lock)
             or lock.source_git_sha != manifest.source_git_sha
             or lock.frozen_data.split != manifest.split
             or lock.frozen_data.manifest.sha256 != manifest.frozen_manifest_sha256

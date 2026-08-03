@@ -298,6 +298,29 @@ def test_service_both_provider_failures_are_hard_failure() -> None:
     assert execution.business_result_sha256 is not None
 
 
+def test_service_preserves_authentication_diagnostic_when_public_failure_is_safe() -> None:
+    auth = ErrorDetail(
+        code="authentication_error",
+        message="provider authentication failed",
+        retryable=False,
+        provider="llm",
+    )
+    result = _result(
+        diagnostics=[
+            _diagnostic("llm", errors=[auth]),
+            _diagnostic("openalex"),
+            _diagnostic("semantic_scholar"),
+        ],
+        stop_reason="dependency_failure",
+    )
+
+    execution = asyncio.run(_service(result).execute(_request()))
+
+    assert isinstance(execution.outcome, SearchFailure)
+    assert execution.outcome.error.code == "dependency_failure"
+    assert execution.diagnostics[0].errors[0].code == "authentication_error"
+
+
 def test_service_rules_fallback_is_partial_success_with_fixed_warning() -> None:
     result = _result(planner_status="rules_fallback")
 

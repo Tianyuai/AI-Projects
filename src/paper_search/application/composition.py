@@ -283,6 +283,7 @@ class ApplicationBundle:
     config_hash: Sha256
     artifact_factory: ArtifactFactory
     experiment_id: ExperimentName
+    optional_modules: dict[str, bool]
     source_git_sha: str
     prompt_version: Literal["query-analyze-v1"]
     mode_binding: ModeBinding
@@ -1081,6 +1082,7 @@ class CompositionRoot:
             config_hash=config_hash,
             artifact_factory=resolved_artifact_factory,
             experiment_id=experiment_definition.name,
+            optional_modules=experiment_definition.flags.model_dump(mode="python"),
             source_git_sha=lock.source_git_sha,
             prompt_version="query-analyze-v1",
             mode_binding=binding,

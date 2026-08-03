@@ -13,7 +13,8 @@ from paper_search.control.budget import (
     HardBudgetController,
     ReservationError,
 )
-from paper_search.application.contracts import SearchRequest, SnapshotRef
+from paper_search.application.contracts import DependencyDiagnostic, SearchRequest, SnapshotRef
+from paper_search.application.experiments import OptionalStageUnavailableError
 from paper_search.application.service import SearchApplicationService
 from paper_search.domain.models import (
     BudgetReservation,
@@ -755,6 +756,56 @@ def test_expected_llm_rerank_timeout_degrades_without_failing_orchestrator() -> 
     assert result.stop_reason == "completed"
     assert result.warnings[-1] == "rerank: rerank_unavailable"
     assert result.diagnostics[-1].errors[0].code == "timeout"
+
+
+def test_optional_rerank_authentication_diagnostic_is_preserved() -> None:
+    events: list[str] = []
+
+    class AuthUnavailableRerank:
+        async def rerank(
+            self,
+            papers: list[Paper],
+            constraints: list[str],
+            *,
+            controller: HardBudgetController,
+        ) -> ConstraintRerankResult:
+            del papers, constraints, controller
+            diagnostic = DependencyDiagnostic(
+                dependency="llm",
+                endpoint="constraint_rerank",
+                model_id=None,
+                usage=UsageActual(),
+                latency_ms=0,
+                cache_hit=False,
+                snapshot_refs=[],
+                errors=[
+                    ErrorDetail(
+                        code="authentication_error",
+                        message="synthetic auth failure",
+                        retryable=False,
+                        provider="llm",
+                    )
+                ],
+            )
+            error = OptionalStageUnavailableError("rerank unavailable")
+            error.diagnostic = diagnostic
+            raise error
+
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": FakeProvider("openalex", events)},
+        config_hash="sha256:" + "6" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        constraint_reranker=AuthUnavailableRerank(),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert result.stop_reason == "dependency_failure"
+    assert result.diagnostics[-1].errors[0].code == "authentication_error"
 
 
 @pytest.mark.parametrize(

@@ -1107,7 +1107,6 @@ def _reject_or_recover_existing_attempt(
             manifest is not None
             and manifest.run_id == claim.run_id
             and manifest.status == "complete"
-            and manifest.config_hash == validation_lock_sha256
             and manifest.ended_at is not None
         ):
             store.transition(
@@ -1129,7 +1128,6 @@ def _reject_or_recover_existing_attempt(
                 if (
                     incomplete_manifest.run_id == claim.run_id
                     and incomplete_manifest.status == "incomplete"
-                    and incomplete_manifest.config_hash == validation_lock_sha256
                 ):
                     completed_at = max(datetime.now(UTC), claim.claimed_at)
                     store.transition(
@@ -1217,13 +1215,13 @@ async def _run_formal_evaluation(
         identifier_map_sha256=inputs.lock.frozen_data.identifier_map.sha256,
         source_git_sha=inputs.lock.source_git_sha,
         tracked_source_dirty=False,
-        config_hash=lock_sha256(inputs.lock),
+        config_hash=bundle.config_hash,
         input_lock_sha256=_sha256_bytes(inputs.lock_bytes),
         prompt_version=inputs.lock.baseline.prompt_version,
         snapshot_set_id=snapshot_set_id,
         snapshot_manifest_sha256=snapshot_sha256,
-        experiment_name="main-baseline",
-        optional_modules=inputs.lock.baseline.optional_modules.model_dump(),
+        experiment_name=bundle.experiment_id,
+        optional_modules=bundle.optional_modules,
         started_at=started_at,
         ended_at=None,
         readiness_summary=readiness.dependencies,

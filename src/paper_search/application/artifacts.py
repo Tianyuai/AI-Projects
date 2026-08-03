@@ -20,6 +20,7 @@ from paper_search.application.contracts import (
     SearchExecutionResult,
     SearchSuccess,
 )
+from paper_search.application.experiments import expected_experiment_flags
 from paper_search.application.locks import (
     CandidateLock,
     InputLock,
@@ -210,7 +211,7 @@ class FormalRunWorkspace:
             or manifest.identifier_map_sha256
             != self._input_lock.frozen_data.identifier_map.sha256
             or manifest.source_git_sha != self._input_lock.source_git_sha
-            or manifest.config_hash != lock_sha256(self._input_lock)
+            or not experiment_manifest_matches_lock(manifest, self._input_lock)
             or manifest.prompt_version != self._input_lock.baseline.prompt_version
         ):
             raise ValueError("formal run manifest does not match input lock bindings")
@@ -593,6 +594,23 @@ def _is_valid_run_id(run_id: str) -> bool:
     if _RUN_ID.fullmatch(run_id) is None:
         return False
     return run_id.split(".", maxsplit=1)[0].upper() not in _WINDOWS_RESERVED
+
+
+def experiment_manifest_matches_lock(
+    manifest: RunManifest,
+    input_lock: InputLock,
+) -> bool:
+    lock_hash = lock_sha256(input_lock)
+    if manifest.experiment_name == "main-baseline":
+        return manifest.config_hash == lock_hash
+    try:
+        expected_flags = expected_experiment_flags(manifest.experiment_name)
+    except ValueError:
+        return False
+    expected = expected_flags.model_dump(mode="python")
+    enabled = {name: value for name, value in manifest.optional_modules.items() if value}
+    expected_enabled = {name: value for name, value in expected.items() if value}
+    return manifest.config_hash != lock_hash and enabled == expected_enabled
 
 
 class CaptureSession:

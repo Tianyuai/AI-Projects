@@ -99,6 +99,28 @@ def _execution(query_id: str) -> EvaluationExecutionRecord:
     )
 
 
+def test_formal_workspace_accepts_nonbaseline_experiment_config_binding(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest().model_copy(
+        update={
+            "config_hash": SHA_B,
+            "experiment_name": "embedding",
+            "optional_modules": {"embedding": True},
+        }
+    )
+
+    workspace = FormalRunWorkspace(
+        runs_root=tmp_path / "runs",
+        manifest=manifest,
+        input_lock_bytes=_input_lock_bytes(),
+        nonce_factory=lambda: "nonce",
+        clock=lambda: NOW,
+    )
+
+    assert workspace.work_dir.exists()
+
+
 def _business(query_id: str) -> BusinessResultRecord:
     return BusinessResultRecord(
         query_id=query_id,

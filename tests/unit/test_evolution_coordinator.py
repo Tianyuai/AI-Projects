@@ -589,14 +589,8 @@ def test_preflight_rejection_stops_before_executor_runs() -> None:
 
 
 def test_execution_round_mismatch_does_not_commit_any_state() -> None:
-    result = run(coordinator(executor=FakeExecutor([execution(2)])))
-
-    assert result.rounds == []
-    assert result.candidates == []
-    assert result.stop_reason == "round_failed"
-    assert result.failed_round == 1
-    assert result.warnings == ["execution: dependency failure"]
-    assert result.decisions[-1].failed_stage == "execution"
+    with pytest.raises(ValueError, match="round number"):
+        run(coordinator(executor=FakeExecutor([execution(2)])))
 
 
 def test_later_executor_failure_preserves_committed_first_seen_state() -> None:
@@ -1009,7 +1003,6 @@ def test_duplicate_cells_in_an_incoming_execution_fail_before_commit() -> None:
         candidates=[paper("p1", "First paper")],
         observations=[observation("p1", matched=False)],
     )
-    first_before = first_execution.model_dump(mode="json")
     second_execution = execution(
         2,
         candidates=[paper("p2", "Second paper")],
@@ -1019,19 +1012,11 @@ def test_duplicate_cells_in_an_incoming_execution_fail_before_commit() -> None:
         ],
     )
 
-    result = run(
-        coordinator(executor=FakeExecutor([first_execution, second_execution])),
-        strategy="fixed_two_round",
-    )
-
-    assert [item.model_dump(mode="json") for item in result.rounds] == [first_before]
-    assert [item.model_dump(mode="json") for item in result.candidates] == first_before[
-        "candidates"
-    ]
-    assert result.stop_reason == "round_failed"
-    assert result.failed_round == 2
-    assert result.warnings == ["execution: dependency failure"]
-    assert result.decisions[-1].failed_stage == "execution"
+    with pytest.raises(ValueError, match="duplicate incoming"):
+        run(
+            coordinator(executor=FakeExecutor([first_execution, second_execution])),
+            strategy="fixed_two_round",
+        )
 
 
 def test_inconsistent_incoming_constraint_cannot_hide_behind_prior_normalized_cell() -> None:
@@ -1040,7 +1025,6 @@ def test_inconsistent_incoming_constraint_cannot_hide_behind_prior_normalized_ce
         candidates=[paper("p1", "First paper")],
         observations=[observation("p1", matched=False)],
     )
-    first_before = first_execution.model_dump(mode="json")
     forged_observation = CandidateConstraintObservation(
         paper_id="p1",
         constraint=ConstraintRef(
@@ -1056,16 +1040,8 @@ def test_inconsistent_incoming_constraint_cannot_hide_behind_prior_normalized_ce
         observations=[forged_observation],
     )
 
-    result = run(
-        coordinator(executor=FakeExecutor([first_execution, second_execution])),
-        strategy="fixed_two_round",
-    )
-
-    assert [item.model_dump(mode="json") for item in result.rounds] == [first_before]
-    assert [item.model_dump(mode="json") for item in result.candidates] == first_before[
-        "candidates"
-    ]
-    assert result.stop_reason == "round_failed"
-    assert result.failed_round == 2
-    assert result.warnings == ["execution: dependency failure"]
-    assert result.decisions[-1].failed_stage == "execution"
+    with pytest.raises(ValueError, match="normalized"):
+        run(
+            coordinator(executor=FakeExecutor([first_execution, second_execution])),
+            strategy="fixed_two_round",
+        )

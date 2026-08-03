@@ -835,7 +835,13 @@ class MockSearchOrchestrator:
                     constraints,
                     controller=self._controller,
                 )
-            except OptionalStageUnavailableError:
+            except OptionalStageUnavailableError as error:
+                diagnostic = getattr(error, "diagnostic", None)
+                if isinstance(diagnostic, DependencyDiagnostic):
+                    diagnostics.append(diagnostic)
+                    optional_failure_reason = _optional_failure_reason(
+                        [diagnostic]
+                    )
                 warnings.append("rerank: rerank_unavailable")
                 trace.append(
                     {"step": "rerank", "status": "degraded", "count": len(papers)}

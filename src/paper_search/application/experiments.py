@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, cast
 
 import yaml
 from pydantic import StrictBool, model_validator
@@ -65,6 +65,13 @@ _DEFINITIONS: dict[ExperimentName, tuple[ExperimentFlags, ExperimentStrategy]] =
         "adaptive-evolution",
     ),
 }
+
+
+def expected_experiment_flags(name: str) -> ExperimentFlags:
+    definition = _DEFINITIONS.get(cast(ExperimentName, name))
+    if definition is None:
+        raise ValueError("unknown experiment name")
+    return definition[0]
 
 
 class ExperimentDefinition(DomainModel):
@@ -171,5 +178,6 @@ __all__ = [
     "ExperimentName",
     "OptionalStageUnavailableError",
     "build_experiment_components",
+    "expected_experiment_flags",
     "load_experiment_definition",
 ]

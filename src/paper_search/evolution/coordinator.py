@@ -279,7 +279,7 @@ class EvolutionCoordinator:
                     raise ValueError("execution round number does not match its plan")
                 execution = _snapshot(execution)
                 _validate_incoming_observations(execution.observations)
-            except ProtectedExecutionError:
+            except (ProtectedExecutionError, ValueError):
                 raise
             except Exception:
                 return _failure(

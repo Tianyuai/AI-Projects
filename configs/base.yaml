@@ -22,7 +22,7 @@ capture_policy:
 routing:
   openalex_calls_min: 3
   openalex_calls_max: 6
-  semantic_scholar_calls_max: 2
+  semantic_scholar_calls_max: 0
   max_results_per_subquery: 50
   max_raw_candidates: 300
   max_deduplicated_candidates: 200

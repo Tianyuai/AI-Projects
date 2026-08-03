@@ -80,8 +80,8 @@ def test_finalize_is_deterministic_clipped_and_inherits_hard_constraints() -> No
         "year_from": 2021,
         "year_to": 2024,
         "venues": ["NeurIPS"],
-        "exclusions": ["surveys"],
     }
+    assert _spec().exclusions == ["surveys"]
     assert all(item.target_constraints for item in first.subqueries)
 
 

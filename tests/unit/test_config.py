@@ -154,6 +154,7 @@ def test_base_config_preserves_the_balanced_integrated_baseline() -> None:
     assert config.budget.max_llm_calls == 5
     assert config.budget.max_iterations == 2
     assert config.routing.openalex_calls_max == 6
+    assert config.routing.semantic_scholar_calls_max == 0
     assert config.budget.max_elapsed_seconds == 90
     assert config.budget.soft_deadline_seconds == 80
     assert config.budget.max_total_tokens == 24_000

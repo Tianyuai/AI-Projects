@@ -57,6 +57,15 @@ def test_lock_fixtures_pin_the_real_quality_gate_policy_hash() -> None:
         assert quality_gates["sha256"] == expected
 
 
+def test_candidate_lock_accepts_openalex_only_routing() -> None:
+    raw = deepcopy(fixture_data("candidate.lock.yaml"))
+    raw["baseline"]["retrieval"]["semantic_scholar_calls_max"] = 0
+
+    lock = CandidateLock.model_validate(raw)
+
+    assert lock.baseline.retrieval.semantic_scholar_calls_max == 0
+
+
 def write_artifact_root(root: Path) -> dict[str, bytes]:
     payloads = artifact_payloads()
     for relative_path, payload in payloads.items():

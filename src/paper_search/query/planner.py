@@ -28,8 +28,6 @@ def _hard_filters(spec: QuerySpec) -> dict[str, object]:
         filters["year_to"] = spec.year_to
     if spec.venues:
         filters["venues"] = list(spec.venues)
-    if spec.exclusions:
-        filters["exclusions"] = list(spec.exclusions)
     return filters
 
 

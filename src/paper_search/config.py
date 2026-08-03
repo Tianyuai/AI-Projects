@@ -103,7 +103,7 @@ class RoutingConfig(BaseModel):
 
     openalex_calls_min: Literal[3] = 3
     openalex_calls_max: Literal[6] = 6
-    semantic_scholar_calls_max: Literal[2] = 2
+    semantic_scholar_calls_max: Literal[0, 2] = 2
     max_results_per_subquery: Literal[50] = 50
     max_raw_candidates: Literal[300] = 300
     max_deduplicated_candidates: Literal[200] = 200

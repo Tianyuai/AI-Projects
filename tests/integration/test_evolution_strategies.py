@@ -24,6 +24,7 @@ from paper_search.evolution import (
     RuleBasedNextRoundGenerator,
     extract_strong_constraints,
 )
+from paper_search.llm.snapshot_adapters import LLMAdapterError
 
 
 def query_spec() -> QuerySpec:
@@ -282,3 +283,28 @@ def test_multi_round_experiments_wrap_the_same_single_round_executor(
     assert executor.plans == [
         round_plan(index) for index in range(1, expected_rounds + 1)
     ]
+
+
+def test_evolution_executor_preserves_typed_adapter_failure() -> None:
+    class ProtectedFailureExecutor:
+        async def execute(
+            self,
+            spec: QuerySpec,
+            plan: RoundPlan,
+        ) -> RoundExecution:
+            del spec, plan
+            raise LLMAdapterError("authentication failed")
+
+    coordinator = build_fake_coordinator(executor=ProtectedFailureExecutor())
+
+    with pytest.raises(LLMAdapterError, match="authentication failed"):
+        asyncio.run(
+            coordinator.run(
+                spec=query_spec(),
+                initial_plan=round_plan(1),
+                strategy="fixed_two_round",
+                max_rounds=2,
+                max_subqueries=2,
+                marginal_gain_threshold=0.0,
+            )
+        )

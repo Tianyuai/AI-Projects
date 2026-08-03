@@ -28,6 +28,7 @@ from paper_search.domain.models import (
     ProviderResult,
     UsageActual,
 )
+from paper_search.errors import ProtectedExecutionError
 from paper_search.retrieval.openalex import (
     OPENALEX_SELECT_FIELDS,
     _filter_expression,
@@ -101,7 +102,7 @@ class ProviderSettlementController(Protocol):
     ) -> None: ...
 
 
-class ProviderAdapterError(RuntimeError):
+class ProviderAdapterError(ProtectedExecutionError):
     """A fixed, credential-safe terminal adapter failure."""
 
 

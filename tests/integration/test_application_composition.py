@@ -5,6 +5,7 @@ import hashlib
 import socket
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import yaml
@@ -17,6 +18,7 @@ from paper_search.application.contracts import SearchRequest
 from paper_search.application.contracts import SearchSuccess
 from paper_search.application.modes import ModeBinding
 from paper_search.control.budget import HardBudgetController
+from paper_search.config import load_runtime_config
 from paper_search.domain.models import (
     QueryAnalysisResult,
     QuerySpec,
@@ -324,6 +326,193 @@ def test_replay_orchestrator_uses_only_replay_adapters_and_baseline_modules(
     assert orchestrator._citation_expander is None  # noqa: SLF001
     assert orchestrator._constraint_reranker is None  # noqa: SLF001
     assert orchestrator._routing_limits == (3, 6, 2)  # noqa: SLF001
+
+
+def test_runtime_experiment_selects_real_service_orchestrator_components(
+    composition_fixture: dict[str, Path],
+) -> None:
+    citation_stage = object()
+
+    class Dependencies:
+        def build_embedding_ranker(self) -> object:
+            raise AssertionError("embedding is not enabled")
+
+        def build_citation_expander(self) -> object:
+            return citation_stage
+
+        def build_constraint_reranker(self) -> object:
+            raise AssertionError("reranking is not enabled")
+
+    runtime_config = load_runtime_config(
+        Path("configs/base.yaml"),
+        env_file=None,
+    ).model_copy(update={"experiment": "citation-expansion"})
+
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["replay_lock"],
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+        runtime_config=runtime_config,
+        ablation_config=Path("configs/ablations.yaml"),
+        experiment_dependencies=Dependencies(),
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load(
+            (
+                composition_fixture["artifact_root"]
+                / "configs/budget_balanced.yaml"
+            ).read_bytes()
+        )
+    )
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        "experiment-routing-inspection",
+    )
+
+    assert bundle.experiment_id == "citation-expansion"
+    assert bundle.config_hash != _compose_replay(composition_fixture).config_hash
+    assert orchestrator._citation_expander is citation_stage  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    ("experiment", "expected_builder", "expected_strategy"),
+    [
+        ("main-baseline", None, "fixed_one_round"),
+        ("embedding", "embedding", "fixed_one_round"),
+        ("citation-expansion", "citation", "fixed_one_round"),
+        ("llm-rerank", "rerank", "fixed_one_round"),
+        ("fixed-two-round", None, "fixed_two_round"),
+        ("adaptive-evolution", None, "adaptive"),
+    ],
+)
+def test_every_registered_runtime_identity_reaches_service_factory(
+    composition_fixture: dict[str, Path],
+    experiment: str,
+    expected_builder: str | None,
+    expected_strategy: str,
+) -> None:
+    built: list[str] = []
+    sentinels = {
+        "embedding": object(),
+        "citation": object(),
+        "rerank": object(),
+    }
+
+    class Dependencies:
+        def build_embedding_ranker(self) -> object:
+            built.append("embedding")
+            return sentinels["embedding"]
+
+        def build_citation_expander(self) -> object:
+            built.append("citation")
+            return sentinels["citation"]
+
+        def build_constraint_reranker(self) -> object:
+            built.append("rerank")
+            return sentinels["rerank"]
+
+    runtime_config = load_runtime_config(
+        Path("configs/base.yaml"),
+        env_file=None,
+    ).model_copy(update={"experiment": experiment})
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["replay_lock"],
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+        runtime_config=runtime_config,
+        experiment_dependencies=Dependencies(),
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load(
+            (
+                composition_fixture["artifact_root"]
+                / "configs/budget_balanced.yaml"
+            ).read_bytes()
+        )
+    )
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        f"identity-{experiment}",
+    )
+    single_round = getattr(orchestrator, "_single_round", orchestrator)
+
+    assert bundle.experiment_id == experiment
+    assert built == ([] if expected_builder is None else [expected_builder])
+    assert single_round._embedding_ranker is (  # noqa: SLF001
+        sentinels["embedding"] if expected_builder == "embedding" else None
+    )
+    assert single_round._citation_expander is (  # noqa: SLF001
+        sentinels["citation"] if expected_builder == "citation" else None
+    )
+    assert single_round._constraint_reranker is (  # noqa: SLF001
+        sentinels["rerank"] if expected_builder == "rerank" else None
+    )
+    actual_strategy = getattr(orchestrator, "_strategy", "fixed_one_round")
+    assert actual_strategy == expected_strategy
+
+
+def test_multi_round_runtime_experiment_wraps_service_single_round_executor(
+    composition_fixture: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class NoOptionalDependencies:
+        def build_embedding_ranker(self) -> object:
+            raise AssertionError("embedding is not enabled")
+
+        def build_citation_expander(self) -> object:
+            raise AssertionError("citation expansion is not enabled")
+
+        def build_constraint_reranker(self) -> object:
+            raise AssertionError("reranking is not enabled")
+
+    runtime_config = load_runtime_config(
+        Path("configs/base.yaml"),
+        env_file=None,
+    ).model_copy(update={"experiment": "fixed-two-round"})
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["replay_lock"],
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+        runtime_config=runtime_config,
+        ablation_config=Path("configs/ablations.yaml"),
+        experiment_dependencies=NoOptionalDependencies(),
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load(
+            (
+                composition_fixture["artifact_root"]
+                / "configs/budget_balanced.yaml"
+            ).read_bytes()
+        )
+    )
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        "multi-round-routing-inspection",
+    )
+
+    assert bundle.experiment_id == "fixed-two-round"
+    assert not isinstance(orchestrator, composition_module.MockSearchOrchestrator)
+    assert isinstance(
+        orchestrator._single_round,  # type: ignore[attr-defined]  # noqa: SLF001
+        composition_module.MockSearchOrchestrator,
+    )
+    assert orchestrator._strategy == "fixed_two_round"  # type: ignore[attr-defined]  # noqa: SLF001
+    single_round = orchestrator._single_round  # type: ignore[attr-defined]  # noqa: SLF001
+    run_spy = AsyncMock(wraps=single_round.run)
+    monkeypatch.setattr(single_round, "run", run_spy)
+
+    asyncio.run(orchestrator.run("offline fixture", max_provider_results=5))
+
+    assert run_spy.await_count == 2
 
 
 def test_low_budget_lock_accepts_low_profile_request(

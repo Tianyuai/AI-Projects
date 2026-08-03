@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Protocol, TypeVar
 
-from paper_search.control.budget import BudgetExceededError
 from paper_search.domain.models import DomainModel, Paper, QuerySpec, UsageEstimate
+from paper_search.errors import ProtectedExecutionError
 
 from .coverage import CoverageAnalyzer, normalize_constraint_value
 from .costing import RoundCostEstimator
@@ -275,23 +275,8 @@ class EvolutionCoordinator:
                     raise ValueError("execution round number does not match its plan")
                 execution = _snapshot(execution)
                 _validate_incoming_observations(execution.observations)
-            except BudgetExceededError:
-                decision = decide_stop(
-                    strategy=strategy,
-                    completed_rounds=len(rounds),
-                    coverage=coverage,
-                    gain=gain,
-                    budget_available=False,
-                    max_rounds=max_rounds,
-                    marginal_gain_threshold=marginal_gain_threshold,
-                )
-                return _finish(
-                    strategy=strategy,
-                    rounds=rounds,
-                    candidates=candidates,
-                    decisions=[*decisions, decision],
-                    warnings=[],
-                )
+            except (ProtectedExecutionError, ValueError):
+                raise
             except Exception:
                 return _failure(
                     stage="execution",

@@ -2,21 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 from typing import Any, Protocol
 
 from pydantic import Field
 
-from paper_search.application.contracts import SnapshotRef
+from paper_search.application.contracts import DependencyDiagnostic, SnapshotRef
 from paper_search.control.budget import (
-    BudgetExceededError,
     HardBudgetController,
     ReservationError,
 )
 from paper_search.domain.models import (
     BudgetReservation,
+    ErrorDetail,
     Paper,
     ProviderResult,
+    UsageActual,
     UsageEstimate,
 )
 from paper_search.ranking.rerank import (
@@ -47,12 +49,14 @@ class _Analyzer(Protocol):
 
 class LLMConstraintRerankResult(ConstraintRerankResult):
     snapshot_refs: list[SnapshotRef] = Field(default_factory=list)
+    diagnostics: list[DependencyDiagnostic] = Field(default_factory=list)
 
 
 def _degraded(
     papers: list[Paper],
     *,
     snapshot_refs: list[SnapshotRef] | None = None,
+    diagnostics: list[DependencyDiagnostic] | None = None,
 ) -> LLMConstraintRerankResult:
     result = ConstraintReranker(lambda paper, constraints: None).rerank(
         papers,
@@ -61,6 +65,7 @@ def _degraded(
     return LLMConstraintRerankResult(
         **result.model_dump(mode="python"),
         snapshot_refs=snapshot_refs or [],
+        diagnostics=diagnostics or [],
     )
 
 
@@ -100,6 +105,30 @@ def _snapshot_ref(result: ProviderResult[Any]) -> SnapshotRef | None:
     )
 
 
+def _diagnostic(
+    result: ProviderResult[Any],
+    ref: SnapshotRef | None,
+) -> DependencyDiagnostic:
+    return DependencyDiagnostic(
+        dependency="llm",
+        endpoint="constraint_rerank",
+        model_id=None,
+        usage=result.usage,
+        latency_ms=result.latency_ms,
+        cache_hit=result.cache_hit,
+        snapshot_refs=[] if ref is None else [ref],
+        errors=[
+            ErrorDetail(
+                code=error.code,
+                message="Reranking dependency reported an error",
+                retryable=error.retryable,
+                provider="llm",
+            )
+            for error in result.errors
+        ],
+    )
+
+
 class LLMConstraintRerankingStage:
     def __init__(
         self,
@@ -136,6 +165,7 @@ class LLMConstraintRerankingStage:
                 batch_count=0,
                 warnings=[],
                 snapshot_refs=[],
+                diagnostics=[],
             )
         process_limit = min(
             len(papers),
@@ -147,15 +177,13 @@ class LLMConstraintRerankingStage:
             return _degraded(papers)
         assessments: dict[str, object] = {}
         refs: list[SnapshotRef] = []
+        diagnostics: list[DependencyDiagnostic] = []
         for offset in range(0, len(processed), self._batch_size):
             batch = processed[offset : offset + self._batch_size]
-            try:
-                reservation = controller.reserve(
-                    f"llm.constraint_rerank:{offset // self._batch_size + 1}",
-                    self._call_estimate,
-                )
-            except BudgetExceededError:
-                return _degraded(papers, snapshot_refs=refs)
+            reservation = controller.reserve(
+                f"llm.constraint_rerank:{offset // self._batch_size + 1}",
+                self._call_estimate,
+            )
             try:
                 result = await self._analyzer.generate_json(
                     prompt_name="constraint_rerank",
@@ -173,6 +201,10 @@ class LLMConstraintRerankingStage:
                     reservation=reservation,
                 )
                 _settle_or_verify(controller, reservation, result)
+            except asyncio.CancelledError:
+                if controller.terminal_outcome(reservation) is None:
+                    controller.fail_closed(reservation, UsageActual())
+                raise
             except ReservationError:
                 if controller.terminal_outcome(reservation) is None:
                     controller.fail_closed(reservation)
@@ -180,24 +212,45 @@ class LLMConstraintRerankingStage:
             except Exception:
                 if controller.terminal_outcome(reservation) is None:
                     controller.release(reservation)
-                return _degraded(papers, snapshot_refs=refs)
+                raise
             ref = _snapshot_ref(result)
             if ref is not None:
                 refs.append(ref)
+            diagnostics.append(_diagnostic(result, ref))
             if result.errors:
-                return _degraded(papers, snapshot_refs=refs)
+                return _degraded(
+                    papers,
+                    snapshot_refs=refs,
+                    diagnostics=diagnostics,
+                )
             raw_assessments = result.data.get("assessments")
             if not isinstance(raw_assessments, list):
-                return _degraded(papers, snapshot_refs=refs)
+                return _degraded(
+                    papers,
+                    snapshot_refs=refs,
+                    diagnostics=diagnostics,
+                )
             for raw in raw_assessments:
                 if not isinstance(raw, dict):
-                    return _degraded(papers, snapshot_refs=refs)
+                    return _degraded(
+                        papers,
+                        snapshot_refs=refs,
+                        diagnostics=diagnostics,
+                    )
                 paper_id = raw.get("paper_id")
                 if not isinstance(paper_id, str) or paper_id in assessments:
-                    return _degraded(papers, snapshot_refs=refs)
+                    return _degraded(
+                        papers,
+                        snapshot_refs=refs,
+                        diagnostics=diagnostics,
+                    )
                 assessments[paper_id] = raw
         if set(assessments) != {paper.canonical_id for paper in processed}:
-            return _degraded(papers, snapshot_refs=refs)
+            return _degraded(
+                papers,
+                snapshot_refs=refs,
+                diagnostics=diagnostics,
+            )
         ranked = ConstraintReranker(
             lambda paper, normalized: assessments[paper.canonical_id],
             max_candidates=process_limit,
@@ -207,6 +260,7 @@ class LLMConstraintRerankingStage:
         return LLMConstraintRerankResult(
             **ranked.model_dump(mode="python"),
             snapshot_refs=refs,
+            diagnostics=diagnostics,
         )
 
 

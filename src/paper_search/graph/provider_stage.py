@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Protocol
 
 from pydantic import Field
 
-from paper_search.application.contracts import SnapshotRef
+from paper_search.application.contracts import DependencyDiagnostic, SnapshotRef
+from paper_search.application.experiments import OptionalStageUnavailableError
 from paper_search.control.budget import HardBudgetController, ReservationError
 from paper_search.domain.models import (
     BudgetReservation,
     CitationExpansion,
+    ErrorDetail,
     Paper,
     ProviderPaperId,
     ProviderResult,
+    UsageActual,
     UsageEstimate,
 )
 from paper_search.graph.citation_expand import (
@@ -33,12 +37,22 @@ class AsyncCitationExpansionStage(Protocol):
     ) -> CitationExpansionResult: ...
 
 
-class CitationExpansionUnavailableError(RuntimeError):
+class CitationExpansionUnavailableError(OptionalStageUnavailableError):
     """The provider could not produce a trustworthy citation expansion."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: DependencyDiagnostic | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class ProviderCitationExpansionResult(CitationExpansionResult):
     snapshot_refs: list[SnapshotRef] = Field(default_factory=list)
+    diagnostics: list[DependencyDiagnostic] = Field(default_factory=list)
 
 
 def _settle_or_verify(
@@ -81,6 +95,27 @@ def _provider_id_map(papers: list[Paper]) -> dict[ProviderPaperId, str]:
                 )
             ] = paper.canonical_id
     return mapping
+
+
+def _diagnostic(result: ProviderResult[Any]) -> DependencyDiagnostic:
+    return DependencyDiagnostic(
+        dependency="semantic_scholar",
+        endpoint="citation_expansion",
+        model_id=None,
+        usage=result.usage,
+        latency_ms=result.latency_ms,
+        cache_hit=result.cache_hit,
+        snapshot_refs=_snapshot_refs(result),
+        errors=[
+            ErrorDetail(
+                code=error.code,
+                message="Citation dependency reported an error",
+                retryable=error.retryable,
+                provider="semantic_scholar",
+            )
+            for error in result.errors
+        ],
+    )
 
 
 class ProviderCitationExpansionStage:
@@ -131,6 +166,10 @@ class ProviderCitationExpansionStage:
                     reservation,
                 )
             _settle_or_verify(controller, reservation, result)
+        except asyncio.CancelledError:
+            if controller.terminal_outcome(reservation) is None:
+                controller.fail_closed(reservation, UsageActual())
+            raise
         except ReservationError:
             if controller.terminal_outcome(reservation) is None:
                 controller.fail_closed(reservation)
@@ -139,9 +178,11 @@ class ProviderCitationExpansionStage:
             if controller.terminal_outcome(reservation) is None:
                 controller.release(reservation)
             raise
+        diagnostic = _diagnostic(result)
         if result.errors:
             raise CitationExpansionUnavailableError(
-                "citation provider returned structured errors"
+                "citation provider returned structured errors",
+                diagnostic=diagnostic,
             )
         return result
 
@@ -162,9 +203,11 @@ class ProviderCitationExpansionStage:
                 truncated=False,
                 warnings=[],
                 snapshot_refs=[],
+                diagnostics=[],
             )
         expansions: list[CitationExpansion] = []
         refs: list[SnapshotRef] = []
+        diagnostics: list[DependencyDiagnostic] = []
         for seed in active_seeds:
             if seed.semantic_scholar_id is None:
                 continue
@@ -180,6 +223,7 @@ class ProviderCitationExpansionStage:
                 )
                 expansions.append(result.data)
                 refs.extend(_snapshot_refs(result))
+                diagnostics.append(_diagnostic(result))
         if not expansions:
             return ProviderCitationExpansionResult(
                 papers=list(seeds),
@@ -188,6 +232,7 @@ class ProviderCitationExpansionStage:
                 truncated=False,
                 warnings=[],
                 snapshot_refs=[],
+                diagnostics=[],
             )
         expanded_papers = [
             paper for expansion in expansions for paper in expansion.papers
@@ -208,6 +253,7 @@ class ProviderCitationExpansionStage:
         return ProviderCitationExpansionResult(
             **resolved.model_dump(mode="python"),
             snapshot_refs=refs,
+            diagnostics=diagnostics,
         )
 
 

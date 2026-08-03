@@ -33,6 +33,10 @@ ExperimentStrategy = Literal[
 ]
 
 
+class OptionalStageUnavailableError(RuntimeError):
+    """An optional stage reported an expected, evidence-bearing outage."""
+
+
 class ExperimentFlags(DomainModel):
     embedding: StrictBool = False
     citation_expansion: StrictBool = False
@@ -165,6 +169,7 @@ __all__ = [
     "ExperimentDependencyFactory",
     "ExperimentFlags",
     "ExperimentName",
+    "OptionalStageUnavailableError",
     "build_experiment_components",
     "load_experiment_definition",
 ]

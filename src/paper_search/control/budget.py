@@ -18,11 +18,14 @@ from paper_search.domain.models import (
 )
 
 
-class BudgetExceededError(RuntimeError):
+from paper_search.errors import ProtectedExecutionError
+
+
+class BudgetExceededError(ProtectedExecutionError):
     """Raised before an operation that would exceed a hard limit."""
 
 
-class ReservationError(RuntimeError):
+class ReservationError(ProtectedExecutionError):
     """Raised when a reservation is invalid or cannot be settled safely."""
 
 

@@ -69,6 +69,9 @@ _SAFE_PROVIDER_WARNING_SUFFIXES = frozenset(
 _MALFORMED_LLM_CODES = frozenset(
     {"invalid_json", "invalid_response", "empty_response"}
 )
+_EXPECTED_OPTIONAL_AVAILABILITY_CODES = frozenset(
+    {"timeout", "network_error", "rate_limited", "server_error"}
+)
 _SAFE_ERROR_DETAILS: dict[SearchErrorCode, str] = {
     "invalid_request": "The search request is invalid",
     "live_not_authorized": "Live search is not authorized",
@@ -142,6 +145,10 @@ class SearchApplicationService:
             for diagnostic in result.diagnostics
             if diagnostic.dependency == "llm"
             for error in diagnostic.errors
+            if not (
+                diagnostic.endpoint == "constraint_rerank"
+                and error.code in _EXPECTED_OPTIONAL_AVAILABILITY_CODES
+            )
         }
         if "snapshot_unavailable" in llm_errors:
             return "snapshot_unavailable"

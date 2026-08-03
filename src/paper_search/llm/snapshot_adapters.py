@@ -20,6 +20,7 @@ from paper_search.domain.models import (
     ProviderResult,
     UsageActual,
 )
+from paper_search.errors import ProtectedExecutionError
 from paper_search.llm.client import (
     LLMResponseDecoder,
     OpenAICompatibleLLMClient,
@@ -55,7 +56,7 @@ class RequestSettlementController(Protocol):
     ) -> None: ...
 
 
-class LLMAdapterError(RuntimeError):
+class LLMAdapterError(ProtectedExecutionError):
     """A fixed, credential-safe terminal adapter failure."""
 
 

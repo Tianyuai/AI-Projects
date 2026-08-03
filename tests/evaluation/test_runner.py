@@ -2237,15 +2237,14 @@ def test_formal_inputs_reject_dirty_tracked_source(
 def test_existing_claim_recovers_complete_published_run_then_rejects_reuse(
     tmp_path: Path,
 ) -> None:
-    validation_hash = "sha256:" + "a" * 64
+    lock_bytes = Path("tests/fixtures/formal_run/capture/config.lock.yaml").read_bytes()
+    validation_hash = runner_module.lock_sha256(
+        runner_module.CandidateLock.model_validate(yaml.safe_load(lock_bytes))
+    )
     shutil.copytree(
         Path("tests/fixtures/formal_run/capture"),
         tmp_path / "capture",
     )
-    manifest_path = tmp_path / "capture" / "run.json"
-    manifest = json.loads(manifest_path.read_bytes())
-    manifest["config_hash"] = validation_hash
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     store = runner_module.ValidationAttemptStore(tmp_path)
     store.claim(
         validation_lock_sha256=validation_hash,
@@ -2264,6 +2263,31 @@ def test_existing_claim_recovers_complete_published_run_then_rejects_reuse(
         )
 
     assert store.read(validation_hash).state == "complete"
+
+
+def test_existing_claim_does_not_recover_complete_run_from_other_lock(
+    tmp_path: Path,
+) -> None:
+    validation_hash = "sha256:" + "a" * 64
+    shutil.copytree(
+        Path("tests/fixtures/formal_run/capture"),
+        tmp_path / "capture",
+    )
+    store = runner_module.ValidationAttemptStore(tmp_path)
+    store.claim(
+        validation_lock_sha256=validation_hash,
+        run_id="capture",
+        claimed_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    with pytest.raises(runner_module.ValidationAttemptConflictError):
+        runner_module._reject_or_recover_existing_attempt(
+            store=store,
+            validation_lock_sha256=validation_hash,
+            output_root=tmp_path,
+        )
+
+    assert store.read(validation_hash).state == "claimed"
 
 
 def test_formal_runner_closes_bundle_when_readiness_probe_raises(
@@ -2436,6 +2460,7 @@ def test_partial_second_reservation_failure_closes_bundle_and_first_query(
             self.optional_modules = lock.baseline.optional_modules.model_dump(
                 mode="python"
             )
+            self.experiment_config = None
 
         def readiness_probe(self) -> object:
             return SimpleNamespace(status="ready", dependencies=[])
@@ -2542,6 +2567,7 @@ def test_post_publication_attempt_transition_error_does_not_mark_run_failed(
             self.optional_modules = lock.baseline.optional_modules.model_dump(
                 mode="python"
             )
+            self.experiment_config = None
 
         def readiness_probe(self) -> object:
             return SimpleNamespace(status="ready", dependencies=[])
@@ -2661,6 +2687,7 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
             self.optional_modules = lock.baseline.optional_modules.model_dump(
                 mode="python"
             )
+            self.experiment_config = None
 
         def readiness_probe(self) -> object:
             return SimpleNamespace(status="ready", dependencies=[])
@@ -2751,7 +2778,10 @@ def test_formal_runner_closes_bundle_when_workspace_setup_raises(
 def test_stale_prepublication_claim_is_reconciled_to_interrupted(
     tmp_path: Path,
 ) -> None:
-    validation_hash = "sha256:" + "c" * 64
+    lock_bytes = Path("tests/fixtures/formal_run/capture/config.lock.yaml").read_bytes()
+    validation_hash = runner_module.lock_sha256(
+        runner_module.CandidateLock.model_validate(yaml.safe_load(lock_bytes))
+    )
     run_id = "validation-crashed"
     store = runner_module.ValidationAttemptStore(tmp_path)
     store.claim(
@@ -2774,6 +2804,7 @@ def test_stale_prepublication_claim_is_reconciled_to_interrupted(
         }
     )
     (incomplete / "run.json").write_text(json.dumps(source_manifest), encoding="utf-8")
+    (incomplete / "config.lock.yaml").write_bytes(lock_bytes)
 
     with pytest.raises(runner_module.ValidationAttemptConflictError):
         runner_module._reject_or_recover_existing_attempt(
@@ -2785,6 +2816,44 @@ def test_stale_prepublication_claim_is_reconciled_to_interrupted(
     claim = store.read(validation_hash)
     assert claim.state == "interrupted"
     assert claim.incident_ref == f"automatic-recovery:{run_id}"
+
+
+def test_stale_claim_ignores_incomplete_run_from_other_lock(tmp_path: Path) -> None:
+    validation_hash = "sha256:" + "c" * 64
+    run_id = "validation-crashed"
+    store = runner_module.ValidationAttemptStore(tmp_path)
+    store.claim(
+        validation_lock_sha256=validation_hash,
+        run_id=run_id,
+        claimed_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    incomplete = tmp_path / f".incomplete-{run_id}-fixture"
+    incomplete.mkdir()
+    source_manifest = json.loads(
+        Path("tests/fixtures/formal_run/capture/run.json").read_bytes()
+    )
+    source_manifest.update(
+        {
+            "run_id": run_id,
+            "status": "incomplete",
+            "gate_result": "not_applicable",
+            "ended_at": None,
+        }
+    )
+    (incomplete / "run.json").write_text(json.dumps(source_manifest), encoding="utf-8")
+    shutil.copy(
+        Path("tests/fixtures/formal_run/capture/config.lock.yaml"),
+        incomplete / "config.lock.yaml",
+    )
+
+    with pytest.raises(runner_module.ValidationAttemptConflictError):
+        runner_module._reject_or_recover_existing_attempt(
+            store=store,
+            validation_lock_sha256=validation_hash,
+            output_root=tmp_path,
+        )
+
+    assert store.read(validation_hash).state == "claimed"
 
 
 def test_missing_reporting_measures_are_not_fabricated_as_zero() -> None:

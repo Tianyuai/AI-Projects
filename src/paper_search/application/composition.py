@@ -42,8 +42,9 @@ from paper_search.application.modes import ModeBinding
 from paper_search.application.service import SearchApplicationService, SearchOrchestrator
 from paper_search.api.routing import SearchServiceRouter
 from paper_search.config import (
+    ExperimentConfigEvidence,
     RuntimeConfig,
-    canonical_config_hash,
+    experiment_config_hash,
     parse_budget_bytes,
     validate_mode_authorization,
 )
@@ -284,6 +285,7 @@ class ApplicationBundle:
     artifact_factory: ArtifactFactory
     experiment_id: ExperimentName
     optional_modules: dict[str, bool]
+    experiment_config: ExperimentConfigEvidence | None
     source_git_sha: str
     prompt_version: Literal["query-analyze-v1"]
     mode_binding: ModeBinding
@@ -966,20 +968,22 @@ class CompositionRoot:
             network_authorized=network_authorized,
         )
         locked_config_hash = lock_sha256(lock)
-        config_hash = (
-            locked_config_hash
-            if runtime_config is None
-            else canonical_config_hash(
-                {
-                    "input_lock_sha256": locked_config_hash,
-                    "experiment": experiment_definition.model_dump(mode="json"),
-                    "embedding": (
-                        runtime_config.embedding.model_dump(mode="json")
-                        if experiment_definition.flags.embedding
-                        else None
-                    ),
-                }
+        experiment_config = (
+            None
+            if experiment_definition.name == "main-baseline"
+            else ExperimentConfigEvidence(
+                experiment=experiment_definition,
+                embedding=(
+                    runtime_config.embedding
+                    if runtime_config is not None
+                    and experiment_definition.flags.embedding
+                    else None
+                ),
             )
+        )
+        config_hash = experiment_config_hash(
+            input_lock_sha256=locked_config_hash,
+            evidence=experiment_config,
         )
         budget_profile = _locked_budget_profile(lock.budget_config.path)
         budgets: dict[str, SearchBudget] = {
@@ -1083,6 +1087,7 @@ class CompositionRoot:
             artifact_factory=resolved_artifact_factory,
             experiment_id=experiment_definition.name,
             optional_modules=experiment_definition.flags.model_dump(mode="python"),
+            experiment_config=experiment_config,
             source_git_sha=lock.source_git_sha,
             prompt_version="query-analyze-v1",
             mode_binding=binding,

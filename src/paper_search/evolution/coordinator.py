@@ -301,13 +301,13 @@ class EvolutionCoordinator:
             current_ids = frozenset(paper.canonical_id for paper in candidates)
 
             try:
-                coverage = _snapshot(
-                    self._coverage_analyzer.analyze(
-                        _snapshot(private_spec),
-                        [paper.canonical_id for paper in candidates],
-                        _snapshot_sequence(observations),
-                    )
+                analyzed_coverage = self._coverage_analyzer.analyze(
+                    _snapshot(private_spec),
+                    [paper.canonical_id for paper in candidates],
+                    _snapshot_sequence(observations),
                 )
+            except ProtectedExecutionError:
+                raise
             except Exception:
                 return _failure(
                     stage="coverage",
@@ -321,15 +321,16 @@ class EvolutionCoordinator:
                     coverage=None,
                     gain=None,
                 )
+            coverage = _snapshot(analyzed_coverage)
 
             try:
-                gain = _snapshot(
-                    self._gain_evaluator.evaluate(
-                        previous_ids,
-                        current_ids,
-                        _snapshot(execution),
-                    )
+                evaluated_gain = self._gain_evaluator.evaluate(
+                    previous_ids,
+                    current_ids,
+                    _snapshot(execution),
                 )
+            except ProtectedExecutionError:
+                raise
             except Exception:
                 return _failure(
                     stage="gain",
@@ -343,6 +344,7 @@ class EvolutionCoordinator:
                     coverage=coverage,
                     gain=None,
                 )
+            gain = _snapshot(evaluated_gain)
 
             decision = decide_stop(
                 strategy=strategy,
@@ -371,9 +373,6 @@ class EvolutionCoordinator:
                     round_number=next_round_number,
                     max_subqueries=max_subqueries,
                 )
-                if generated_plan.round_number != next_round_number:
-                    raise ValueError("generated round number does not match request")
-                next_plan = _snapshot(generated_plan)
             except NoTargetedQueriesError:
                 if strategy == "fixed_two_round" and coverage.is_complete:
                     next_plan = _fixed_two_round_fallback(plans[0], next_round_number)
@@ -390,6 +389,8 @@ class EvolutionCoordinator:
                         coverage=coverage,
                         gain=gain,
                     )
+            except ProtectedExecutionError:
+                raise
             except Exception:
                 return _failure(
                     stage="generation",
@@ -403,6 +404,10 @@ class EvolutionCoordinator:
                     coverage=coverage,
                     gain=gain,
                 )
+            else:
+                if generated_plan.round_number != next_round_number:
+                    raise ValueError("generated round number does not match request")
+                next_plan = _snapshot(generated_plan)
 
             try:
                 estimate = _snapshot(

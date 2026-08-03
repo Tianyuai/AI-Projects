@@ -181,6 +181,17 @@ class RetainingCoverageAnalyzer(FakeCoverageAnalyzer):
         return self._reports[len(self.calls) - 1]
 
 
+class ProtectedCoverageAnalyzer(FakeCoverageAnalyzer):
+    def analyze(
+        self,
+        spec: QuerySpec,
+        candidate_ids: Sequence[str],
+        observations: Sequence[CandidateConstraintObservation],
+    ) -> CoverageReport:
+        self.calls.append((spec, list(candidate_ids), list(observations)))
+        raise ProtectedExecutionError("protected coverage failure")
+
+
 class FakeGenerator:
     def __init__(
         self,
@@ -213,6 +224,20 @@ class FakeGenerator:
         if len(self.calls) == self._fail_on_call:
             raise RuntimeError("secret generation prompt")
         return round_plan(round_number + self._round_number_offset)
+
+
+class ProtectedGenerator(FakeGenerator):
+    async def generate(
+        self,
+        *,
+        spec: QuerySpec,
+        coverage: CoverageReport,
+        prior_plans: Sequence[RoundPlan],
+        round_number: int,
+        max_subqueries: int,
+    ) -> RoundPlan:
+        del spec, coverage, prior_plans, round_number, max_subqueries
+        raise ProtectedExecutionError("protected generation failure")
 
 
 class FakeEstimator:
@@ -277,6 +302,17 @@ class RetainingGainEvaluator(FakeGainEvaluator):
     ) -> MarginalGain:
         self.calls.append((previous_ids, current_ids, execution))
         return self._retained
+
+
+class ProtectedGainEvaluator(FakeGainEvaluator):
+    def evaluate(
+        self,
+        previous_ids: frozenset[str],
+        current_ids: frozenset[str],
+        execution: RoundExecution,
+    ) -> MarginalGain:
+        self.calls.append((previous_ids, current_ids, execution))
+        raise ProtectedExecutionError("protected gain failure")
 
 
 class FakeBudget:
@@ -712,13 +748,16 @@ def test_postcommit_dependency_failure_preserves_first_seen_state(
 @pytest.mark.parametrize(
     "updates",
     [
+        {"coverage_analyzer": ProtectedCoverageAnalyzer()},
+        {"gain_evaluator": ProtectedGainEvaluator()},
+        {"generator": ProtectedGenerator()},
         {"estimator": ProtectedEstimator()},
         {"budget": ProtectedBudget()},
         {"estimator": ProtectedEstimator(fail_on_call=2)},
         {"budget": ProtectedBudget(fail_on_call=2)},
     ],
 )
-def test_protected_estimate_and_preflight_failures_propagate(
+def test_protected_stage_failures_propagate(
     updates: dict[str, object],
 ) -> None:
     with pytest.raises(ProtectedExecutionError):
@@ -808,21 +847,16 @@ def test_invalid_generated_round_sequence_fails_before_estimation_or_execution(
     fake_executor = FakeExecutor([first_execution, execution(2)])
     estimator = FakeEstimator()
 
-    result = run(
-        coordinator(
-            executor=fake_executor,
-            generator=FakeGenerator(round_number_offset=round_number_offset),
-            estimator=estimator,
-        ),
-        strategy="fixed_two_round",
-    )
+    with pytest.raises(ValueError, match="generated round number"):
+        run(
+            coordinator(
+                executor=fake_executor,
+                generator=FakeGenerator(round_number_offset=round_number_offset),
+                estimator=estimator,
+            ),
+            strategy="fixed_two_round",
+        )
 
-    assert result.rounds == [first_execution]
-    assert result.candidates == [first_paper]
-    assert result.stop_reason == "round_failed"
-    assert result.failed_round == 2
-    assert result.warnings == ["generation: dependency failure"]
-    assert result.decisions[-1].failed_stage == "generation"
     assert len(estimator.calls) == 1
     assert len(fake_executor.calls) == 1
 

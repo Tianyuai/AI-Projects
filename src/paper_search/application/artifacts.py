@@ -29,6 +29,7 @@ from paper_search.application.locks import (
     lock_sha256,
 )
 from paper_search.control.ledger import LedgerReport
+from paper_search.config import ExperimentConfigEvidence, experiment_config_hash
 from paper_search.domain.models import (
     DependencyStatus,
     DomainModel,
@@ -147,6 +148,7 @@ class RunManifest(DomainModel):
     snapshot_manifest_sha256: Sha256
     experiment_name: NonEmptyStr
     optional_modules: dict[NonEmptyStr, bool]
+    experiment_config: ExperimentConfigEvidence | None = None
     started_at: datetime
     ended_at: datetime | None
     readiness_summary: list[DependencyStatus]
@@ -197,22 +199,9 @@ class FormalRunWorkspace:
         if _sha256(self._input_lock_bytes) != manifest.input_lock_sha256:
             raise ValueError("input lock sha256 does not match exact input bytes")
         self._input_lock = _parse_lock(self._input_lock_bytes)
-        expected_mode: SearchMode = (
-            "replay" if isinstance(self._input_lock, ReplayLock) else "live"
-        )
-        if manifest.execution_mode != expected_mode:
-            raise ValueError("formal run execution mode does not match input lock")
-        if (
-            manifest.split != self._input_lock.frozen_data.split
-            or manifest.frozen_manifest_sha256
-            != self._input_lock.frozen_data.manifest.sha256
-            or manifest.partition_sha256
-            != self._input_lock.frozen_data.partition_sha256
-            or manifest.identifier_map_sha256
-            != self._input_lock.frozen_data.identifier_map.sha256
-            or manifest.source_git_sha != self._input_lock.source_git_sha
-            or not experiment_manifest_matches_lock(manifest, self._input_lock)
-            or manifest.prompt_version != self._input_lock.baseline.prompt_version
+        if not run_manifest_matches_input_lock_bytes(
+            manifest,
+            self._input_lock_bytes,
         ):
             raise ValueError("formal run manifest does not match input lock bindings")
         self._validator = validator or (lambda path: None)
@@ -601,16 +590,53 @@ def experiment_manifest_matches_lock(
     input_lock: InputLock,
 ) -> bool:
     lock_hash = lock_sha256(input_lock)
-    if manifest.experiment_name == "main-baseline":
-        return manifest.config_hash == lock_hash
     try:
         expected_flags = expected_experiment_flags(manifest.experiment_name)
     except ValueError:
         return False
-    expected = expected_flags.model_dump(mode="python")
-    enabled = {name: value for name, value in manifest.optional_modules.items() if value}
-    expected_enabled = {name: value for name, value in expected.items() if value}
-    return manifest.config_hash != lock_hash and enabled == expected_enabled
+    expected_modules = expected_flags.model_dump(mode="python")
+    if manifest.optional_modules != expected_modules:
+        return False
+    if manifest.experiment_name == "main-baseline":
+        return manifest.experiment_config is None and manifest.config_hash == lock_hash
+    evidence = manifest.experiment_config
+    if evidence is None or evidence.experiment.name != manifest.experiment_name:
+        return False
+    return manifest.config_hash == experiment_config_hash(
+        input_lock_sha256=lock_hash,
+        evidence=evidence,
+    )
+
+
+def run_manifest_matches_input_lock_bytes(
+    manifest: RunManifest,
+    input_lock_bytes: bytes,
+    *,
+    expected_lock_sha256: Sha256 | None = None,
+) -> bool:
+    """Verify exact input-lock bytes and all manifest bindings used for recovery."""
+
+    try:
+        input_lock = _parse_lock(input_lock_bytes)
+    except ValueError:
+        return False
+    canonical_lock_sha256 = lock_sha256(input_lock)
+    expected_mode: SearchMode = (
+        "replay" if isinstance(input_lock, ReplayLock) else "live"
+    )
+    return (
+        (expected_lock_sha256 is None or canonical_lock_sha256 == expected_lock_sha256)
+        and _sha256(input_lock_bytes) == manifest.input_lock_sha256
+        and manifest.execution_mode == expected_mode
+        and manifest.split == input_lock.frozen_data.split
+        and manifest.frozen_manifest_sha256 == input_lock.frozen_data.manifest.sha256
+        and manifest.partition_sha256 == input_lock.frozen_data.partition_sha256
+        and manifest.identifier_map_sha256
+        == input_lock.frozen_data.identifier_map.sha256
+        and manifest.source_git_sha == input_lock.source_git_sha
+        and experiment_manifest_matches_lock(manifest, input_lock)
+        and manifest.prompt_version == input_lock.baseline.prompt_version
+    )
 
 
 class CaptureSession:
@@ -966,4 +992,5 @@ __all__ = [
     "CaptureSession",
     "FormalRunWorkspace",
     "RunManifest",
+    "run_manifest_matches_input_lock_bytes",
 ]

@@ -18,7 +18,7 @@ from paper_search.application.contracts import SearchRequest
 from paper_search.application.contracts import SearchSuccess
 from paper_search.application.modes import ModeBinding
 from paper_search.control.budget import HardBudgetController
-from paper_search.config import load_runtime_config
+from paper_search.config import experiment_config_hash, load_runtime_config
 from paper_search.domain.models import (
     QueryAnalysisResult,
     QuerySpec,
@@ -377,6 +377,25 @@ def test_runtime_experiment_selects_real_service_orchestrator_components(
     assert orchestrator._citation_expander is citation_stage  # type: ignore[attr-defined]  # noqa: SLF001
 
 
+def test_explicit_main_baseline_uses_lock_identity(
+    composition_fixture: dict[str, Path],
+) -> None:
+    runtime_config = load_runtime_config(Path("configs/base.yaml"), env_file=None)
+
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["replay_lock"],
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+        runtime_config=runtime_config,
+    )
+
+    assert bundle.config_hash == _compose_replay(composition_fixture).config_hash
+    assert bundle.experiment_config is None
+
+
 @pytest.mark.parametrize(
     ("experiment", "expected_builder", "expected_strategy"),
     [
@@ -443,6 +462,11 @@ def test_every_registered_runtime_identity_reaches_service_factory(
     single_round = getattr(orchestrator, "_single_round", orchestrator)
 
     assert bundle.experiment_id == experiment
+    assert (bundle.experiment_config is None) is (experiment == "main-baseline")
+    assert bundle.config_hash == experiment_config_hash(
+        input_lock_sha256=_compose_replay(composition_fixture).config_hash,
+        evidence=bundle.experiment_config,
+    )
     assert built == ([] if expected_builder is None else [expected_builder])
     assert single_round._embedding_ranker is (  # noqa: SLF001
         sentinels["embedding"] if expected_builder == "embedding" else None

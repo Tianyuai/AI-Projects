@@ -32,7 +32,11 @@ from paper_search.evaluation.attempts import (
     ValidationAttemptStore,
 )
 from paper_search.evaluation.execution_adapter import AdaptedExecution, adapt_execution
-from paper_search.application.artifacts import FormalRunWorkspace, RunManifest
+from paper_search.application.artifacts import (
+    FormalRunWorkspace,
+    RunManifest,
+    run_manifest_matches_input_lock_bytes,
+)
 from paper_search.application.locks import (
     CandidateLock,
     ReplayLock,
@@ -1097,17 +1101,26 @@ def _reject_or_recover_existing_attempt(
         return
     claim = store.read(validation_lock_sha256)
     if claim.state == "claimed":
+        published_root = output_root / claim.run_id
         try:
             manifest = RunManifest.model_validate_json(
-                (output_root / claim.run_id / "run.json").read_bytes()
+                (published_root / "run.json").read_bytes()
             )
+            published_lock_bytes = (published_root / "config.lock.yaml").read_bytes()
         except (OSError, ValueError):
             manifest = None
+            published_lock_bytes = None
         if (
             manifest is not None
+            and published_lock_bytes is not None
             and manifest.run_id == claim.run_id
             and manifest.status == "complete"
             and manifest.ended_at is not None
+            and run_manifest_matches_input_lock_bytes(
+                manifest,
+                published_lock_bytes,
+                expected_lock_sha256=validation_lock_sha256,
+            )
         ):
             store.transition(
                 validation_lock_sha256=validation_lock_sha256,
@@ -1123,11 +1136,19 @@ def _reject_or_recover_existing_attempt(
                     incomplete_manifest = RunManifest.model_validate_json(
                         (incomplete_path / "run.json").read_bytes()
                     )
+                    incomplete_lock_bytes = (
+                        incomplete_path / "config.lock.yaml"
+                    ).read_bytes()
                 except (OSError, ValueError):
                     continue
                 if (
                     incomplete_manifest.run_id == claim.run_id
                     and incomplete_manifest.status == "incomplete"
+                    and run_manifest_matches_input_lock_bytes(
+                        incomplete_manifest,
+                        incomplete_lock_bytes,
+                        expected_lock_sha256=validation_lock_sha256,
+                    )
                 ):
                     completed_at = max(datetime.now(UTC), claim.claimed_at)
                     store.transition(
@@ -1222,6 +1243,7 @@ async def _run_formal_evaluation(
         snapshot_manifest_sha256=snapshot_sha256,
         experiment_name=bundle.experiment_id,
         optional_modules=bundle.optional_modules,
+        experiment_config=bundle.experiment_config,
         started_at=started_at,
         ended_at=None,
         readiness_summary=readiness.dependencies,

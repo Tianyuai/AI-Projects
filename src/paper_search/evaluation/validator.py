@@ -14,7 +14,7 @@ from pydantic import TypeAdapter
 
 from paper_search.application.artifacts import (
     RunManifest,
-    experiment_manifest_matches_lock,
+    run_manifest_matches_input_lock_bytes,
 )
 from paper_search.application.locks import (
     CandidateLock,
@@ -298,17 +298,7 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
 
         lock_bytes = (root / "config.lock.yaml").read_bytes()
         lock = _LOCK_ADAPTER.validate_python(yaml.safe_load(lock_bytes))
-        exact_lock_sha = f"sha256:{hashlib.sha256(lock_bytes).hexdigest()}"
-        if (
-            exact_lock_sha != manifest.input_lock_sha256
-            or not experiment_manifest_matches_lock(manifest, lock)
-            or lock.source_git_sha != manifest.source_git_sha
-            or lock.frozen_data.split != manifest.split
-            or lock.frozen_data.manifest.sha256 != manifest.frozen_manifest_sha256
-            or lock.frozen_data.partition_sha256 != manifest.partition_sha256
-            or lock.frozen_data.identifier_map.sha256 != manifest.identifier_map_sha256
-            or lock.baseline.prompt_version != manifest.prompt_version
-        ):
+        if not run_manifest_matches_input_lock_bytes(manifest, lock_bytes):
             issues.append(_issue("lock_binding_invalid", "config.lock.yaml", "Input lock binding is invalid"))
         (
             frozen_queries,

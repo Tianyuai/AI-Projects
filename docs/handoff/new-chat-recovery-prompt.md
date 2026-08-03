@@ -8,7 +8,7 @@
 【项目与分支】
 - 工作树：D:\AI Projects\.worktrees\week3
 - 当前分支：codex/project-document-handoff
-- 当前 HEAD：a069165（最新文档交接更新提交）
+- 当前分支包含最新文档交接提交；收到提示后先用 `git rev-parse --short HEAD` 核验当前 HEAD。
 - Task 4 review-fix 工程提交：ddf9972；文档交接提交：48d3aa8；Task 4 初版基线：8ce02a8。
 - 当前没有应被覆盖的 Task 4 源码 WIP；但用户已有未跟踪文件必须保留，不要 reset、checkout、clean 或删除任何现有修改。
 - 用户已有未跟踪文件也必须保留：.gate0-report.json、.sheet-build/、outputs/、docs/superpowers/plans/ 等。

@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 import sys
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
@@ -64,6 +66,14 @@ def build_parser() -> argparse.ArgumentParser:
     compare = commands.add_parser("compare-replay", help="compare capture and replay")
     compare.add_argument("capture_run", type=Path)
     compare.add_argument("replay_run", type=Path)
+    serve = commands.add_parser("serve", help="serve the canonical replay API")
+    serve.add_argument("--lock", type=Path, required=True)
+    serve.add_argument("--mode", choices=("replay",), required=True)
+    serve.add_argument("--snapshot-manifest", type=Path, required=True)
+    serve.add_argument("--capture-output-root", type=Path, required=True)
+    serve.add_argument("--allow-live", action="store_true")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8000)
     return parser
 
 
@@ -145,6 +155,79 @@ async def _run_smoke(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
         await _close_bundle(bundle)
 
 
+def _run_serve(args: argparse.Namespace) -> int:
+    """Run the only HTTP server boundary after validating local-only binding."""
+    if not 1 <= args.port <= 65_535:
+        raise ValueError("invalid server binding")
+
+    from paper_search.api.app import create_app
+
+    bundle = CompositionRoot.compose_server(
+        replay_lock_path=Path(args.lock),
+        snapshot_manifest_path=Path(args.snapshot_manifest),
+        artifact_root=Path.cwd(),
+        capture_output_root=Path(args.capture_output_root),
+        live_authorized=bool(args.allow_live),
+    )
+
+    @asynccontextmanager
+    async def lifespan(_: object) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            await bundle.aclose()
+
+    try:
+        import uvicorn
+
+        config = uvicorn.Config(
+            create_app(bundle.service_router, lifespan=lifespan),
+            host=args.host,
+            port=args.port,
+            access_log=False,
+            log_config=None,
+            log_level="critical",
+        )
+        server = uvicorn.Server(config)
+        interrupted = False
+        previous_handler = signal.getsignal(signal.SIGINT)
+
+        def request_shutdown(_: int, __: object) -> None:
+            nonlocal interrupted
+            interrupted = True
+            server.should_exit = True
+
+        signal.signal(signal.SIGINT, request_shutdown)
+        break_signal = getattr(signal, "SIGBREAK", None)
+        previous_break_handler = None
+        if break_signal is not None:
+            previous_break_handler = signal.getsignal(break_signal)
+            signal.signal(break_signal, request_shutdown)
+        setattr(server, "install_signal_handlers", lambda: None)
+        try:
+            try:
+                server.run()
+            except SystemExit as error:
+                if error.code not in (None, 0):
+                    raise RuntimeError("server did not start") from error
+                raise
+        finally:
+            signal.signal(signal.SIGINT, previous_handler)
+            if break_signal is not None and previous_break_handler is not None:
+                signal.signal(break_signal, previous_break_handler)
+        if interrupted:
+            return 130
+        if not server.started:
+            raise RuntimeError("server did not start")
+        return 0
+    finally:
+        awaitable = bundle.aclose()
+        try:
+            asyncio.run(awaitable)
+        except RuntimeError:
+            awaitable.close()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -152,6 +235,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return verify_run_command(args.run_directory)
     if args.command == "compare-replay":
         return compare_replay_command(args.capture_run, args.replay_run)
+    if args.command == "serve":
+        try:
+            return _run_serve(args)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            return 130
+        except (OSError, RuntimeError, TypeError, ValueError):
+            print("serve failed: startup error", file=sys.stderr)
+            return 2
     if args.command == "evaluate":
         try:
             result = asyncio.run(

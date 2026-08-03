@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
+from uuid import uuid4
 
 import httpx
 from pydantic import SecretStr
 
 from paper_search.application.artifacts import ArtifactFactory
-from paper_search.application.contracts import ReadyHealthResponse
+from paper_search.application.contracts import (
+    ReadyHealthResponse,
+    SearchExecutionResult,
+    SearchFailure,
+    SearchRequest,
+    SearchSuccess,
+)
 from paper_search.application.locks import (
     InputLock,
     ReplayLock,
@@ -23,6 +30,7 @@ from paper_search.application.locks import (
 )
 from paper_search.application.modes import ModeBinding
 from paper_search.application.service import SearchApplicationService, SearchOrchestrator
+from paper_search.api.routing import SearchServiceRouter
 from paper_search.config import parse_budget_bytes, validate_mode_authorization
 from paper_search.control.budget import HardBudgetController
 from paper_search.control.pricing import ActualCostPricer, parse_pricing_policy_bytes
@@ -98,9 +106,73 @@ class ApplicationBundle:
     source_git_sha: str
     prompt_version: Literal["query-analyze-v1"]
     mode_binding: ModeBinding
+    _owns_artifact_factory: bool = field(default=True, repr=False, compare=False)
 
     async def aclose(self) -> None:
-        await self.artifact_factory.aclose()
+        if self._owns_artifact_factory:
+            await self.artifact_factory.aclose()
+
+
+@dataclass(frozen=True)
+class ServerApplicationBundle:
+    """Process-bound replay service plus isolated live request composition."""
+
+    replay: ApplicationBundle
+    live_factory: Callable[[], ApplicationBundle] | None
+    capture_artifact_factory: ArtifactFactory
+    service_router: SearchServiceRouter
+    _close: Callable[[], Awaitable[None]] = field(repr=False, compare=False)
+
+    async def aclose(self) -> None:
+        await self._close()
+
+
+class _RequestLiveCaptureService:
+    """Publish one validated live capture before exposing a success response."""
+
+    def __init__(
+        self,
+        *,
+        bundle: ApplicationBundle,
+        input_lock_bytes: bytes,
+        release_bundle: Callable[[ApplicationBundle], None],
+        run_id_factory: Callable[[], str],
+    ) -> None:
+        self._bundle = bundle
+        self._input_lock_bytes = input_lock_bytes
+        self._release_bundle = release_bundle
+        self._run_id_factory = run_id_factory
+
+    async def execute_and_publish(self, request: SearchRequest) -> SearchExecutionResult:
+        run_id = self._run_id_factory()
+        session = None
+        try:
+            session = self._bundle.artifact_factory.start_capture(
+                run_id=run_id,
+                input_lock_bytes=self._input_lock_bytes,
+            )
+            execution = await self._bundle.service.execute(request, run_id=run_id)
+            session.record_execution(execution)
+            if isinstance(execution.outcome, SearchFailure):
+                session.fail(execution.outcome.error.code)
+                return execution
+            if not isinstance(execution.outcome, SearchSuccess):
+                raise RuntimeError("live execution has an invalid outcome")
+            session.seal()
+            session.publish()
+            return execution
+        except BaseException:
+            if session is not None and session.work_dir.exists():
+                try:
+                    session.fail("internal_error")
+                except (OSError, RuntimeError, ValueError):
+                    pass
+            raise
+        finally:
+            try:
+                await self._bundle.aclose()
+            finally:
+                self._release_bundle(self._bundle)
 
 
 def _replay_estimates(
@@ -457,6 +529,139 @@ class CompositionRoot:
     """Build the only production search boundary from verified immutable inputs."""
 
     @classmethod
+    def compose_server(
+        cls,
+        *,
+        replay_lock_path: Path,
+        snapshot_manifest_path: Path,
+        artifact_root: Path,
+        capture_output_root: Path,
+        live_authorized: bool,
+        environ: Mapping[str, str] | None = None,
+    ) -> ServerApplicationBundle:
+        """Bind one replay service and optionally authorize isolated live captures."""
+        try:
+            replay_lock_bytes = replay_lock_path.read_bytes()
+        except OSError as error:
+            raise ValueError("replay lock is unavailable") from error
+        verified_replay = load_verified_input_lock_bytes(
+            replay_lock_bytes,
+            artifact_root=artifact_root,
+        )
+        replay_lock = verified_replay.lock
+        if not isinstance(replay_lock, ReplayLock):
+            raise ValueError("server requires a replay lock")
+        if live_authorized and not replay_lock.runtime_allow_live:
+            raise ValueError("replay lock does not allow live execution")
+
+        source_lock_path: Path | None = None
+        source_lock_bytes: bytes | None = None
+        if live_authorized:
+            capture_root = capture_output_root.resolve()
+            source_root = (
+                capture_root / replay_lock.source_capture_run_id
+            ).resolve()
+            if not source_root.is_relative_to(capture_root):
+                raise ValueError("source capture run id escapes capture output root")
+            source_lock_path = source_root / "config.lock.yaml"
+            source_replay_path = source_root / "replay.lock.yaml"
+            try:
+                source_replay_bytes = source_replay_path.read_bytes()
+                source_lock_bytes = source_lock_path.read_bytes()
+            except OSError as error:
+                raise ValueError("source live capture lock is unavailable") from error
+            if source_replay_bytes != replay_lock_bytes:
+                raise ValueError("source capture lineage does not match replay lock")
+            source_verified = load_verified_input_lock_bytes(
+                source_lock_bytes,
+                artifact_root=artifact_root,
+            )
+            if isinstance(source_verified.lock, ReplayLock):
+                raise ValueError("source capture must use a live input lock")
+
+        replay = cls.compose(
+            lock_path=replay_lock_path,
+            mode="replay",
+            artifact_root=artifact_root,
+            output_root=capture_output_root,
+            snapshot_manifest_path=snapshot_manifest_path,
+            environ=environ,
+            lock_bytes=replay_lock_bytes,
+        )
+        capture_artifact_factory = ArtifactFactory(output_root=capture_output_root.resolve())
+        active_live: dict[int, ApplicationBundle] = {}
+        closed = False
+
+        def release_live(bundle: ApplicationBundle) -> None:
+            active_live.pop(id(bundle), None)
+
+        live_factory: Callable[[], ApplicationBundle] | None = None
+        live_service_factory = None
+        if live_authorized:
+            assert source_lock_path is not None
+            assert source_lock_bytes is not None
+
+            def create_live() -> ApplicationBundle:
+                if closed:
+                    raise RuntimeError("server is shutting down")
+                bundle = cls.compose(
+                    lock_path=source_lock_path,
+                    mode="live",
+                    artifact_root=artifact_root,
+                    output_root=capture_output_root,
+                    network_authorized=True,
+                    environ=environ,
+                    lock_bytes=source_lock_bytes,
+                    artifact_factory=capture_artifact_factory,
+                )
+                active_live[id(bundle)] = bundle
+                return bundle
+
+            def create_live_service() -> _RequestLiveCaptureService:
+                bundle = create_live()
+                return _RequestLiveCaptureService(
+                    bundle=bundle,
+                    input_lock_bytes=source_lock_bytes,
+                    release_bundle=release_live,
+                    run_id_factory=lambda: f"serve-{uuid4()}",
+                )
+
+            live_factory = create_live
+            live_service_factory = create_live_service
+
+        router = SearchServiceRouter(
+            replay_service=replay.service,
+            readiness=replay.readiness_probe(),
+            live_service_factory=live_service_factory,
+            runtime_allow_live=replay_lock.runtime_allow_live,
+            server_live_authorized=live_authorized,
+        )
+
+        async def close_server() -> None:
+            nonlocal closed
+            if closed:
+                return
+            closed = True
+            bundles = list(active_live.values())
+            active_live.clear()
+            try:
+                for bundle in bundles:
+                    await bundle.aclose()
+            finally:
+                try:
+                    await capture_artifact_factory.aclose()
+                finally:
+                    await replay.aclose()
+
+        return ServerApplicationBundle(
+            replay=replay,
+            live_factory=live_factory,
+            capture_artifact_factory=capture_artifact_factory,
+            service_router=router,
+            _close=close_server,
+        )
+
+    @classmethod
     def compose(
         cls,
         *,
@@ -468,6 +673,7 @@ class CompositionRoot:
         network_authorized: bool = False,
         environ: Mapping[str, str] | None = None,
         lock_bytes: bytes | None = None,
+        artifact_factory: ArtifactFactory | None = None,
     ) -> ApplicationBundle:
         verified = (
             load_verified_input_lock(lock_path, artifact_root=artifact_root)
@@ -490,7 +696,9 @@ class CompositionRoot:
                 verified.artifact_bytes[lock.budget_config.path]
             ),
         }
-        artifact_factory = ArtifactFactory(output_root=output_root.resolve())
+        resolved_artifact_factory = artifact_factory or ArtifactFactory(
+            output_root=output_root.resolve()
+        )
         binding: ModeBinding
         orchestrator_factory: Callable[
             [HardBudgetController, str], SearchOrchestrator
@@ -551,7 +759,7 @@ class CompositionRoot:
                 config_hash=config_hash,
                 pricer=pricer,
                 credentials=credentials,
-                artifact_factory=artifact_factory,
+                artifact_factory=resolved_artifact_factory,
             )
 
             binding = ModeBinding(
@@ -575,9 +783,10 @@ class CompositionRoot:
             service=service,
             readiness_probe=readiness_probe,
             config_hash=config_hash,
-            artifact_factory=artifact_factory,
+            artifact_factory=resolved_artifact_factory,
             experiment_id="main-baseline",
             source_git_sha=lock.source_git_sha,
             prompt_version="query-analyze-v1",
             mode_binding=binding,
+            _owns_artifact_factory=artifact_factory is None,
         )

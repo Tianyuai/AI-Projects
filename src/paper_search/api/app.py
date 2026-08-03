@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Final
 
 from fastapi import FastAPI, Request
@@ -59,9 +61,11 @@ def _error_response(
 
 def create_app(
     service_router: SearchServiceRouter | None = None,
+    *,
+    lifespan: Callable[[FastAPI], AbstractAsyncContextManager[None]] | None = None,
 ) -> FastAPI:
     """Create an API that exposes only typed, safe application outcomes."""
-    application = FastAPI()
+    application = FastAPI(lifespan=lifespan)
     install_ui(application)
 
     @application.exception_handler(RequestValidationError)

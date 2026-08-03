@@ -273,6 +273,45 @@ def test_live_secret_is_resolved_only_into_private_clients(
     assert readiness.last_authorized_probe_at is None
 
 
+def test_live_readiness_uses_authorized_probe_evidence(
+    composition_fixture: dict[str, Path],
+) -> None:
+    from datetime import UTC, datetime
+
+    from paper_search.application.readiness import (
+        AuthorizedCapability,
+        AuthorizedReadinessEvidence,
+        write_authorized_readiness,
+    )
+
+    now = datetime.now(UTC)
+    evidence = AuthorizedReadinessEvidence(
+        schema_version="gate0-readiness-v1",
+        generated_at=now,
+        capabilities=[
+            AuthorizedCapability(name=name, state="ready", observed_at=now)
+            for name in ("llm", "openalex", "semantic_scholar")
+        ],
+    )
+    root = composition_fixture["artifact_root"]
+    write_authorized_readiness(
+        root / "data" / "annotation_work" / "provider_readiness.live.json",
+        evidence,
+    )
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["candidate_lock"],
+        mode="live",
+        artifact_root=root,
+        output_root=composition_fixture["output_root"],
+        network_authorized=True,
+        environ={"LLM_API_KEY": "secret"},
+    )
+
+    response = bundle.readiness_probe()
+    assert response.status == "ready"
+    assert response.last_authorized_probe_at == now
+
+
 def test_service_constructs_a_fresh_controller_for_each_request(
     composition_fixture: dict[str, Path],
     monkeypatch: pytest.MonkeyPatch,

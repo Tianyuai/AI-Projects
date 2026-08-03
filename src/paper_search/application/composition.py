@@ -6,7 +6,7 @@ import os
 import stat
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, NoReturn, Protocol
 from uuid import uuid4
@@ -39,6 +39,10 @@ from paper_search.application.locks import (
     lock_sha256,
 )
 from paper_search.application.modes import ModeBinding
+from paper_search.application.readiness import (
+    build_live_readiness,
+    load_live_readiness,
+)
 from paper_search.application.service import SearchApplicationService, SearchOrchestrator
 from paper_search.api.routing import SearchServiceRouter
 from paper_search.config import (
@@ -484,23 +488,32 @@ def _replay_readiness(binding: ModeBinding) -> Callable[[], ReadyHealthResponse]
     return lambda: response
 
 
-def _live_readiness(binding: ModeBinding) -> Callable[[], ReadyHealthResponse]:
-    response = ReadyHealthResponse(
-        status="degraded",
-        execution_mode="live",
-        snapshot_set_id=binding.snapshot_set_id,
-        dependencies=[
-            DependencyStatus(
-                dependency=dependency,
-                state="degraded",
-                cache_hit=False,
-                error_codes=[],
+def _live_readiness(
+    binding: ModeBinding,
+    artifact_root: Path,
+) -> Callable[[], ReadyHealthResponse]:
+    evidence = load_live_readiness(artifact_root)
+
+    def probe() -> ReadyHealthResponse:
+        if evidence is None:
+            return ReadyHealthResponse(
+                status="degraded",
+                execution_mode="live",
+                snapshot_set_id=binding.snapshot_set_id,
+                dependencies=[
+                    DependencyStatus(
+                        dependency=dependency,
+                        state="degraded",
+                        cache_hit=False,
+                        error_codes=[],
+                    )
+                    for dependency in _DEPENDENCIES
+                ],
+                last_authorized_probe_at=None,
             )
-            for dependency in _DEPENDENCIES
-        ],
-        last_authorized_probe_at=None,
-    )
-    return lambda: response
+        return build_live_readiness(evidence, datetime.now(UTC))
+
+    return probe
 
 
 def _snapshot_manifest_time(path: Path) -> datetime:
@@ -1069,7 +1082,7 @@ class CompositionRoot:
                 snapshot_set_id=None,
                 snapshot_manifest_sha256=None,
             )
-            readiness_probe = _live_readiness(binding)
+            readiness_probe = _live_readiness(binding, artifact_root)
 
         service = SearchApplicationService(
             orchestrator_factory=orchestrator_factory,

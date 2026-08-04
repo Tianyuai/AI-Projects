@@ -85,15 +85,16 @@ _SECRET_MARKERS = (
     b"private_key",
     b"access_token",
 )
+_CREDENTIAL_URL = re.compile(rb"(?i)https?://[^/\s:@]+:[^/\s@]+@")
 
 
 def _secret_scan_failure(content: bytes, *, raw_response: bool) -> bool:
     """Return whether an artifact carries a prohibited secret or private path."""
 
+    if raw_response:
+        return _CREDENTIAL_URL.search(content) is not None
     if _PRIVATE_PATH.search(content) is not None:
         return True
-    if raw_response:
-        return False
     lowered = content.lower()
     return any(marker in lowered for marker in _SECRET_MARKERS)
 

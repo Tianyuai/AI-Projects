@@ -156,6 +156,23 @@ def test_secret_scan_ignores_legitimate_words_in_raw_responses() -> None:
     )
 
 
+def test_secret_scan_ignores_home_paths_in_raw_provider_urls() -> None:
+    assert not validator_module._secret_scan_failure(
+        (
+            b'{"pdf_url":"https://journals.library.brocku.ca/brocked/'
+            b'index.php/home/article/download/38"}'
+        ),
+        raw_response=True,
+    )
+
+
+def test_secret_scan_flags_credential_urls_in_raw_responses() -> None:
+    assert validator_module._secret_scan_failure(
+        b'{"url":"https://user:secret@example.com/x"}',
+        raw_response=True,
+    )
+
+
 def test_secret_scan_flags_metadata_secret_markers() -> None:
     assert validator_module._secret_scan_failure(
         b'{"authorization":"Bearer secret"}',

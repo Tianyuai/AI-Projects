@@ -12,6 +12,7 @@ from typing import Any, Literal, NoReturn, Protocol
 from uuid import uuid4
 
 import httpx
+import yaml
 from pydantic import SecretStr
 
 from paper_search.application.artifacts import ArtifactFactory
@@ -469,6 +470,27 @@ def _locked_budget_profile(path: str) -> Literal["low", "balanced"]:
     raise ValueError("lock budget path must identify the low or balanced profile")
 
 
+def _prompt_system_message(prompt_bytes: bytes) -> str:
+    """Build the deterministic system message from the bound prompt artifact."""
+    try:
+        raw = yaml.safe_load(prompt_bytes)
+    except yaml.YAMLError as error:
+        raise ValueError("invalid prompt artifact") from error
+    if not isinstance(raw, dict):
+        raise ValueError("invalid prompt artifact")
+    instructions = raw.get("instructions", [])
+    if not isinstance(instructions, list) or not all(
+        isinstance(item, str) for item in instructions
+    ):
+        raise ValueError("prompt instructions must be a list of strings")
+    lines = ["Respond with a JSON object."]
+    response_model = raw.get("response_model")
+    if isinstance(response_model, str) and response_model:
+        lines.append(f"The JSON object must match the {response_model} contract.")
+    lines.extend(f"- {item}" for item in instructions)
+    return "\n".join(lines)
+
+
 def _replay_readiness(binding: ModeBinding) -> Callable[[], ReadyHealthResponse]:
     response = ReadyHealthResponse(
         status="ready",
@@ -658,6 +680,7 @@ class _LiveOrchestratorFactory:
         experiment_definition: ExperimentDefinition,
         experiment_dependencies: ExperimentDependencyFactory | None,
         runtime_config: RuntimeConfig | None,
+        prompt_instructions: str | None = None,
     ) -> None:
         self._lock = lock
         self._config_hash = config_hash
@@ -667,6 +690,7 @@ class _LiveOrchestratorFactory:
         self._experiment_definition = experiment_definition
         self._experiment_dependencies = experiment_dependencies
         self._runtime_config = runtime_config
+        self._prompt_instructions = prompt_instructions
 
     def __repr__(self) -> str:
         return "_LiveOrchestratorFactory(credentials=**********)"
@@ -709,6 +733,7 @@ class _LiveOrchestratorFactory:
             prompt_artifact_sha256=(
                 lock.baseline.planner.prompt_config.sha256
             ),
+            prompt_instructions=self._prompt_instructions,
         )
         providers = {
             "openalex": LiveCaptureSearchProvider(
@@ -1085,6 +1110,9 @@ class CompositionRoot:
                 experiment_definition=experiment_definition,
                 experiment_dependencies=experiment_dependencies,
                 runtime_config=runtime_config,
+                prompt_instructions=_prompt_system_message(
+                    verified.artifact_bytes[lock.baseline.planner.prompt_config.path]
+                ),
             )
 
             binding = ModeBinding(

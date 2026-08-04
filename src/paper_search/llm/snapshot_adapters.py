@@ -252,6 +252,7 @@ class LiveCaptureLLMAnalyzer:
         prompt_artifact_sha256: str,
         decoder: LLMResponseDecoder | None = None,
         clock: Clock = _utc_now,
+        prompt_instructions: str | None = None,
     ) -> None:
         self._client = client
         self._capture_store = capture_store
@@ -263,6 +264,7 @@ class LiveCaptureLLMAnalyzer:
         self._decoder = decoder or LLMResponseDecoder(
             prompt_version=client.prompt_version
         )
+        self._prompt_instructions = prompt_instructions
         self._clock = clock
 
     async def generate_json(
@@ -302,6 +304,11 @@ class LiveCaptureLLMAnalyzer:
                     response = await self._client.request_response(
                         prompt_name=prompt_name,
                         payload=payload,
+                        prompt_instructions=(
+                            self._prompt_instructions
+                            if prompt_name == "query_analyze"
+                            else None
+                        ),
                     )
                 except httpx.TimeoutException:
                     code, message, retryable = (

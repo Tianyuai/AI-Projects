@@ -91,6 +91,8 @@ async def _live(
     transport: httpx.MockTransport,
     controller: object,
     reservation: BudgetReservation | None = None,
+    *,
+    prompt_instructions: str | None = None,
 ) -> tuple[object, DependencyCaptureStore]:
     store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
     async with httpx.AsyncClient(transport=transport) as http_client:
@@ -108,6 +110,7 @@ async def _live(
             pricer=_pricer(),
             controller=controller,  # type: ignore[arg-type]
             clock=lambda: CAPTURED_AT,
+            prompt_instructions=prompt_instructions,
         )
         result = await analyzer.generate_json(
             prompt_name="query_analyze",
@@ -115,6 +118,37 @@ async def _live(
             reservation=reservation or _reservation(),
         )
     return result, store
+
+
+def test_live_analyzer_sends_bound_prompt_instructions(tmp_path: Path) -> None:
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            content=_response_bytes({"ok": True}),
+            request=request,
+        )
+
+    asyncio.run(
+        _live(
+            tmp_path,
+            httpx.MockTransport(handler),
+            SettlementRecorder(),
+            prompt_instructions=(
+                "Respond with a JSON object.\n- Return one QuerySpec and one SearchPlan."
+            ),
+        )
+    )
+
+    system = seen[0]["messages"][0]
+    assert system["role"] == "system"
+    assert "Return one QuerySpec and one SearchPlan" in system["content"]
+    assert json.loads(seen[0]["messages"][1]["content"]) == {
+        "prompt_name": "query_analyze",
+        "payload": {"query": "graph retrieval"},
+    }
 
 
 def _budget_controller(*, formal_live: bool = True) -> HardBudgetController:

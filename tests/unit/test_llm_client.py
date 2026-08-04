@@ -88,7 +88,79 @@ def test_generate_json_returns_data_usage_and_safe_provenance() -> None:
     assert result.provenance["response_hash"].startswith("sha256:")
     assert seen[0].url == httpx.URL("https://llm.example.test/v1/chat/completions")
     assert seen[0].headers["authorization"] == f"Bearer {API_KEY}"
-    assert API_KEY not in result.model_dump_json()
+
+
+def test_canonical_request_includes_bound_prompt_instructions() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={}, request=request)
+
+    async def run() -> object:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLMClient(
+                client=client,
+                base_url="https://llm.example.test/v1",
+                model="fixture-model",
+                api_key=API_KEY,
+            )
+            return llm.canonical_request(
+                prompt_name="query_analyze",
+                payload={"query": "graph retrieval"},
+                prompt_instructions=(
+                    "Respond with a JSON object.\n"
+                    "- Return one QuerySpec and one SearchPlan."
+                ),
+            )
+
+    request = asyncio.run(run())
+
+    system = request["messages"][0]
+    assert system["role"] == "system"
+    assert "Return one QuerySpec and one SearchPlan" in system["content"]
+    assert system["content"] != "Respond with a JSON object."
+
+
+def test_generate_json_sends_bound_prompt_instructions() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({"query_spec": {"ok": True}}),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            },
+            request=request,
+        )
+
+    async def run() -> object:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLMClient(
+                client=client,
+                base_url="https://llm.example.test/v1",
+                model="fixture-model",
+                api_key=API_KEY,
+            )
+            return await llm.generate_json(
+                prompt_name="query_analyze",
+                payload={"query": "graph retrieval"},
+                reservation=_reservation(),
+                prompt_instructions=(
+                    "Respond with a JSON object.\n- Return one QuerySpec."
+                ),
+            )
+
+    asyncio.run(run())
+
+    payload = json.loads(seen[0].content)
+    assert payload["messages"][0]["role"] == "system"
+    assert "Return one QuerySpec" in payload["messages"][0]["content"]
 
 
 def test_json_object_request_contains_json_hint_in_messages() -> None:

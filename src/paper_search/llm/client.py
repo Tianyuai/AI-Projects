@@ -283,14 +283,22 @@ class OpenAICompatibleLLMClient:
         return self._prompt_version
 
     def canonical_request(
-        self, *, prompt_name: str, payload: dict[str, object]
+        self,
+        *,
+        prompt_name: str,
+        payload: dict[str, object],
+        prompt_instructions: str | None = None,
     ) -> dict[str, object]:
         request: dict[str, object] = {
             "model": self._model,
             "messages": [
                 {
                     "role": "system",
-                    "content": "Respond with a JSON object.",
+                    "content": (
+                        prompt_instructions
+                        if prompt_instructions is not None
+                        else "Respond with a JSON object."
+                    ),
                 },
                 {
                     "role": "user",
@@ -326,7 +334,11 @@ class OpenAICompatibleLLMClient:
         }
 
     async def request_response(
-        self, *, prompt_name: str, payload: dict[str, object]
+        self,
+        *,
+        prompt_name: str,
+        payload: dict[str, object],
+        prompt_instructions: str | None = None,
     ) -> httpx.Response:
         return await self._client.post(
             self._transport_endpoint,
@@ -334,7 +346,11 @@ class OpenAICompatibleLLMClient:
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
             },
-            json=self.canonical_request(prompt_name=prompt_name, payload=payload),
+            json=self.canonical_request(
+                prompt_name=prompt_name,
+                payload=payload,
+                prompt_instructions=prompt_instructions,
+            ),
             follow_redirects=False,
         )
 
@@ -344,6 +360,7 @@ class OpenAICompatibleLLMClient:
         prompt_name: str,
         payload: dict[str, object],
         reservation: BudgetReservation,
+        prompt_instructions: str | None = None,
     ) -> ProviderResult[dict[str, Any]]:
         """Return decoded JSON or a structured, credential-safe error."""
         if reservation.reserved.llm_calls < 1:
@@ -351,7 +368,11 @@ class OpenAICompatibleLLMClient:
         requested_at = self._clock()
         started = time.perf_counter()
         try:
-            response = await self.request_response(prompt_name=prompt_name, payload=payload)
+            response = await self.request_response(
+                prompt_name=prompt_name,
+                payload=payload,
+                prompt_instructions=prompt_instructions,
+            )
         except httpx.TimeoutException:
             elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
             return _transport_error_result(

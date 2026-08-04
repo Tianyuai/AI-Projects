@@ -106,6 +106,9 @@ class _BaselineDependencyTrap:
     def build_constraint_reranker(self) -> NoReturn:
         raise AssertionError("main baseline cannot construct LLM reranking")
 
+    def build_title_candidate_stage(self) -> NoReturn:
+        raise AssertionError("main baseline cannot construct title candidates")
+
 
 _MAIN_BASELINE_COMPONENTS: ExperimentComponents = build_experiment_components(
     ExperimentDefinition(
@@ -235,6 +238,19 @@ class _RequestExperimentDependencies:
         return LLMConstraintRerankingStage(
             analyzer=self.analyzer,
             call_estimate=self.analysis_estimate,
+        )
+
+    def build_title_candidate_stage(self) -> Any:
+        from paper_search.retrieval.title_candidates import LLMTitleCandidateStage
+
+        provider = self.providers.get("openalex")
+        if provider is None:
+            raise ValueError("title candidates require openalex")
+        return LLMTitleCandidateStage(
+            analyzer=self.analyzer,
+            provider=provider,
+            llm_estimate=self.analysis_estimate,
+            search_estimate=self.provider_estimates["openalex"],
         )
 
 
@@ -607,6 +623,7 @@ def _replay_factory(
             embedding_ranker=components.embedding_ranker,
             citation_expander=components.citation_expander,
             constraint_reranker=components.constraint_reranker,
+            title_candidate_stage=components.title_candidate_stage,
         )
         return _with_evolution(
             orchestrator=orchestrator,
@@ -793,6 +810,7 @@ class _LiveOrchestratorFactory:
             embedding_ranker=components.embedding_ranker,
             citation_expander=components.citation_expander,
             constraint_reranker=components.constraint_reranker,
+            title_candidate_stage=components.title_candidate_stage,
         )
         return _LiveRunOrchestrator(
             orchestrator=_with_evolution(

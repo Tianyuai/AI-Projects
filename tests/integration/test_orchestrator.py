@@ -42,6 +42,7 @@ from paper_search.ranking.rerank import (
     ConstraintScoredPaper,
 )
 from paper_search.ranking.llm_stage import LLMConstraintRerankingStage
+from paper_search.retrieval.title_candidates import TitleCandidateRecallResult
 from paper_search.retrieval.snapshot_adapters import ProviderAdapterError
 
 
@@ -198,6 +199,52 @@ class SettlingAnalyzer(FakeAnalyzer):
         result = await super().__call__(query, reservation)
         self.controller.settle(reservation, result.usage)
         return result
+
+
+class FakeTitleCandidateStage:
+    def __init__(
+        self,
+        papers: list[Paper],
+        *,
+        degraded: bool = False,
+    ) -> None:
+        self.papers = papers
+        self.degraded = degraded
+
+    async def recall(
+        self,
+        spec: object,
+        *,
+        controller: object,
+    ) -> TitleCandidateRecallResult:
+        del spec, controller
+        if self.degraded:
+            return TitleCandidateRecallResult(
+                provider_result=_result(
+                    "title_candidates",
+                    [],
+                    UsageActual(),
+                ),
+                status="degraded",
+                diagnostics=[],
+                warnings=["unavailable"],
+                titles_generated=0,
+                titles_searched=0,
+                truncated=False,
+            )
+        return TitleCandidateRecallResult(
+            provider_result=_result(
+                "title_candidates",
+                self.papers,
+                UsageActual(search_api_calls=1),
+            ),
+            status="applied",
+            diagnostics=[],
+            warnings=[],
+            titles_generated=len(self.papers),
+            titles_searched=len(self.papers),
+            truncated=False,
+        )
 
 
 class SettlingProvider(FakeProvider):
@@ -660,6 +707,80 @@ def test_structured_provider_citation_failure_degrades_in_orchestrator() -> None
     }
     assert result.stop_reason == "completed"
     assert controller.committed_usage.search_api_calls == 3
+
+
+def test_title_candidate_stage_adds_papers_to_pool() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget())
+    stage = FakeTitleCandidateStage(
+        [
+            Paper(
+                canonical_id="openalex:W99",
+                title="Gold",
+                openalex_id="W99",
+                sources=["openalex"],
+            )
+        ]
+    )
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": FakeProvider("openalex", events)},
+        config_hash="sha256:" + "c" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        title_candidate_stage=stage,
+    )
+
+    result = asyncio.run(
+        orchestrator.run("graph retrieval", max_provider_results=5)
+    )
+
+    assert "openalex:W99" in {
+        paper.canonical_id for paper in result.papers
+    }
+    steps = [
+        entry
+        for entry in result.trace
+        if entry.get("step") == "title_candidates"
+    ]
+    assert steps and steps[0]["status"] == "applied"
+    assert steps[0]["count"] == 1
+    assert result.stop_reason == "completed"
+
+
+def test_title_candidate_stage_degraded_keeps_run_complete() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget())
+    stage = FakeTitleCandidateStage([], degraded=True)
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": FakeProvider("openalex", events)},
+        config_hash="sha256:" + "c" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        title_candidate_stage=stage,
+    )
+
+    result = asyncio.run(
+        orchestrator.run("graph retrieval", max_provider_results=5)
+    )
+
+    assert [paper.canonical_id for paper in result.papers] == [
+        "openalex:W1"
+    ]
+    assert "title_candidates: unavailable" in result.warnings
+    steps = [
+        entry
+        for entry in result.trace
+        if entry.get("step") == "title_candidates"
+    ]
+    assert steps and steps[0]["status"] == "degraded"
+    assert steps[0]["count"] == 0
+    assert result.stop_reason == "completed"
 
 
 def test_llm_rerank_stage_awaits_same_controller_without_nested_event_loop(

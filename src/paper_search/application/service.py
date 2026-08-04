@@ -59,6 +59,8 @@ _SAFE_WARNING_EXACT = frozenset(
         "embedding: encoder_unavailable",
         "embedding: cuda_oom_cpu_fallback",
         "embedding: unsanitized_warning",
+        "title_candidates: unavailable",
+        "title_candidates: malformed",
     }
 )
 _SAFE_PROVIDER_WARNING_SUFFIXES = frozenset(

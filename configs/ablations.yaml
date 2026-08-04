@@ -4,6 +4,7 @@ baseline:
   embedding: false
   citation_expansion: false
   llm_rerank: false
+  title_candidates: false
   fixed_two_round: false
   adaptive_evolution: false
   low_budget: false
@@ -14,6 +15,7 @@ query-planning:
   embedding: false
   citation_expansion: false
   llm_rerank: false
+  title_candidates: false
   fixed_two_round: false
   adaptive_evolution: false
   low_budget: false
@@ -24,6 +26,7 @@ multi-source:
   embedding: false
   citation_expansion: false
   llm_rerank: false
+  title_candidates: false
   fixed_two_round: false
   adaptive_evolution: false
   low_budget: false
@@ -34,6 +37,7 @@ embedding:
   embedding: true
   citation_expansion: false
   llm_rerank: false
+  title_candidates: false
   fixed_two_round: false
   adaptive_evolution: false
   low_budget: false
@@ -44,6 +48,7 @@ citation-expansion:
   embedding: false
   citation_expansion: true
   llm_rerank: false
+  title_candidates: false
   fixed_two_round: false
   adaptive_evolution: false
   low_budget: false
@@ -54,6 +59,18 @@ llm-rerank:
   embedding: false
   citation_expansion: false
   llm_rerank: true
+  title_candidates: false
+  fixed_two_round: false
+  adaptive_evolution: false
+  low_budget: false
+  balanced: false
+title-candidates:
+  query_planning: false
+  multi_source: false
+  embedding: false
+  citation_expansion: false
+  llm_rerank: false
+  title_candidates: true
   fixed_two_round: false
   adaptive_evolution: false
   low_budget: false
@@ -64,6 +81,7 @@ fixed-two-round:
   embedding: false
   citation_expansion: false
   llm_rerank: false
+  title_candidates: false
   fixed_two_round: true
   adaptive_evolution: false
   low_budget: false
@@ -74,6 +92,7 @@ adaptive-evolution:
   embedding: false
   citation_expansion: false
   llm_rerank: false
+  title_candidates: false
   fixed_two_round: false
   adaptive_evolution: true
   low_budget: false
@@ -84,6 +103,7 @@ low-budget:
   embedding: false
   citation_expansion: false
   llm_rerank: false
+  title_candidates: false
   fixed_two_round: false
   adaptive_evolution: false
   low_budget: true
@@ -94,6 +114,7 @@ balanced:
   embedding: false
   citation_expansion: false
   llm_rerank: false
+  title_candidates: false
   fixed_two_round: false
   adaptive_evolution: false
   low_budget: false

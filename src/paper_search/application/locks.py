@@ -113,6 +113,7 @@ class BaselineOptionalModules(_LockModel):
     embedding: Literal[False]
     citation_expansion: Literal[False]
     constraint_reranking: Literal[False]
+    title_candidates: Literal[False] = False
     fixed_two_round: Literal[False]
     adaptive_evolution: Literal[False]
 

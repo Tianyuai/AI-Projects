@@ -1,5 +1,5 @@
 {
-  "config_hash": "sha256:81b2b3871e21d59e54141642237c9877678f0d42ef1c441859184d5b5e20dd4d",
+    "config_hash": "sha256:136366305e45fd3b78d3437706473fad0b46674d0f2d0cab68a538fc77eee39d",
   "ended_at": "2026-08-02T00:00:00Z",
   "execution_mode": "replay",
   "experiment_name": "main-baseline",
@@ -13,7 +13,8 @@
     "citation_expansion": false,
     "constraint_reranking": false,
     "embedding": false,
-    "fixed_two_round": false
+    "fixed_two_round": false,
+    "title_candidates": false
   },
   "partition_sha256": "sha256:19b3ba1a584ab488ecb0aed1b10a63726880d9747e407099b9963656f1588fc4",
   "project_receipt_count": 2,

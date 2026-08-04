@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from paper_search.graph.provider_stage import AsyncCitationExpansionStage
     from paper_search.ranking.embedding import EmbeddingRankingStage
     from paper_search.ranking.llm_stage import AsyncConstraintRerankingStage
+    from paper_search.retrieval.title_candidates import AsyncTitleCandidateStage
 
 
 ExperimentName = Literal[
@@ -23,6 +24,7 @@ ExperimentName = Literal[
     "embedding",
     "citation-expansion",
     "llm-rerank",
+    "title-candidates",
     "fixed-two-round",
     "adaptive-evolution",
 ]
@@ -41,6 +43,7 @@ class ExperimentFlags(DomainModel):
     embedding: StrictBool = False
     citation_expansion: StrictBool = False
     constraint_reranking: StrictBool = False
+    title_candidates: StrictBool = False
     fixed_two_round: StrictBool = False
     adaptive_evolution: StrictBool = False
 
@@ -54,6 +57,10 @@ _DEFINITIONS: dict[ExperimentName, tuple[ExperimentFlags, ExperimentStrategy]] =
     ),
     "llm-rerank": (
         ExperimentFlags(constraint_reranking=True),
+        "fixed-one-round",
+    ),
+    "title-candidates": (
+        ExperimentFlags(title_candidates=True),
         "fixed-one-round",
     ),
     "fixed-two-round": (
@@ -92,6 +99,7 @@ class ExperimentComponents:
     embedding_ranker: EmbeddingRankingStage | None
     citation_expander: AsyncCitationExpansionStage | None
     constraint_reranker: AsyncConstraintRerankingStage | None
+    title_candidate_stage: AsyncTitleCandidateStage | None
     evolution_strategy: EvolutionStrategy
 
 
@@ -102,6 +110,8 @@ class ExperimentDependencyFactory(Protocol):
 
     def build_constraint_reranker(self) -> AsyncConstraintRerankingStage: ...
 
+    def build_title_candidate_stage(self) -> AsyncTitleCandidateStage: ...
+
 
 def _optional_flags(raw: object) -> ExperimentFlags:
     if not isinstance(raw, dict):
@@ -110,6 +120,7 @@ def _optional_flags(raw: object) -> ExperimentFlags:
         "embedding": raw.get("embedding"),
         "citation_expansion": raw.get("citation_expansion"),
         "constraint_reranking": raw.get("llm_rerank"),
+        "title_candidates": raw.get("title_candidates"),
         "fixed_two_round": raw.get("fixed_two_round"),
         "adaptive_evolution": raw.get("adaptive_evolution"),
     }
@@ -164,6 +175,11 @@ def build_experiment_components(
         constraint_reranker=(
             dependencies.build_constraint_reranker()
             if definition.flags.constraint_reranking
+            else None
+        ),
+        title_candidate_stage=(
+            dependencies.build_title_candidate_stage()
+            if definition.flags.title_candidates
             else None
         ),
         evolution_strategy=strategy_map[definition.strategy],

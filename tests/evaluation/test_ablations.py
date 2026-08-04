@@ -20,6 +20,7 @@ REQUIRED_CASE_NAMES = [
     "embedding",
     "citation-expansion",
     "llm-rerank",
+    "title-candidates",
     "fixed-two-round",
     "adaptive-evolution",
     "low-budget",
@@ -31,6 +32,7 @@ PUBLIC_MODULES = (
     "embedding",
     "citation_expansion",
     "llm_rerank",
+    "title_candidates",
     "fixed_two_round",
     "adaptive_evolution",
     "low_budget",
@@ -282,12 +284,14 @@ def test_yaml_matrix_lists_required_cases_and_safe_public_booleans() -> None:
     assert matrix["embedding"]["embedding"] is True
     assert matrix["citation-expansion"]["citation_expansion"] is True
     assert matrix["llm-rerank"]["llm_rerank"] is True
+    assert matrix["title-candidates"]["title_candidates"] is True
 
     for case_name, modules in matrix.items():
         if case_name != "embedding":
             assert modules["embedding"] is False
         assert modules["citation_expansion"] is (case_name == "citation-expansion")
         assert modules["llm_rerank"] is (case_name == "llm-rerank")
+        assert modules["title_candidates"] is (case_name == "title-candidates")
 
 
 def test_readme_documents_offline_injected_owner_only_ablation_policy() -> None:

@@ -22,6 +22,7 @@ EXPECTED = {
     "embedding": ({"embedding": True}, "fixed-one-round"),
     "citation-expansion": ({"citation_expansion": True}, "fixed-one-round"),
     "llm-rerank": ({"constraint_reranking": True}, "fixed-one-round"),
+    "title-candidates": ({"title_candidates": True}, "fixed-one-round"),
     "fixed-two-round": ({"fixed_two_round": True}, "fixed-two-round"),
     "adaptive-evolution": (
         {"adaptive_evolution": True},
@@ -45,6 +46,7 @@ def test_registry_loads_only_the_exact_named_flag(
         "constraint_reranking": False,
         "fixed_two_round": False,
         "adaptive_evolution": False,
+        "title_candidates": False,
         **enabled,
     }
     assert definition.name == name
@@ -97,6 +99,9 @@ class DependencyTrap:
     def build_constraint_reranker(self) -> object:
         raise AssertionError("baseline must not construct LLM reranking")
 
+    def build_title_candidate_stage(self) -> object:
+        raise AssertionError("baseline must not construct title candidates")
+
 
 def test_main_baseline_constructs_no_optional_dependencies() -> None:
     definition = ExperimentDefinition(
@@ -113,6 +118,36 @@ def test_main_baseline_constructs_no_optional_dependencies() -> None:
     assert components.embedding_ranker is None
     assert components.citation_expander is None
     assert components.constraint_reranker is None
+    assert components.title_candidate_stage is None
+    assert components.evolution_strategy == "fixed_one_round"
+
+
+class TitleCandidateDependencyFactory(DependencyTrap):
+    def __init__(self) -> None:
+        self.built = False
+
+    def build_title_candidate_stage(self) -> object:
+        self.built = True
+        return object()
+
+
+def test_title_candidates_experiment_constructs_stage() -> None:
+    factory = TitleCandidateDependencyFactory()
+    definition = load_experiment_definition(
+        "title-candidates",
+        ablation_config=ABLATION_CONFIG,
+    )
+
+    components = build_experiment_components(
+        definition,
+        dependencies=factory,
+    )
+
+    assert factory.built is True
+    assert components.title_candidate_stage is not None
+    assert components.embedding_ranker is None
+    assert components.citation_expander is None
+    assert components.constraint_reranker is None
     assert components.evolution_strategy == "fixed_one_round"
 
 
@@ -126,6 +161,7 @@ optional = {
     "paper_search.graph.provider_stage",
     "paper_search.ranking.llm_stage",
     "paper_search.ranking.sentence_transformer",
+    "paper_search.retrieval.title_candidates",
 }
 print(json.dumps(sorted(optional.intersection(sys.modules))))
 """
@@ -149,6 +185,7 @@ import paper_search.application.composition
 optional = {
     "paper_search.graph.provider_stage",
     "paper_search.ranking.llm_stage",
+    "paper_search.retrieval.title_candidates",
 }
 print(json.dumps(sorted(optional.intersection(sys.modules))))
 """

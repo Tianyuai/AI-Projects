@@ -63,6 +63,7 @@ from paper_search.retrieval.routing import route_baseline_subqueries
 if TYPE_CHECKING:
     from paper_search.graph.provider_stage import AsyncCitationExpansionStage
     from paper_search.ranking.llm_stage import AsyncConstraintRerankingStage
+    from paper_search.retrieval.title_candidates import AsyncTitleCandidateStage
 
 
 Analyzer = Callable[[str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]]
@@ -70,6 +71,7 @@ Analyzer = Callable[[str, BudgetReservation], Awaitable[ProviderResult[dict[str,
 
 _SAFE_CITATION_WARNINGS = frozenset({"unresolved_citation_edge"})
 _SAFE_RERANK_WARNINGS = frozenset({"rerank_unavailable"})
+_SAFE_TITLE_CANDIDATE_WARNINGS = frozenset({"unavailable", "malformed"})
 _OPTIONAL_FAILURE_CODES = frozenset(
     {"authentication_error", "integrity_failure", "snapshot_unavailable"}
 )
@@ -387,6 +389,7 @@ class MockSearchOrchestrator:
         embedding_ranker: EmbeddingRankingStage | None = None,
         citation_expander: AsyncCitationExpansionStage | None = None,
         constraint_reranker: AsyncConstraintRerankingStage | None = None,
+        title_candidate_stage: AsyncTitleCandidateStage | None = None,
         pricer: ActualCostPricer | None = None,
         provider_adapter_names: Mapping[DependencyName, str] | None = None,
     ) -> None:
@@ -409,6 +412,7 @@ class MockSearchOrchestrator:
         self._embedding_ranker = embedding_ranker
         self._citation_expander = citation_expander
         self._constraint_reranker = constraint_reranker
+        self._title_candidate_stage = title_candidate_stage
         self._pricer = pricer
         self._provider_adapter_names = dict(provider_adapter_names or {})
         self._parser = QueryParser(QueryPlanner())
@@ -762,13 +766,71 @@ class MockSearchOrchestrator:
             for name, result in sorted(provider_results.items())
         )
 
-        merged = deduplicate_papers([paper for result in provider_results.values() for paper in result.data])
+        fusion_input: dict[str, ProviderResult[list[Paper]]] = {
+            name: result for name, result in provider_results.items()
+        }
+        if self._title_candidate_stage is not None:
+            try:
+                title_recall = await self._title_candidate_stage.recall(
+                    analysis.query_spec,
+                    controller=self._controller,
+                )
+            except OptionalStageUnavailableError as error:
+                diagnostic = getattr(error, "diagnostic", None)
+                if isinstance(diagnostic, DependencyDiagnostic):
+                    diagnostics.append(diagnostic)
+                    optional_failure_reason = _optional_failure_reason(
+                        [diagnostic]
+                    )
+                warnings.append("title_candidates: unavailable")
+                trace.append(
+                    {
+                        "step": "title_candidates",
+                        "status": "degraded",
+                        "count": 0,
+                    }
+                )
+            else:
+                diagnostics.extend(title_recall.diagnostics)
+                optional_failure_reason = optional_failure_reason or (
+                    _optional_failure_reason(title_recall.diagnostics)
+                )
+                safe_warnings = [
+                    warning
+                    for warning in title_recall.warnings
+                    if warning in _SAFE_TITLE_CANDIDATE_WARNINGS
+                ]
+                warnings.extend(
+                    f"title_candidates: {warning}" for warning in safe_warnings
+                )
+                if title_recall.provider_result.data:
+                    fusion_input["title_candidates"] = (
+                        title_recall.provider_result
+                    )
+                trace.append(
+                    {
+                        "step": "title_candidates",
+                        "status": title_recall.status,
+                        "count": len(title_recall.provider_result.data),
+                        "titles_generated": title_recall.titles_generated,
+                        "titles_searched": title_recall.titles_searched,
+                        "truncated": title_recall.truncated,
+                    }
+                )
+
+        merged = deduplicate_papers(
+            [
+                paper
+                for result in fusion_input.values()
+                for paper in result.data
+            ]
+        )
         trace.append({"step": "deduplicate", "count": len(merged.papers)})
         filtered = apply_hard_filters(merged.papers, analysis.query_spec)
         trace.append({"step": "filter", "accepted": len(filtered.accepted)})
         accepted_ids = {item.paper.canonical_id for item in filtered.accepted}
         fused = fuse_provider_results(
-            cast(Mapping[str, ProviderResult[list[Paper]]], provider_results),
+            cast(Mapping[str, ProviderResult[list[Paper]]], fusion_input),
             method="rrf",
         )
         papers = [item.paper for item in fused if item.paper.canonical_id in accepted_ids]

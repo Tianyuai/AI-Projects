@@ -18,6 +18,7 @@ PUBLIC_MODULES: tuple[str, ...] = (
     "embedding",
     "citation_expansion",
     "llm_rerank",
+    "title_candidates",
     "fixed_two_round",
     "adaptive_evolution",
     "low_budget",

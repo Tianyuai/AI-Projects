@@ -91,6 +91,13 @@ def normalize_query_analysis(
         _string_list(spec.get("must_have"))
         + _string_list(spec.get("constraints"))
     )
+    constraint_values = [
+        value
+        for value in spec.get("constraints", {}).values()
+        if isinstance(value, str) and value.strip()
+    ] if isinstance(spec.get("constraints"), Mapping) else []
+    must_have = _ordered_unique(must_have + constraint_values)
+    topics = _ordered_unique(topics + constraint_values)
     exclusions = _ordered_unique(
         _string_list(spec.get("exclusions"))
         + _string_list(spec.get("excluded_topics"))
@@ -119,8 +126,8 @@ def normalize_query_analysis(
                 "provider_hint": "either",
             }
         )
-    if len(subqueries) < 3:
-        raise ValueError("model search plan requires at least three subqueries")
+    if not subqueries:
+        raise ValueError("model search plan requires at least one subquery")
 
     filters = plan.get("inherited_hard_filters", {})
     if not isinstance(filters, Mapping):

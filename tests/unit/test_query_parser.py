@@ -142,6 +142,30 @@ def test_flexible_model_payload_is_normalized_to_primary_analysis() -> None:
     )
 
 
+def test_flexible_model_payload_with_two_subqueries_is_supplemented() -> None:
+    payload = _flexible_payload("Which paper introduced the concept of dataset distillation?")
+    payload["search_plan"]["subqueries"] = [
+        "dataset distillation synthetic dataset",
+        "distillation from large datasets efficient training",
+    ]
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(
+            "Which paper introduced the concept of dataset distillation?",
+            _provider_result(payload),
+        )
+    )
+
+    assert result.planner_status == "primary"
+    assert len(result.search_plan.subqueries) >= 3
+    assert any(
+        item.text == "Which paper introduced the concept of dataset distillation?"
+        for item in result.search_plan.subqueries
+    )
+    assert "research papers" in result.query_spec.must_have
+    assert "research papers" in result.query_spec.topics
+
+
 def test_invalid_payload_is_repaired_once() -> None:
     query = "graph retrieval"
     calls = 0

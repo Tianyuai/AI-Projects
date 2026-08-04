@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from paper_search.application.contracts import SnapshotRef
 from paper_search.control.budget import HardBudgetController
 from paper_search.control.pricing import ActualCostPricer
 from paper_search.domain.models import (
@@ -185,19 +187,34 @@ def _error_result(
     prompt_version: str,
     usage: UsageActual,
     request_id: str | None = None,
+    snapshot_ref: SnapshotRef | None = None,
 ) -> ProviderResult[dict[str, Any]]:
+    provenance: dict[str, str] = {
+        "provider": "llm",
+        "endpoint": "/chat/completions",
+        "model_id": model_id,
+        "requested_at": requested_at.isoformat(),
+        "response_hash": _sha256(response_bytes),
+        "prompt_version": prompt_version,
+        "request_id": request_id or "unavailable",
+    }
+    if snapshot_ref is not None:
+        provenance.update(
+            {
+                "snapshot_entry_id": snapshot_ref.entry_id,
+                "snapshot_cache_key": snapshot_ref.cache_key,
+                "snapshot_response_sha256": snapshot_ref.response_sha256,
+                "snapshot_path": snapshot_ref.snapshot_path,
+                "snapshot_refs": json.dumps(
+                    [snapshot_ref.model_dump(mode="json")],
+                    separators=(",", ":"),
+                ),
+            }
+        )
     return ProviderResult[dict[str, Any]](
         data={},
         usage=usage,
-        provenance={
-            "provider": "llm",
-            "endpoint": "/chat/completions",
-            "model_id": model_id,
-            "requested_at": requested_at.isoformat(),
-            "response_hash": _sha256(response_bytes),
-            "prompt_version": prompt_version,
-            "request_id": request_id or "unavailable",
-        },
+        provenance=provenance,
         cache_hit=False,
         latency_ms=usage.elapsed_ms,
         errors=[
@@ -383,6 +400,35 @@ class LiveCaptureLLMAnalyzer:
 
             if terminal is None:
                 raise RuntimeError("missing terminal LLM result")
+            if response is not None and response.status_code != 200:
+                safe_headers: dict[str, str] = {}
+                content_type = response.headers.get("content-type")
+                if content_type is not None:
+                    safe_headers["content-type"] = content_type
+                if request_id is not None:
+                    safe_headers["x-request-id"] = request_id
+                snapshot_ref = self._capture_store.stage_error(
+                    identity,
+                    error_code=code,
+                    message=message,
+                    retryable=retryable,
+                    response_bytes=response_bytes,
+                    safe_headers=safe_headers,
+                    captured_at=requested_at,
+                )
+                terminal = _error_result(
+                    code=code,
+                    message=message,
+                    retryable=retryable,
+                    model_id=self._client.model_id,
+                    requested_at=requested_at,
+                    response_bytes=response_bytes,
+                    prompt_version=self._client.prompt_version,
+                    usage=accumulated,
+                    request_id=request_id,
+                    snapshot_ref=snapshot_ref,
+                )
+
             self._controller.settle(reservation, terminal.usage)
             return terminal
         except asyncio.CancelledError as cancellation:
@@ -484,6 +530,18 @@ class ReplayLLMAnalyzer:
                 response_bytes=b"",
                 prompt_version=self._prompt_version,
                 usage=UsageActual(),
+            )
+        if snapshot.error is not None:
+            return _error_result(
+                code=snapshot.error.code,
+                message=snapshot.error.message,
+                retryable=snapshot.error.retryable,
+                model_id=self._model_id,
+                requested_at=self._clock(),
+                response_bytes=snapshot.response_bytes,
+                prompt_version=self._prompt_version,
+                usage=UsageActual(),
+                snapshot_ref=snapshot.ref,
             )
         decoded = self._decoder.decode(
             snapshot.response_bytes,

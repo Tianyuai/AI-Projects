@@ -109,6 +109,17 @@ def _reject_secret_keys(value: object) -> None:
             _reject_secret_keys(nested)
 
 
+def _sanitize_error_bytes(value: bytes) -> bytes:
+    """Drop provider error bytes that may contain credential-shaped data."""
+    try:
+        text = value.decode("utf-8")
+    except UnicodeDecodeError:
+        return b""
+    if _SECRET_HEADER_VALUE.search(text) or _SECRET_FIELD_NAME.search(text):
+        return b""
+    return value
+
+
 class DependencyRequestIdentity(DomainModel):
     schema_version: Literal["dependency-request-v1"] = "dependency-request-v1"
     dependency: DependencyName
@@ -201,6 +212,12 @@ class DependencyRequestIdentity(DomainModel):
         )
 
 
+class SnapshotErrorV2(DomainModel):
+    code: NonEmptyStr
+    message: NonEmptyStr
+    retryable: bool
+
+
 class SnapshotEntryV2(DomainModel):
     entry_id: NonEmptyStr
     request: DependencyRequestIdentity
@@ -209,6 +226,7 @@ class SnapshotEntryV2(DomainModel):
     captured_at: datetime
     response_path: SafeRelativePath
     safe_headers: dict[NonEmptyStr, NonEmptyStr]
+    error: SnapshotErrorV2 | None = None
 
 
 class DependencySnapshotManifestV2(DomainModel):
@@ -221,6 +239,7 @@ class DependencySnapshotManifestV2(DomainModel):
 class SnapshotRead(DomainModel):
     ref: SnapshotRef
     response_bytes: bytes
+    error: SnapshotErrorV2 | None = None
 
 
 def _identity_cache_key(identity: DependencyRequestIdentity) -> str:
@@ -237,14 +256,14 @@ def _response_path(identity: DependencyRequestIdentity, cache_key: str) -> str:
 
 def _entry_metadata_bytes(entries: list[SnapshotEntryV2]) -> bytes:
     return _canonical_json_bytes(
-        [entry.model_dump(mode="json") for entry in entries]
+        [entry.model_dump(mode="json", exclude_none=True) for entry in entries]
     )
 
 
 def _manifest_bytes(manifest: DependencySnapshotManifestV2) -> bytes:
     return (
         json.dumps(
-            manifest.model_dump(mode="json"),
+            manifest.model_dump(mode="json", exclude_none=True),
             ensure_ascii=False,
             indent=2,
             sort_keys=True,
@@ -338,6 +357,54 @@ class DependencyCaptureStore:
             safe_headers=_sanitize_headers(safe_headers),
         )
         _atomic_new_file(self.root / response_path, response_bytes)
+        self._entries.append(entry)
+        self._cache_keys.add(cache_key)
+        return _snapshot_ref(entry)
+
+    def stage_error(
+        self,
+        identity: DependencyRequestIdentity,
+        *,
+        error_code: str,
+        message: str,
+        retryable: bool,
+        response_bytes: bytes,
+        safe_headers: Mapping[str, str],
+        captured_at: datetime,
+    ) -> SnapshotRef:
+        if self._sealed:
+            raise RuntimeError("snapshot store is sealed")
+        cache_key = _identity_cache_key(identity)
+        if cache_key in self._cache_keys:
+            raise ValueError("duplicate cache key")
+
+        stored_bytes = _sanitize_error_bytes(response_bytes)
+        response_sha256 = _sha256(stored_bytes)
+        entry_id = _sha256(
+            _canonical_json_bytes(
+                {
+                    "cache_key": cache_key,
+                    "error_code": error_code,
+                    "response_sha256": response_sha256,
+                }
+            )
+        )
+        response_path = _response_path(identity, cache_key)
+        entry = SnapshotEntryV2(
+            entry_id=entry_id,
+            request=identity,
+            cache_key=cache_key,
+            response_sha256=response_sha256,
+            captured_at=captured_at,
+            response_path=response_path,
+            safe_headers=_sanitize_headers(safe_headers),
+            error=SnapshotErrorV2(
+                code=error_code,
+                message=message,
+                retryable=retryable,
+            ),
+        )
+        _atomic_new_file(self.root / response_path, stored_bytes)
         self._entries.append(entry)
         self._cache_keys.add(cache_key)
         return _snapshot_ref(entry)
@@ -441,7 +508,11 @@ class DependencySnapshotReader:
             raise ValueError("snapshot response is unavailable") from error
         if _sha256(response_bytes) != entry.response_sha256:
             raise ValueError("snapshot response hash mismatch")
-        return SnapshotRead(ref=_snapshot_ref(entry), response_bytes=response_bytes)
+        return SnapshotRead(
+            ref=_snapshot_ref(entry),
+            response_bytes=response_bytes,
+            error=entry.error,
+        )
 
 
 def migrate_v1_to_v2(
@@ -554,6 +625,7 @@ __all__ = [
     "DependencyRequestIdentity",
     "DependencySnapshotManifestV2",
     "DependencySnapshotReader",
+    "SnapshotErrorV2",
     "SnapshotEntryV2",
     "SnapshotRead",
 ]

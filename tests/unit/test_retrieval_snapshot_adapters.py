@@ -25,8 +25,10 @@ from paper_search.retrieval.snapshot_adapters import (
     ProviderAdapterError,
     ReplaySearchProvider,
 )
+from paper_search.retrieval.openalex import OPENALEX_SELECT_FIELDS
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
+    DependencyRequestIdentity,
     DependencySnapshotReader,
 )
 
@@ -74,6 +76,24 @@ def _reader(
         store.manifest_path,
         snapshot_manifest_sha256=store.manifest_sha256,
         snapshot_set_id=snapshot_set_id,
+    )
+
+
+def _openalex_identity() -> DependencyRequestIdentity:
+    return DependencyRequestIdentity.from_canonical_request(
+        dependency="openalex",
+        operation="search",
+        method="GET",
+        endpoint="/works",
+        model_or_adapter="openalex-works-v1",
+        canonical_request={
+            "query": "RAG",
+            "filters": {},
+            "limit": 3,
+            "cursor": "*",
+            "per_page": 3,
+            "select": OPENALEX_SELECT_FIELDS,
+        },
     )
 
 
@@ -243,7 +263,9 @@ def test_capture_identity_is_safe_and_excludes_credentials(tmp_path: Path) -> No
     assert "api_key" not in serialized.casefold()
 
 
-def test_failed_response_body_is_not_captured_and_retries_are_accounted(tmp_path: Path) -> None:
+def test_failed_response_is_captured_as_error_and_retries_are_accounted(
+    tmp_path: Path,
+) -> None:
     attempts = 0
     sleeps: list[float] = []
 
@@ -272,8 +294,14 @@ def test_failed_response_body_is_not_captured_and_retries_are_accounted(tmp_path
     assert sleeps == [1.0, 2.0]
     assert result.usage.search_api_calls == 3
     assert controller.settled[0][1].cost_cny == Decimal("0.000180")
-    assert store.seal().entries == []
-    assert b"sensitive failed body" not in store.manifest_path.read_bytes()
+    manifest = store.seal()
+    assert len(manifest.entries) == 1
+    assert manifest.entries[0].error is not None
+    assert manifest.entries[0].error.code == "server_error"
+    assert manifest.entries[0].error.retryable is True
+    assert manifest.entries[0].response_sha256 == (
+        "sha256:" + hashlib.sha256(b"sensitive failed body").hexdigest()
+    )
 
 
 def test_replay_miss_is_structured_and_has_no_network_dependency(tmp_path: Path) -> None:
@@ -596,3 +624,63 @@ def test_http_200_invalid_bytes_are_captured_before_decode_and_replayed(
     assert replayed_refs == captured_refs
     assert captured.provenance["response_hash"] == expected_hash
     assert replayed.provenance["response_hash"] == expected_hash
+
+
+def test_openalex_error_is_captured_and_replayed(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            text='{"message":"Too Many Requests"}',
+            request=request,
+        )
+
+    async def run() -> tuple[object, object]:
+        live, store, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+        )
+        async with client:
+            captured = await live.search("RAG", {}, 3, _reservation())
+        manifest = store.seal()
+        replay = ReplaySearchProvider(
+            dependency="openalex",
+            reader=_reader(store, snapshot_set_id=manifest.snapshot_set_id),
+            clock=lambda: CAPTURED_AT,
+        )
+        replayed = await replay.search("RAG", {}, 3, _reservation(0))
+        return captured, replayed
+
+    live_result, replay_result = asyncio.run(run())
+
+    assert [error.code for error in live_result.errors] == ["rate_limited"]
+    assert [error.code for error in replay_result.errors] == ["rate_limited"]
+    assert live_result.data == []
+    assert replay_result.data == []
+    assert live_result.provenance["snapshot_refs"]
+    assert replay_result.provenance["snapshot_refs"] == live_result.provenance["snapshot_refs"]
+
+
+def test_replay_reproduces_staged_provider_error(tmp_path: Path) -> None:
+    store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
+    store.stage_error(
+        _openalex_identity(),
+        error_code="rate_limited",
+        message="openalex request was rate limited",
+        retryable=True,
+        response_bytes=b'{"message":"Too Many Requests"}',
+        safe_headers={"content-type": "application/json"},
+        captured_at=CAPTURED_AT,
+    )
+    manifest = store.seal()
+    replay = ReplaySearchProvider(
+        dependency="openalex",
+        reader=_reader(store, snapshot_set_id=manifest.snapshot_set_id),
+        clock=lambda: CAPTURED_AT,
+    )
+
+    result = asyncio.run(replay.search("RAG", {}, 3, _reservation(0)))
+
+    assert result.data == []
+    assert [error.code for error in result.errors] == ["rate_limited"]
+    assert result.provenance["snapshot_refs"]

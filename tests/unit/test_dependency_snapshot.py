@@ -117,6 +117,37 @@ def test_duplicate_cache_key_is_rejected(tmp_path: Path) -> None:
         )
 
 
+def test_store_round_trips_error_snapshot(tmp_path: Path) -> None:
+    store = DependencyCaptureStore(tmp_path, clock=lambda: CAPTURED_AT)
+    identity = _identity("openalex")
+    body = b'{"message":"Too Many Requests"}\n'
+
+    staged = store.stage_error(
+        identity,
+        error_code="rate_limited",
+        message="openalex request was rate limited",
+        retryable=True,
+        response_bytes=body,
+        safe_headers={"content-type": "application/json"},
+        captured_at=CAPTURED_AT,
+    )
+    manifest = store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+
+    replayed = reader.read(identity)
+    assert replayed.response_bytes == body
+    assert replayed.ref == staged
+    assert replayed.error is not None
+    assert replayed.error.code == "rate_limited"
+    assert replayed.error.retryable is True
+    assert manifest.entries[0].error is not None
+    assert manifest.entries[0].error.message == "openalex request was rate limited"
+
+
 def test_unsealed_store_cannot_be_read_and_sealed_store_cannot_be_written(
     tmp_path: Path,
 ) -> None:

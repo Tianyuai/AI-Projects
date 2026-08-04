@@ -46,6 +46,7 @@ from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
     DependencyRequestIdentity,
     DependencySnapshotReader,
+    SnapshotErrorV2,
 )
 
 
@@ -115,6 +116,7 @@ class _RequestOutcome:
     error: ErrorDetail | None
     captured_at: datetime
     safe_headers: dict[str, str]
+    error_response_bytes: bytes = b""
 
 
 ResultT = TypeVar("ResultT")
@@ -381,6 +383,7 @@ class LiveCaptureSearchProvider:
             request_params = dict(params)
 
         last_error: ErrorDetail | None = None
+        error_response_bytes = b""
         attempts_made = 0
         for retry_index in range(attempts_allowed):
             remaining_seconds = operation.remaining_seconds()
@@ -445,6 +448,7 @@ class LiveCaptureSearchProvider:
                         safe_headers=safe_headers,
                     )
                 else:
+                    error_response_bytes = response.content
                     last_error = _status_error(
                         self._dependency,
                         response.status_code,
@@ -477,6 +481,7 @@ class LiveCaptureSearchProvider:
             error=last_error,
             captured_at=captured_at,
             safe_headers={},
+            error_response_bytes=error_response_bytes,
         )
 
     @staticmethod
@@ -494,6 +499,23 @@ class LiveCaptureSearchProvider:
             identity,
             response_bytes=outcome.content,
             safe_headers=outcome.safe_headers,
+            captured_at=outcome.captured_at,
+        )
+
+    def _capture_error(
+        self,
+        identity: DependencyRequestIdentity,
+        outcome: _RequestOutcome,
+    ) -> SnapshotRef:
+        if outcome.error is None:
+            raise RuntimeError("cannot capture a successful provider outcome as an error")
+        return self._capture_store.stage_error(
+            identity,
+            error_code=outcome.error.code,
+            message=outcome.error.message,
+            retryable=outcome.error.retryable,
+            response_bytes=outcome.error_response_bytes,
+            safe_headers={},
             captured_at=outcome.captured_at,
         )
 
@@ -588,9 +610,11 @@ class LiveCaptureSearchProvider:
                 remaining_calls=operation.reservation.reserved.search_api_calls - calls,
             )
             calls += outcome.calls
-            if outcome.error is not None or outcome.content is None:
-                if outcome.error is not None:
-                    errors.append(outcome.error)
+            if outcome.error is not None:
+                errors.append(outcome.error)
+                refs.append(self._capture_error(identity, outcome))
+                break
+            if outcome.content is None:
                 break
             refs.append(self._capture(identity, outcome))
             hashes.append(_sha256(outcome.content))
@@ -745,6 +769,7 @@ class LiveCaptureSearchProvider:
         hashes: list[str] = []
         if outcome.error is not None:
             errors.append(outcome.error)
+            refs.append(self._capture_error(identity, outcome))
         elif outcome.content is not None:
             refs.append(self._capture(identity, outcome))
             hashes.append(_sha256(outcome.content))
@@ -817,6 +842,7 @@ class LiveCaptureSearchProvider:
         hashes: list[str] = []
         if outcome.error is not None:
             errors.append(outcome.error)
+            refs.append(self._capture_error(identity, outcome))
         elif outcome.content is not None:
             refs.append(self._capture(identity, outcome))
             hashes.append(_sha256(outcome.content))
@@ -902,12 +928,20 @@ class ReplaySearchProvider:
     def _read(
         self,
         identity: DependencyRequestIdentity,
-    ) -> tuple[bytes | None, SnapshotRef | None]:
+    ) -> tuple[bytes | None, SnapshotRef | None, SnapshotErrorV2 | None]:
         try:
             snapshot = self._reader.read(identity)
         except KeyError:
-            return None, None
-        return snapshot.response_bytes, snapshot.ref
+            return None, None, None
+        return snapshot.response_bytes, snapshot.ref, snapshot.error
+
+    def _snapshot_error(self, error: SnapshotErrorV2) -> ErrorDetail:
+        return _error(
+            self._dependency,
+            error.code,
+            error.message,
+            retryable=error.retryable,
+        )
 
     def _result(
         self,
@@ -1007,7 +1041,11 @@ class ReplaySearchProvider:
                 adapter=self._adapter,
                 canonical_request=canonical,
             )
-            content, ref = self._read(identity)
+            content, ref, error = self._read(identity)
+            if error is not None:
+                errors.append(self._snapshot_error(error))
+                refs.append(ref)
+                break
             if content is None or ref is None:
                 errors.append(self._miss())
                 break
@@ -1072,12 +1110,15 @@ class ReplaySearchProvider:
             adapter=self._adapter,
             canonical_request=canonical,
         )
-        content, ref = self._read(identity)
+        content, ref, error = self._read(identity)
         errors: list[ErrorDetail] = []
         papers: list[Paper] = []
         refs: list[SnapshotRef] = []
         hashes: list[str] = []
-        if content is None or ref is None:
+        if error is not None:
+            errors.append(self._snapshot_error(error))
+            refs.append(ref)
+        elif content is None or ref is None:
             errors.append(self._miss())
         else:
             decoded = decode_semantic_scholar_search(content, limit=limit)
@@ -1113,12 +1154,15 @@ class ReplaySearchProvider:
             adapter=self._adapter,
             canonical_request={"fields": _FIELDS, "ids": ids},
         )
-        content, ref = self._read(identity)
+        content, ref, error = self._read(identity)
         errors: list[ErrorDetail] = []
         papers: list[Paper] = []
         refs: list[SnapshotRef] = []
         hashes: list[str] = []
-        if content is None or ref is None:
+        if error is not None:
+            errors.append(self._snapshot_error(error))
+            refs.append(ref)
+        elif content is None or ref is None:
             errors.append(self._miss())
         else:
             decoded = decode_semantic_scholar_batch(content)
@@ -1160,12 +1204,15 @@ class ReplaySearchProvider:
                 "paper_id": paper_id.value,
             },
         )
-        content, ref = self._read(identity)
+        content, ref, error = self._read(identity)
         errors: list[ErrorDetail] = []
         expansion = CitationExpansion(papers=[], raw_edges=[])
         refs: list[SnapshotRef] = []
         hashes: list[str] = []
-        if content is None or ref is None:
+        if error is not None:
+            errors.append(self._snapshot_error(error))
+            refs.append(ref)
+        elif content is None or ref is None:
             errors.append(self._miss())
         else:
             decoded = decode_semantic_scholar_expansion(

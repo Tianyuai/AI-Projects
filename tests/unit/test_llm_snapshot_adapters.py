@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -26,6 +27,7 @@ from paper_search.llm.snapshot_adapters import (
 )
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
+    DependencyRequestIdentity,
     DependencySnapshotReader,
 )
 
@@ -166,6 +168,96 @@ def test_real_budget_controller_success_settles_once(tmp_path: Path) -> None:
     assert controller.reserved_usage.llm_calls == 0
     with pytest.raises(ReservationError, match="reservation is unknown"):
         settlement.settle(reservation, result.usage)
+
+
+def test_live_llm_error_is_captured_and_replayed(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            text='{"error":"rate limited"}',
+            request=request,
+        )
+
+    controller = SettlementRecorder()
+    result, store = asyncio.run(
+        _live(
+            tmp_path,
+            httpx.MockTransport(handler),
+            controller,
+        )
+    )
+    manifest = store.seal()
+    replay = ReplayLLMAnalyzer(
+        reader=DependencySnapshotReader(
+            store.manifest_path,
+            snapshot_manifest_sha256=store.manifest_sha256,
+            snapshot_set_id=manifest.snapshot_set_id,
+        ),
+        model_id="qwen-test-v1",
+        prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
+        prompt_version="query-analyze-v1",
+    )
+    replayed = asyncio.run(
+        replay.generate_json(
+            prompt_name="query_analyze",
+            payload={"query": "graph retrieval"},
+            reservation=_reservation(),
+        )
+    )
+
+    assert result.errors[0].code == "rate_limited"
+    assert replayed.errors[0].code == "rate_limited"
+    assert result.provenance.get("snapshot_refs")
+    assert replayed.provenance.get("snapshot_refs") == result.provenance.get("snapshot_refs")
+
+
+def test_replay_reproduces_staged_llm_error(tmp_path: Path) -> None:
+    store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
+    identity = DependencyRequestIdentity.from_canonical_request(
+        dependency="llm",
+        operation="generate_json",
+        method="POST",
+        endpoint="/chat/completions",
+        model_or_adapter="qwen-test-v1",
+        canonical_request={
+            "prompt_name": "query_analyze",
+            "payload": {"query": "graph retrieval"},
+            "prompt_artifact_sha256": PROMPT_ARTIFACT_SHA256,
+            "prompt_version": "query-analyze-v1",
+        },
+    )
+    store.stage_error(
+        identity,
+        error_code="rate_limited",
+        message="LLM request was rate limited",
+        retryable=True,
+        response_bytes=b'{"error":"rate limited"}',
+        safe_headers={"content-type": "application/json"},
+        captured_at=CAPTURED_AT,
+    )
+    manifest = store.seal()
+    replay = ReplayLLMAnalyzer(
+        reader=DependencySnapshotReader(
+            store.manifest_path,
+            snapshot_manifest_sha256=store.manifest_sha256,
+            snapshot_set_id=manifest.snapshot_set_id,
+        ),
+        model_id="qwen-test-v1",
+        prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
+        prompt_version="query-analyze-v1",
+    )
+
+    result = asyncio.run(
+        replay.generate_json(
+            prompt_name="query_analyze",
+            payload={"query": "graph retrieval"},
+            reservation=_reservation(),
+        )
+    )
+
+    assert result.errors[0].code == "rate_limited"
+    assert result.data == {}
+    assert result.provenance.get("snapshot_refs")
 
 
 def test_real_budget_controller_terminal_failure_records_usage_and_hard_stops(
@@ -504,7 +596,7 @@ def test_injected_decoder_cannot_bypass_replay_prompt_version_validation(
     ("status_code", "expected_code", "expected_calls"),
     [(401, "authentication_error", 1), (400, "invalid_request", 1)],
 )
-def test_nonretryable_http_errors_are_sanitized_and_not_captured(
+def test_nonretryable_http_errors_are_sanitized_error_snapshots(
     tmp_path: Path,
     status_code: int,
     expected_code: str,
@@ -531,7 +623,13 @@ def test_nonretryable_http_errors_are_sanitized_and_not_captured(
     assert result.errors[0].code == expected_code
     assert "top-secret" not in result.model_dump_json()
     assert "sk-live-request-secret" not in result.model_dump_json()
-    assert not (store.root / "responses").exists()
+    manifest = store.seal()
+    assert len(manifest.entries) == 1
+    assert manifest.entries[0].error is not None
+    assert manifest.entries[0].error.code == expected_code
+    assert manifest.entries[0].response_sha256 == (
+        "sha256:" + hashlib.sha256(b"").hexdigest()
+    )
     assert len(controller.settled) == 1
 
 

@@ -3056,6 +3056,95 @@ def test_retrieval_response_requires_bound_decodable_configured_snapshot(
     )
 
 
+def test_retrieval_response_with_content_errors_is_parseable_when_snapshot_bound(
+    tmp_path: Path,
+) -> None:
+    store = DependencyCaptureStore(tmp_path / "snapshots")
+    identity = DependencyRequestIdentity.from_canonical_request(
+        dependency="openalex",
+        operation="search",
+        method="GET",
+        endpoint="/works",
+        model_or_adapter="openalex-v1",
+        canonical_request={"query": "one"},
+    )
+    ref = store.stage_success(
+        identity,
+        response_bytes=b'{"results":[{"id":"W1","title":"One"}]}',
+        safe_headers={"content-type": "application/json"},
+        captured_at=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+    manifest = store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+    execution = EvaluationExecutionRecord(
+        query_id="q1",
+        run_id="formal-1",
+        outcome_kind="success",
+        business_result_sha256="sha256:" + "a" * 64,
+        usage=UsageActual(cost_cny=Decimal("0")),
+        diagnostics=[
+            DependencyDiagnostic(
+                dependency="openalex",
+                endpoint="dependency",
+                model_id=None,
+                usage=UsageActual(cost_cny=Decimal("0")),
+                latency_ms=1,
+                cache_hit=False,
+                snapshot_refs=[ref],
+                errors=[
+                    ErrorDetail(
+                        code="invalid_work",
+                        message="OpenAlex work must have a title",
+                        retryable=False,
+                        provider="openalex",
+                    )
+                ],
+            ),
+        ],
+        retrieved_paper_ids=["openalex:W1"],
+        post_filter_paper_ids=["openalex:W1"],
+        is_partial=True,
+        planner_status="primary",
+        planner_fallback=False,
+        stop_reason="completed",
+    )
+    measures = runner_module.formal_audit_measures(
+        frozen_queries=[
+            EvaluationQuery(
+                query_id="q1",
+                query="one",
+                relevant_paper_ids=["openalex:W1"],
+                metadata={"split": "dev"},
+            )
+        ],
+        executions=[execution],
+        business_results=[],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("3"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+        configured_endpoints={"openalex": "/works"},
+        snapshot_manifest=manifest,
+        snapshot_reader=reader,
+        prompt_version="query-analyze-v1",
+    )
+
+    assert measures["parseable_configured_retrieval_response_rate"] == MeasureValue(
+        numerator=1, denominator=1, value=1
+    )
+
+
 @pytest.mark.parametrize(
     "published_post_filter_ids",
     [[], ["openalex:W1", "openalex:W2"]],

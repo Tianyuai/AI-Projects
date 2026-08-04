@@ -200,7 +200,7 @@ def _snapshot_retrieval_evidence(
     openalex_candidate_ids: set[str] = set()
     for diagnostic in execution.diagnostics:
         configured_endpoint = configured_endpoints.get(diagnostic.dependency)
-        if configured_endpoint is None or diagnostic.errors:
+        if configured_endpoint is None:
             continue
         for ref in diagnostic.snapshot_refs:
             entry = entries.get((ref.dependency, ref.cache_key))

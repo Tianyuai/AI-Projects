@@ -1,4 +1,4 @@
-experiment: main-baseline
+experiment: title-candidates
 
 embedding:
   enabled: false

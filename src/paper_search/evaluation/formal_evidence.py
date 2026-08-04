@@ -32,7 +32,7 @@ from paper_search.evaluation.gates import MeasureValue
 from paper_search.evaluation.metrics import EvaluationResult, evaluate
 from paper_search.llm.client import LLMResponseDecoder
 from paper_search.processing import apply_hard_filters
-from paper_search.query.parser import rule_fallback
+from paper_search.query.parser import normalize_query_analysis, rule_fallback
 from paper_search.retrieval.openalex import decode_openalex_page
 from paper_search.retrieval.semantic_scholar import (
     decode_semantic_scholar_batch,
@@ -337,8 +337,9 @@ def _bound_llm_query_specs(
             if decoded.errors:
                 continue
             try:
-                analysis = QueryAnalysisResult.model_validate(decoded.data)
-            except ValueError:
+                normalized = normalize_query_analysis(decoded.data, query.query)
+                analysis = QueryAnalysisResult.model_validate(normalized)
+            except (TypeError, ValueError):
                 continue
             specs.append(
                 analysis.query_spec.model_copy(

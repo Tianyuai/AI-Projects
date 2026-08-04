@@ -92,6 +92,56 @@ def test_valid_payload_uses_existing_domain_models() -> None:
     assert result.planner_status == "primary"
 
 
+def _flexible_payload(query: str) -> dict[str, object]:
+    return {
+        "original_query": query,
+        "query_spec": {
+            "intent": "information_retrieval",
+            "domain": "computer_vision",
+            "core_concepts": [
+                "motion trajectory prediction",
+                "scene image conditioning",
+            ],
+            "constraints": {
+                "content_type": "research papers",
+                "output_target": "motion trajectory",
+            },
+            "excluded_topics": ["non-academic posts"],
+        },
+        "search_plan": {
+            "strategy": "keyword_expansion_and_semantic_search",
+            "subqueries": [
+                "motion trajectory prediction conditioned on scene image",
+                "visual context aware trajectory forecasting research papers",
+                "scene image based motion prediction deep learning",
+                "image-conditioned human motion trajectory prediction",
+            ],
+        },
+    }
+
+
+def test_flexible_model_payload_is_normalized_to_primary_analysis() -> None:
+    query = "Which research papers propose motion trajectory conditioned on scene image?"
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(
+            query,
+            _provider_result(_flexible_payload(query)),
+        )
+    )
+
+    assert result.planner_status == "primary"
+    assert result.query_spec.original_query == query
+    assert "motion trajectory prediction" in result.query_spec.topics
+    assert result.query_spec.must_have
+    assert result.query_spec.exclusions == ["non-academic posts"]
+    assert len(result.search_plan.subqueries) == 4
+    assert all(
+        item.query_type in {"exact", "expanded", "decomposed"}
+        for item in result.search_plan.subqueries
+    )
+
+
 def test_invalid_payload_is_repaired_once() -> None:
     query = "graph retrieval"
     calls = 0

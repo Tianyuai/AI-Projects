@@ -416,10 +416,52 @@ def test_runtime_experiment_selects_real_service_orchestrator_components(
     assert orchestrator._citation_expander is citation_stage  # type: ignore[attr-defined]  # noqa: SLF001
 
 
+def test_title_candidates_experiment_builds_stage_with_per_call_estimates(
+    composition_fixture: dict[str, Path],
+) -> None:
+    runtime_config = load_runtime_config(
+        Path("configs/base.yaml"),
+        env_file=None,
+    ).model_copy(update={"experiment": "title-candidates"})
+
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["replay_lock"],
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+        runtime_config=runtime_config,
+        ablation_config=Path("configs/ablations.yaml"),
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load(
+            (
+                composition_fixture["artifact_root"]
+                / "configs/budget_balanced.yaml"
+            ).read_bytes()
+        )
+    )
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        "title-candidates-inspection",
+    )
+    stage = orchestrator._title_candidate_stage  # type: ignore[attr-defined]  # noqa: SLF001
+
+    assert stage is not None
+    assert stage._llm_estimate.llm_calls == 1  # type: ignore[attr-defined]  # noqa: SLF001
+    assert stage._llm_estimate.input_tokens == 2000  # type: ignore[attr-defined]  # noqa: SLF001
+    assert stage._llm_estimate.output_tokens == 1000  # type: ignore[attr-defined]  # noqa: SLF001
+    assert stage._search_estimate.search_api_calls == 1  # type: ignore[attr-defined]  # noqa: SLF001
+
+
 def test_explicit_main_baseline_uses_lock_identity(
     composition_fixture: dict[str, Path],
 ) -> None:
-    runtime_config = load_runtime_config(Path("configs/base.yaml"), env_file=None)
+    runtime_config = load_runtime_config(
+        Path("configs/base.yaml"),
+        env_file=None,
+    ).model_copy(update={"experiment": "main-baseline"})
 
     bundle = CompositionRoot.compose(
         lock_path=composition_fixture["replay_lock"],
@@ -442,6 +484,7 @@ def test_explicit_main_baseline_uses_lock_identity(
         ("embedding", "embedding", "fixed_one_round"),
         ("citation-expansion", "citation", "fixed_one_round"),
         ("llm-rerank", "rerank", "fixed_one_round"),
+        ("title-candidates", "title", "fixed_one_round"),
         ("fixed-two-round", None, "fixed_two_round"),
         ("adaptive-evolution", None, "adaptive"),
     ],
@@ -457,6 +500,7 @@ def test_every_registered_runtime_identity_reaches_service_factory(
         "embedding": object(),
         "citation": object(),
         "rerank": object(),
+        "title": object(),
     }
 
     class Dependencies:
@@ -471,6 +515,10 @@ def test_every_registered_runtime_identity_reaches_service_factory(
         def build_constraint_reranker(self) -> object:
             built.append("rerank")
             return sentinels["rerank"]
+
+        def build_title_candidate_stage(self) -> object:
+            built.append("title")
+            return sentinels["title"]
 
     runtime_config = load_runtime_config(
         Path("configs/base.yaml"),
@@ -515,6 +563,9 @@ def test_every_registered_runtime_identity_reaches_service_factory(
     )
     assert single_round._constraint_reranker is (  # noqa: SLF001
         sentinels["rerank"] if expected_builder == "rerank" else None
+    )
+    assert single_round._title_candidate_stage is (  # noqa: SLF001
+        sentinels["title"] if expected_builder == "title" else None
     )
     actual_strategy = getattr(orchestrator, "_strategy", "fixed_one_round")
     assert actual_strategy == expected_strategy

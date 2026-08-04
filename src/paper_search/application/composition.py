@@ -249,8 +249,16 @@ class _RequestExperimentDependencies:
         return LLMTitleCandidateStage(
             analyzer=self.analyzer,
             provider=provider,
-            llm_estimate=self.analysis_estimate,
-            search_estimate=self.provider_estimates["openalex"],
+            llm_estimate=self.analysis_estimate.model_copy(
+                update={
+                    "llm_calls": 1,
+                    "input_tokens": 2000,
+                    "output_tokens": 1000,
+                }
+            ),
+            search_estimate=self.provider_estimates["openalex"].model_copy(
+                update={"search_api_calls": 1}
+            ),
         )
 
 

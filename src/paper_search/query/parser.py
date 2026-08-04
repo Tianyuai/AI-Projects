@@ -73,6 +73,23 @@ def normalize_query_analysis(
     raw_spec = data.get("query_spec")
     raw_plan = data.get("search_plan")
     if not isinstance(raw_spec, Mapping) or not isinstance(raw_plan, Mapping):
+        wrapped = data.get("QueryAnalysisResult")
+        if not isinstance(wrapped, Mapping):
+            wrapped = data.get("query_analysis_result")
+        if isinstance(wrapped, Mapping):
+            if not isinstance(raw_spec, Mapping):
+                raw_spec = wrapped.get("query_spec")
+            if not isinstance(raw_plan, Mapping):
+                raw_plan = wrapped.get("search_plan")
+            if not isinstance(raw_spec, Mapping):
+                raw_spec = wrapped.get("QuerySpec")
+            if not isinstance(raw_plan, Mapping):
+                raw_plan = wrapped.get("SearchPlan")
+        if not isinstance(raw_spec, Mapping):
+            raw_spec = data.get("QuerySpec")
+        if not isinstance(raw_plan, Mapping):
+            raw_plan = data.get("SearchPlan")
+    if not isinstance(raw_spec, Mapping) or not isinstance(raw_plan, Mapping):
         raise ValueError("model analysis must include query_spec and search_plan")
     spec = raw_spec
     plan = raw_plan

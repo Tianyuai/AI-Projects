@@ -166,6 +166,92 @@ def test_flexible_model_payload_with_two_subqueries_is_supplemented() -> None:
     assert "research papers" in result.query_spec.topics
 
 
+def test_wrapped_query_analysis_result_is_normalized_to_primary_analysis() -> None:
+    query = "Which research papers propose motion trajectory conditioned on scene image?"
+    payload = {"QueryAnalysisResult": _flexible_payload(query)}
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(
+            query,
+            _provider_result(payload),
+        )
+    )
+
+    assert result.planner_status == "primary"
+    assert result.query_spec.original_query == query
+    assert "motion trajectory prediction" in result.query_spec.topics
+    assert len(result.search_plan.subqueries) == 4
+
+
+def test_split_query_spec_and_search_plan_is_normalized_to_primary_analysis() -> None:
+    query = "Which research papers propose motion trajectory conditioned on scene image?"
+    flexible = _flexible_payload(query)
+    payload = {
+        "QuerySpec": flexible["query_spec"],
+        "SearchPlan": flexible["search_plan"],
+    }
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(
+            query,
+            _provider_result(payload),
+        )
+    )
+
+    assert result.planner_status == "primary"
+    assert result.query_spec.original_query == query
+    assert "motion trajectory prediction" in result.query_spec.topics
+    assert len(result.search_plan.subqueries) == 4
+
+
+def test_wrapped_pascal_case_analysis_is_normalized_to_primary_analysis() -> None:
+    query = "Which research papers propose motion trajectory conditioned on scene image?"
+    flexible = _flexible_payload(query)
+    payload = {
+        "QueryAnalysisResult": {
+            "QuerySpec": flexible["query_spec"],
+            "SearchPlan": flexible["search_plan"],
+            "original_query": query,
+        }
+    }
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(
+            query,
+            _provider_result(payload),
+        )
+    )
+
+    assert result.planner_status == "primary"
+    assert result.query_spec.original_query == query
+    assert "motion trajectory prediction" in result.query_spec.topics
+    assert len(result.search_plan.subqueries) == 4
+
+
+def test_wrapped_snake_case_analysis_is_normalized_to_primary_analysis() -> None:
+    query = "Which research papers propose motion trajectory conditioned on scene image?"
+    flexible = _flexible_payload(query)
+    payload = {
+        "query_analysis_result": {
+            "original_query": query,
+            "query_spec": flexible["query_spec"],
+            "search_plan": flexible["search_plan"],
+        }
+    }
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(
+            query,
+            _provider_result(payload),
+        )
+    )
+
+    assert result.planner_status == "primary"
+    assert result.query_spec.original_query == query
+    assert "motion trajectory prediction" in result.query_spec.topics
+    assert len(result.search_plan.subqueries) == 4
+
+
 def test_invalid_payload_is_repaired_once() -> None:
     query = "graph retrieval"
     calls = 0

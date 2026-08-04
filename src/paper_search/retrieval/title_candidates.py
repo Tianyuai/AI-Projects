@@ -218,6 +218,46 @@ def _llm_diagnostic(
     )
 
 
+def _provider_failure_diagnostic() -> DependencyDiagnostic:
+    return DependencyDiagnostic(
+        dependency="openalex",
+        endpoint="title_candidates",
+        model_id=None,
+        usage=UsageActual(search_api_calls=1),
+        latency_ms=0,
+        cache_hit=False,
+        snapshot_refs=[],
+        errors=[
+            ErrorDetail(
+                code="provider_error",
+                message="Title candidate search failed",
+                retryable=False,
+                provider="openalex",
+            )
+        ],
+    )
+
+
+def _llm_failure_diagnostic() -> DependencyDiagnostic:
+    return DependencyDiagnostic(
+        dependency="llm",
+        endpoint="title_candidates",
+        model_id=None,
+        usage=UsageActual(llm_calls=1),
+        latency_ms=0,
+        cache_hit=False,
+        snapshot_refs=[],
+        errors=[
+            ErrorDetail(
+                code="provider_error",
+                message="Title candidate generation failed",
+                retryable=False,
+                provider="llm",
+            )
+        ],
+    )
+
+
 def _empty_provider_result(
     usage: UsageActual,
 ) -> ProviderResult[list[Paper]]:
@@ -322,6 +362,7 @@ class LLMTitleCandidateStage:
             )
         except BudgetExceededError:
             return _degraded([], ["unavailable"], UsageActual())
+        diagnostics: list[DependencyDiagnostic] = []
         try:
             llm_result = await self._analyzer.generate_json(
                 prompt_name="title_candidates",
@@ -342,10 +383,21 @@ class LLMTitleCandidateStage:
             raise
         except Exception:
             if controller.terminal_outcome(llm_reservation) is None:
-                controller.release(llm_reservation)
-            raise
+                try:
+                    controller.fail_closed(
+                        llm_reservation,
+                        UsageActual(llm_calls=1),
+                    )
+                except Exception:
+                    pass
+            diagnostics.append(_llm_failure_diagnostic())
+            return _degraded(
+                diagnostics,
+                ["unavailable"],
+                UsageActual(llm_calls=1),
+            )
         llm_ref = _llm_snapshot_ref(llm_result.provenance)
-        diagnostics = [_llm_diagnostic(llm_result, llm_ref)]
+        diagnostics.append(_llm_diagnostic(llm_result, llm_ref))
         if llm_result.errors:
             return _degraded(diagnostics, ["unavailable"], llm_result.usage)
         titles = extract_title_candidates(
@@ -393,9 +445,18 @@ class LLMTitleCandidateStage:
                     controller.fail_closed(reservation)
                 raise
             except Exception:
+                searches += 1
                 if controller.terminal_outcome(reservation) is None:
-                    controller.release(reservation)
-                raise
+                    try:
+                        controller.fail_closed(
+                            reservation,
+                            UsageActual(search_api_calls=1),
+                        )
+                    except Exception:
+                        pass
+                diagnostics.append(_provider_failure_diagnostic())
+                search_errors += 1
+                continue
             searches += 1
             usage = _add_usage(usage, search.usage)
             diagnostics.append(_provider_diagnostic(search))

@@ -20,6 +20,8 @@ from paper_search.retrieval.title_candidates import (
     LLMTitleCandidateStage,
     extract_title_candidates,
 )
+from paper_search.retrieval.snapshot_adapters import ProviderAdapterError
+from paper_search.llm.snapshot_adapters import LLMAdapterError
 
 
 def _budget(**updates: object) -> SearchBudget:
@@ -114,6 +116,17 @@ class CancellingTitleAnalyzer(FakeTitleAnalyzer):
         raise asyncio.CancelledError()
 
 
+class RaisingTitleAnalyzer(FakeTitleAnalyzer):
+    async def generate_json(
+        self,
+        *,
+        prompt_name: str,
+        payload: dict[str, object],
+        reservation: object,
+    ) -> ProviderResult[dict[str, Any]]:
+        raise LLMAdapterError("LLM live capture failed")
+
+
 class FakeTitleProvider:
     def __init__(
         self,
@@ -159,6 +172,28 @@ class FakeTitleProvider:
                 else []
             ),
         )
+
+
+class RaisingTitleProvider(FakeTitleProvider):
+    def __init__(
+        self,
+        results: dict[str, list[Paper]],
+        *,
+        raising_queries: set[str],
+    ) -> None:
+        super().__init__(results)
+        self.raising_queries = raising_queries
+
+    async def search(
+        self,
+        query: str,
+        filters: dict[str, object],
+        limit: int,
+        reservation: object,
+    ) -> ProviderResult[list[Paper]]:
+        if query in self.raising_queries:
+            raise ProviderAdapterError("provider live capture failed")
+        return await super().search(query, filters, limit, reservation)
 
 
 def _stage(
@@ -349,3 +384,54 @@ def test_recall_fails_closed_on_cancellation() -> None:
     assert analyzer.reservation is not None
     terminal = controller.terminal_outcome(analyzer.reservation)
     assert terminal is not None and terminal[0] == "failed"
+
+
+def test_recall_continues_past_provider_adapter_failure() -> None:
+    controller = HardBudgetController(_budget())
+    analyzer = FakeTitleAnalyzer({"titles": ["Good", "Bad"]})
+    provider = RaisingTitleProvider(
+        {"Good": [Paper(canonical_id="openalex:W1", title="A")]},
+        raising_queries={"Bad"},
+    )
+    stage = _stage(analyzer, provider)
+
+    result = asyncio.run(
+        stage.recall(_spec(), controller=controller)
+    )
+
+    assert result.status == "applied"
+    assert [p.canonical_id for p in result.provider_result.data] == [
+        "openalex:W1"
+    ]
+    assert result.titles_searched == 2
+    assert result.diagnostics[-1].dependency == "openalex"
+    assert result.diagnostics[-1].errors
+
+
+def test_recall_all_title_searches_fail_degrades() -> None:
+    controller = HardBudgetController(_budget())
+    analyzer = FakeTitleAnalyzer({"titles": ["Only"]})
+    provider = RaisingTitleProvider({}, raising_queries={"Only"})
+    stage = _stage(analyzer, provider)
+
+    result = asyncio.run(
+        stage.recall(_spec(), controller=controller)
+    )
+
+    assert result.status == "degraded"
+    assert result.provider_result.data == []
+    assert result.warnings == ["unavailable"]
+
+
+def test_recall_degrades_on_llm_adapter_failure() -> None:
+    controller = HardBudgetController(_budget())
+    stage = _stage(RaisingTitleAnalyzer({}), FakeTitleProvider())
+
+    result = asyncio.run(
+        stage.recall(_spec(), controller=controller)
+    )
+
+    assert result.status == "degraded"
+    assert result.warnings == ["unavailable"]
+    assert result.provider_result.data == []
+    assert result.diagnostics and result.diagnostics[0].errors

@@ -76,8 +76,8 @@ def test_year_range_uses_current_year_by_default() -> None:
 @pytest.mark.parametrize(
     ("filename", "tokens", "cost", "rerank_candidates", "search_calls"),
     [
-        ("budget_low.yaml", 10_000, 0.10, 12, 12),
-        ("budget_balanced.yaml", 24_000, 0.30, 30, 18),
+        ("budget_low.yaml", 10_000, 0.10, 12, 12, 90),
+        ("budget_balanced.yaml", 24_000, 0.30, 30, 18, 180),
     ],
 )
 def test_budget_profiles_match_prd(
@@ -86,6 +86,7 @@ def test_budget_profiles_match_prd(
     cost: float,
     rerank_candidates: int,
     search_calls: int,
+    elapsed_seconds: int,
 ) -> None:
     budget = load_budget(f"configs/{filename}")
 
@@ -99,7 +100,7 @@ def test_budget_profiles_match_prd(
     assert budget.max_output_papers == 50
     assert budget.max_citation_seeds == 2
     assert budget.target_citation_seeds == 1
-    assert budget.max_elapsed_seconds == 90
+    assert budget.max_elapsed_seconds == elapsed_seconds
     assert budget.soft_deadline_seconds == 80
     assert budget.max_total_tokens == tokens
     assert budget.max_cost_cny == pytest.approx(cost)

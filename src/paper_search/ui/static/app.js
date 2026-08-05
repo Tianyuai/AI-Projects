@@ -3,69 +3,186 @@
 const form = document.querySelector("#search-form");
 const queryInput = document.querySelector("#query");
 const modeSelect = document.querySelector("#mode");
+const submitButton = document.querySelector("#submit-search");
+const cancelButton = document.querySelector("#cancel-search");
 const status = document.querySelector("#status");
 const results = document.querySelector("#results");
+const resultSummary = document.querySelector("#result-summary");
+const selectedGroup = document.querySelector("#selected-group");
+const selectedResults = document.querySelector("#selected-results");
+const selectedCount = document.querySelector("#selected-count");
+const highGroup = document.querySelector("#high-group");
+const highResults = document.querySelector("#high-results");
+const partialGroup = document.querySelector("#partial-group");
+const partialResults = document.querySelector("#partial-results");
+const highCount = document.querySelector("#high-count");
+const partialCount = document.querySelector("#partial-count");
+const emptyState = document.querySelector("#empty-state");
+const evidencePanel = document.querySelector("#evidence-panel");
 const provenance = document.querySelector("#provenance");
 const diagnostics = document.querySelector("#diagnostics");
 
 let activeController = null;
 let requestSequence = 0;
 
-function appendText(parent, tagName, value) {
+function textElement(tagName, value, className) {
   const element = document.createElement(tagName);
   element.textContent = String(value ?? "Unknown");
-  parent.append(element);
+  if (className) element.className = className;
   return element;
 }
 
+function listText(values, fallback = "Not provided") {
+  return Array.isArray(values) && values.length ? values.join(", ") : fallback;
+}
+
+function formatScore(value) {
+  return Number.isFinite(Number(value)) ? Number(value).toFixed(3) : "Not scored";
+}
+
 function appendDefinition(label, value) {
-  appendText(provenance, "dt", label);
-  appendText(provenance, "dd", value);
+  provenance.append(textElement("dt", label), textElement("dd", value));
 }
 
 function clearOutput() {
-  results.replaceChildren();
+  selectedResults.replaceChildren();
+  highResults.replaceChildren();
+  partialResults.replaceChildren();
   provenance.replaceChildren();
   diagnostics.replaceChildren();
+  selectedGroup.hidden = true;
+  highGroup.hidden = true;
+  partialGroup.hidden = true;
+  results.hidden = true;
+  emptyState.hidden = true;
+  evidencePanel.hidden = true;
 }
 
-function renderPaper(item, group) {
+function setBusy(isBusy) {
+  form.setAttribute("aria-busy", String(isBusy));
+  submitButton.disabled = isBusy;
+  submitButton.textContent = isBusy ? "Searching…" : "Search papers";
+  cancelButton.hidden = !isBusy;
+}
+
+function addChip(container, value, variant) {
+  if (value === null || value === undefined || value === "") return;
+  const chip = textElement("span", value, `chip${variant ? ` ${variant}` : ""}`);
+  container.append(chip);
+}
+
+function evidenceRow(label, values, tone) {
+  const row = document.createElement("div");
+  row.className = "evidence-row";
+  row.append(textElement("span", label, `evidence-label ${tone ?? ""}`));
+  row.append(textElement("span", listText(values)));
+  return row;
+}
+
+function renderPaper(item, group, selectedIds) {
   const paper = item.paper ?? item;
   const evidence = item.evidence ?? {};
-  const row = document.createElement("li");
-  appendText(row, "h3", paper.title);
-  appendText(row, "p", `Group: ${group}`);
-  appendText(row, "p", `ID: ${paper.canonical_id}`);
-  appendText(row, "p", `Fusion/RRF score: ${evidence.fusion_score ?? item.score ?? "Unknown"}`);
-  appendText(row, "p", `Source ranks: ${JSON.stringify(evidence.source_ranks ?? item.source_ranks ?? {})}`);
-  appendText(row, "p", `Relevance: ${evidence.relevance_level ?? group}`);
-  appendText(row, "p", `Matched subqueries: ${(evidence.matched_subqueries ?? []).join(", ")}`);
-  appendText(row, "p", `Matched constraints: ${(evidence.matched_constraints ?? []).join(", ")}`);
-  appendText(row, "p", `Unmatched constraints: ${(evidence.unmatched_constraints ?? []).join(", ")}`);
-  appendText(row, "p", `Filter reasons: ${(evidence.filter_reasons ?? []).join(", ")}`);
-  results.append(row);
+  const article = document.createElement("article");
+  article.className = `paper-card ${group}`;
+
+  const top = document.createElement("div");
+  top.className = "card-topline";
+  const groupLabels = {
+    high: "High relevance",
+    partial: "Partial relevance",
+    selected: "Selected result",
+  };
+  addChip(top, groupLabels[group] ?? "Result", group);
+  if (group !== "selected" && selectedIds.has(paper.canonical_id)) {
+    addChip(top, "Selected", "selected");
+  }
+  addChip(top, `Score ${formatScore(evidence.final_score ?? evidence.fusion_score ?? item.score)}`, "score");
+  article.append(top);
+
+  const title = textElement("h4", paper.title ?? "Untitled paper");
+  if (paper.url) {
+    const link = document.createElement("a");
+    link.href = paper.url;
+    link.target = "_blank";
+    link.rel = "noreferrer noopener";
+    link.textContent = title.textContent;
+    title.replaceChildren(link);
+  }
+  article.append(title);
+
+  const metadata = document.createElement("div");
+  metadata.className = "metadata";
+  addChip(metadata, paper.publication_year, "neutral");
+  addChip(metadata, paper.venue, "neutral");
+  addChip(metadata, paper.citation_count === null || paper.citation_count === undefined ? null : `${paper.citation_count} citations`, "neutral");
+  (paper.sources ?? []).forEach((source) => addChip(metadata, source, "source"));
+  if (!metadata.childElementCount) addChip(metadata, "Metadata unavailable", "muted");
+  article.append(metadata);
+
+  if (paper.authors?.length) article.append(textElement("p", listText(paper.authors), "authors"));
+  article.append(textElement("p", paper.abstract || "Abstract not available from the current provider response.", `abstract${paper.abstract ? "" : " muted-text"}`));
+
+  if (item.evidence) {
+    const evidenceBox = document.createElement("div");
+    evidenceBox.className = "paper-evidence";
+    evidenceBox.append(
+      evidenceRow("Matched query parts", evidence.matched_subqueries),
+      evidenceRow("Matched constraints", evidence.matched_constraints, "positive"),
+      evidenceRow("Open constraints", evidence.unmatched_constraints, "warning"),
+      evidenceRow("Filter notes", evidence.filter_reasons)
+    );
+    article.append(evidenceBox);
+  }
+
+  const rankEntries = Object.entries(evidence.source_ranks ?? item.source_ranks ?? {});
+  if (rankEntries.length) {
+    article.append(textElement("p", `Source ranks: ${rankEntries.map(([source, rank]) => `${source} #${rank}`).join(" · ")}`, "source-ranks"));
+  }
+  return article;
+}
+
+function appendDiagnosticSection(title, entries, formatter, emptyMessage) {
+  const section = document.createElement("section");
+  section.append(textElement("h3", title));
+  if (!entries.length) {
+    section.append(textElement("p", emptyMessage, "muted-text"));
+  } else {
+    entries.forEach((entry) => section.append(textElement("p", formatter(entry))));
+  }
+  diagnostics.append(section);
 }
 
 function renderSuccess(payload) {
   clearOutput();
-  appendText(results, "li", `Selected paper IDs: ${(payload.selected_paper_ids ?? []).join(", ")}`);
   const selectedIds = new Set(payload.selected_paper_ids ?? []);
-  const selectedPapers = new Map();
-  [
-    ...(payload.fused_papers ?? []),
-    ...(payload.high_relevance ?? []),
-    ...(payload.partial_relevance ?? []),
-  ].forEach((item) => {
+  const high = payload.high_relevance ?? [];
+  const partial = payload.partial_relevance ?? [];
+  const rankedIds = new Set(
+    [...high, ...partial].map((item) => (item.paper ?? item).canonical_id)
+  );
+  const selectedFallback = (payload.fused_papers ?? []).filter((item) => {
     const paper = item.paper ?? item;
-    if (selectedIds.has(paper.canonical_id)) selectedPapers.set(paper.canonical_id, item);
+    return selectedIds.has(paper.canonical_id) && !rankedIds.has(paper.canonical_id);
   });
-  selectedPapers.forEach((paper) => renderPaper(paper, "selected"));
-  (payload.high_relevance ?? []).forEach((paper) => renderPaper(paper, "high"));
-  (payload.partial_relevance ?? []).forEach((paper) => renderPaper(paper, "partial"));
+
+  selectedFallback.forEach((item) => selectedResults.append(renderPaper(item, "selected", selectedIds)));
+  high.forEach((item) => highResults.append(renderPaper(item, "high", selectedIds)));
+  partial.forEach((item) => partialResults.append(renderPaper(item, "partial", selectedIds)));
+  selectedCount.textContent = String(selectedFallback.length);
+  highCount.textContent = String(high.length);
+  partialCount.textContent = String(partial.length);
+  selectedGroup.hidden = selectedFallback.length === 0;
+  highGroup.hidden = high.length === 0;
+  partialGroup.hidden = partial.length === 0;
+  const displayedCount = selectedFallback.length + high.length + partial.length;
+  resultSummary.textContent = `${selectedIds.size} selected · ${displayedCount} shown`;
+  results.hidden = displayedCount === 0;
+  emptyState.hidden = displayedCount !== 0;
 
   appendDefinition("Execution mode", payload.execution_mode);
+  appendDefinition("Selected paper IDs", listText(payload.selected_paper_ids, "None"));
   appendDefinition("Snapshot set", payload.snapshot_set_id);
-  appendDefinition("Snapshot captured", payload.snapshot_captured_at);
+  appendDefinition("Snapshot captured", payload.snapshot_captured_at ?? "Not captured");
   appendDefinition("Config hash", payload.config_hash);
   appendDefinition("Run ID", payload.run_id);
   appendDefinition("Usage", JSON.stringify(payload.usage ?? {}));
@@ -74,25 +191,44 @@ function renderSuccess(payload) {
   appendDefinition("Planner fallback", payload.planner_fallback);
   appendDefinition("Planner status", payload.planner_status);
 
-  appendText(diagnostics, "h3", "Dependency statuses");
-  (payload.dependency_status ?? []).forEach((dependency) => {
-    appendText(diagnostics, "p", `${dependency.dependency}: ${dependency.state} (cache: ${dependency.cache_hit})`);
-  });
-  appendText(diagnostics, "h3", "Safe warnings");
-  (payload.warnings ?? []).forEach((warning) => appendText(diagnostics, "p", warning));
-  appendText(diagnostics, "h3", "Citation edges");
-  (payload.citation_edges ?? []).forEach((edge) => {
-    appendText(diagnostics, "p", `${edge.citing_canonical_id} → ${edge.cited_canonical_id} (${edge.provider})`);
-  });
+  appendDiagnosticSection(
+    "Dependency statuses",
+    payload.dependency_status ?? [],
+    (dependency) => `${dependency.dependency}: ${dependency.state} (cache: ${dependency.cache_hit})`,
+    "No dependency diagnostics were returned."
+  );
+  appendDiagnosticSection("Safe warnings", payload.warnings ?? [], (warning) => warning, "No warnings.");
+  appendDiagnosticSection(
+    "Citation edges",
+    payload.citation_edges ?? [],
+    (edge) => `${edge.citing_canonical_id} → ${edge.cited_canonical_id} (${edge.provider})`,
+    "No citation edges were returned."
+  );
+  evidencePanel.hidden = false;
   status.textContent = payload.is_partial ? "Search completed with partial results." : "Search completed.";
-  status.className = "";
+  status.className = payload.is_partial ? "status warning" : "status success";
 }
 
 function renderError(payload) {
   clearOutput();
   status.textContent = `Search failed: ${payload.code}: ${payload.detail}`;
-  status.className = "error";
+  status.className = "status error";
 }
+
+document.querySelectorAll(".example-query").forEach((button) => {
+  button.addEventListener("click", () => {
+    queryInput.value = button.dataset.query ?? "";
+    queryInput.focus();
+  });
+});
+
+cancelButton.addEventListener("click", () => {
+  activeController?.abort();
+  requestSequence += 1;
+  setBusy(false);
+  status.textContent = "Search cancelled.";
+  status.className = "status warning";
+});
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -108,8 +244,9 @@ form.addEventListener("submit", async (event) => {
     mode: modeSelect.value,
   };
   clearOutput();
+  setBusy(true);
   status.textContent = "Loading search results…";
-  status.className = "";
+  status.className = "status loading";
 
   try {
     const response = await fetch("/v1/search", {
@@ -125,5 +262,10 @@ form.addEventListener("submit", async (event) => {
   } catch (error) {
     if (error.name === "AbortError" || sequence !== requestSequence) return;
     renderError({ code: "request_failed", detail: "The search request could not be completed safely." });
+  } finally {
+    if (sequence === requestSequence) {
+      activeController = null;
+      setBusy(false);
+    }
   }
 });

@@ -4,7 +4,9 @@
 
 - 正式后端语义基线：`0c88a9afd1ae530fb05635576f9ffdcafda89a3a`
 - 新版 UI：`ae77493aa453a003aadaf23552c6f01c2ccffc0e`
-- 发布分支：`codex/ui-backend-integration`
+- UI 来源分支：`codex/ui-improvements`
+- 整合分支：`codex/ui-backend-integration`，2026-08-06 合入
+  `codex/project-document-handoff`（整合 HEAD `6029c0f702b260f31c4a7a3c48ad360107a56ee3`）
 - 整合方式：静态 UI overlay
 
 `ae77493` 以 `0c88a9a` 为祖先。两者之间的变更仅涉及以下三个静态资源：
@@ -16,6 +18,10 @@ src/paper_search/ui/static/styles.css
 ```
 
 没有修改 Python 后端、API 合约、检索逻辑、候选生成、融合排序、预算控制、锁验证或冻结实验输入。因此，运行证据中的后端算法身份仍由获批输入锁绑定的 `source_git_sha` 决定；UI 版本单独记录为 `ae77493`，不得将两者混写为同一实验身份。
+
+合入 `codex/project-document-handoff` 时，该分支额外携带了离线 `ranking-metrics`
+（MRR/NDCG）独立命令行工具；它只生成诊断 artifact，不改变正式评测契约或检索语义，
+因此 `backend_semantics_modified=false` 的声明仍然成立。
 
 机器可读文件见 `docs/deployment/ui-overlay.provenance.json`。其中三个文件的哈希均针对 Git 中的规范 blob 字节计算，不受 Windows checkout 的 CRLF 转换影响。
 

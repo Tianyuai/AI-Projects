@@ -150,7 +150,7 @@ def test_runtime_settings_and_policy_bindings_are_reproducible(tmp_path: Path) -
 def test_base_config_preserves_the_balanced_integrated_baseline() -> None:
     config = load_runtime_config(Path("configs/base.yaml"), env_file=None)
 
-    assert config.budget.max_search_api_calls == 18
+    assert config.budget.max_search_api_calls == 24
     assert config.budget.max_llm_calls == 5
     assert config.budget.max_iterations == 2
     assert config.routing.openalex_calls_max == 6
@@ -170,7 +170,7 @@ def test_title_candidates_config_loads_the_experiment() -> None:
 
     assert config.experiment == "title-candidates"
     assert config.budget_profile == "balanced"
-    assert config.budget.max_search_api_calls == 18
+    assert config.budget.max_search_api_calls == 24
     assert config.routing.semantic_scholar_calls_max == 0
 
 

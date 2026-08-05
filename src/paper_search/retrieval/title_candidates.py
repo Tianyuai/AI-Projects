@@ -52,14 +52,17 @@ _TITLE_KEYS = (
     "papers",
     "candidates",
 )
-_MAX_TITLES = 10
+_MAX_TITLES = 15
 _DEFAULT_INSTRUCTIONS = (
-    'Respond with a JSON object whose only key is "titles", a list of 10 '
+    'Respond with a JSON object whose only key is "titles", a list of 15 '
     "strings. Each string must be the full, exact title of a specific real "
     "published academic paper that directly answers the research query. "
     "Titles must read like genuine paper titles and use precise academic "
     "terminology, including the specific methods, datasets, phenomena, or "
     "problem formulations named in the research goal and constraints. "
+    "Cover distinct aspects and facets of the research goal across the "
+    "candidates: method variants, dataset-specific works, and problem "
+    "reformulations, so the set as a whole spans the query's semantic space. "
     "Prefer well-known, verifiable papers; vary the phrasing across "
     "candidates, e.g., synonyms, alternate problem framings, and "
     "method-first versus task-first titles. Only include papers you are "
@@ -322,7 +325,7 @@ class LLMTitleCandidateStage:
         provider: SearchProvider,
         llm_estimate: UsageEstimate,
         search_estimate: UsageEstimate,
-        max_titles: int = 10,
+        max_titles: int = 15,
         max_results_per_title: int = 10,
         instructions: str | None = None,
     ) -> None:

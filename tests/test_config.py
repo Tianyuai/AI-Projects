@@ -77,7 +77,7 @@ def test_year_range_uses_current_year_by_default() -> None:
     ("filename", "tokens", "cost", "rerank_candidates", "search_calls", "elapsed_seconds", "soft_deadline_seconds"),
     [
         ("budget_low.yaml", 10_000, 0.10, 12, 12, 90, 80),
-        ("budget_balanced.yaml", 24_000, 0.30, 30, 18, 180, 170),
+        ("budget_balanced.yaml", 24_000, 0.30, 30, 24, 180, 170),
     ],
 )
 def test_budget_profiles_match_prd(

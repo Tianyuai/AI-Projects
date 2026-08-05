@@ -74,7 +74,7 @@ def test_year_range_uses_current_year_by_default() -> None:
 
 
 @pytest.mark.parametrize(
-    ("filename", "tokens", "cost", "rerank_candidates", "search_calls"),
+    ("filename", "tokens", "cost", "rerank_candidates", "search_calls", "elapsed_seconds"),
     [
         ("budget_low.yaml", 10_000, 0.10, 12, 12, 90),
         ("budget_balanced.yaml", 24_000, 0.30, 30, 18, 180),

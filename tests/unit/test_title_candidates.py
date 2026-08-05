@@ -313,6 +313,32 @@ def test_recall_searches_titles_and_dedupes() -> None:
     assert "instructions" in payload
 
 
+def test_recall_payload_includes_query_spec_context() -> None:
+    controller = HardBudgetController(_budget())
+    analyzer = FakeTitleAnalyzer({"titles": ["One"]})
+    stage = _stage(analyzer, FakeTitleProvider())
+    spec = _spec()
+
+    asyncio.run(stage.recall(spec, controller=controller))
+
+    _, payload, _ = analyzer.calls[0]
+    assert payload["research_goal"] == spec.research_goal
+    assert payload["topics"] == spec.topics
+    assert payload["must_have"] == spec.must_have
+
+
+def test_default_title_candidate_limits_are_ten() -> None:
+    stage = LLMTitleCandidateStage(
+        analyzer=FakeTitleAnalyzer({"titles": []}),
+        provider=FakeTitleProvider(),
+        llm_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        search_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    assert stage._max_titles == 10  # type: ignore[attr-defined]  # noqa: SLF001
+    assert "a list of 10" in stage._instructions  # type: ignore[attr-defined]  # noqa: SLF001
+
+
 def test_recall_continues_past_a_failed_title_search() -> None:
     controller = HardBudgetController(_budget())
     analyzer = FakeTitleAnalyzer({"titles": ["Good", "Bad"]})

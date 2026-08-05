@@ -150,7 +150,7 @@ def test_runtime_settings_and_policy_bindings_are_reproducible(tmp_path: Path) -
 def test_base_config_preserves_the_balanced_integrated_baseline() -> None:
     config = load_runtime_config(Path("configs/base.yaml"), env_file=None)
 
-    assert config.budget.max_search_api_calls == 12
+    assert config.budget.max_search_api_calls == 18
     assert config.budget.max_llm_calls == 5
     assert config.budget.max_iterations == 2
     assert config.routing.openalex_calls_max == 6
@@ -160,6 +160,18 @@ def test_base_config_preserves_the_balanced_integrated_baseline() -> None:
     assert config.budget.max_total_tokens == 24_000
     assert config.budget.max_output_papers == 50
     assert config.budget.max_cost_cny == pytest.approx(0.30)
+
+
+def test_title_candidates_config_loads_the_experiment() -> None:
+    config = load_runtime_config(
+        Path("configs/title_candidates.yaml"),
+        env_file=None,
+    )
+
+    assert config.experiment == "title-candidates"
+    assert config.budget_profile == "balanced"
+    assert config.budget.max_search_api_calls == 18
+    assert config.routing.semantic_scholar_calls_max == 0
 
 
 def test_embedding_config_accepts_explicit_cuda_with_cpu_fallback(

@@ -74,10 +74,10 @@ def test_year_range_uses_current_year_by_default() -> None:
 
 
 @pytest.mark.parametrize(
-    ("filename", "tokens", "cost", "rerank_candidates"),
+    ("filename", "tokens", "cost", "rerank_candidates", "search_calls"),
     [
-        ("budget_low.yaml", 10_000, 0.10, 12),
-        ("budget_balanced.yaml", 24_000, 0.30, 30),
+        ("budget_low.yaml", 10_000, 0.10, 12, 12),
+        ("budget_balanced.yaml", 24_000, 0.30, 30, 18),
     ],
 )
 def test_budget_profiles_match_prd(
@@ -85,10 +85,11 @@ def test_budget_profiles_match_prd(
     tokens: int,
     cost: float,
     rerank_candidates: int,
+    search_calls: int,
 ) -> None:
     budget = load_budget(f"configs/{filename}")
 
-    assert budget.max_search_api_calls == 12
+    assert budget.max_search_api_calls == search_calls
     assert budget.target_search_api_calls == 8
     assert budget.max_llm_calls == 5
     assert budget.target_llm_calls == 3

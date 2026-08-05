@@ -1,4 +1,4 @@
-max_search_api_calls: 12
+max_search_api_calls: 18
 target_search_api_calls: 8
 max_llm_calls: 5
 target_llm_calls: 3

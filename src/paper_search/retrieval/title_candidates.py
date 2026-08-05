@@ -54,11 +54,16 @@ _TITLE_KEYS = (
 )
 _MAX_TITLES = 10
 _DEFAULT_INSTRUCTIONS = (
-    'Respond with a JSON object whose only key is "titles", a list of 5 '
-    "strings. Each string must be the full title of a specific, real, "
-    "published academic paper that directly addresses the research query. "
-    "Use the exact real paper title as published. Only include papers you "
-    "are confident exist; do not invent, paraphrase, or describe papers. "
+    'Respond with a JSON object whose only key is "titles", a list of 10 '
+    "strings. Each string must be the full, exact title of a specific real "
+    "published academic paper that directly answers the research query. "
+    "Titles must read like genuine paper titles and use precise academic "
+    "terminology, including the specific methods, datasets, phenomena, or "
+    "problem formulations named in the research goal and constraints. "
+    "Prefer well-known, verifiable papers; vary the phrasing across "
+    "candidates, e.g., synonyms, alternate problem framings, and "
+    "method-first versus task-first titles. Only include papers you are "
+    "confident exist; never invent, paraphrase, or describe papers. "
     "Do not add explanations."
 )
 
@@ -317,7 +322,7 @@ class LLMTitleCandidateStage:
         provider: SearchProvider,
         llm_estimate: UsageEstimate,
         search_estimate: UsageEstimate,
-        max_titles: int = 5,
+        max_titles: int = 10,
         max_results_per_title: int = 10,
         instructions: str | None = None,
     ) -> None:
@@ -368,6 +373,9 @@ class LLMTitleCandidateStage:
                 prompt_name="title_candidates",
                 payload={
                     "query": spec.original_query,
+                    "research_goal": spec.research_goal,
+                    "topics": list(spec.topics),
+                    "must_have": list(spec.must_have),
                     "instructions": self._instructions,
                 },
                 reservation=llm_reservation,

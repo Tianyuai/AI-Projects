@@ -452,7 +452,9 @@ def test_title_candidates_experiment_builds_stage_with_per_call_estimates(
     assert stage._llm_estimate.llm_calls == 1  # type: ignore[attr-defined]  # noqa: SLF001
     assert stage._llm_estimate.input_tokens == 2000  # type: ignore[attr-defined]  # noqa: SLF001
     assert stage._llm_estimate.output_tokens == 1000  # type: ignore[attr-defined]  # noqa: SLF001
+    assert stage._llm_estimate.elapsed_ms == 20000  # type: ignore[attr-defined]  # noqa: SLF001
     assert stage._search_estimate.search_api_calls == 1  # type: ignore[attr-defined]  # noqa: SLF001
+    assert stage._search_estimate.elapsed_ms == 10000  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 def test_explicit_main_baseline_uses_lock_identity(

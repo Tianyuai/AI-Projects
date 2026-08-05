@@ -54,7 +54,7 @@ _TITLE_KEYS = (
 )
 _MAX_TITLES = 15
 _DEFAULT_INSTRUCTIONS = (
-    'Respond with a JSON object whose only key is "titles", a list of 15 '
+    'Respond with a JSON object whose only key is "titles", a list of 10 '
     "strings. Each string must be the full, exact title of a specific real "
     "published academic paper that directly answers the research query. "
     "Titles must read like genuine paper titles and use precise academic "
@@ -325,7 +325,7 @@ class LLMTitleCandidateStage:
         provider: SearchProvider,
         llm_estimate: UsageEstimate,
         search_estimate: UsageEstimate,
-        max_titles: int = 15,
+        max_titles: int = 10,
         max_results_per_title: int = 10,
         instructions: str | None = None,
     ) -> None:

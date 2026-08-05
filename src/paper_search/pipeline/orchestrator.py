@@ -390,6 +390,7 @@ class MockSearchOrchestrator:
         citation_expander: AsyncCitationExpansionStage | None = None,
         constraint_reranker: AsyncConstraintRerankingStage | None = None,
         title_candidate_stage: AsyncTitleCandidateStage | None = None,
+        max_output_papers: int | None = None,
         pricer: ActualCostPricer | None = None,
         provider_adapter_names: Mapping[DependencyName, str] | None = None,
     ) -> None:
@@ -413,6 +414,16 @@ class MockSearchOrchestrator:
         self._citation_expander = citation_expander
         self._constraint_reranker = constraint_reranker
         self._title_candidate_stage = title_candidate_stage
+        if (
+            max_output_papers is not None
+            and (
+                isinstance(max_output_papers, bool)
+                or not isinstance(max_output_papers, int)
+                or max_output_papers < 1
+            )
+        ):
+            raise ValueError("max_output_papers must be a positive integer")
+        self._max_output_papers = max_output_papers
         self._pricer = pricer
         self._provider_adapter_names = dict(provider_adapter_names or {})
         self._parser = QueryParser(QueryPlanner())
@@ -968,6 +979,18 @@ class MockSearchOrchestrator:
                         "truncated": rerank.truncated,
                     }
                 )
+        if self._max_output_papers is not None and len(papers) > self._max_output_papers:
+            papers = papers[: self._max_output_papers]
+            selected_fused = [
+                fused_by_id[paper.canonical_id] for paper in papers
+            ]
+            trace.append(
+                {
+                    "step": "truncate",
+                    "count": len(papers),
+                    "max_output_papers": self._max_output_papers,
+                }
+            )
         status = self._controller.stop_status()
         stop_reason = (
             status

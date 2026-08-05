@@ -633,6 +633,7 @@ def _replay_factory(
             citation_expander=components.citation_expander,
             constraint_reranker=components.constraint_reranker,
             title_candidate_stage=components.title_candidate_stage,
+            max_output_papers=lock.baseline.retrieval.max_output_papers,
         )
         return _with_evolution(
             orchestrator=orchestrator,
@@ -820,6 +821,7 @@ class _LiveOrchestratorFactory:
             citation_expander=components.citation_expander,
             constraint_reranker=components.constraint_reranker,
             title_candidate_stage=components.title_candidate_stage,
+            max_output_papers=lock.baseline.retrieval.max_output_papers,
         )
         return _LiveRunOrchestrator(
             orchestrator=_with_evolution(

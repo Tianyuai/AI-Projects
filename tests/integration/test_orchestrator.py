@@ -783,6 +783,53 @@ def test_title_candidate_stage_degraded_keeps_run_complete() -> None:
     assert result.stop_reason == "completed"
 
 
+def test_max_output_papers_truncates_final_papers_but_not_pool() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(_budget())
+
+    class MultiProvider:
+        async def search(
+            self,
+            query: str,
+            filters: dict[str, object],
+            limit: int,
+            reservation: object,
+        ) -> ProviderResult[list[Paper]]:
+            del query, filters, limit, reservation
+            return _result(
+                "openalex",
+                [
+                    Paper(
+                        canonical_id=f"openalex:W{i}",
+                        title=f"Paper {i}",
+                        openalex_id=f"W{i}",
+                        sources=["openalex"],
+                    )
+                    for i in range(3)
+                ],
+                UsageActual(search_api_calls=1),
+            )
+
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=FakeAnalyzer(events),
+        providers={"openalex": MultiProvider()},
+        config_hash="sha256:" + "c" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        max_output_papers=1,
+    )
+
+    result = asyncio.run(
+        orchestrator.run("graph retrieval", max_provider_results=5)
+    )
+
+    assert [paper.canonical_id for paper in result.papers] == ["openalex:W0"]
+    assert len(result.retrieved_paper_ids) == 3
+    assert len(result.post_filter_paper_ids) == 3
+
+
 def test_llm_rerank_stage_awaits_same_controller_without_nested_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

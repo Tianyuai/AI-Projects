@@ -449,6 +449,7 @@ def test_title_candidates_experiment_builds_stage_with_per_call_estimates(
     stage = orchestrator._title_candidate_stage  # type: ignore[attr-defined]  # noqa: SLF001
 
     assert stage is not None
+    assert orchestrator._max_output_papers == 50  # type: ignore[attr-defined]  # noqa: SLF001
     assert stage._llm_estimate.llm_calls == 1  # type: ignore[attr-defined]  # noqa: SLF001
     assert stage._llm_estimate.input_tokens == 2000  # type: ignore[attr-defined]  # noqa: SLF001
     assert stage._llm_estimate.output_tokens == 1000  # type: ignore[attr-defined]  # noqa: SLF001

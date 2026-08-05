@@ -8,7 +8,12 @@ const cancelButton = document.querySelector("#cancel-search");
 const status = document.querySelector("#status");
 const results = document.querySelector("#results");
 const resultSummary = document.querySelector("#result-summary");
+const selectedGroup = document.querySelector("#selected-group");
+const selectedResults = document.querySelector("#selected-results");
+const selectedCount = document.querySelector("#selected-count");
+const highGroup = document.querySelector("#high-group");
 const highResults = document.querySelector("#high-results");
+const partialGroup = document.querySelector("#partial-group");
 const partialResults = document.querySelector("#partial-results");
 const highCount = document.querySelector("#high-count");
 const partialCount = document.querySelector("#partial-count");
@@ -40,10 +45,14 @@ function appendDefinition(label, value) {
 }
 
 function clearOutput() {
+  selectedResults.replaceChildren();
   highResults.replaceChildren();
   partialResults.replaceChildren();
   provenance.replaceChildren();
   diagnostics.replaceChildren();
+  selectedGroup.hidden = true;
+  highGroup.hidden = true;
+  partialGroup.hidden = true;
   results.hidden = true;
   emptyState.hidden = true;
   evidencePanel.hidden = true;
@@ -78,8 +87,15 @@ function renderPaper(item, group, selectedIds) {
 
   const top = document.createElement("div");
   top.className = "card-topline";
-  addChip(top, group === "high" ? "High relevance" : "Partial relevance", group);
-  if (selectedIds.has(paper.canonical_id)) addChip(top, "Selected", "selected");
+  const groupLabels = {
+    high: "High relevance",
+    partial: "Partial relevance",
+    selected: "Selected result",
+  };
+  addChip(top, groupLabels[group] ?? "Result", group);
+  if (group !== "selected" && selectedIds.has(paper.canonical_id)) {
+    addChip(top, "Selected", "selected");
+  }
   addChip(top, `Score ${formatScore(evidence.final_score ?? evidence.fusion_score ?? item.score)}`, "score");
   article.append(top);
 
@@ -106,15 +122,17 @@ function renderPaper(item, group, selectedIds) {
   if (paper.authors?.length) article.append(textElement("p", listText(paper.authors), "authors"));
   article.append(textElement("p", paper.abstract || "Abstract not available from the current provider response.", `abstract${paper.abstract ? "" : " muted-text"}`));
 
-  const evidenceBox = document.createElement("div");
-  evidenceBox.className = "paper-evidence";
-  evidenceBox.append(
-    evidenceRow("Matched query parts", evidence.matched_subqueries),
-    evidenceRow("Matched constraints", evidence.matched_constraints, "positive"),
-    evidenceRow("Open constraints", evidence.unmatched_constraints, "warning"),
-    evidenceRow("Filter notes", evidence.filter_reasons)
-  );
-  article.append(evidenceBox);
+  if (item.evidence) {
+    const evidenceBox = document.createElement("div");
+    evidenceBox.className = "paper-evidence";
+    evidenceBox.append(
+      evidenceRow("Matched query parts", evidence.matched_subqueries),
+      evidenceRow("Matched constraints", evidence.matched_constraints, "positive"),
+      evidenceRow("Open constraints", evidence.unmatched_constraints, "warning"),
+      evidenceRow("Filter notes", evidence.filter_reasons)
+    );
+    article.append(evidenceBox);
+  }
 
   const rankEntries = Object.entries(evidence.source_ranks ?? item.source_ranks ?? {});
   if (rankEntries.length) {
@@ -139,14 +157,27 @@ function renderSuccess(payload) {
   const selectedIds = new Set(payload.selected_paper_ids ?? []);
   const high = payload.high_relevance ?? [];
   const partial = payload.partial_relevance ?? [];
+  const rankedIds = new Set(
+    [...high, ...partial].map((item) => (item.paper ?? item).canonical_id)
+  );
+  const selectedFallback = (payload.fused_papers ?? []).filter((item) => {
+    const paper = item.paper ?? item;
+    return selectedIds.has(paper.canonical_id) && !rankedIds.has(paper.canonical_id);
+  });
 
+  selectedFallback.forEach((item) => selectedResults.append(renderPaper(item, "selected", selectedIds)));
   high.forEach((item) => highResults.append(renderPaper(item, "high", selectedIds)));
   partial.forEach((item) => partialResults.append(renderPaper(item, "partial", selectedIds)));
+  selectedCount.textContent = String(selectedFallback.length);
   highCount.textContent = String(high.length);
   partialCount.textContent = String(partial.length);
-  resultSummary.textContent = `${selectedIds.size} selected · ${high.length + partial.length} ranked`;
-  results.hidden = high.length + partial.length === 0;
-  emptyState.hidden = high.length + partial.length !== 0;
+  selectedGroup.hidden = selectedFallback.length === 0;
+  highGroup.hidden = high.length === 0;
+  partialGroup.hidden = partial.length === 0;
+  const displayedCount = selectedFallback.length + high.length + partial.length;
+  resultSummary.textContent = `${selectedIds.size} selected · ${displayedCount} shown`;
+  results.hidden = displayedCount === 0;
+  emptyState.hidden = displayedCount !== 0;
 
   appendDefinition("Execution mode", payload.execution_mode);
   appendDefinition("Selected paper IDs", listText(payload.selected_paper_ids, "None"));

@@ -74,6 +74,7 @@ select { min-width: 12rem; padding: .65rem .8rem; border: 1px solid var(--border
 .count { display: grid; place-items: center; min-width: 1.8rem; min-height: 1.8rem; padding-inline: .45rem; border-radius: 999px; background: var(--surface-soft); color: var(--muted); font-size: .78rem; }
 .card-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
 .paper-card { min-width: 0; padding: 1.25rem; border: 1px solid var(--border); border-radius: 1rem; background: var(--surface); box-shadow: 0 5px 18px rgb(31 44 78 / 5%); }
+.paper-card.selected { border-top: 3px solid var(--brand); }
 .paper-card.high { border-top: 3px solid var(--success); }
 .paper-card.partial { border-top: 3px solid var(--warning); }
 .card-topline, .metadata { display: flex; flex-wrap: wrap; gap: .4rem; }

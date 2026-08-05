@@ -54,11 +54,15 @@
           <div><p class="eyebrow">Ranked output</p><h2 id="results-heading">Results</h2></div>
           <p id="result-summary" class="result-summary"></p>
         </div>
-        <section class="result-group" aria-labelledby="high-heading">
+        <section id="selected-group" class="result-group" aria-labelledby="selected-heading" hidden>
+          <div class="group-heading"><h3 id="selected-heading">Selected results</h3><span id="selected-count" class="count"></span></div>
+          <div id="selected-results" class="card-grid"></div>
+        </section>
+        <section id="high-group" class="result-group" aria-labelledby="high-heading">
           <div class="group-heading"><h3 id="high-heading">High relevance</h3><span id="high-count" class="count"></span></div>
           <div id="high-results" class="card-grid"></div>
         </section>
-        <section class="result-group" aria-labelledby="partial-heading">
+        <section id="partial-group" class="result-group" aria-labelledby="partial-heading">
           <div class="group-heading"><h3 id="partial-heading">Partial relevance</h3><span id="partial-count" class="count"></span></div>
           <div id="partial-results" class="card-grid"></div>
         </section>

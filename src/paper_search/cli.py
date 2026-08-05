@@ -91,6 +91,14 @@ def build_parser() -> argparse.ArgumentParser:
     compare = commands.add_parser("compare-replay", help="compare capture and replay")
     compare.add_argument("capture_run", type=Path)
     compare.add_argument("replay_run", type=Path)
+    ranking = commands.add_parser(
+        "ranking-metrics",
+        help="compute standalone ranked-retrieval metrics (MRR/NDCG)",
+    )
+    ranking.add_argument("--gold", type=Path, required=True)
+    ranking.add_argument("--pred", type=Path, required=True)
+    ranking.add_argument("--out", type=Path, required=True)
+    ranking.add_argument("--id-map", type=Path)
     serve = commands.add_parser("serve", help="serve the canonical replay API")
     serve.add_argument("--lock", type=Path, required=True)
     serve.add_argument("--mode", choices=("replay",), required=True)
@@ -271,6 +279,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return verify_run_command(args.run_directory)
     if args.command == "compare-replay":
         return compare_replay_command(args.capture_run, args.replay_run)
+    if args.command == "ranking-metrics":
+        from paper_search.evaluation.ranking_metrics import run_cli
+
+        return run_cli(args.gold, args.pred, args.out, args.id_map)
     if args.command == "serve":
         try:
             return _run_serve(args)

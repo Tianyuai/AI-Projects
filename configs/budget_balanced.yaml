@@ -9,6 +9,6 @@ max_output_papers: 50
 max_citation_seeds: 2
 target_citation_seeds: 1
 max_elapsed_seconds: 180
-soft_deadline_seconds: 80
+soft_deadline_seconds: 170
 max_total_tokens: 24000
 max_cost_cny: 0.30

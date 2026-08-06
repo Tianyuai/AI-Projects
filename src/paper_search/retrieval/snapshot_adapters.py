@@ -247,12 +247,17 @@ def _error(
 
 
 def _key_quota_exhausted(response: httpx.Response) -> bool:
-    """Return True when OpenAlex reports zero credits left for the used key."""
+    """Return True when the used OpenAlex key cannot afford another search.
+
+    OpenAlex list requests cost 10 credits. When the daily balance drops below
+    that, responses 429 with ``x-ratelimit-remaining`` set to the leftover
+    (positive) balance, so ``<= 0`` alone would never trigger rotation.
+    """
     remaining = response.headers.get("x-ratelimit-remaining")
     if remaining is None:
         return False
     try:
-        return int(remaining) <= 0
+        return int(remaining) < 10
     except (TypeError, ValueError):
         return False
 

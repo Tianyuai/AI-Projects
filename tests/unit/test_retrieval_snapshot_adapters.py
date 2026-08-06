@@ -251,7 +251,7 @@ def test_openalex_does_not_rotate_on_transient_rate_limit(
         if len(seen) == 1:
             return httpx.Response(
                 429,
-                headers={"x-ratelimit-remaining": "5"},
+                headers={"x-ratelimit-remaining": "9950"},
                 request=request,
             )
         return httpx.Response(
@@ -273,6 +273,42 @@ def test_openalex_does_not_rotate_on_transient_rate_limit(
     result = asyncio.run(run())
 
     assert seen == ["synthetic-key", "synthetic-key", "synthetic-key"]
+    assert result.errors == []
+
+
+def test_openalex_rotates_when_remaining_credits_cannot_afford_search(
+    tmp_path: Path,
+) -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        api_key = request.url.params["api_key"]
+        seen.append(api_key)
+        if api_key == "synthetic-key":
+            return httpx.Response(
+                429,
+                headers={"x-ratelimit-remaining": "6"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> object:
+        live, _, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+            additional_api_keys=["fallback-key"],
+        )
+        async with client:
+            return await live.search("RAG", {}, 3, _reservation())
+
+    result = asyncio.run(run())
+
+    assert seen[:2] == ["synthetic-key", "fallback-key"]
     assert result.errors == []
 
 

@@ -133,6 +133,7 @@ async def _capture(
     dependency: str,
     handler: Callable[[httpx.Request], httpx.Response],
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    mailto: str | None = None,
 ) -> tuple[LiveCaptureSearchProvider, DependencyCaptureStore, SettlementSpy, httpx.AsyncClient]:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
@@ -144,6 +145,7 @@ async def _capture(
         pricer=_pricer(),
         controller=controller,
         api_key="synthetic-key",
+        mailto=mailto,
         clock=lambda: CAPTURED_AT,
         sleep=sleep,
         jitter=lambda: 0.0,
@@ -261,6 +263,39 @@ def test_capture_identity_is_safe_and_excludes_credentials(tmp_path: Path) -> No
     serialized = manifest.model_dump_json() + result.model_dump_json()
     assert "synthetic-key" not in serialized
     assert "api_key" not in serialized.casefold()
+
+
+def test_openalex_mailto_is_sent_but_never_enters_snapshot_identity(
+    tmp_path: Path,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> object:
+        live, store, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+            mailto="team@example.com",
+        )
+        async with client:
+            result = await live.search("RAG", {}, 3, _reservation())
+        manifest = store.seal()
+        return result, manifest
+
+    result, manifest = asyncio.run(run())
+    serialized = manifest.model_dump_json() + result.model_dump_json()
+
+    assert seen[0].url.params["mailto"] == "team@example.com"
+    assert "team@example.com" not in serialized
+    assert "mailto" not in serialized.casefold()
 
 
 def test_failed_response_is_captured_as_error_and_retries_are_accounted(

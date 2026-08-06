@@ -46,6 +46,7 @@ async def run_search(
     limit: int = 2,
     calls: int = 1,
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    mailto: str | None = None,
 ) -> ProviderResult[list[Any]]:
     async with httpx.AsyncClient(
         base_url="https://api.openalex.org",
@@ -58,6 +59,7 @@ async def run_search(
             client=client,
             cache=cache,
             api_key=API_KEY,
+            mailto=mailto,
             **provider_kwargs,
         )
         return await provider.search(query, filters or {}, limit, reservation(calls))
@@ -111,6 +113,70 @@ def test_search_removes_openalex_wildcards_and_collapses_whitespace(
     )
 
     assert seen[0].url.params["search"] == "graph retrieval methods"
+
+
+def test_search_includes_mailto_when_explicitly_configured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=fixture_bytes("works_page_1.json"))
+
+    monkeypatch.delenv("OPENALEX_MAILTO", raising=False)
+    asyncio.run(
+        run_search(
+            SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            handler,
+            mailto="team@example.com",
+        )
+    )
+
+    assert seen[0].url.params["mailto"] == "team@example.com"
+
+
+def test_search_reads_mailto_from_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=fixture_bytes("works_page_1.json"))
+
+    monkeypatch.setenv("OPENALEX_MAILTO", "env@example.com")
+    asyncio.run(
+        run_search(
+            SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            handler,
+        )
+    )
+
+    assert seen[0].url.params["mailto"] == "env@example.com"
+
+
+def test_search_omits_mailto_when_unconfigured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=fixture_bytes("works_page_1.json"))
+
+    monkeypatch.delenv("OPENALEX_MAILTO", raising=False)
+    asyncio.run(
+        run_search(
+            SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            handler,
+        )
+    )
+
+    assert "mailto" not in seen[0].url.params
 
 
 def test_search_rejects_query_that_is_empty_after_wildcard_normalization(

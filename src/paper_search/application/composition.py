@@ -650,6 +650,7 @@ class _LiveCredentials:
     llm: SecretStr
     openalex: SecretStr | None
     semantic_scholar: SecretStr | None
+    openalex_mailto: str | None = None
 
     def __repr__(self) -> str:
         return "_LiveCredentials(llm=**********, openalex=**********, semantic_scholar=**********)"
@@ -775,6 +776,7 @@ class _LiveOrchestratorFactory:
                     if self._credentials.openalex is not None
                     else None
                 ),
+                mailto=self._credentials.openalex_mailto,
             ),
             "semantic_scholar": LiveCaptureSearchProvider(
                 dependency="semantic_scholar",
@@ -1130,6 +1132,7 @@ class CompositionRoot:
                     if resolved_environ.get("SEMANTIC_SCHOLAR_API_KEY")
                     else None
                 ),
+                openalex_mailto=resolved_environ.get("OPENALEX_MAILTO"),
             )
             orchestrator_factory = _LiveOrchestratorFactory(
                 lock=lock,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
@@ -196,6 +197,7 @@ class OpenAlexProvider:
         client: httpx.AsyncClient,
         cache: SQLiteResponseCache,
         api_key: str,
+        mailto: str | None = None,
         clock: Clock = _utc_now,
         sleep: Sleep = asyncio.sleep,
         jitter: Jitter = random.random,
@@ -206,6 +208,7 @@ class OpenAlexProvider:
         self._client = client
         self._cache = cache
         self._api_key = api_key
+        self._mailto = mailto if mailto is not None else os.environ.get("OPENALEX_MAILTO")
         self._clock = clock
         self._sleep = sleep
         self._jitter = jitter
@@ -383,6 +386,8 @@ class OpenAlexProvider:
                 "search": normalized_query,
                 "select": OPENALEX_SELECT_FIELDS,
             }
+            if self._mailto:
+                params["mailto"] = self._mailto
             if filter_value is not None:
                 params["filter"] = filter_value
             key = make_cache_key("openalex", _ENDPOINT, params, self._cache_version)

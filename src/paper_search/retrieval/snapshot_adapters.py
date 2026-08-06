@@ -313,6 +313,7 @@ class LiveCaptureSearchProvider:
         pricer: ActualCostPricer,
         controller: ProviderSettlementController,
         api_key: str | None = None,
+        mailto: str | None = None,
         adapter_version: str | None = None,
         clock: Clock = _utc_now,
         sleep: Sleep | None = None,
@@ -324,6 +325,7 @@ class LiveCaptureSearchProvider:
         self._pricer = pricer
         self._controller = controller
         self._api_key = api_key
+        self._mailto = mailto
         self._adapter = adapter_version or _ADAPTERS[dependency]
         self._clock = clock
         self._sleep = sleep or asyncio.sleep
@@ -372,15 +374,14 @@ class LiveCaptureSearchProvider:
                 safe_headers={},
             )
         headers = {"Accept": "application/json"}
+        request_params = dict(params)
         if self._api_key:
             if self._dependency == "openalex":
-                request_params = dict(params)
                 request_params["api_key"] = self._api_key
             else:
-                request_params = dict(params)
                 headers["x-api-key"] = self._api_key
-        else:
-            request_params = dict(params)
+        if self._dependency == "openalex" and self._mailto:
+            request_params["mailto"] = self._mailto
 
         last_error: ErrorDetail | None = None
         error_response_bytes = b""

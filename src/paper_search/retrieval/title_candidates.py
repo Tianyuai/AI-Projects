@@ -52,9 +52,9 @@ _TITLE_KEYS = (
     "papers",
     "candidates",
 )
-_MAX_TITLES = 15
+_MAX_TITLES = 20
 _DEFAULT_INSTRUCTIONS = (
-    'Respond with a JSON object whose only key is "titles", a list of 10 '
+    'Respond with a JSON object whose only key is "titles", a list of 20 '
     "strings. Each string must be the full, exact title of a specific real "
     "published academic paper that directly answers the research query. "
     "Titles must read like genuine paper titles and use precise academic "
@@ -89,7 +89,7 @@ def extract_title_candidates(data: object, *, limit: int = 5) -> list[str]:
         or not isinstance(limit, int)
         or not 1 <= limit <= _MAX_TITLES
     ):
-        raise ValueError("limit must be an integer between 1 and 10")
+        raise ValueError("limit must be an integer between 1 and 20")
     collected: list[str] = []
 
     def walk(value: object) -> None:
@@ -325,7 +325,7 @@ class LLMTitleCandidateStage:
         provider: SearchProvider,
         llm_estimate: UsageEstimate,
         search_estimate: UsageEstimate,
-        max_titles: int = 10,
+        max_titles: int = 20,
         max_results_per_title: int = 10,
         instructions: str | None = None,
     ) -> None:

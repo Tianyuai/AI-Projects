@@ -327,7 +327,7 @@ def test_recall_payload_includes_query_spec_context() -> None:
     assert payload["must_have"] == spec.must_have
 
 
-def test_default_title_candidate_limits_are_ten() -> None:
+def test_default_title_candidate_limits_are_twenty() -> None:
     stage = LLMTitleCandidateStage(
         analyzer=FakeTitleAnalyzer({"titles": []}),
         provider=FakeTitleProvider(),
@@ -335,8 +335,8 @@ def test_default_title_candidate_limits_are_ten() -> None:
         search_estimate=UsageEstimate(search_api_calls=1),
     )
 
-    assert stage._max_titles == 10  # type: ignore[attr-defined]  # noqa: SLF001
-    assert "a list of 10" in stage._instructions  # type: ignore[attr-defined]  # noqa: SLF001
+    assert stage._max_titles == 20  # type: ignore[attr-defined]  # noqa: SLF001
+    assert "a list of 20" in stage._instructions  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 def test_recall_continues_past_a_failed_title_search() -> None:

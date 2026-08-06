@@ -679,6 +679,30 @@ def test_provider_secrets_are_confined_to_redacted_private_factory(
     assert all(secret not in exposed for secret in secrets.values())
 
 
+def test_openalex_api_keys_collects_numbered_environment_variables() -> None:
+    keys = composition_module._openalex_api_keys(
+        {
+            "OPENALEX_API_KEY": "key-one",
+            "OPENALEX_API_KEY_2": "key-one",
+            "OPENALEX_API_KEY_3": "key-three",
+            "LLM_API_KEY": "ignored",
+        }
+    )
+
+    assert [key.get_secret_value() for key in keys] == ["key-one", "key-three"]
+
+
+def test_openalex_api_keys_stops_at_first_missing_number() -> None:
+    keys = composition_module._openalex_api_keys(
+        {
+            "OPENALEX_API_KEY": "key-one",
+            "OPENALEX_API_KEY_3": "key-three",
+        }
+    )
+
+    assert [key.get_secret_value() for key in keys] == ["key-one"]
+
+
 def _empty_live_result() -> OrchestratorResult:
     return OrchestratorResult(
         query_analysis=QueryAnalysisResult(

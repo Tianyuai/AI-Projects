@@ -146,6 +146,7 @@ def test_env_example_has_only_documented_variables() -> None:
     expected = {
         "HF_TOKEN",
         "OPENALEX_API_KEY",
+        "OPENALEX_API_KEY_2",
         "OPENALEX_MAILTO",
         "SEMANTIC_SCHOLAR_API_KEY",
         "LLM_API_KEY",

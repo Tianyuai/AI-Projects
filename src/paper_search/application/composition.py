@@ -648,12 +648,32 @@ def _replay_factory(
 @dataclass(frozen=True, repr=False)
 class _LiveCredentials:
     llm: SecretStr
-    openalex: SecretStr | None
     semantic_scholar: SecretStr | None
+    openalex_keys: tuple[SecretStr, ...] = ()
     openalex_mailto: str | None = None
 
     def __repr__(self) -> str:
-        return "_LiveCredentials(llm=**********, openalex=**********, semantic_scholar=**********)"
+        return (
+            "_LiveCredentials(llm=**********, "
+            f"openalex_keys={len(self.openalex_keys)}x**********, "
+            "semantic_scholar=**********)"
+        )
+
+
+def _openalex_api_keys(environ: Mapping[str, str]) -> tuple[SecretStr, ...]:
+    """Collect OPENALEX_API_KEY, OPENALEX_API_KEY_2, ... in order."""
+    keys: list[str] = []
+    index = 0
+    while True:
+        name = "OPENALEX_API_KEY" if index == 0 else f"OPENALEX_API_KEY_{index + 1}"
+        value = environ.get(name)
+        if value is None:
+            break
+        value = value.strip()
+        if value and value not in keys:
+            keys.append(value)
+        index += 1
+    return tuple(SecretStr(key) for key in keys)
 
 
 class _LiveRunOrchestrator:
@@ -772,9 +792,14 @@ class _LiveOrchestratorFactory:
                 pricer=self._pricer,
                 controller=controller,
                 api_key=(
-                    self._credentials.openalex.get_secret_value()
-                    if self._credentials.openalex is not None
+                    self._credentials.openalex_keys[0].get_secret_value()
+                    if self._credentials.openalex_keys
                     else None
+                ),
+                additional_api_keys=(
+                    [key.get_secret_value() for key in self._credentials.openalex_keys[1:]]
+                    if len(self._credentials.openalex_keys) > 1
+                    else ()
                 ),
                 mailto=self._credentials.openalex_mailto,
             ),
@@ -1122,11 +1147,7 @@ class CompositionRoot:
             pricer = ActualCostPricer(pricing_policy)
             credentials = _LiveCredentials(
                 llm=SecretStr(llm_api_key),
-                openalex=(
-                    SecretStr(resolved_environ["OPENALEX_API_KEY"])
-                    if resolved_environ.get("OPENALEX_API_KEY")
-                    else None
-                ),
+                openalex_keys=_openalex_api_keys(resolved_environ),
                 semantic_scholar=(
                     SecretStr(resolved_environ["SEMANTIC_SCHOLAR_API_KEY"])
                     if resolved_environ.get("SEMANTIC_SCHOLAR_API_KEY")

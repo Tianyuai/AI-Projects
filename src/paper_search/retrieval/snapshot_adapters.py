@@ -246,6 +246,17 @@ def _error(
     )
 
 
+def _key_quota_exhausted(response: httpx.Response) -> bool:
+    """Return True when OpenAlex reports zero credits left for the used key."""
+    remaining = response.headers.get("x-ratelimit-remaining")
+    if remaining is None:
+        return False
+    try:
+        return int(remaining) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _status_error(
     dependency: ProviderName,
     status_code: int,
@@ -313,6 +324,7 @@ class LiveCaptureSearchProvider:
         pricer: ActualCostPricer,
         controller: ProviderSettlementController,
         api_key: str | None = None,
+        additional_api_keys: Sequence[str] = (),
         mailto: str | None = None,
         adapter_version: str | None = None,
         clock: Clock = _utc_now,
@@ -324,6 +336,14 @@ class LiveCaptureSearchProvider:
         self._capture_store = capture_store
         self._pricer = pricer
         self._controller = controller
+        keys: list[str] = []
+        if api_key:
+            keys.append(api_key)
+        for key in additional_api_keys:
+            if key and key not in keys:
+                keys.append(key)
+        self._api_keys = tuple(keys)
+        self._key_cursor = 0
         self._api_key = api_key
         self._mailto = mailto
         self._adapter = adapter_version or _ADAPTERS[dependency]
@@ -375,11 +395,11 @@ class LiveCaptureSearchProvider:
             )
         headers = {"Accept": "application/json"}
         request_params = dict(params)
-        if self._api_key:
-            if self._dependency == "openalex":
-                request_params["api_key"] = self._api_key
-            else:
-                headers["x-api-key"] = self._api_key
+        if self._dependency == "openalex":
+            if self._api_keys:
+                request_params["api_key"] = self._api_keys[self._key_cursor]
+        elif self._api_key:
+            headers["x-api-key"] = self._api_key
         if self._dependency == "openalex" and self._mailto:
             request_params["mailto"] = self._mailto
 
@@ -461,6 +481,15 @@ class LiveCaptureSearchProvider:
                 or retry_index + 1 >= attempts_allowed
             ):
                 break
+            if (
+                self._dependency == "openalex"
+                and len(self._api_keys) > 1
+                and last_error.code == "rate_limited"
+                and _key_quota_exhausted(response)
+                and self._rotate_key()
+            ):
+                request_params["api_key"] = self._api_keys[self._key_cursor]
+                continue
             delay_seconds = min(8, 2**retry_index) + self._jitter()
             remaining_seconds = operation.remaining_seconds()
             if delay_seconds >= remaining_seconds:
@@ -484,6 +513,12 @@ class LiveCaptureSearchProvider:
             safe_headers={},
             error_response_bytes=error_response_bytes,
         )
+
+    def _rotate_key(self) -> bool:
+        if self._key_cursor + 1 >= len(self._api_keys):
+            return False
+        self._key_cursor += 1
+        return True
 
     @staticmethod
     def _settle(operation: _LiveOperation) -> UsageActual:

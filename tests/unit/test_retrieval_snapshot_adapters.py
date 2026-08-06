@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -134,6 +134,7 @@ async def _capture(
     handler: Callable[[httpx.Request], httpx.Response],
     sleep: Callable[[float], Awaitable[None]] | None = None,
     mailto: str | None = None,
+    additional_api_keys: Sequence[str] = (),
 ) -> tuple[LiveCaptureSearchProvider, DependencyCaptureStore, SettlementSpy, httpx.AsyncClient]:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
@@ -145,6 +146,7 @@ async def _capture(
         pricer=_pricer(),
         controller=controller,
         api_key="synthetic-key",
+        additional_api_keys=additional_api_keys,
         mailto=mailto,
         clock=lambda: CAPTURED_AT,
         sleep=sleep,
@@ -190,6 +192,130 @@ def test_openalex_live_and_replay_are_identical_and_refs_are_page_ordered(tmp_pa
         for name in ("works_page_1.json", "works_page_2.json")
     ]
     assert [ref["response_sha256"] for ref in refs] == expected_hashes
+
+
+def test_openalex_rotates_to_next_key_when_quota_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        api_key = request.url.params["api_key"]
+        seen.append((api_key, request.url.params["cursor"]))
+        if api_key == "synthetic-key":
+            return httpx.Response(
+                429,
+                headers={"x-ratelimit-remaining": "0"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> object:
+        live, store, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+            additional_api_keys=["fallback-key"],
+        )
+        async with client:
+            result = await live.search("RAG", {}, 3, _reservation())
+        return result, store.seal()
+
+    result, manifest = asyncio.run(run())
+
+    assert [api_key for api_key, _ in seen] == [
+        "synthetic-key",
+        "fallback-key",
+        "fallback-key",
+    ]
+    assert [cursor for _, cursor in seen] == ["*", "*", "cursor-page-2"]
+    assert result.errors == []
+    captured_hashes = {
+        entry.request.canonical_request_sha256 for entry in manifest.entries
+    }
+    assert _openalex_identity().canonical_request_sha256 in captured_hashes
+
+
+def test_openalex_does_not_rotate_on_transient_rate_limit(
+    tmp_path: Path,
+) -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        api_key = request.url.params["api_key"]
+        seen.append(api_key)
+        if len(seen) == 1:
+            return httpx.Response(
+                429,
+                headers={"x-ratelimit-remaining": "5"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> object:
+        live, _, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+            additional_api_keys=["fallback-key"],
+        )
+        async with client:
+            return await live.search("RAG", {}, 3, _reservation())
+
+    result = asyncio.run(run())
+
+    assert seen == ["synthetic-key", "synthetic-key", "synthetic-key"]
+    assert result.errors == []
+
+
+def test_openalex_key_rotation_persists_for_followup_requests(
+    tmp_path: Path,
+) -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        api_key = request.url.params["api_key"]
+        seen.append(api_key)
+        if api_key == "synthetic-key":
+            return httpx.Response(
+                429,
+                headers={"x-ratelimit-remaining": "0"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> object:
+        live, _, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+            additional_api_keys=["fallback-key"],
+        )
+        async with client:
+            await live.search("RAG", {}, 3, _reservation())
+            await live.search("graph retrieval", {}, 3, _reservation())
+
+    asyncio.run(run())
+
+    assert seen == [
+        "synthetic-key",
+        "fallback-key",
+        "fallback-key",
+        "fallback-key",
+        "fallback-key",
+    ]
 
 
 def test_semantic_scholar_get_and_post_have_distinct_identities(tmp_path: Path) -> None:

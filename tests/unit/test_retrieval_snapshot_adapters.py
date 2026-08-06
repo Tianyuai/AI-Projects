@@ -24,6 +24,7 @@ from paper_search.retrieval.snapshot_adapters import (
     LiveCaptureSearchProvider,
     ProviderAdapterError,
     ReplaySearchProvider,
+    _attempt_timeout,
 )
 from paper_search.retrieval.openalex import OPENALEX_SELECT_FIELDS
 from paper_search.storage.dependency_snapshot import (
@@ -238,6 +239,23 @@ def test_openalex_rotates_to_next_key_when_quota_is_exhausted(
         entry.request.canonical_request_sha256 for entry in manifest.entries
     }
     assert _openalex_identity().canonical_request_sha256 in captured_hashes
+
+
+@pytest.mark.parametrize(
+    ("remaining", "read_timeout", "expected"),
+    [
+        (120.0, 20.0, 20.0),
+        (5.0, 20.0, 5.0),
+        (120.0, None, 120.0),
+        (120.0, 0.0, 120.0),
+    ],
+)
+def test_attempt_timeout_is_bounded_by_read_timeout(
+    remaining: float,
+    read_timeout: float | None,
+    expected: float,
+) -> None:
+    assert _attempt_timeout(remaining, read_timeout) == expected
 
 
 def test_openalex_does_not_rotate_on_transient_rate_limit(

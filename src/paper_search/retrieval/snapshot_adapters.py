@@ -262,6 +262,13 @@ def _key_quota_exhausted(response: httpx.Response) -> bool:
         return False
 
 
+def _attempt_timeout(remaining_seconds: float, read_timeout: float | None) -> float:
+    """Bound one HTTP attempt by the configured read timeout as well as the deadline."""
+    if read_timeout is None or read_timeout <= 0:
+        return remaining_seconds
+    return min(remaining_seconds, read_timeout)
+
+
 def _status_error(
     dependency: ProviderName,
     status_code: int,
@@ -423,8 +430,17 @@ class LiveCaptureSearchProvider:
                 break
             operation.start_attempt()
             attempts_made += 1
+            configured_read = self._client.timeout.read
+            attempt_timeout = _attempt_timeout(
+                remaining_seconds,
+                (
+                    float(configured_read)
+                    if isinstance(configured_read, (int, float))
+                    else None
+                ),
+            )
             try:
-                async with asyncio.timeout(remaining_seconds):
+                async with asyncio.timeout(attempt_timeout):
                     response = await self._client.request(
                         method,
                         f"{_BASE_URLS[self._dependency]}{endpoint}",
@@ -432,7 +448,7 @@ class LiveCaptureSearchProvider:
                         json=body,
                         headers=headers,
                         follow_redirects=False,
-                        timeout=remaining_seconds,
+                        timeout=attempt_timeout,
                     )
             except (TimeoutError, httpx.TimeoutException):
                 operation.finish_attempt()

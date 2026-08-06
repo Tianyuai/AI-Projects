@@ -259,7 +259,7 @@ class _RequestExperimentDependencies:
                 }
             ),
             search_estimate=self.provider_estimates["openalex"].model_copy(
-                update={"search_api_calls": 1, "elapsed_ms": 3000}
+                update={"search_api_calls": 1, "elapsed_ms": 8000}
             ),
         )
 

@@ -459,9 +459,8 @@ class LLMTitleCandidateStage:
                 searches += 1
                 if controller.terminal_outcome(reservation) is None:
                     try:
-                        controller.fail_closed(
+                        controller.release(
                             reservation,
-                            UsageActual(search_api_calls=1),
                         )
                     except Exception:
                         pass

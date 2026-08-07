@@ -682,8 +682,6 @@ class LiveCaptureSearchProvider:
                 break
             refs.append(self._capture(identity, outcome))
             hashes.append(_sha256(outcome.content))
-            if operation.remaining_seconds() <= 0:
-                raise TimeoutError("provider deadline expired during capture")
             try:
                 decoded = decode_openalex_page(outcome.content, limit=remaining)
             except ValueError:
@@ -696,8 +694,6 @@ class LiveCaptureSearchProvider:
                     )
                 )
                 break
-            if operation.remaining_seconds() <= 0:
-                raise TimeoutError("provider deadline expired during decode")
             papers.extend(decoded.papers)
             errors.extend(decoded.errors)
             raw_seen += decoded.raw_count
@@ -842,11 +838,7 @@ class LiveCaptureSearchProvider:
         elif outcome.content is not None:
             refs.append(self._capture(identity, outcome))
             hashes.append(_sha256(outcome.content))
-            if operation.remaining_seconds() <= 0:
-                raise TimeoutError("provider deadline expired during capture")
             decoded = decode(outcome.content)
-            if operation.remaining_seconds() <= 0:
-                raise TimeoutError("provider deadline expired during decode")
             papers.extend(decoded.papers)
             errors.extend(decoded.errors)
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))

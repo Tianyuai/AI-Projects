@@ -245,6 +245,53 @@ def test_live_llm_error_is_captured_and_replayed(tmp_path: Path) -> None:
     assert replayed.provenance.get("snapshot_refs") == result.provenance.get("snapshot_refs")
 
 
+def test_live_llm_malformed_content_is_captured_and_replayed(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=(
+                b'{"choices":[{"message":{"content":"not-json"}}],'
+                b'"usage":{"prompt_tokens":5,"completion_tokens":3}}'
+            ),
+            request=request,
+        )
+
+    controller = SettlementRecorder()
+    result, store = asyncio.run(
+        _live(
+            tmp_path,
+            httpx.MockTransport(handler),
+            controller,
+        )
+    )
+    manifest = store.seal()
+    replay = ReplayLLMAnalyzer(
+        reader=DependencySnapshotReader(
+            store.manifest_path,
+            snapshot_manifest_sha256=store.manifest_sha256,
+            snapshot_set_id=manifest.snapshot_set_id,
+        ),
+        model_id="deepseek-test-v1",
+        prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
+        prompt_version="query-analyze-v1",
+    )
+    replayed = asyncio.run(
+        replay.generate_json(
+            prompt_name="query_analyze",
+            payload={"query": "graph retrieval"},
+            reservation=_reservation(),
+        )
+    )
+
+    assert result.errors[0].code == "invalid_json"
+    assert result.provenance.get("snapshot_refs")
+    assert replayed.errors[0].code == "invalid_json"
+    assert (
+        replayed.provenance.get("snapshot_refs")
+        == result.provenance.get("snapshot_refs")
+    )
+
+
 def test_replay_reproduces_staged_llm_error(tmp_path: Path) -> None:
     store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
     identity = DependencyRequestIdentity.from_canonical_request(

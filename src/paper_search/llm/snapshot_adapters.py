@@ -357,7 +357,33 @@ class LiveCaptureLLMAnalyzer:
                         snapshot_ref=None,
                     )
                     if decoded.errors:
-                        terminal = decoded.model_copy(
+                        safe_headers: dict[str, str] = {}
+                        content_type = response.headers.get("content-type")
+                        if content_type is not None:
+                            safe_headers["content-type"] = content_type
+                        if request_id is not None:
+                            safe_headers["x-request-id"] = request_id
+                        snapshot_ref = self._capture_store.stage_error(
+                            identity,
+                            error_code=decoded.errors[0].code,
+                            message=decoded.errors[0].message,
+                            retryable=decoded.errors[0].retryable,
+                            response_bytes=response_bytes,
+                            safe_headers=safe_headers,
+                            captured_at=requested_at,
+                        )
+                        self._capture_store.annotate_usage(
+                            snapshot_ref.entry_id,
+                            accumulated,
+                        )
+                        decoded_with_ref = self._decoder.decode(
+                            response_bytes,
+                            model_id=self._client.model_id,
+                            captured_at=requested_at,
+                            cache_hit=False,
+                            snapshot_ref=snapshot_ref,
+                        )
+                        terminal = decoded_with_ref.model_copy(
                             update={
                                 "usage": accumulated,
                                 "latency_ms": accumulated.elapsed_ms,

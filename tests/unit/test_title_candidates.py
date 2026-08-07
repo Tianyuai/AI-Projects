@@ -434,6 +434,30 @@ def test_recall_continues_past_provider_adapter_failure() -> None:
     assert result.diagnostics[-1].errors
 
 
+def test_recall_continues_past_midlist_provider_failure_without_poisoning_controller() -> None:
+    controller = HardBudgetController(_budget(max_search_api_calls=8))
+    analyzer = FakeTitleAnalyzer({"titles": ["Good1", "Bad", "Good2", "Good3"]})
+    provider = RaisingTitleProvider(
+        {
+            "Good1": [Paper(canonical_id="openalex:W1", title="A")],
+            "Good2": [Paper(canonical_id="openalex:W2", title="B")],
+            "Good3": [Paper(canonical_id="openalex:W3", title="C")],
+        },
+        raising_queries={"Bad"},
+    )
+    stage = _stage(analyzer, provider, max_titles=4)
+
+    result = asyncio.run(stage.recall(_spec(), controller=controller))
+
+    assert result.titles_searched == 4
+    assert controller.stop_status() == "continue"
+    assert [p.canonical_id for p in result.provider_result.data] == [
+        "openalex:W1",
+        "openalex:W2",
+        "openalex:W3",
+    ]
+
+
 def test_recall_all_title_searches_fail_degrades() -> None:
     controller = HardBudgetController(_budget())
     analyzer = FakeTitleAnalyzer({"titles": ["Only"]})

@@ -1,5 +1,5 @@
 {
-    "config_hash": "sha256:136366305e45fd3b78d3437706473fad0b46674d0f2d0cab68a538fc77eee39d",
+    "config_hash": "sha256:ed73383ca279f3d34ed021b4d66019e2bb8e207440ba0ad091ab84bbbb2f2b72",
   "ended_at": "2026-08-02T00:00:00Z",
   "execution_mode": "replay",
   "experiment_name": "main-baseline",
@@ -7,7 +7,7 @@
   "frozen_manifest_sha256": "sha256:451d33a1f5d75c01df25e4e8ce7a7e1e1a446e94c40d01ef4bdca4a41dc1c65f",
   "gate_result": "failed",
   "identifier_map_sha256": "sha256:420728bdf408ac4607beeb99392c0fe23218a8e4b1681023b6a7d44349e37eb4",
-  "input_lock_sha256": "sha256:bce265a748bf1b4dc7fa0390f8f3a820ed82e97e9d72695ebffac99432675d6d",
+  "input_lock_sha256": "sha256:1a2443c0cddf11b126be2769b86571db6ae84a2d8264e4bd1a577e6b35abf650",
   "optional_modules": {
     "adaptive_evolution": false,
     "citation_expansion": false,
@@ -42,8 +42,8 @@
   ],
   "run_id": "replay",
   "schema_version": "formal-run-v1",
-  "snapshot_manifest_sha256": "sha256:f2482b26a805d1685baa40073f668aa19b9ea6ac747abcc5c16f9b01e389da3d",
-  "snapshot_set_id": "sha256:d379189926e89ea7c180f6505520712b17bf14b6ca84aea911949aba3f0d7980",
+  "snapshot_manifest_sha256": "sha256:1322aba21d74c567c9a41a64e60f225cccd2d1f5e1ffed3d5bbfa78714bad398",
+  "snapshot_set_id": "sha256:df06ffe647842f9833d996eb2e0e667335462c5a4736c1e66ad148a54f4dcd3b",
   "source_git_sha": "task2-fixture-commit",
   "split": "dev",
   "started_at": "2026-08-02T00:00:00Z",

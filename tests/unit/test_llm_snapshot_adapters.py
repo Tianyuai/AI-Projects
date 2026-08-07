@@ -99,7 +99,7 @@ async def _live(
         client = OpenAICompatibleLLMClient(
             client=http_client,
             base_url="https://llm.example.test/v1",
-            model="qwen-test-v1",
+            model="deepseek-test-v1",
             api_key="unit-test-secret",
             clock=lambda: CAPTURED_AT,
         )
@@ -227,7 +227,7 @@ def test_live_llm_error_is_captured_and_replayed(tmp_path: Path) -> None:
             snapshot_manifest_sha256=store.manifest_sha256,
             snapshot_set_id=manifest.snapshot_set_id,
         ),
-        model_id="qwen-test-v1",
+        model_id="deepseek-test-v1",
         prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
         prompt_version="query-analyze-v1",
     )
@@ -252,7 +252,7 @@ def test_replay_reproduces_staged_llm_error(tmp_path: Path) -> None:
         operation="generate_json",
         method="POST",
         endpoint="/chat/completions",
-        model_or_adapter="qwen-test-v1",
+        model_or_adapter="deepseek-test-v1",
         canonical_request={
             "prompt_name": "query_analyze",
             "payload": {"query": "graph retrieval"},
@@ -276,7 +276,7 @@ def test_replay_reproduces_staged_llm_error(tmp_path: Path) -> None:
             snapshot_manifest_sha256=store.manifest_sha256,
             snapshot_set_id=manifest.snapshot_set_id,
         ),
-        model_id="qwen-test-v1",
+        model_id="deepseek-test-v1",
         prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
         prompt_version="query-analyze-v1",
     )
@@ -319,7 +319,7 @@ def test_real_budget_controller_terminal_failure_records_usage_and_hard_stops(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
-                    model="qwen-test-v1",
+                    model="deepseek-test-v1",
                     api_key="unit-test-secret",
                 ),
                 capture_store=store,
@@ -366,7 +366,7 @@ def test_cancellation_after_dispatch_fail_closes_then_reraises_cancelled_error(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
-                    model="qwen-test-v1",
+                    model="deepseek-test-v1",
                     api_key="unit-test-secret",
                 ),
                 capture_store=DependencyCaptureStore(tmp_path / "cancelled"),
@@ -410,7 +410,7 @@ def test_unexpected_exception_after_dispatch_commits_conservative_usage(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
-                    model="qwen-test-v1",
+                    model="deepseek-test-v1",
                     api_key="unit-test-secret",
                 ),
                 capture_store=DependencyCaptureStore(tmp_path / "unexpected"),
@@ -464,7 +464,7 @@ def test_usage_measurement_failure_after_response_commits_one_unknown_attempt(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
-                    model="qwen-test-v1",
+                    model="deepseek-test-v1",
                     api_key="unit-test-secret",
                 ),
                 capture_store=DependencyCaptureStore(tmp_path / "measurement-failure"),
@@ -511,7 +511,7 @@ def test_live_capture_builds_safe_identity_and_stages_exact_success_bytes(
     assert (store.root / entry.response_path).read_bytes() == raw
     assert entry.request.dependency == "llm"
     assert entry.request.endpoint == "/chat/completions"
-    assert entry.request.model_or_adapter == "qwen-test-v1"
+    assert entry.request.model_or_adapter == "deepseek-test-v1"
     assert "secret" not in entry.model_dump_json().casefold()
     assert len(controller.settled) == 1
 
@@ -539,7 +539,7 @@ def test_replay_uses_identical_decoder_zero_cost_and_snapshot_provenance(
     replay = ReplayLLMAnalyzer(
         prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
         reader=reader,
-        model_id="qwen-test-v1",
+        model_id="deepseek-test-v1",
         clock=lambda: CAPTURED_AT,
     )
 
@@ -580,7 +580,7 @@ def test_replay_llm_reports_captured_usage_instead_of_zero(tmp_path: Path) -> No
     replay = ReplayLLMAnalyzer(
         prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
         reader=reader,
-        model_id="qwen-test-v1",
+        model_id="deepseek-test-v1",
         clock=lambda: CAPTURED_AT,
     )
 
@@ -608,7 +608,7 @@ def test_replay_miss_is_snapshot_unavailable_without_network_fallback(
     replay = ReplayLLMAnalyzer(
         prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
         reader=reader,
-        model_id="qwen-test-v1",
+        model_id="deepseek-test-v1",
         clock=lambda: CAPTURED_AT,
     )
 
@@ -656,7 +656,7 @@ def test_injected_decoder_cannot_bypass_replay_prompt_version_validation(
         ReplayLLMAnalyzer(
             prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
             reader=reader,
-            model_id="qwen-test-v1",
+            model_id="deepseek-test-v1",
             prompt_version=secret_prompt_version,
             decoder=LLMResponseDecoder(prompt_version="query-analyze-v1"),
         )
@@ -791,7 +791,7 @@ def test_staging_failure_commits_all_valued_attempts_to_real_controller(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
-                    model="qwen-test-v1",
+                    model="deepseek-test-v1",
                     api_key="unit-test-secret",
                 ),
                 capture_store=BrokenCaptureStore(),  # type: ignore[arg-type]
@@ -860,7 +860,7 @@ def test_pricing_failure_preserves_prior_valued_attempts_in_real_controller(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
-                    model="qwen-test-v1",
+                    model="deepseek-test-v1",
                     api_key="unit-test-secret",
                 ),
                 capture_store=DependencyCaptureStore(tmp_path / "partial-pricing"),
@@ -908,7 +908,7 @@ def test_terminal_internal_failure_records_accumulated_usage_fail_closed(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
-                    model="qwen-test-v1",
+                    model="deepseek-test-v1",
                     api_key="unit-test-secret",
                 ),
                 capture_store=store,
@@ -958,7 +958,7 @@ def test_terminal_settlement_failure_is_fixed_no_chain_adapter_error(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
-                    model="qwen-test-v1",
+                    model="deepseek-test-v1",
                     api_key="unit-test-secret",
                 ),
                 capture_store=DependencyCaptureStore(tmp_path / "terminal-mask"),
@@ -1007,7 +1007,7 @@ def test_cancellation_preserves_cancelled_error_when_terminal_settlement_fails(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
                     base_url="https://llm.example.test/v1",
-                    model="qwen-test-v1",
+                    model="deepseek-test-v1",
                     api_key="unit-test-secret",
                 ),
                 capture_store=DependencyCaptureStore(tmp_path / "cancel-mask"),

@@ -119,8 +119,8 @@ class BaselineOptionalModules(_LockModel):
 
 
 class BaselineBinding(_LockModel):
-    primary_model: Literal["qwen3.7-plus"]
-    fallback_model: Literal["qwen3.6-flash"]
+    primary_model: Literal["deepseek-v4-flash"]
+    fallback_model: Literal["deepseek-v4-flash"]
     prompt_version: Literal["query-analyze-v1"]
     strategy: Literal["fixed-one-round"]
     planner: PlannerBinding

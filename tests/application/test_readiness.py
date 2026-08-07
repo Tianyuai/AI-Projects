@@ -96,7 +96,7 @@ def test_build_requires_each_used_capability() -> None:
 
 def test_probe_maps_mock_provider_responses() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "dashscope.aliyuncs.com":
+        if request.url.host == "api.deepseek.com":
             return httpx.Response(
                 200,
                 json={"choices": [{"message": {"content": "{}"}}]},
@@ -132,7 +132,7 @@ def test_probe_maps_mock_provider_responses() -> None:
 
 def test_probe_maps_rate_limit_to_degraded() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.host == "dashscope.aliyuncs.com":
+        if request.url.host == "api.deepseek.com":
             return httpx.Response(429, text="rate limited")
         if request.url.host == "api.openalex.org":
             return httpx.Response(500, text="server error")

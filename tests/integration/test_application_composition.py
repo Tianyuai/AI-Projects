@@ -51,9 +51,9 @@ effective_at: '2026-07-01T00:00:00Z'
 source_identity: composition-test-policy
 rounding_quantum_cny: '0.000001'
 rates:
-  - {dependency: llm, model_or_adapter: qwen3.7-plus, unit: input_token, price_cny_per_unit: '0.000002'}
-  - {dependency: llm, model_or_adapter: qwen3.7-plus, unit: output_token, price_cny_per_unit: '0.000003'}
-  - {dependency: llm, model_or_adapter: qwen3.7-plus, unit: request, price_cny_per_unit: '0.000100'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: input_token, price_cny_per_unit: '0.000002'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: output_token, price_cny_per_unit: '0.000003'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: request, price_cny_per_unit: '0.000100'}
   - {dependency: openalex, model_or_adapter: openalex-works-v1, unit: request, price_cny_per_unit: '0.000050'}
   - {dependency: semantic_scholar, model_or_adapter: semantic-graph-v1, unit: request, price_cny_per_unit: '0.000060'}
 """

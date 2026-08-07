@@ -24,8 +24,8 @@ from paper_search.domain.models import DomainModel
 
 FRESHNESS = timedelta(minutes=15)
 _EXPECTED_DEPENDENCIES = ("llm", "openalex", "semantic_scholar")
-_DEFAULT_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-_DEFAULT_LLM_MODEL = "qwen3.7-plus"
+_DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
+_DEFAULT_LLM_MODEL = "deepseek-v4-flash"
 _OPENALEX_PROBE_URL = "https://api.openalex.org/works"
 _SEMANTIC_SCHOLAR_PROBE_URL = (
     "https://api.semanticscholar.org/graph/v1/paper/search"

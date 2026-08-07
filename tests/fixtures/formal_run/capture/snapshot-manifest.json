@@ -9,7 +9,7 @@
         "dependency": "llm",
         "endpoint": "/chat/completions",
         "method": "POST",
-        "model_or_adapter": "qwen3.7-plus",
+        "model_or_adapter": "deepseek-v4-flash",
         "operation": "generate_json",
         "schema_version": "dependency-request-v1"
       },

@@ -299,7 +299,7 @@ def test_fixture_policy_values_llm_usage_with_exact_decimal_cost() -> None:
 
     valued = pricer.value_actual(
         dependency="llm",
-        model_or_adapter="qwen-test-v1",
+        model_or_adapter="deepseek-test-v1",
         usage=UsageActual(llm_calls=1, input_tokens=5, output_tokens=3),
     )
 
@@ -378,7 +378,7 @@ def test_policy_models_are_strict_and_loader_rejects_naive_or_float_yaml(tmp_pat
         module.PricingRate.model_validate(
             {
                 "dependency": "llm",
-                "model_or_adapter": "qwen-test-v1",
+                "model_or_adapter": "deepseek-test-v1",
                 "unit": "input_token",
                 "price_cny_per_unit": 0.000002,
             }
@@ -387,7 +387,7 @@ def test_policy_models_are_strict_and_loader_rejects_naive_or_float_yaml(tmp_pat
         module.PricingRate.model_validate(
             {
                 "dependency": "llm",
-                "model_or_adapter": "qwen-test-v1",
+                "model_or_adapter": "deepseek-test-v1",
                 "unit": "token",
                 "price_cny_per_unit": Decimal("0.000002"),
             }
@@ -466,7 +466,7 @@ def test_unknown_model_or_missing_priced_unit_fails_closed() -> None:
     with pytest.raises(pricing_error, match="rate"):
         missing_unit_pricer.value_actual(
             dependency="llm",
-            model_or_adapter="qwen-test-v1",
+            model_or_adapter="deepseek-test-v1",
             usage=UsageActual(llm_calls=1, output_tokens=1),
         )
 
@@ -499,13 +499,13 @@ def test_duplicate_rate_ineffective_policy_missing_usage_and_billed_mismatch_fai
     with pytest.raises(pricing_error, match="usage"):
         pricer.value_actual(
             dependency="llm",
-            model_or_adapter="qwen-test-v1",
+            model_or_adapter="deepseek-test-v1",
             usage=UsageActual(),
         )
     with pytest.raises(pricing_error, match="billed"):
         pricer.value_actual(
             dependency="llm",
-            model_or_adapter="qwen-test-v1",
+            model_or_adapter="deepseek-test-v1",
             usage=UsageActual(llm_calls=1, input_tokens=5, output_tokens=3, cost_cny=Decimal("0.1")),
         )
 

@@ -88,7 +88,7 @@ from paper_search.storage.dependency_snapshot import (
 )
 
 
-_LLM_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+_LLM_BASE_URL = "https://api.deepseek.com/v1"
 _DEPENDENCIES: tuple[DependencyName, ...] = (
     "llm",
     "openalex",

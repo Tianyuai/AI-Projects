@@ -35,6 +35,6 @@ retry:
   backoff_rule: min(8,2^retry_index)+jitter[0,1)
 
 budget_profile: balanced
-llm_base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-llm_model_primary: qwen3.7-plus
-llm_model_fallback: qwen3.6-flash
+llm_base_url: https://api.deepseek.com/v1
+llm_model_primary: deepseek-v4-flash
+llm_model_fallback: deepseek-v4-flash

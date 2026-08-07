@@ -13,8 +13,8 @@ frozen_data:
   query_count: 2
   partition_sha256: sha256:19b3ba1a584ab488ecb0aed1b10a63726880d9747e407099b9963656f1588fc4
 baseline:
-  primary_model: qwen3.7-plus
-  fallback_model: qwen3.6-flash
+  primary_model: deepseek-v4-flash
+  fallback_model: deepseek-v4-flash
   prompt_version: query-analyze-v1
   strategy: fixed-one-round
   planner:

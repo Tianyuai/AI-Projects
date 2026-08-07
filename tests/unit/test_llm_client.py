@@ -229,7 +229,7 @@ def test_llm_decoder_records_snapshot_refs_in_provenance() -> None:
 
     result = decoder.decode(
         response,
-        model_id="qwen3.7-plus",
+        model_id="deepseek-v4-flash",
         captured_at=datetime(2026, 8, 3, tzinfo=UTC),
         cache_hit=False,
         snapshot_ref=ref,
@@ -284,6 +284,50 @@ def test_dashscope_json_request_disables_thinking_and_stays_bounded() -> None:
     assert "max_tokens" not in body or body["max_tokens"] > 0
 
 
+def test_deepseek_json_request_disables_thinking() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            json={
+                "model": "fixture-model",
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps({"query_spec": {"ok": True}}),
+                        }
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+            },
+            request=request,
+        )
+
+    async def run() -> object:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            llm = OpenAICompatibleLLMClient(
+                client=client,
+                base_url="https://api.deepseek.com/v1",
+                model="fixture-model",
+                api_key=API_KEY,
+                prompt_version="query-analyze-v1",
+            )
+            return await llm.generate_json(
+                prompt_name="query_analyze",
+                payload={"query": "graph retrieval"},
+                reservation=_reservation(),
+            )
+
+    asyncio.run(run())
+
+    body = json.loads(seen[0].content)
+    assert body["thinking"] == {"type": "disabled"}
+    assert "enable_thinking" not in body
+
+
 def test_non_dashscope_json_request_omits_dashscope_specific_fields() -> None:
     seen: list[httpx.Request] = []
 
@@ -325,6 +369,7 @@ def test_non_dashscope_json_request_omits_dashscope_specific_fields() -> None:
 
     body = json.loads(seen[0].content)
     assert "enable_thinking" not in body
+    assert "thinking" not in body
 
 
 def test_invalid_json_is_a_structured_error_without_credential_leakage() -> None:

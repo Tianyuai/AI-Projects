@@ -264,6 +264,7 @@ class OpenAICompatibleLLMClient:
         self._client = client
         self._transport_endpoint = f"{normalized_url}/chat/completions"
         self._dashscope_compatible = "dashscope.aliyuncs.com" in normalized_url
+        self._deepseek_compatible = "api.deepseek.com" in normalized_url
         self._model = validate_model_id(model)
         self._api_key = api_key
         self._prompt_version = validate_prompt_version(prompt_version)
@@ -314,6 +315,8 @@ class OpenAICompatibleLLMClient:
         }
         if self._dashscope_compatible:
             request["enable_thinking"] = False
+        elif self._deepseek_compatible:
+            request["thinking"] = {"type": "disabled"}
         return request
 
     def canonical_identity_request(

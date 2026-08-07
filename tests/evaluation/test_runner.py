@@ -3272,7 +3272,7 @@ def test_business_query_analysis_requires_bound_llm_snapshot(
         model_id = (
             "safe-but-unlocked"
             if llm_request_binding == "wrong_safe_model"
-            else "qwen3.7-plus"
+            else "deepseek-v4-flash"
         )
         request_query = "other" if llm_request_binding == "unrelated_query" else "one"
         llm_identity = DependencyRequestIdentity.from_canonical_request(
@@ -3395,7 +3395,7 @@ def test_business_query_analysis_requires_bound_llm_snapshot(
         prompt_version="query-analyze-v1",
         prompt_name="query_analyze",
         prompt_artifact_sha256="sha256:" + "a" * 64,
-        llm_model_allowlist=frozenset({"qwen3.7-plus", "qwen3.6-flash"}),
+        llm_model_allowlist=frozenset({"deepseek-v4-flash", "deepseek-v4-flash"}),
     )
 
     request_is_bound = llm_request_binding == "exact"

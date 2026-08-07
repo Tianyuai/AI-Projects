@@ -67,7 +67,7 @@ def _production_pricing_bytes() -> bytes:
     for rate in rates:
         assert isinstance(rate, dict)
         if rate["dependency"] == "llm":
-            rate["model_or_adapter"] = "qwen-production-v1"
+            rate["model_or_adapter"] = "deepseek-production-v1"
     return yaml.safe_dump(raw, sort_keys=False).encode("utf-8")
 
 
@@ -539,7 +539,7 @@ def _rewrite_pricing_identity(
         ("adapter", "unknown-adapter"),
         ("adapter", "mock-adapter"),
         ("adapter", "synthetic-adapter"),
-        ("adapter", "qwen-test-v1"),
+        ("adapter", "deepseek-test-v1"),
         ("adapter", "fixture-adapter"),
     ],
 )

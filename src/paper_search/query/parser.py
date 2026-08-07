@@ -112,6 +112,10 @@ def normalize_query_analysis(
             raw_spec = data.get("QuerySpec")
         if not isinstance(raw_plan, Mapping):
             raw_plan = data.get("SearchPlan")
+    if not isinstance(raw_spec, Mapping):
+        top_subqueries = data.get("subqueries")
+        if isinstance(top_subqueries, list) and top_subqueries:
+            raw_spec = {"subqueries": top_subqueries}
     if not isinstance(raw_spec, Mapping) or not isinstance(raw_plan, Mapping):
         raise ValueError("model analysis must include query_spec and search_plan")
     spec = raw_spec

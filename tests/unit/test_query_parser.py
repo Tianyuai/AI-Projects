@@ -240,6 +240,51 @@ def test_spec_subqueries_fallback_is_normalized_to_primary_analysis() -> None:
     assert result.search_plan.subqueries[0].text == "knowledge graph heterogeneous graph"
 
 
+def test_top_level_subqueries_without_query_spec_are_normalized_to_primary_analysis() -> None:
+    query = (
+        "What are the works that addressed the differences between individual "
+        "annotators or the group-level attributes of annotators by adding "
+        "individual layers?"
+    )
+    payload: dict[str, object] = {
+        "query": query,
+        "subqueries": [
+            "works addressing individual annotator differences by adding individual layers",
+            "works addressing group-level annotator attributes by adding individual layers",
+        ],
+        "search_plan": {
+            "steps": [
+                {
+                    "action": "search",
+                    "query": (
+                        "works addressing individual annotator differences "
+                        "by adding individual layers"
+                    ),
+                },
+                {
+                    "action": "search",
+                    "query": (
+                        "works addressing group-level annotator attributes "
+                        "by adding individual layers"
+                    ),
+                },
+            ]
+        },
+    }
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(query, _provider_result(payload))
+    )
+
+    assert result.planner_status == "primary"
+    assert result.query_spec.research_goal == query
+    assert len(result.search_plan.subqueries) >= 2
+    assert (
+        result.search_plan.subqueries[0].text
+        == "works addressing individual annotator differences by adding individual layers"
+    )
+
+
 def test_wrapped_query_analysis_result_is_normalized_to_primary_analysis() -> None:
     query = "Which research papers propose motion trajectory conditioned on scene image?"
     payload = {"QueryAnalysisResult": _flexible_payload(query)}

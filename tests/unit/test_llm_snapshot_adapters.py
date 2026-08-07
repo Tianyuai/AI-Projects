@@ -553,9 +553,47 @@ def test_replay_uses_identical_decoder_zero_cost_and_snapshot_provenance(
 
     assert replay_result.data == live_result.data
     assert replay_result.cache_hit is True
-    assert replay_result.usage == UsageActual()
+    assert replay_result.usage == live_result.usage
+    assert replay_result.usage != UsageActual()
     assert replay_result.provenance["snapshot_set_id"] == manifest.snapshot_set_id
     assert "snapshot_entry_id" in replay_result.provenance
+
+
+def test_replay_llm_reports_captured_usage_instead_of_zero(tmp_path: Path) -> None:
+    raw = _response_bytes({"ok": True})
+    controller = SettlementRecorder()
+    live_result, store = asyncio.run(
+        _live(
+            tmp_path,
+            httpx.MockTransport(
+                lambda request: httpx.Response(200, content=raw, request=request)
+            ),
+            controller,
+        )
+    )
+    manifest = store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+    replay = ReplayLLMAnalyzer(
+        prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
+        reader=reader,
+        model_id="qwen-test-v1",
+        clock=lambda: CAPTURED_AT,
+    )
+
+    replay_result = asyncio.run(
+        replay.generate_json(
+            prompt_name="query_analyze",
+            payload={"query": "graph retrieval"},
+            reservation=_reservation(),
+        )
+    )
+
+    assert live_result.usage != UsageActual()
+    assert replay_result.usage == live_result.usage
 
 
 def test_replay_miss_is_snapshot_unavailable_without_network_fallback(

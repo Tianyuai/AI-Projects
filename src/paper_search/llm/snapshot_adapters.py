@@ -376,6 +376,10 @@ class LiveCaptureLLMAnalyzer:
                             safe_headers=safe_headers,
                             captured_at=requested_at,
                         )
+                        self._capture_store.annotate_usage(
+                            snapshot_ref.entry_id,
+                            accumulated,
+                        )
                         decoded_with_ref = self._decoder.decode(
                             response_bytes,
                             model_id=self._client.model_id,
@@ -422,6 +426,10 @@ class LiveCaptureLLMAnalyzer:
                     response_bytes=response_bytes,
                     safe_headers=safe_headers,
                     captured_at=requested_at,
+                )
+                self._capture_store.annotate_usage(
+                    snapshot_ref.entry_id,
+                    accumulated,
                 )
                 terminal = _error_result(
                     code=code,
@@ -547,7 +555,7 @@ class ReplayLLMAnalyzer:
                 requested_at=self._clock(),
                 response_bytes=snapshot.response_bytes,
                 prompt_version=self._prompt_version,
-                usage=UsageActual(),
+                usage=snapshot.usage or UsageActual(),
                 snapshot_ref=snapshot.ref,
             )
         decoded = self._decoder.decode(
@@ -560,7 +568,10 @@ class ReplayLLMAnalyzer:
         provenance = dict(decoded.provenance)
         provenance["snapshot_set_id"] = self._reader.snapshot_set_id
         return decoded.model_copy(
-            update={"usage": UsageActual(), "provenance": provenance}
+            update={
+                "usage": snapshot.usage or UsageActual(),
+                "provenance": provenance,
+            }
         )
 
 

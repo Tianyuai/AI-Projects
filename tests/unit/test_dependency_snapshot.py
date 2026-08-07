@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from paper_search.domain.models import UsageActual
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
     DependencyRequestIdentity,
@@ -78,6 +80,36 @@ def test_store_round_trips_exact_bytes_for_every_dependency(
     assert replayed.response_bytes == response
     assert replayed.ref == staged
     assert reader.snapshot_set_id == manifest.snapshot_set_id
+
+
+def test_annotated_usage_round_trips_through_reader(tmp_path: Path) -> None:
+    store = DependencyCaptureStore(tmp_path, clock=lambda: CAPTURED_AT)
+    ref = store.stage_success(
+        _identity(),
+        response_bytes=b"{}",
+        safe_headers={"content-type": "application/json"},
+        captured_at=CAPTURED_AT,
+    )
+    usage = UsageActual(
+        search_api_calls=4,
+        llm_calls=1,
+        input_tokens=7,
+        output_tokens=3,
+        cost_cny=Decimal("0.000240"),
+        elapsed_ms=12_345,
+    )
+
+    store.annotate_usage(ref.entry_id, usage)
+    manifest = store.seal()
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+
+    replayed = reader.read(_identity())
+    assert manifest.entries[0].usage == usage
+    assert replayed.usage == usage
 
 
 def test_identity_and_cache_key_are_deterministic(tmp_path: Path) -> None:

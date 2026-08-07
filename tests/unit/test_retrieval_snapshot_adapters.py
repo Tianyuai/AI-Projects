@@ -185,7 +185,6 @@ def test_openalex_live_and_replay_are_identical_and_refs_are_page_ordered(tmp_pa
 
     assert cursors == ["*", "cursor-page-2"]
     assert replay_result.data == live_result.data
-    assert replay_result.usage == UsageActual()
     refs = json.loads(live_result.provenance["snapshot_refs"])
     expected_hashes = [
         "sha256:"
@@ -193,6 +192,108 @@ def test_openalex_live_and_replay_are_identical_and_refs_are_page_ordered(tmp_pa
         for name in ("works_page_1.json", "works_page_2.json")
     ]
     assert [ref["response_sha256"] for ref in refs] == expected_hashes
+
+
+def test_replay_reports_captured_usage_instead_of_zero(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params["cursor"]
+        name = "works_page_1.json" if cursor == "*" else "works_page_2.json"
+        return httpx.Response(200, content=(OPENALEX / name).read_bytes(), request=request)
+
+    async def run() -> tuple[object, object]:
+        live, store, _, client = await _capture(
+            tmp_path, dependency="openalex", handler=handler
+        )
+        async with client:
+            captured = await live.search("RAG", {}, 3, _reservation())
+        manifest = store.seal()
+        replay = ReplaySearchProvider(
+            dependency="openalex",
+            reader=_reader(store, snapshot_set_id=manifest.snapshot_set_id),
+            clock=lambda: CAPTURED_AT,
+        )
+        replayed = await replay.search("RAG", {}, 3, _reservation(0))
+        return captured, replayed
+
+    captured, replayed = asyncio.run(run())
+
+    assert captured.usage.search_api_calls == 2
+    assert captured.usage != UsageActual()
+    assert replayed.usage == captured.usage
+
+
+def test_replay_commits_the_same_budget_usage_as_live(tmp_path: Path) -> None:
+    budget = SearchBudget(
+        max_search_api_calls=3,
+        target_search_api_calls=1,
+        max_llm_calls=1,
+        target_llm_calls=0,
+        max_total_tokens=1,
+        max_cost_cny=1.0,
+        max_elapsed_seconds=120,
+        soft_deadline_seconds=100,
+    )
+    estimate = UsageEstimate(
+        search_api_calls=3,
+        cost_cny=Decimal("0.01"),
+        elapsed_ms=60_000,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> tuple[UsageActual, UsageActual, str, str]:
+        live_controller = HardBudgetController(
+            budget,
+            formal_live=True,
+            clock=lambda: CAPTURED_AT,
+        )
+        reservation = live_controller.reserve("provider.search", estimate)
+        store = DependencyCaptureStore(
+            tmp_path / "snapshot",
+            clock=lambda: CAPTURED_AT,
+        )
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=store,
+                pricer=_pricer(),
+                controller=live_controller,
+                api_key="synthetic-key",
+                clock=lambda: CAPTURED_AT,
+            )
+            await provider.search("RAG", {}, 3, reservation)
+        manifest = store.seal()
+
+        replay_controller = HardBudgetController(
+            budget,
+            formal_live=False,
+            clock=lambda: CAPTURED_AT,
+        )
+        replay_reservation = replay_controller.reserve("provider.search", estimate)
+        replay = ReplaySearchProvider(
+            dependency="openalex",
+            reader=_reader(store, snapshot_set_id=manifest.snapshot_set_id),
+            clock=lambda: CAPTURED_AT,
+        )
+        replayed = await replay.search("RAG", {}, 3, replay_reservation)
+        replay_controller.settle(replay_reservation, replayed.usage)
+        return (
+            live_controller.committed_usage,
+            replay_controller.committed_usage,
+            live_controller.stop_status(),
+            replay_controller.stop_status(),
+        )
+
+    live_committed, replay_committed, live_status, replay_status = asyncio.run(run())
+
+    assert live_committed == replay_committed
+    assert live_status == replay_status
 
 
 def test_openalex_rotates_to_next_key_when_quota_is_exhausted(
@@ -424,7 +525,8 @@ def test_semantic_scholar_live_and_replay_normalize_identically(tmp_path: Path) 
 
     assert replayed.data == captured.data
     assert replayed.errors == captured.errors
-    assert replayed.usage == UsageActual()
+    assert replayed.usage == captured.usage
+    assert replayed.usage != UsageActual()
 
 
 def test_capture_identity_is_safe_and_excludes_credentials(tmp_path: Path) -> None:

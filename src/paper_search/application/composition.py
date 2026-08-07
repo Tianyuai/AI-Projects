@@ -405,31 +405,12 @@ class _RequestLiveCaptureService:
 
 def _replay_estimates(
     controller: HardBudgetController,
+    *,
+    lock: ReplayLock,
+    pricer: ActualCostPricer,
 ) -> tuple[UsageEstimate, dict[str, UsageEstimate]]:
-    budget = controller.budget
-    output_tokens = budget.max_total_tokens // 6
-    input_tokens = budget.max_total_tokens - output_tokens
-    elapsed_ms = min(
-        budget.max_elapsed_seconds * 1_000,
-        3 * 20 * 1_000,
-    )
-    return (
-        UsageEstimate(
-            llm_calls=3,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            cost_cny=0,
-            elapsed_ms=elapsed_ms,
-        ),
-        {
-            dependency: UsageEstimate(
-                search_api_calls=3,
-                cost_cny=0,
-                elapsed_ms=elapsed_ms,
-            )
-            for dependency in ("openalex", "semantic_scholar")
-        },
-    )
+    """Mirror the live estimates so replay budget decisions stay identical."""
+    return _live_estimates(controller, lock=lock, pricer=pricer)
 
 
 def _live_estimates(
@@ -582,6 +563,7 @@ def _replay_factory(
     *,
     reader: DependencySnapshotReader,
     lock: ReplayLock,
+    pricer: ActualCostPricer,
     config_hash: Sha256,
     experiment_definition: ExperimentDefinition,
     experiment_dependencies: ExperimentDependencyFactory | None,
@@ -592,7 +574,11 @@ def _replay_factory(
         run_id: str,
     ) -> SearchOrchestrator:
         del run_id
-        analysis_estimate, provider_estimates = _replay_estimates(controller)
+        analysis_estimate, provider_estimates = _replay_estimates(
+            controller,
+            lock=lock,
+            pricer=pricer,
+        )
         analyzer = ReplayLLMAnalyzer(
             reader=reader,
             model_id=lock.baseline.primary_model,
@@ -1129,6 +1115,11 @@ class CompositionRoot:
             orchestrator_factory = _replay_factory(
                 reader=reader,
                 lock=lock,
+                pricer=ActualCostPricer(
+                    parse_pricing_policy_bytes(
+                        verified.artifact_bytes[lock.pricing_policy.path]
+                    )
+                ),
                 config_hash=config_hash,
                 experiment_definition=experiment_definition,
                 experiment_dependencies=experiment_dependencies,

@@ -139,6 +139,13 @@ def _aggregate_attempts(attempts: list[UsageActual]) -> UsageActual:
     )
 
 
+def _terminal_usage(operation: _LiveOperation) -> UsageActual:
+    """Return the exact usage the operation would settle for its attempts."""
+    if operation.attempts:
+        return _aggregate_attempts(operation.attempts)
+    return UsageActual(cost_cny=Decimal("0"))
+
+
 class _LiveOperation:
     """Track one reservation from first dispatch to exactly one terminal action."""
 
@@ -698,6 +705,11 @@ class LiveCaptureSearchProvider:
                 break
             cursor = decoded.next_cursor
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
+        if refs:
+            self._capture_store.annotate_usage(
+                refs[0].entry_id,
+                _terminal_usage(operation),
+            )
         usage = self._settle(operation)
         return ProviderResult[list[Paper]](
             data=papers,
@@ -838,6 +850,11 @@ class LiveCaptureSearchProvider:
             papers.extend(decoded.papers)
             errors.extend(decoded.errors)
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
+        if refs:
+            self._capture_store.annotate_usage(
+                refs[0].entry_id,
+                _terminal_usage(operation),
+            )
         usage = self._settle(operation)
         return ProviderResult[list[Paper]](
             data=papers,
@@ -916,6 +933,11 @@ class LiveCaptureSearchProvider:
             expansion = decoded.expansion
             errors.extend(decoded.errors)
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
+        if refs:
+            self._capture_store.annotate_usage(
+                refs[0].entry_id,
+                _terminal_usage(operation),
+            )
         usage = self._settle(operation)
         return ProviderResult[CitationExpansion](
             data=expansion,
@@ -985,12 +1007,22 @@ class ReplaySearchProvider:
     def _read(
         self,
         identity: DependencyRequestIdentity,
-    ) -> tuple[bytes | None, SnapshotRef | None, SnapshotErrorV2 | None]:
+    ) -> tuple[
+        bytes | None,
+        SnapshotRef | None,
+        SnapshotErrorV2 | None,
+        UsageActual | None,
+    ]:
         try:
             snapshot = self._reader.read(identity)
         except KeyError:
-            return None, None, None
-        return snapshot.response_bytes, snapshot.ref, snapshot.error
+            return None, None, None, None
+        return (
+            snapshot.response_bytes,
+            snapshot.ref,
+            snapshot.error,
+            snapshot.usage,
+        )
 
     def _snapshot_error(self, error: SnapshotErrorV2) -> ErrorDetail:
         return _error(
@@ -1009,10 +1041,11 @@ class ReplaySearchProvider:
         hashes: list[str],
         refs: list[SnapshotRef],
         errors: list[ErrorDetail],
+        usage: UsageActual | None = None,
     ) -> ProviderResult[Any]:
         return ProviderResult[Any](
             data=data,
-            usage=UsageActual(),
+            usage=usage or UsageActual(),
             provenance={
                 "provider": self._dependency,
                 "endpoint": endpoint,
@@ -1067,6 +1100,7 @@ class ReplaySearchProvider:
         errors: list[ErrorDetail] = []
         refs: list[SnapshotRef] = []
         hashes: list[str] = []
+        usages: list[UsageActual] = []
         while raw_seen < limit:
             if cursor in seen:
                 errors.append(
@@ -1098,16 +1132,20 @@ class ReplaySearchProvider:
                 adapter=self._adapter,
                 canonical_request=canonical,
             )
-            content, ref, error = self._read(identity)
+            content, ref, error, usage = self._read(identity)
             if error is not None:
                 errors.append(self._snapshot_error(error))
                 refs.append(ref)
+                if usage is not None:
+                    usages.append(usage)
                 break
             if content is None or ref is None:
                 errors.append(self._miss())
                 break
             refs.append(ref)
             hashes.append(_sha256(content))
+            if usage is not None:
+                usages.append(usage)
             try:
                 decoded = decode_openalex_page(content, limit=remaining)
             except ValueError:
@@ -1133,6 +1171,7 @@ class ReplaySearchProvider:
             hashes=hashes,
             refs=refs,
             errors=errors,
+            usage=_aggregate_attempts(usages) if usages else None,
         )
 
     async def _semantic_search(
@@ -1167,7 +1206,7 @@ class ReplaySearchProvider:
             adapter=self._adapter,
             canonical_request=canonical,
         )
-        content, ref, error = self._read(identity)
+        content, ref, error, usage = self._read(identity)
         errors: list[ErrorDetail] = []
         papers: list[Paper] = []
         refs: list[SnapshotRef] = []
@@ -1190,6 +1229,7 @@ class ReplaySearchProvider:
             hashes=hashes,
             refs=refs,
             errors=errors,
+            usage=usage,
         )
 
     async def batch_details(
@@ -1211,7 +1251,7 @@ class ReplaySearchProvider:
             adapter=self._adapter,
             canonical_request={"fields": _FIELDS, "ids": ids},
         )
-        content, ref, error = self._read(identity)
+        content, ref, error, usage = self._read(identity)
         errors: list[ErrorDetail] = []
         papers: list[Paper] = []
         refs: list[SnapshotRef] = []
@@ -1234,6 +1274,7 @@ class ReplaySearchProvider:
             hashes=hashes,
             refs=refs,
             errors=errors,
+            usage=usage,
         )
 
     async def _expansion(
@@ -1261,7 +1302,7 @@ class ReplaySearchProvider:
                 "paper_id": paper_id.value,
             },
         )
-        content, ref, error = self._read(identity)
+        content, ref, error, usage = self._read(identity)
         errors: list[ErrorDetail] = []
         expansion = CitationExpansion(papers=[], raw_edges=[])
         refs: list[SnapshotRef] = []
@@ -1289,6 +1330,7 @@ class ReplaySearchProvider:
             hashes=hashes,
             refs=refs,
             errors=errors,
+            usage=usage,
         )
 
     async def references(

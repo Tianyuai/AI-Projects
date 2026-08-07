@@ -20,6 +20,7 @@ from paper_search.domain.models import (
     NonEmptyStr,
     SafeRelativePath,
     Sha256,
+    UsageActual,
 )
 from paper_search.storage.cache import make_cache_key
 
@@ -227,6 +228,7 @@ class SnapshotEntryV2(DomainModel):
     response_path: SafeRelativePath
     safe_headers: dict[NonEmptyStr, NonEmptyStr]
     error: SnapshotErrorV2 | None = None
+    usage: UsageActual | None = None
 
 
 class DependencySnapshotManifestV2(DomainModel):
@@ -240,6 +242,7 @@ class SnapshotRead(DomainModel):
     ref: SnapshotRef
     response_bytes: bytes
     error: SnapshotErrorV2 | None = None
+    usage: UsageActual | None = None
 
 
 def _identity_cache_key(identity: DependencyRequestIdentity) -> str:
@@ -409,6 +412,25 @@ class DependencyCaptureStore:
         self._cache_keys.add(cache_key)
         return _snapshot_ref(entry)
 
+    def annotate_usage(
+        self,
+        entry_id: str,
+        usage: UsageActual,
+    ) -> None:
+        """Attach the settled usage of one captured call to its snapshot entry."""
+        if self._sealed:
+            raise RuntimeError("snapshot store is sealed")
+        for index, entry in enumerate(self._entries):
+            if entry.entry_id != entry_id:
+                continue
+            if entry.usage is not None:
+                raise ValueError("snapshot usage is already annotated")
+            self._entries[index] = entry.model_copy(
+                update={"usage": UsageActual.model_validate(usage.model_dump(mode="python"))}
+            )
+            return
+        raise KeyError(f"snapshot entry is unavailable: {entry_id}")
+
     def seal(self) -> DependencySnapshotManifestV2:
         if self._sealed:
             raise RuntimeError("snapshot store is sealed")
@@ -512,6 +534,7 @@ class DependencySnapshotReader:
             ref=_snapshot_ref(entry),
             response_bytes=response_bytes,
             error=entry.error,
+            usage=entry.usage,
         )
 
 

@@ -166,6 +166,80 @@ def test_flexible_model_payload_with_two_subqueries_is_supplemented() -> None:
     assert "research papers" in result.query_spec.topics
 
 
+def test_steps_plan_and_constraint_descriptions_are_normalized_to_primary_analysis() -> None:
+    query = (
+        "What works introduce the feasibility of creating adversarial examples "
+        "that can break LMMs?"
+    )
+    payload: dict[str, object] = {
+        "query_spec": {
+            "original_query": query,
+            "constraints": [
+                {
+                    "type": "explicit",
+                    "description": (
+                        "Works must study adversarial examples against "
+                        "large multimodal models."
+                    ),
+                }
+            ],
+            "subqueries": [
+                "adversarial examples against large multimodal models",
+                "breaking large multimodal models with adversarial examples",
+            ],
+        },
+        "search_plan": {
+            "steps": [
+                {
+                    "action": "search",
+                    "query": "adversarial examples against large multimodal models",
+                },
+                {
+                    "action": "search",
+                    "query": (
+                        "breaking large multimodal models with adversarial examples"
+                    ),
+                },
+            ]
+        },
+    }
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(query, _provider_result(payload))
+    )
+
+    assert result.planner_status == "primary"
+    assert any("adversarial examples" in item for item in result.query_spec.must_have)
+    assert len(result.search_plan.subqueries) >= 2
+    assert (
+        result.search_plan.subqueries[0].text
+        == "adversarial examples against large multimodal models"
+    )
+
+
+def test_spec_subqueries_fallback_is_normalized_to_primary_analysis() -> None:
+    query = "Which papers describe a knowledge graph as a type of a heterogeneous graph?"
+    payload: dict[str, object] = {
+        "query_spec": {
+            "original_query": query,
+            "research_goal": "Find papers describing knowledge graphs as heterogeneous graphs",
+            "subqueries": [
+                "knowledge graph heterogeneous graph",
+                "knowledge graph as heterogeneous graph papers",
+            ],
+        },
+        "search_plan": {},
+    }
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(query, _provider_result(payload))
+    )
+
+    assert result.planner_status == "primary"
+    assert len(result.search_plan.subqueries) >= 2
+    assert result.search_plan.subqueries[0].text == "knowledge graph heterogeneous graph"
+
+
 def test_wrapped_query_analysis_result_is_normalized_to_primary_analysis() -> None:
     query = "Which research papers propose motion trajectory conditioned on scene image?"
     payload = {"QueryAnalysisResult": _flexible_payload(query)}

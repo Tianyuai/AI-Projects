@@ -55,6 +55,29 @@ def _string_list(value: object) -> list[str]:
     return []
 
 
+def _constraint_strings(value: object) -> list[str]:
+    """Extract constraint text from strings, mappings, or lists of either."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Mapping):
+        for key in ("description", "value", "text"):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested.strip():
+                return [nested]
+        values = [
+            nested
+            for nested in value.values()
+            if isinstance(nested, str) and nested.strip()
+        ]
+        return _ordered_unique(_string_list(value) + values)
+    if isinstance(value, list):
+        result: list[str] = []
+        for item in value:
+            result.extend(_constraint_strings(item))
+        return result
+    return []
+
+
 def _year(value: object) -> int | None:
     if isinstance(value, bool):
         return None
@@ -104,16 +127,10 @@ def normalize_query_analysis(
         + _string_list(spec.get("topic"))
         + _string_list(spec.get("domain"))
     )
+    constraint_values = _constraint_strings(spec.get("constraints"))
     must_have = _ordered_unique(
-        _string_list(spec.get("must_have"))
-        + _string_list(spec.get("constraints"))
+        _string_list(spec.get("must_have")) + constraint_values
     )
-    constraint_values = [
-        value
-        for value in spec.get("constraints", {}).values()
-        if isinstance(value, str) and value.strip()
-    ] if isinstance(spec.get("constraints"), Mapping) else []
-    must_have = _ordered_unique(must_have + constraint_values)
     topics = _ordered_unique(topics + constraint_values)
     exclusions = _ordered_unique(
         _string_list(spec.get("exclusions"))
@@ -121,6 +138,12 @@ def normalize_query_analysis(
     )
 
     raw_subqueries = plan.get("subqueries")
+    if not isinstance(raw_subqueries, list):
+        raw_subqueries = plan.get("steps")
+    if not isinstance(raw_subqueries, list):
+        raw_subqueries = plan.get("queries")
+    if not isinstance(raw_subqueries, list):
+        raw_subqueries = spec.get("subqueries")
     if not isinstance(raw_subqueries, list):
         raise ValueError("model search plan must include subqueries")
     subqueries: list[dict[str, object]] = []

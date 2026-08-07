@@ -452,9 +452,15 @@ class LLMTitleCandidateStage:
                     controller.fail_closed(reservation, UsageActual())
                 raise
             except ReservationError:
+                searches += 1
                 if controller.terminal_outcome(reservation) is None:
-                    controller.fail_closed(reservation)
-                raise
+                    try:
+                        controller.release(reservation)
+                    except Exception:
+                        pass
+                diagnostics.append(_provider_failure_diagnostic())
+                search_errors += 1
+                continue
             except Exception:
                 searches += 1
                 if controller.terminal_outcome(reservation) is None:

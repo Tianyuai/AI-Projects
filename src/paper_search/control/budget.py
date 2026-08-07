@@ -703,8 +703,11 @@ class HardBudgetController:
             (actual.llm_calls, reserved.llm_calls, "llm_calls"),
             (actual.input_tokens, reserved.input_tokens, "input_tokens"),
             (actual.output_tokens, reserved.output_tokens, "output_tokens"),
-            (actual.elapsed_ms, reserved.elapsed_ms, "elapsed_ms"),
         )
+        # elapsed_ms is intentionally soft: network latency varies beyond any
+        # estimate, and the query-level max_elapsed hard limit still enforces
+        # the total. A per-reservation elapsed overrun must not fail the settle
+        # (which would fail-closed the whole query).
         for value, limit, label in checks:
             if value > limit:
                 raise ReservationError(f"actual {label} exceeds its reservation")

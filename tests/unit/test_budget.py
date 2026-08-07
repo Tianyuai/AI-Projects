@@ -117,6 +117,23 @@ def test_settle_rejects_usage_above_reservation_and_keeps_it_active() -> None:
     assert controller.committed_usage.search_api_calls == 0
 
 
+def test_settle_allows_elapsed_above_reservation() -> None:
+    controller_type, _, _ = budget_api()
+    controller = controller_type(make_budget(max_elapsed_seconds=10))
+    reservation = controller.reserve(
+        "provider.search",
+        UsageEstimate(search_api_calls=1, elapsed_ms=1_000),
+    )
+
+    controller.settle(
+        reservation,
+        UsageActual(search_api_calls=1, elapsed_ms=2_001),
+    )
+
+    assert controller.committed_usage.search_api_calls == 1
+    assert controller.committed_usage.elapsed_ms == 2_001
+
+
 def test_reservation_cannot_be_settled_twice() -> None:
     controller_type, _, reservation_error = budget_api()
     controller = controller_type(make_budget())

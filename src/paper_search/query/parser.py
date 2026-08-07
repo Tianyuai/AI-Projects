@@ -145,6 +145,8 @@ def normalize_query_analysis(
     if not isinstance(raw_subqueries, list):
         raw_subqueries = spec.get("subqueries")
     if not isinstance(raw_subqueries, list):
+        raw_subqueries = spec.get("sub_queries")
+    if not isinstance(raw_subqueries, list):
         raise ValueError("model search plan must include subqueries")
     subqueries: list[dict[str, object]] = []
     for index, item in enumerate(raw_subqueries):
@@ -152,6 +154,12 @@ def normalize_query_analysis(
             text = item
         elif isinstance(item, Mapping):
             text = item.get("text") or item.get("query")
+            if not isinstance(text, str) or not text.strip():
+                action = item.get("action")
+                if isinstance(action, str):
+                    match = re.search(r"['\"]([^'\"]{3,})['\"]", action)
+                    if match is not None:
+                        text = match.group(1)
         else:
             text = None
         if not isinstance(text, str) or not text.strip():

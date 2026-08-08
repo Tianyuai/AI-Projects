@@ -842,7 +842,7 @@ def test_retry_is_not_started_when_backoff_exceeds_remaining_deadline(
 ) -> None:
     settled = SettlementSpy()
     reservation = _reservation().model_copy(
-        update={"expires_at": datetime.now(UTC) + timedelta(milliseconds=20)}
+        update={"expires_at": datetime.now(UTC) + timedelta(milliseconds=100)}
     )
     sleeps: list[float] = []
 
@@ -877,11 +877,11 @@ def test_total_wall_deadline_rejects_response_that_crosses_deadline(tmp_path: Pa
     settled = SettlementSpy()
     now = datetime.now(UTC)
     reservation = _reservation().model_copy(
-        update={"expires_at": now + timedelta(milliseconds=20)}
+        update={"expires_at": now + timedelta(milliseconds=100)}
     )
 
     async def handler(request: httpx.Request) -> httpx.Response:
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.2)
         return httpx.Response(200, content=(S2 / "search.json").read_bytes(), request=request)
 
     async def run() -> object:

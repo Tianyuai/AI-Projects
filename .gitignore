@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.uv-cache/
 .coverage
 htmlcov/
 
@@ -28,3 +29,6 @@ data/annotation_work/
 /runs/
 /validation-attempts/
 /private-gate0/
+.pdf-check/
+.sheet-build/
+.superpowers/

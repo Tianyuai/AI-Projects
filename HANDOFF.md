@@ -1,6 +1,6 @@
 # paper-search 项目交接
 
-更新于 2026-08-08。权威工作区：`D:\AI Projects\.worktrees\week3`。
+更新于 2026-08-09。权威工作区：`D:\AI Projects\.worktrees\week3`。
 
 ## 1. 项目目标
 
@@ -15,6 +15,7 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - 最近四轮正式 capture 均因 OpenAlex 限流或额度问题 gate failed；已完成查询的 replay 可干净复现。
 - 51/60 查询零命中，最终共命中约 10 篇 gold；召回是主要瓶颈。
 - 全量测试最近记录为 1856 passed / 36 skipped。
+- 当前候选锁已重建并绑定提交 `c427541670e2523f8556a0d204eae964198ef9b1`；readiness 已确认 LLM、OpenAlex、Semantic Scholar 均为 ready。
 
 ## 3. 活跃文件
 
@@ -34,15 +35,14 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 
 ## 5. 下一步
 
-1. 本次清理完成后，基于最终提交和最新 ledger checkpoint 重建下一版候选锁；
-2. 在单独授权后跑 readiness → dev capture → verify → replay → compare；
-3. 完成 Gold 精确可用性和标题候选流失诊断；
-4. 优先优化标题候选保留与输出选择；
-5. Query Evolution 仅在重做生产分析组合和预算估计后进行小规模探针。
+1. 在单独授权后使用当前候选锁跑 dev capture → verify → replay → compare；
+2. 完成 Gold 精确可用性和标题候选流失诊断；
+3. 优先优化标题候选保留与输出选择；
+4. Query Evolution 仅在重做生产分析组合和预算估计后进行小规模探针。
 
 ## 6. 锁状态
 
-旧 v21 锁绑定 `c22abf9`。设计与清理提交已经改变 HEAD，因此 v21 不得继续用于正式 capture。重建锁和 live capture 都需要单独授权，本次清理不执行。
+旧 v21 锁绑定 `c22abf9`，已因源码 SHA 不匹配而废弃。当前候选锁为 v22，绑定提交 `c427541670e2523f8556a0d204eae964198ef9b1` 和最新 ledger checkpoint；readiness 已通过。capture、validation 和任何新的在线实验仍需要单独授权。
 
 ## 7. 环境与红线
 

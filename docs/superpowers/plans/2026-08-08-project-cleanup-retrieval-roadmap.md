@@ -29,9 +29,9 @@
 
 **Interfaces:**
 - Consumes: 设计文档中批准的精确删除清单
-- Produces: 不含旧缓存、旧提交包和过时 Task 4 交接文档的工作区；后续工具目录不会重新污染 `git status`
+- Produces: 受保护证据保持不变，旧缓存、旧提交包和过时 Task 4 交接文档被移除
 
-- [ ] **Step 1: 验证删除目标与保护目录**
+- [ ] **Step 1: 校验并删除精确目标**
 
 Run:
 
@@ -54,45 +54,11 @@ $deleteTargets = @(
   'docs\superpowers\plans\2026-07-28-week3-task9-embedding-ranking.md',
   'docs\superpowers\plans\2026-07-29-data-freeze-v2.md'
 )
-$protectedTargets = @('runs', 'data', '.venv')
-foreach ($relative in $deleteTargets) {
-  $resolved = [IO.Path]::GetFullPath((Join-Path $workspaceRoot $relative))
-  if (-not $resolved.StartsWith($workspaceRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Target escaped workspace: $resolved"
+foreach ($protected in @('runs', 'data', '.venv')) {
+  if (-not (Test-Path -LiteralPath (Join-Path $workspaceRoot $protected))) {
+    throw "Protected path missing: $protected"
   }
-  [PSCustomObject]@{ Relative = $relative; Absolute = $resolved; Exists = Test-Path -LiteralPath $resolved }
 }
-foreach ($relative in $protectedTargets) {
-  $resolved = Join-Path $workspaceRoot $relative
-  if (-not (Test-Path -LiteralPath $resolved)) { throw "Protected path missing: $resolved" }
-}
-```
-
-Expected: all delete targets resolve below the workspace; `runs`, `data`, and `.venv` exist.
-
-- [ ] **Step 2: 删除精确目标**
-
-Run:
-
-```powershell
-$workspaceRoot = [IO.Path]::GetFullPath('D:\AI Projects\.worktrees\week3')
-$deleteTargets = @(
-  '.mypy_cache',
-  '.ruff_cache',
-  '.uv-cache',
-  '.pdf-check',
-  '.sheet-build',
-  '.superpowers\sdd',
-  '.gate0-report.json',
-  'outputs\annotation_status_20260729',
-  'deliverables\初赛提交包_20260805',
-  'deliverables\VivaAI_材料交接包_20260805.zip',
-  'docs\PROJECT_HANDOFF_TASK4.md',
-  'docs\superpowers\plans\2026-07-28-task10-experiment-ablation.md',
-  'docs\superpowers\plans\2026-07-28-week3-task10-experimentation.md',
-  'docs\superpowers\plans\2026-07-28-week3-task9-embedding-ranking.md',
-  'docs\superpowers\plans\2026-07-29-data-freeze-v2.md'
-)
 foreach ($relative in $deleteTargets) {
   $resolved = [IO.Path]::GetFullPath((Join-Path $workspaceRoot $relative))
   if (-not $resolved.StartsWith($workspaceRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
@@ -104,9 +70,9 @@ foreach ($relative in $deleteTargets) {
 }
 ```
 
-Expected: command exits 0; no protected path appears in `$deleteTargets`.
+Expected: command exits 0; only the approved literal targets are removed; `runs`, `data`, and `.venv` remain present.
 
-- [ ] **Step 3: 更新 `.gitignore`**
+- [ ] **Step 2: 更新 `.gitignore`**
 
 Apply:
 
@@ -120,7 +86,7 @@ Apply:
  .mypy_cache/
  .coverage
  htmlcov/
-+
+
 +# Local build and agent work products
 +.uv-cache/
 +.pdf-check/
@@ -128,12 +94,12 @@ Apply:
 +.superpowers/
 ```
 
-- [ ] **Step 4: 验证清理结果**
+- [ ] **Step 3: 验证并提交 tracked 清理**
 
 Run:
 
 ```powershell
-$deleted = @(
+foreach ($path in @(
   '.mypy_cache', '.ruff_cache', '.uv-cache', '.pdf-check', '.sheet-build',
   '.superpowers\sdd', '.gate0-report.json', 'outputs\annotation_status_20260729',
   'deliverables\初赛提交包_20260805', 'deliverables\VivaAI_材料交接包_20260805.zip',
@@ -142,27 +108,19 @@ $deleted = @(
   'docs\superpowers\plans\2026-07-28-week3-task10-experimentation.md',
   'docs\superpowers\plans\2026-07-28-week3-task9-embedding-ranking.md',
   'docs\superpowers\plans\2026-07-29-data-freeze-v2.md'
-)
-$remaining = $deleted | Where-Object { Test-Path -LiteralPath $_ }
-if ($remaining) { throw "Approved targets still exist: $($remaining -join ', ')" }
-foreach ($protected in @('runs', 'data', '.venv')) {
-  if (-not (Test-Path -LiteralPath $protected)) { throw "Protected path missing: $protected" }
+)) {
+  if (Test-Path -LiteralPath $path) { throw "Approved target remains: $path" }
 }
-git status --short
-```
-
-Expected: no approved deletion target remains; protected paths exist; Git shows the tracked deletion of `docs/PROJECT_HANDOFF_TASK4.md` and the `.gitignore` modification.
-
-- [ ] **Step 5: 提交 tracked 清理规则**
-
-Run:
-
-```powershell
+foreach ($path in @('runs', 'data', '.venv')) {
+  if (-not (Test-Path -LiteralPath $path)) { throw "Protected path missing: $path" }
+}
 git add -- .gitignore docs/PROJECT_HANDOFF_TASK4.md
+git diff --cached --check
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 git commit -m "chore: remove obsolete project handoff artifacts"
 ```
 
-Expected: one commit containing only `.gitignore` and the tracked Task 4 handoff deletion. Untracked deliverables are not staged.
+Expected: one commit contains only `.gitignore` and the tracked Task 4 handoff deletion. Untracked deliverables are not staged.
 
 ---
 
@@ -181,7 +139,7 @@ Expected: one commit containing only `.gitignore` and the tracked Task 4 handoff
 - Consumes: Task 1 保留下来的 2026-08-06 交付物
 - Produces: 三个简洁目录名和可继续运行的 replay 演示脚本
 
-- [ ] **Step 1: 验证重命名源与目标**
+- [ ] **Step 1: 校验并重命名目录**
 
 Run:
 
@@ -196,31 +154,21 @@ foreach ($pair in $moves) {
   $source = [IO.Path]::GetFullPath((Join-Path $workspaceRoot $pair[0]))
   $destination = [IO.Path]::GetFullPath((Join-Path $workspaceRoot $pair[1]))
   if (-not (Test-Path -LiteralPath $source)) { throw "Missing source: $source" }
-  if (Test-Path -LiteralPath $destination) { throw "Destination already exists: $destination" }
-  if (-not $source.StartsWith($workspaceRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Source escaped workspace: $source"
+  if (Test-Path -LiteralPath $destination) { throw "Destination exists: $destination" }
+  foreach ($path in @($source, $destination)) {
+    if (-not $path.StartsWith($workspaceRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+      throw "Path escaped workspace: $path"
+    }
   }
-  if (-not $destination.StartsWith($workspaceRoot + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Destination escaped workspace: $destination"
-  }
+}
+foreach ($pair in $moves) {
+  Move-Item -LiteralPath $pair[0] -Destination $pair[1]
 }
 ```
 
-Expected: all three sources exist and all three destinations are absent.
+Expected: the three new directories exist and the old names are absent.
 
-- [ ] **Step 2: 执行字面路径重命名**
-
-Run:
-
-```powershell
-Move-Item -LiteralPath 'deliverables\初赛提交包_20260806' -Destination 'deliverables\submission'
-Move-Item -LiteralPath 'deliverables\演示包_20260806' -Destination 'deliverables\demo'
-Move-Item -LiteralPath 'deliverables\项目文档_20260806' -Destination 'deliverables\project-docs'
-```
-
-Expected: the three new directories exist and the old directory names are absent.
-
-- [ ] **Step 3: 更新交付物版本说明与演示脚本**
+- [ ] **Step 2: 更新版本说明与演示脚本**
 
 Apply:
 
@@ -266,7 +214,7 @@ Create `deliverables/project-docs/README.md` with:
 正式评测证据仍以工作区 `runs/` 中的密封运行记录为准。
 ```
 
-- [ ] **Step 4: 验证新目录和硬编码路径**
+- [ ] **Step 3: 验证目录与硬编码路径**
 
 Run:
 
@@ -274,18 +222,16 @@ Run:
 foreach ($path in @('deliverables\submission', 'deliverables\demo', 'deliverables\project-docs')) {
   if (-not (Test-Path -LiteralPath $path)) { throw "Renamed deliverable missing: $path" }
 }
-foreach ($path in @('deliverables\初赛提交包_20260806', 'deliverables\演示包_20260806', 'deliverables\项目文档_20260806')) {
-  if (Test-Path -LiteralPath $path) { throw "Old deliverable path remains: $path" }
-}
 $stale = rg -n "初赛提交包_20260806|演示包_20260806|项目文档_20260806" deliverables
 $rgCode = $LASTEXITCODE
 if ($rgCode -eq 0) { throw "Stale deliverable path found: $stale" }
 if ($rgCode -ne 1) { throw "rg failed with exit code $rgCode" }
 ```
 
-Expected: existence checks pass; `rg` returns no match. Do not stage `deliverables/`.
+Expected: new directories are present and no old path remains. Do not stage `deliverables/`.
 
 ---
+
 ### Task 3: 合并实验结论并重写活跃路线文档
 
 **Files:**
@@ -339,11 +285,11 @@ Replace `docs/experiment-decisions.md` with:
 | Embedding Reranking | gold top-50 从 13 降至 6，F1 从 0.0081 降至 0.0044 | 否决 | 候选池、表示或训练目标改变，且离线 F1 超过原排序 |
 | Query Rewrite | W1–W5 未救回零命中查询 | 否决 | 生成器获得旧实验没有的新证据 |
 | LLM Query Variants | gold top-50 从 13 降至 8–10，并增加大量请求 | 否决 | 小规模 exact-ID recall 提升且不损失已有命中 |
-| Title Candidates | 唯一正向召回信号；联合池覆盖 41 篇 gold、24 个查询 | 继续 | 优先诊断候选从验证、融合到最终输出的流失，不先增加标题数量 |
+| Title Candidates | 独立 P0 标题探针的联合池覆盖 41 篇 gold、24 个查询；尚不是与正式最终输出的同阶段对照 | 继续 | 先做同一 run 的阶段流失诊断，不先增加标题数量 |
 
 ## 当前结论
 
-召回仍是主要瓶颈，但下一步不是继续增加检索模块，而是先确认 gold 的 OpenAlex 可用性，并定位标题候选在现有流水线中的流失位置。
+召回仍是主要瓶颈，但下一步不是继续增加检索模块，而是先确认 gold 的 OpenAlex 可用性，并用同一 run 验证标题候选是否以及在哪个阶段流失。
 ```
 
 - [ ] **Step 3: 重写检索路线图**
@@ -358,7 +304,7 @@ Replace `docs/retrieval-roadmap.md` with:
 ## 当前判断
 
 - 当前宏 F1 约 0.006，51/60 查询零命中，召回是主要瓶颈。
-- 标题候选是唯一已有正向召回信号，但候选联合池到最终输出存在明显流失。
+- 标题候选是唯一已有正向召回信号；不同实验显示候选池与最终命中存在潜在落差，但尚不能直接归因。
 - Citation、Topic、Embedding、普通 Query Rewrite 和既有 LLM Query Variants 已被实测否决，详见 `experiment-decisions.md`。
 
 ## Phase 0：建立干净基线
@@ -459,7 +405,7 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 
 Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrite 和既有 LLM Query Variants 均已有负向实测。除非方法或输入发生实质变化并先通过低成本探针，否则不要重复。
 
-标题候选是唯一已有正向召回信号。后续先定位候选在 OpenAlex 验证、融合和最终输出之间的流失。
+标题候选是唯一已有正向召回信号，但当前数据不是同一 run 的阶段对照。后续先验证候选是否在 OpenAlex 验证、融合或最终输出阶段流失。
 
 ## 5. 下一步
 
@@ -479,6 +425,10 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - 密钥位于 `D:\AI Projects\Projects\.env`，不得读取、打印或提交；
 - 正式命令只加载 `LLM_API_KEY`、`OPENALEX_API_KEY`（含 `_2.._7`）和 `SEMANTIC_SCHOLAR_API_KEY`；
 - 不加载 `LLM_BASE_URL`、`LLM_MODEL_PRIMARY`、`LLM_MODEL_FALLBACK`；
+- OpenAlex key 必须从裸名 `OPENALEX_API_KEY` 开始连续编号；余额低于一次 search 成本才轮换，余额充足的 429 按每秒限流退避；
+- DeepSeek 请求必须保留 `thinking: disabled`；
+- 每次正式 run 都会推进 ledger，重建锁前必须重新读取 `project_checkpoint()`；
+- `c22abf9` 的 reservation elapsed 软处理和标题阶段降级不可回退；
 - 不删除 `runs/`、`_diag_*` 或 `data/`，不修改 `data/manifest.json`；
 - capture 与 replay 之间不得提交代码；
 - 不在聊天或公开文档中写入冻结查询文本；
@@ -561,7 +511,7 @@ Expected: commit includes only the four active documents. `deliverables/` remain
 - Consumes: Tasks 1–3
 - Produces: 可交接的清理结果；不创建新文件、不运行网络评测
 
-- [ ] **Step 1: 检查保护路径与新目录**
+- [ ] **Step 1: 检查保护路径、新目录和旧引用**
 
 Run:
 
@@ -573,40 +523,22 @@ foreach ($path in @(
 )) {
   if (-not (Test-Path -LiteralPath $path)) { throw "Required path missing: $path" }
 }
-```
-
-Expected: command exits 0.
-
-- [ ] **Step 2: 检查旧活跃路径引用**
-
-Run as one command:
-
-```powershell
 $stale = rg -n --hidden --glob '!.git/**' --glob '!runs/**' --glob '!data/**' --glob '!docs/superpowers/specs/2026-08-08-project-cleanup-retrieval-roadmap-design.md' --glob '!docs/superpowers/plans/2026-08-08-project-cleanup-retrieval-roadmap.md' "improvement-plan-2026-08-07|academic_retrieval_v3_optimization_plan|初赛提交包_20260806|演示包_20260806|项目文档_20260806|PROJECT_HANDOFF_TASK4" .
 $rgCode = $LASTEXITCODE
 if ($rgCode -eq 0) { throw "Stale active path found: $stale" }
 if ($rgCode -ne 1) { throw "rg failed with exit code $rgCode" }
 ```
 
-Expected: no match.
+Expected: all required paths exist and no stale active path remains.
 
-- [ ] **Step 3: 检查 Git 差异与暂存边界**
+- [ ] **Step 2: 检查 Git 边界与锁交接**
 
 Run:
 
 ```powershell
 git diff --check
 git status --short
-```
-
-Expected: `git diff --check` exits 0. `git status --short` may show only `?? deliverables/` because deliverables intentionally remain local and untracked; no deleted cache、旧计划或 `outputs/` 条目残留。
-
-- [ ] **Step 4: 记录锁交接状态**
-
-Run:
-
-```powershell
 rg -n "v21|c22abf9|不得继续用于正式 capture|单独授权|重建下一版锁" HANDOFF.md docs/retrieval-roadmap.md
 ```
 
-Expected: `HANDOFF.md` explicitly marks v21 unusable; the roadmap requires lock renewal before the next baseline. Do not rebuild the lock in this plan.
+Expected: `git diff --check` exits 0; status may show only `?? deliverables/`; HANDOFF marks v21 unusable and the roadmap requires lock renewal. Do not rebuild the lock in this plan.

@@ -229,7 +229,7 @@ Apply:
 +++ deliverables/submission/README.md
 @@
  ## 命名与版本
- 
+
  - 团队：VivaAI
  - 项目：科研场景下复杂学术查询的智能论文搜索与推荐
 +- 包版本：2026-08-06
@@ -238,7 +238,7 @@ Apply:
 +++ deliverables/demo/README.md
 @@
  # 演示视频录制包（给队友）
- 
+
  本包用于录制初赛项目视频（Replay UI 演示），已实测可运行。
 +
 +包版本：2026-08-06。
@@ -499,7 +499,7 @@ Apply:
 -（LLM 生成 10 个候选论文标题，经 OpenAlex 验证后并入候选池；编排器按 `max_output_papers=50`
 +（LLM 生成 20 个候选论文标题，经 OpenAlex 验证后并入候选池；编排器按 `max_output_papers=50`
  截断最终输出）。
- 
+
  可选模块的实现或离线测试通过不代表晋升。晋升需要 Gate 0–5、三次同配置 dev 比较、1,000 次 bootstrap、一次 selection-only validation 比较及单独批准；在证据不完整或阈值不通过时保持 default-off。
 +
 +当前项目状态见 `HANDOFF.md`；检索提升顺序见 `docs/retrieval-roadmap.md`；已完成实验的继续/停止决策见 `docs/experiment-decisions.md`。
@@ -610,4 +610,3 @@ rg -n "v21|c22abf9|不得继续用于正式 capture|单独授权|重建下一版
 ```
 
 Expected: `HANDOFF.md` explicitly marks v21 unusable; the roadmap requires lock renewal before the next baseline. Do not rebuild the lock in this plan.
-

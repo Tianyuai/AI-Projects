@@ -81,10 +81,12 @@ paper-search compare-replay tests/fixtures/formal_run/capture tests/fixtures/for
 `configs/base.yaml` 固定 `experiment: main-baseline`。可选身份为 `embedding`、`citation-expansion`、
 `llm-rerank`、`title-candidates`、`fixed-two-round` 和 `adaptive-evolution`；每个身份只构造其
 声明组件，baseline 不加载可选依赖。`title-candidates` 使用 `configs/title_candidates.yaml`
-（LLM 生成 10 个候选论文标题，经 OpenAlex 验证后并入候选池；编排器按 `max_output_papers=50`
+（LLM 生成 20 个候选论文标题，经 OpenAlex 验证后并入候选池；编排器按 `max_output_papers=50`
 截断最终输出）。
 
 可选模块的实现或离线测试通过不代表晋升。晋升需要 Gate 0–5、三次同配置 dev 比较、1,000 次 bootstrap、一次 selection-only validation 比较及单独批准；在证据不完整或阈值不通过时保持 default-off。
+
+当前项目状态见 `HANDOFF.md`；检索提升顺序见 `docs/retrieval-roadmap.md`；已完成实验的继续/停止决策见 `docs/experiment-decisions.md`。
 
 Embedding 的离线聚焦验证命令为：
 

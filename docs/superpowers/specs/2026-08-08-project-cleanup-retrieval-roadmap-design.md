@@ -57,7 +57,7 @@ The four plan files are currently untracked and superseded by later integrated p
 
 ### 3.3 Preserve evidence and current deliverables
 
-Preserve without content changes:
+Preserve all substantive artifacts. Only path-reference and provenance metadata may change where required by the approved renames:
 
 - `runs/`, including failed captures, snapshots, ledger files, and every `_diag_*` artifact
 - `data/`, including frozen gold, manifests, identifier maps, and readiness evidence
@@ -84,7 +84,7 @@ Apply these renames:
 
 Create `docs/experiment-decisions.md` as the authoritative record of completed diagnostic experiments. After its valid evidence is transferred, delete `academic_retrieval_v3_optimization_plan.md`.
 
-Dates and version provenance move into each deliverable README or document metadata instead of remaining in active directory names. Search the repository after every rename and update live references in documentation and scripts. Do not rewrite frozen evidence merely to replace a path string.
+Dates and version provenance move into each deliverable README or document metadata instead of remaining in active directory names. Update the existing submission and demo READMEs, and create `deliverables/project-docs/README.md` because that source directory does not currently have one. Search the repository after every rename and update live references in documentation and scripts. Do not rewrite frozen evidence merely to replace a path string.
 
 Update `HANDOFF.md` to describe the post-cleanup paths, current baseline state, approved roadmap, rejected experiments, and lock consequences. Do not create a second project-status document.
 

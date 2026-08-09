@@ -2,16 +2,27 @@
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
 import math
 import os
 import re
+import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Awaitable, Callable, Literal
+from urllib.parse import quote
 
+import httpx
+from pydantic import SecretStr
+
+from paper_search.control.ledger import DEV_RUN_CAP_CNY, SQLiteBudgetLedger
+from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
+from paper_search.domain.models import UsageActual
 from paper_search.evaluation.dataset import (
     EvaluationQuery,
     IdentifierMap,
@@ -100,6 +111,7 @@ class ProbeCounters:
     http_attempts: int
     http_status_counts: Mapping[str, int]
     timeout_count: int
+    retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -120,6 +132,25 @@ class DiagnosticUsage:
     timeouts: int
     ledger_checkpoint_before_sha256: str
     ledger_checkpoint_after_sha256: str
+
+
+ClockFn = Callable[[], datetime]
+SleepFn = Callable[[float], Awaitable[None]]
+
+
+class ProbeGlobalError(RuntimeError):
+    """A provider or orchestration error that invalidates the whole probe."""
+
+    def __init__(self, reason: str, *, attempts: int) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.attempts = attempts
+
+
+@dataclass(frozen=True)
+class DiagnosticRunResult:
+    diagnostic_run_id: str
+    payload: dict[str, object]
 
 
 def _read_json_object(path: Path) -> dict[str, object]:
@@ -331,16 +362,21 @@ def _direction_and_reasons(
     context: OfflineContext,
     probe: ProbeBatch,
 ) -> tuple[bool, str | None, list[str]]:
-    counts = {status: 0 for status in AVAILABILITY_STATUSES}
+    counts: dict[AvailabilityStatus, int] = {
+        status: 0 for status in AVAILABILITY_STATUSES
+    }
     for work in context.gold_index.work_to_identifier_kind:
         status = probe.status_by_work.get(work)
         if status is None:
             raise ValueError("probe status is incomplete")
         counts[status] += 1
+    problem_statuses: tuple[AvailabilityStatus, ...] = (
+        "unknown_transient",
+        "invalid_identifier",
+        "integrity_failure",
+    )
     reasons = [
-        f"{status}_present"
-        for status in ("unknown_transient", "invalid_identifier", "integrity_failure")
-        if counts[status]
+        f"{status}_present" for status in problem_statuses if counts[status]
     ]
     if reasons:
         return False, None, sorted(reasons)
@@ -384,18 +420,22 @@ def assemble_report(
     expected_works = set(context.gold_index.work_to_identifier_kind)
     if set(probe.status_by_work) != expected_works:
         raise ValueError("probe status keys do not match unique gold works")
-    availability = {status: 0 for status in AVAILABILITY_STATUSES}
+    availability: dict[AvailabilityStatus, int] = {
+        status: 0 for status in AVAILABILITY_STATUSES
+    }
     for status in probe.status_by_work.values():
         if status not in availability:
             raise ValueError("unknown availability status")
         availability[status] += 1
 
-    pipeline_stages = {stage: 0 for stage in PIPELINE_STAGES}
-    cross_tab = {
+    pipeline_stages: dict[PipelineStage, int] = {
+        stage: 0 for stage in PIPELINE_STAGES
+    }
+    cross_tab: dict[AvailabilityStatus, dict[PipelineStage, int]] = {
         status: {stage: 0 for stage in PIPELINE_STAGES}
         for status in AVAILABILITY_STATUSES
     }
-    query_coverage = {
+    query_coverage: dict[AvailabilityStatus, dict[PipelineStage, set[str]]] = {
         status: {stage: set() for stage in PIPELINE_STAGES}
         for status in AVAILABILITY_STATUSES
     }
@@ -558,3 +598,375 @@ def write_atomic_text(path: Path, content: str) -> None:
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def collect_openalex_keys(environ: Mapping[str, str]) -> tuple[SecretStr, ...]:
+    base_name = "OPENALEX_API_KEY"
+    base_value = environ.get(base_name)
+    numbered = {
+        int(match.group(1)): value
+        for name, value in environ.items()
+        if (match := re.fullmatch(r"OPENALEX_API_KEY_(\d+)", name))
+    }
+    if not isinstance(base_value, str) or not base_value:
+        if numbered:
+            raise ValueError("OPENALEX_API_KEY is missing")
+        raise ValueError("OPENALEX_API_KEY is missing")
+    if any(index < 2 for index in numbered):
+        raise ValueError("OpenAlex key sequence is invalid")
+    highest = max(numbered, default=1)
+    if set(numbered) != set(range(2, highest + 1)):
+        raise ValueError("OpenAlex key sequence is not contiguous")
+    values = [base_value, *(numbered[index] for index in range(2, highest + 1))]
+    if any(not value for value in values):
+        raise ValueError("OpenAlex key sequence contains an empty key")
+    return tuple(SecretStr(value) for value in values)
+
+
+def exact_work_endpoint(identifier: str) -> str:
+    normalized = normalize_paper_id(identifier)
+    kind, separator, value = normalized.partition(":")
+    if not separator or kind not in {"doi", "openalex"}:
+        raise ValueError("unsupported exact identifier")
+    if kind == "openalex":
+        return f"/works/{quote(value, safe='')}"
+    return f"/works/{quote('https://doi.org/' + value, safe='')}"
+
+
+def _retry_delay(response: httpx.Response | None, retry_number: int) -> float:
+    if response is not None:
+        header = response.headers.get("Retry-After")
+        if header is not None:
+            try:
+                value = float(header)
+            except ValueError:
+                value = -1.0
+            if math.isfinite(value) and value >= 0:
+                return min(value, 10.0)
+    return min(float(retry_number), 10.0)
+
+
+def _response_matches(identifier: str, payload: object) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    normalized = normalize_paper_id(identifier)
+    if normalized.startswith("doi:"):
+        response_identifier = payload.get("doi")
+    else:
+        response_identifier = payload.get("id")
+    if not isinstance(response_identifier, str):
+        return False
+    try:
+        return normalize_paper_id(response_identifier) == normalized
+    except ValueError:
+        return False
+
+
+async def probe_openalex_exact(
+    work_ids: Sequence[str],
+    *,
+    client: httpx.AsyncClient,
+    keys: Sequence[SecretStr],
+    sleep: SleepFn = asyncio.sleep,
+    clock: ClockFn = lambda: datetime.now(UTC),
+) -> ProbeBatch:
+    del clock
+    if not keys:
+        raise ProbeGlobalError("OpenAlex keys are missing", attempts=0)
+    ordered_ids = sorted(set(work_ids))
+    status_by_work: dict[str, AvailabilityStatus] = {}
+    status_counts = {"200": 0, "404": 0, "429": 0, "5xx": 0}
+    timeout_count = 0
+    attempts_total = 0
+    retries_total = 0
+    key_index = 0
+
+    for identifier in ordered_ids:
+        try:
+            endpoint = exact_work_endpoint(identifier)
+        except ValueError:
+            status_by_work[identifier] = "invalid_identifier"
+            continue
+
+        work_attempts = 0
+        while work_attempts < 3:
+            work_attempts += 1
+            attempts_total += 1
+            try:
+                response = await client.get(
+                    f"https://api.openalex.org{endpoint}",
+                    params={
+                        "api_key": keys[key_index].get_secret_value(),
+                        "select": "id,doi",
+                    },
+                )
+            except httpx.TimeoutException:
+                timeout_count += 1
+                if work_attempts >= 3:
+                    status_by_work[identifier] = "unknown_transient"
+                    break
+                retries_total += 1
+                await sleep(_retry_delay(None, work_attempts))
+                continue
+            except httpx.RequestError as error:
+                raise ProbeGlobalError(
+                    f"OpenAlex request failed: {type(error).__name__}",
+                    attempts=attempts_total,
+                ) from error
+
+            if response.status_code == 200:
+                status_counts["200"] += 1
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = None
+                status_by_work[identifier] = (
+                    "available" if _response_matches(identifier, payload) else "integrity_failure"
+                )
+                break
+            if response.status_code == 404:
+                status_counts["404"] += 1
+                status_by_work[identifier] = "exact_not_found"
+                break
+            if response.status_code == 429:
+                status_counts["429"] += 1
+                remaining = response.headers.get("x-ratelimit-remaining")
+                try:
+                    low_quota = remaining is not None and int(remaining) < 10
+                except ValueError:
+                    low_quota = False
+                if low_quota and len(keys) > 1:
+                    key_index = (key_index + 1) % len(keys)
+                if work_attempts >= 3:
+                    status_by_work[identifier] = "unknown_transient"
+                    break
+                retries_total += 1
+                await sleep(_retry_delay(response, work_attempts))
+                continue
+            if 500 <= response.status_code <= 599:
+                status_counts["5xx"] += 1
+                if work_attempts >= 3:
+                    status_by_work[identifier] = "unknown_transient"
+                    break
+                retries_total += 1
+                await sleep(_retry_delay(response, work_attempts))
+                continue
+            if response.status_code in {401, 403} or 400 <= response.status_code <= 499:
+                raise ProbeGlobalError(
+                    f"OpenAlex non-retryable HTTP {response.status_code}",
+                    attempts=attempts_total,
+                )
+            raise ProbeGlobalError(
+                f"OpenAlex unexpected HTTP {response.status_code}",
+                attempts=attempts_total,
+            )
+
+    return ProbeBatch(
+        status_by_work=status_by_work,
+        counters=ProbeCounters(
+            http_attempts=attempts_total,
+            http_status_counts=status_counts,
+            timeout_count=timeout_count,
+            retries=retries_total,
+        ),
+    )
+
+
+def _usage_from_probe(counters: ProbeCounters) -> DiagnosticUsage:
+    statuses = counters.http_status_counts
+    return DiagnosticUsage(
+        unique_requests_planned=0,
+        http_attempts=counters.http_attempts,
+        retries=counters.retries,
+        http_200=statuses.get("200", 0),
+        http_404=statuses.get("404", 0),
+        http_429=statuses.get("429", 0),
+        http_5xx=statuses.get("5xx", 0),
+        timeouts=counters.timeout_count,
+        ledger_checkpoint_before_sha256="0" * 64,
+        ledger_checkpoint_after_sha256="0" * 64,
+    )
+
+
+def _priced_usage(pricer: ActualCostPricer, attempts: int) -> UsageActual:
+    return pricer.value_actual(
+        dependency="openalex",
+        model_or_adapter="openalex-works-v1",
+        usage=UsageActual(search_api_calls=attempts),
+    )
+
+
+def _render_markdown(payload: Mapping[str, object]) -> str:
+    counts = payload["counts"]
+    availability = payload["availability"]
+    stages = payload["pipeline_stages"]
+    assert isinstance(counts, dict)
+    assert isinstance(availability, dict)
+    assert isinstance(stages, dict)
+    reason_codes = payload["reason_codes"]
+    reason_text = (
+        ", ".join(str(item) for item in reason_codes)
+        if isinstance(reason_codes, list)
+        else str(reason_codes)
+    )
+    return "\n".join(
+        [
+            "# Gold Availability Bottleneck Attribution",
+            "",
+            f"- Schema: `{payload['schema_version']}`",
+            f"- Source run: `{payload['source_run_id']}`",
+            f"- Diagnostic complete: `{payload['diagnostic_complete']}`",
+            "",
+            "## Denominators",
+            "",
+            f"- Queries: {counts['query_count']}",
+            f"- Raw gold identifiers: {counts['raw_gold_identifier_count']}",
+            f"- Normalized query–work associations: {counts['normalized_query_work_count']}",
+            f"- Unique works: {counts['unique_work_count']}",
+            "",
+            "## Availability",
+            "",
+            *[f"- {key}: {availability[key]}" for key in AVAILABILITY_STATUSES],
+            "",
+            "## Pipeline stages",
+            "",
+            *[f"- {key}: {stages[key]}" for key in PIPELINE_STAGES],
+            "",
+            f"- Recommended direction: `{payload['recommended_direction']}`",
+            f"- Reason codes: `{reason_text}`",
+            "",
+        ]
+    )
+
+
+async def run_diagnostic(
+    *,
+    run: Path,
+    gold_path: Path,
+    id_map_path: Path,
+    ledger_path: Path,
+    pricing_path: Path,
+    out_json: Path,
+    out_report: Path,
+    client: httpx.AsyncClient | None = None,
+    environ: Mapping[str, str] | None = None,
+    sleep: SleepFn = asyncio.sleep,
+    clock: ClockFn = lambda: datetime.now(UTC),
+) -> DiagnosticRunResult:
+    context = load_offline_context(run, gold_path, id_map_path)
+    keys = collect_openalex_keys(environ if environ is not None else os.environ)
+    pricing = load_pricing_policy(pricing_path)
+    pricer = ActualCostPricer(pricing, valued_at=clock())
+    ledger = SQLiteBudgetLedger(ledger_path, clock=clock)
+    checkpoint_before = ledger.project_checkpoint()[1]
+    estimate = _priced_usage(pricer, 402)
+    diagnostic_run_id = f"{context.source_run_id}-gold-availability"
+    reservation = ledger.reserve(
+        run_id=diagnostic_run_id,
+        query_id="aggregate-gold-availability",
+        estimate=estimate,
+        run_cap_cny=DEV_RUN_CAP_CNY,
+    )
+    owns_client = client is None
+    active_client = client or httpx.AsyncClient()
+    try:
+        try:
+            probe = await probe_openalex_exact(
+                list(context.gold_index.work_to_identifier_kind),
+                client=active_client,
+                keys=keys,
+                sleep=sleep,
+                clock=clock,
+            )
+        except ProbeGlobalError as error:
+            ledger.fail(reservation, _priced_usage(pricer, error.attempts))
+            raise
+        usage = _usage_from_probe(probe.counters)
+        usage = DiagnosticUsage(
+            **{
+                **usage.__dict__,
+                "unique_requests_planned": context.gold_index.unique_work_count,
+                "ledger_checkpoint_before_sha256": checkpoint_before.removeprefix("sha256:"),
+            }
+        )
+        actual = _priced_usage(pricer, probe.counters.http_attempts)
+        ledger.settle(reservation, actual)
+        checkpoint_after = ledger.project_checkpoint()[1]
+        usage = DiagnosticUsage(
+            **{
+                **usage.__dict__,
+                "ledger_checkpoint_after_sha256": checkpoint_after.removeprefix("sha256:"),
+            }
+        )
+        current_hashes = {
+            "gold_sha256": _sha256_hex(gold_path),
+            "identifier_map_sha256": _sha256_hex(id_map_path),
+            "executions_sha256": _sha256_hex(run / "executions.jsonl"),
+            "business_results_sha256": _sha256_hex(run / "business-results.jsonl"),
+            "gates_sha256": _sha256_hex(run / "gates.json"),
+            "run_sha256": _sha256_hex(run / "run.json"),
+        }
+        if current_hashes != dict(context.input_hashes):
+            raise ValueError("diagnostic input hashes changed before publication")
+        payload = assemble_report(context, probe, usage)
+        json_content = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n"
+        write_atomic_text(out_json, json_content)
+        write_atomic_text(out_report, _render_markdown(payload))
+        return DiagnosticRunResult(diagnostic_run_id, payload)
+    finally:
+        if owns_client:
+            await active_client.aclose()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run the aggregate gold availability bottleneck diagnostic."
+    )
+    parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument("--gold", type=Path, required=True)
+    parser.add_argument("--id-map", type=Path, required=True)
+    parser.add_argument("--ledger", type=Path, required=True)
+    parser.add_argument("--pricing-policy", type=Path, required=True)
+    parser.add_argument("--out-json", type=Path, required=True)
+    parser.add_argument("--out-report", type=Path, required=True)
+    arguments = parser.parse_args(argv)
+    try:
+        result = asyncio.run(
+            run_diagnostic(
+                run=arguments.run,
+                gold_path=arguments.gold,
+                id_map_path=arguments.id_map,
+                ledger_path=arguments.ledger,
+                pricing_path=arguments.pricing_policy,
+                out_json=arguments.out_json,
+                out_report=arguments.out_report,
+            )
+        )
+    except Exception as error:
+        print(f"diagnostic failed: {type(error).__name__}", file=sys.stderr)
+        return 1
+    payload = result.payload
+    counts = payload["counts"]
+    if not isinstance(counts, dict):
+        print("diagnostic failed: invalid counts", file=sys.stderr)
+        return 1
+    print(f"schema_version={payload['schema_version']}")
+    print(f"diagnostic_complete={payload['diagnostic_complete']}")
+    print(
+        "counts="
+        f"{counts['raw_gold_identifier_count']}/"
+        f"{counts['normalized_query_work_count']}/"
+        f"{counts['unique_work_count']}"
+    )
+    print(f"recommended_direction={payload['recommended_direction']}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

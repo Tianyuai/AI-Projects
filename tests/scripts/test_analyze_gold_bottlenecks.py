@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 import pytest
+from pydantic import SecretStr
 
 try:
     from scripts.analyze_gold_bottlenecks import (
@@ -19,8 +23,8 @@ try:
         assemble_report,
         assert_safe_report,
         load_offline_context,
-        write_atomic_text,
-    )
+    write_atomic_text,
+)
 except ModuleNotFoundError as error:
     if error.name != "scripts.analyze_gold_bottlenecks":
         raise
@@ -89,6 +93,37 @@ except ModuleNotFoundError as error:
     assert_safe_report = _missing_api
     load_offline_context = _missing_api
     write_atomic_text = _missing_api
+
+try:
+    from scripts.analyze_gold_bottlenecks import (
+        DiagnosticRunResult,
+        ProbeGlobalError,
+        collect_openalex_keys,
+        exact_work_endpoint,
+        main,
+        probe_openalex_exact,
+        run_diagnostic,
+    )
+except ImportError:
+
+    @dataclass(frozen=True)
+    class DiagnosticRunResult:
+        diagnostic_run_id: str
+        payload: dict[str, object]
+
+    class ProbeGlobalError(RuntimeError):
+        def __init__(self, attempts: int = 0) -> None:
+            super().__init__("diagnostic probe is not implemented")
+            self.attempts = attempts
+
+    def _missing_task2_api(*args: object, **kwargs: object) -> Any:
+        raise AssertionError("probe and orchestration APIs are not implemented")
+
+    collect_openalex_keys = _missing_task2_api
+    exact_work_endpoint = _missing_task2_api
+    main = _missing_task2_api
+    probe_openalex_exact = _missing_task2_api
+    run_diagnostic = _missing_task2_api
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -368,3 +403,278 @@ def test_offline_sealed_run_validation_fails_closed(
 
     with pytest.raises(ValueError, match=message):
         load_offline_context(run_copy, GOLD_PATH, ID_MAP_PATH)
+
+
+def test_keys_require_contiguous_process_environment_sequence() -> None:
+    keys = collect_openalex_keys(
+        {
+            "OPENALEX_API_KEY": "k1",
+            "OPENALEX_API_KEY_2": "k2",
+        }
+    )
+    assert [key.get_secret_value() for key in keys] == ["k1", "k2"]
+
+    with pytest.raises(ValueError, match="contiguous"):
+        collect_openalex_keys(
+            {
+                "OPENALEX_API_KEY": "k1",
+                "OPENALEX_API_KEY_3": "k3",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ("identifier", "expected"),
+    [
+        ("openalex:W2", "/works/W2"),
+        (
+            "doi:10.1000/a",
+            "/works/https%3A%2F%2Fdoi.org%2F10.1000%2Fa",
+        ),
+    ],
+)
+def test_exact_endpoint_is_identifier_only(identifier: str, expected: str) -> None:
+    endpoint = exact_work_endpoint(identifier)
+    assert endpoint == expected
+    assert "search" not in endpoint
+    assert "filter" not in endpoint
+
+
+def test_exact_probe_retries_timeout_then_reuses_success_without_search() -> None:
+    attempts = 0
+    requested_paths: list[str] = []
+    waits: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        requested_paths.append(request.url.raw_path.decode("ascii").split("?", 1)[0])
+        if attempts == 1:
+            raise httpx.ReadTimeout("temporary timeout", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "id": "https://openalex.org/W1",
+                "doi": "https://doi.org/10.1000/a",
+            },
+            request=request,
+        )
+
+    async def sleep(seconds: float) -> None:
+        waits.append(seconds)
+
+    async def execute() -> ProbeBatch:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await probe_openalex_exact(
+                ["doi:10.1000/a"],
+                client=client,
+                keys=(SecretStr("synthetic-key"),),
+                sleep=sleep,
+                clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+            )
+
+    result = asyncio.run(execute())
+
+    assert result.status_by_work == {"doi:10.1000/a": "available"}
+    assert result.counters.http_attempts == 2
+    assert result.counters.timeout_count == 1
+    assert waits == [1.0]
+    assert requested_paths == [
+        "/works/https%3A%2F%2Fdoi.org%2F10.1000%2Fa",
+        "/works/https%3A%2F%2Fdoi.org%2F10.1000%2Fa",
+    ]
+
+
+@pytest.mark.parametrize("status", [404, 429, 500, 502])
+def test_exact_probe_classifies_terminal_and_transient_responses(status: int) -> None:
+    async def sleep(seconds: float) -> None:
+        return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, request=request, headers={"Retry-After": "0"})
+
+    async def execute() -> ProbeBatch:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await probe_openalex_exact(
+                ["openalex:W2"],
+                client=client,
+                keys=(SecretStr("synthetic-key"),),
+                sleep=sleep,
+                clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+            )
+
+    result = asyncio.run(execute())
+
+    if status == 404:
+        assert result.status_by_work == {"openalex:W2": "exact_not_found"}
+    else:
+        assert result.status_by_work == {"openalex:W2": "unknown_transient"}
+        assert result.counters.http_attempts == 3
+
+
+def test_low_quota_429_rotates_to_next_key() -> None:
+    seen_keys: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen_keys.append(request.url.params["api_key"])
+        if len(seen_keys) == 1:
+            return httpx.Response(
+                429,
+                headers={"Retry-After": "0", "x-ratelimit-remaining": "5"},
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={"id": "https://openalex.org/W2"},
+            request=request,
+        )
+
+    async def sleep(seconds: float) -> None:
+        return None
+
+    async def execute() -> ProbeBatch:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await probe_openalex_exact(
+                ["openalex:W2"],
+                client=client,
+                keys=(SecretStr("k1"), SecretStr("k2")),
+                sleep=sleep,
+                clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+            )
+
+    result = asyncio.run(execute())
+
+    assert result.status_by_work == {"openalex:W2": "available"}
+    assert seen_keys == ["k1", "k2"]
+
+
+def test_200_identifier_mismatch_is_integrity_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"id": "https://openalex.org/W999"},
+            request=request,
+        )
+
+    async def execute() -> ProbeBatch:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await probe_openalex_exact(
+                ["openalex:W2"],
+                client=client,
+                keys=(SecretStr("k1"),),
+                sleep=lambda seconds: asyncio.sleep(0),
+                clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+            )
+
+    result = asyncio.run(execute())
+    assert result.status_by_work == {"openalex:W2": "integrity_failure"}
+
+
+def test_authentication_failure_is_global_and_reports_attempt_count() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, request=request)
+
+    async def execute() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            await probe_openalex_exact(
+                ["openalex:W2"],
+                client=client,
+                keys=(SecretStr("k1"),),
+                sleep=lambda seconds: asyncio.sleep(0),
+                clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+            )
+
+    with pytest.raises(ProbeGlobalError) as error:
+        asyncio.run(execute())
+    assert error.value.attempts == 1
+
+
+def test_run_diagnostic_uses_one_aggregate_receipt_and_settles_actual(
+    tmp_path: Path,
+) -> None:
+    requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(404, request=request)
+
+    async def execute() -> DiagnosticRunResult:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await run_diagnostic(
+                run=SOURCE_RUN,
+                gold_path=GOLD_PATH,
+                id_map_path=ID_MAP_PATH,
+                ledger_path=tmp_path / "formal.sqlite3",
+                pricing_path=ROOT / "data" / "annotation_work" / "pricing_v1.yaml",
+                out_json=tmp_path / "report.json",
+                out_report=tmp_path / "report.md",
+                client=client,
+                environ={"OPENALEX_API_KEY": "synthetic-key"},
+                sleep=lambda seconds: asyncio.sleep(0),
+                clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+            )
+
+    result = asyncio.run(execute())
+    assert requests == 134
+    assert result.payload["usage"]["http_attempts"] == 134
+
+    from paper_search.control.ledger import SQLiteBudgetLedger
+
+    report = SQLiteBudgetLedger(
+        tmp_path / "formal.sqlite3",
+        clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+    ).report(result.diagnostic_run_id)
+    assert len(report.receipts) == 1
+    assert report.receipts[0].query_id == "aggregate-gold-availability"
+    assert report.actual.search_api_calls == 134
+
+
+def test_cli_stdout_contains_only_fixed_aggregate_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    payload = {
+        "schema_version": "gold-bottleneck-attribution-v1",
+        "diagnostic_complete": True,
+        "counts": {
+            "raw_gold_identifier_count": 143,
+            "normalized_query_work_count": 139,
+            "unique_work_count": 134,
+        },
+        "recommended_direction": None,
+    }
+
+    async def fake_run(**kwargs: object) -> DiagnosticRunResult:
+        return DiagnosticRunResult("diagnostic-run", payload)
+
+    import scripts.analyze_gold_bottlenecks as module
+
+    monkeypatch.setattr(module, "run_diagnostic", fake_run)
+    exit_code = main(
+        [
+            "--run",
+            str(SOURCE_RUN),
+            "--gold",
+            str(GOLD_PATH),
+            "--id-map",
+            str(ID_MAP_PATH),
+            "--ledger",
+            str(tmp_path / "ledger.sqlite3"),
+            "--pricing-policy",
+            str(ROOT / "data" / "annotation_work" / "pricing_v1.yaml"),
+            "--out-json",
+            str(tmp_path / "report.json"),
+            "--out-report",
+            str(tmp_path / "report.md"),
+        ]
+    )
+
+    assert exit_code == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "schema_version=gold-bottleneck-attribution-v1",
+        "diagnostic_complete=True",
+        "counts=143/139/134",
+        "recommended_direction=None",
+    ]

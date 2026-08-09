@@ -1127,7 +1127,8 @@ class ReplaySearchProvider:
             content, ref, error, usage = self._read(identity)
             if error is not None:
                 errors.append(self._snapshot_error(error))
-                refs.append(ref)
+                if ref is not None:
+                    refs.append(ref)
                 if usage is not None:
                     usages.append(usage)
                 break
@@ -1205,7 +1206,8 @@ class ReplaySearchProvider:
         hashes: list[str] = []
         if error is not None:
             errors.append(self._snapshot_error(error))
-            refs.append(ref)
+            if ref is not None:
+                refs.append(ref)
         elif content is None or ref is None:
             errors.append(self._miss())
         else:
@@ -1250,7 +1252,8 @@ class ReplaySearchProvider:
         hashes: list[str] = []
         if error is not None:
             errors.append(self._snapshot_error(error))
-            refs.append(ref)
+            if ref is not None:
+                refs.append(ref)
         elif content is None or ref is None:
             errors.append(self._miss())
         else:
@@ -1301,7 +1304,8 @@ class ReplaySearchProvider:
         hashes: list[str] = []
         if error is not None:
             errors.append(self._snapshot_error(error))
-            refs.append(ref)
+            if ref is not None:
+                refs.append(ref)
         elif content is None or ref is None:
             errors.append(self._miss())
         else:

@@ -10,20 +10,25 @@ import tempfile
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import httpx
 from pydantic import ConfigDict, ValidationError, field_validator, model_validator
 
 from paper_search.application.contracts import (
-    DependencyStatus,
     ReadyHealthResponse,
 )
-from paper_search.domain.models import DomainModel
+from paper_search.domain.models import DependencyStatus, DomainModel
 
 
 FRESHNESS = timedelta(minutes=15)
-_EXPECTED_DEPENDENCIES = ("llm", "openalex", "semantic_scholar")
+CapabilityName = Literal["llm", "openalex", "semantic_scholar"]
+CapabilityState = Literal["ready", "degraded", "failed"]
+_EXPECTED_DEPENDENCIES: tuple[CapabilityName, ...] = (
+    "llm",
+    "openalex",
+    "semantic_scholar",
+)
 _DEFAULT_LLM_BASE_URL = "https://api.deepseek.com/v1"
 _DEFAULT_LLM_MODEL = "deepseek-v4-flash"
 _OPENALEX_PROBE_URL = "https://api.openalex.org/works"
@@ -35,8 +40,8 @@ _SEMANTIC_SCHOLAR_PROBE_URL = (
 class AuthorizedCapability(DomainModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    name: Literal["llm", "openalex", "semantic_scholar"]
-    state: Literal["ready", "degraded", "failed"]
+    name: CapabilityName
+    state: CapabilityState
     observed_at: datetime
 
     @field_validator("observed_at")
@@ -74,7 +79,7 @@ class AuthorizedReadinessEvidence(DomainModel):
         return self
 
 
-def _probe_state(response: httpx.Response, *, valid: bool) -> str:
+def _probe_state(response: httpx.Response, *, valid: bool) -> CapabilityState:
     if response.status_code == 200 and valid:
         return "ready"
     if response.status_code == 429 or 500 <= response.status_code <= 599:
@@ -88,7 +93,7 @@ async def _probe_llm(
     api_key: str,
     base_url: str,
     model: str,
-) -> str:
+) -> CapabilityState:
     endpoint = f"{base_url.rstrip('/')}/chat/completions"
     payload: dict[str, object] = {
         "model": model,
@@ -115,8 +120,8 @@ async def _probe_openalex(
     client: httpx.AsyncClient,
     *,
     api_key: str | None,
-) -> str:
-    params: dict[str, object] = {"per_page": 1, "select": "id"}
+) -> CapabilityState:
+    params: dict[str, str | int] = {"per_page": 1, "select": "id"}
     if api_key:
         params["api_key"] = api_key
     try:
@@ -144,8 +149,8 @@ async def _probe_semantic_scholar(
     client: httpx.AsyncClient,
     *,
     api_key: str | None,
-) -> str:
-    params: dict[str, object] = {
+) -> CapabilityState:
+    params: dict[str, str | int] = {
         "query": "readiness probe",
         "limit": 1,
         "fields": "paperId",
@@ -194,7 +199,7 @@ async def probe_live_readiness(
                 pool=5,
             )
         )
-    observed_at: list[tuple[str, str, datetime]] = []
+    observed_at: list[tuple[CapabilityName, CapabilityState, datetime]] = []
     try:
         llm_state = await _probe_llm(
             client,
@@ -246,10 +251,11 @@ def build_live_readiness(
         raise ValueError(
             f"unknown readiness dependency: {sorted(unknown)}"
         )
+    required_names = tuple(cast(CapabilityName, name) for name in required)
     elapsed = now - evidence.generated_at
     fresh = timedelta(0) <= elapsed < FRESHNESS
     ready = fresh and all(
-        states[requirement] == "ready" for requirement in required
+        states[requirement] == "ready" for requirement in required_names
     )
     return ReadyHealthResponse(
         status="ready" if ready else "degraded",

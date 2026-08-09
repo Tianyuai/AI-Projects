@@ -357,19 +357,19 @@ class LiveCaptureLLMAnalyzer:
                         snapshot_ref=None,
                     )
                     if decoded.errors:
-                        safe_headers: dict[str, str] = {}
+                        decoded_error_headers: dict[str, str] = {}
                         content_type = response.headers.get("content-type")
                         if content_type is not None:
-                            safe_headers["content-type"] = content_type
+                            decoded_error_headers["content-type"] = content_type
                         if request_id is not None:
-                            safe_headers["x-request-id"] = request_id
+                            decoded_error_headers["x-request-id"] = request_id
                         snapshot_ref = self._capture_store.stage_error(
                             identity,
                             error_code=decoded.errors[0].code,
                             message=decoded.errors[0].message,
                             retryable=decoded.errors[0].retryable,
                             response_bytes=response_bytes,
-                            safe_headers=safe_headers,
+                            safe_headers=decoded_error_headers,
                             captured_at=requested_at,
                         )
                         self._capture_store.annotate_usage(
@@ -390,16 +390,16 @@ class LiveCaptureLLMAnalyzer:
                             }
                         )
                     else:
-                        safe_headers: dict[str, str] = {}
+                        success_headers: dict[str, str] = {}
                         content_type = response.headers.get("content-type")
                         if content_type is not None:
-                            safe_headers["content-type"] = content_type
+                            success_headers["content-type"] = content_type
                         if request_id is not None:
-                            safe_headers["x-request-id"] = request_id
+                            success_headers["x-request-id"] = request_id
                         snapshot_ref = self._capture_store.stage_success(
                             identity,
                             response_bytes=response_bytes,
-                            safe_headers=safe_headers,
+                            safe_headers=success_headers,
                             captured_at=requested_at,
                         )
                         self._capture_store.annotate_usage(
@@ -438,19 +438,19 @@ class LiveCaptureLLMAnalyzer:
             if terminal is None:
                 raise RuntimeError("missing terminal LLM result")
             if response is not None and response.status_code != 200:
-                safe_headers: dict[str, str] = {}
+                http_error_headers: dict[str, str] = {}
                 content_type = response.headers.get("content-type")
                 if content_type is not None:
-                    safe_headers["content-type"] = content_type
+                    http_error_headers["content-type"] = content_type
                 if request_id is not None:
-                    safe_headers["x-request-id"] = request_id
+                    http_error_headers["x-request-id"] = request_id
                 snapshot_ref = self._capture_store.stage_error(
                     identity,
                     error_code=code,
                     message=message,
                     retryable=retryable,
                     response_bytes=response_bytes,
-                    safe_headers=safe_headers,
+                    safe_headers=http_error_headers,
                     captured_at=requested_at,
                 )
                 self._capture_store.annotate_usage(

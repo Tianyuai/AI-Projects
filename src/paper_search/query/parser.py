@@ -38,20 +38,20 @@ def _string_list(value: object) -> list[str]:
     if isinstance(value, str):
         return [value]
     if isinstance(value, Mapping):
-        result: list[str] = []
+        mapped_result: list[str] = []
         for key, nested in value.items():
-            result.append(
+            mapped_result.append(
                 f"{key}: {nested}" if isinstance(nested, str) else str(key)
             )
-        return result
+        return mapped_result
     if isinstance(value, list):
-        result: list[str] = []
+        listed_result: list[str] = []
         for item in value:
             if isinstance(item, str):
-                result.append(item)
+                listed_result.append(item)
             elif isinstance(item, Mapping):
-                result.extend(_string_list(item))
-        return result
+                listed_result.extend(_string_list(item))
+        return listed_result
     return []
 
 
@@ -154,6 +154,7 @@ def normalize_query_analysis(
         raise ValueError("model search plan must include subqueries")
     subqueries: list[dict[str, object]] = []
     for index, item in enumerate(raw_subqueries):
+        text: object = None
         if isinstance(item, str):
             text = item
         elif isinstance(item, Mapping):

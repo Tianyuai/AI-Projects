@@ -360,7 +360,7 @@ def test_replay_is_run_local_zero_spend_and_does_not_mutate_live_project(
 
     replay_report = replay.report("replay-run")
     after = live.report("live-run")
-    assert replay_report.actual == UsageActual(cost_cny=Decimal("0"))
+    assert replay_report.actual == _actual("0.10")
     assert replay_report.project_actual_cny == Decimal("0")
     assert after == before
 

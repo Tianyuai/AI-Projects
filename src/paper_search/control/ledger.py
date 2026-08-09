@@ -543,9 +543,7 @@ class SQLiteBudgetLedger:
         now = self._clock()
         if now.tzinfo is None:
             raise ValueError("ledger clock must return a timezone-aware datetime")
-        checkpoint = (
-            UsageActual(cost_cny=Decimal("0")) if self._replay else actual
-        )
+        checkpoint = actual
         values = _usage_values(checkpoint)
         with self._immediate() as connection:
             row = connection.execute(
@@ -596,7 +594,7 @@ class SQLiteBudgetLedger:
         reservation: LedgerReservation,
         actual: UsageActual,
     ) -> Literal["reserved", "checkpointed", "settled", "failed"]:
-        expected = UsageActual(cost_cny=Decimal("0")) if self._replay else actual
+        expected = actual
         with self._immediate() as connection:
             self._recover_locked(connection)
             row = connection.execute(
@@ -746,7 +744,7 @@ class SQLiteBudgetLedger:
             if stored != reservation:
                 raise LedgerReservationError("reservation does not match stored state")
             if self._replay:
-                values = _usage_values(UsageActual(cost_cny=Decimal("0")))
+                values = _usage_values(actual)
             else:
                 if row["checkpoint_present"]:
                     checkpoint = UsageActual.model_validate(

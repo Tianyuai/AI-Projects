@@ -279,9 +279,13 @@ For each execution:
 3. Build `title_historical` from post-title refs only when that diagnostic has no errors.
 4. Build `title_repaired` from every valid decoded paper in post-title refs, while counting error-bearing responses in aggregate.
 5. Deduplicate each source by canonical ID in encounter order.
-6. Use stored `post_filter_paper_ids` as the eligibility set.
+6. Use stored `post_filter_paper_ids` as the historical eligibility set.
+7. For valid papers newly recovered from error-bearing title responses, load the
+   sealed `QuerySpec` from the matching business result and call
+   `apply_hard_filters`. Add only accepted canonical IDs to the repaired
+   eligibility set; do not re-filter or otherwise change historical candidates.
 
-Before variants, reconstruct historical RRF with title weight `1.0` and compare the full ordered IDs to stored `business-results.jsonl`. Raise `ValueError("historical Top-50 reconstruction mismatch")` on any mismatch or if totals differ from 60 queries / 2,908 results.
+Before variants, reconstruct historical RRF with title weight `1.0` and compare the full ordered IDs to stored `business-results.jsonl`. Raise `ValueError("historical Top-50 reconstruction mismatch")` on any mismatch or if totals differ from 60 queries / 2,908 results. Also compare the historical source commit with `HEAD` for `src/paper_search/processing/filters.py`; fail closed if that file differs, because only an unchanged filter implementation permits the repaired eligibility expansion.
 
 - [ ] **Step 6: Implement scoring and promotion guards**
 

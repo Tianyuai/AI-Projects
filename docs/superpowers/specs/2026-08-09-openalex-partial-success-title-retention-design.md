@@ -42,10 +42,16 @@ OpenAlex provider 的 decoder 会跳过无效 Work，并同时返回：
 
 1. 按快照顺序重建 baseline OpenAlex 与 title-candidates 来源列表；
 2. 使用历史语义重建标准 RRF；
-3. 仅保留 `post_filter_paper_ids` 中的候选；
+3. 历史重建仅保留 `post_filter_paper_ids` 中的候选；
 4. 与封存 `selected_paper_ids` 逐查询、逐顺序比较。
 
 已有只读试算能够精确复现 60/60 条 Top-50 序列，总结果均为 2,908。正式诊断脚本仍须把该结果作为 fail-closed Gate；任何不一致都停止变体评估。
+
+部分成功修复可能恢复历史合并池中不存在的 paper，因此不能仍以历史
+`post_filter_paper_ids` 作为修复候选的完整上限。诊断程序只对“从 error-bearing
+标题响应新恢复、且不在历史过滤集合中”的 papers，使用已封存 `QuerySpec`
+重跑同一纯 hard filter；仅将 accepted IDs 加入修复资格集合。该 hard-filter
+实现从历史源提交到当前源码未变；若后续比较发现实现差异，必须停止评估。
 
 ## Top-50 对照设计
 

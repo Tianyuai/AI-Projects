@@ -18,9 +18,9 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - 标题部分成功页修复已完成；封存离线对照精确重建 60/60 查询和 2,908 个 Top-50 结果。候选池 exact gold 从 19 增至 20，但最终仍为 13，没有排序变体晋级。
 - 15 个既有 mypy 错误已通过只涉及类型收窄和局部命名的最小修复清零；相关 85 个回归测试通过，业务行为未扩张。
 - 最新全量验证为 1923 passed / 36 skipped / 1 环境失败；进程级 Git ownership 兼容设置已消除 clone 失败，剩余失败是 Windows 当前 GBK locale 解码 `uv build` UTF-8 输出的问题，不涉及本次文档，已登记为本次诊断的 packaging 平台环境豁免，不能据此声称全量完全通过。Git 已跟踪 Python 文件 Ruff 全部通过，`mypy src scripts/analyze_gold_bottlenecks.py` 为 0 errors。
-- 最新项目 ledger 为 1986 条，根哈希为 `sha256:9739fc7b5c4ba48cf3b995b70019f58248f890f7f1ded2cd98e4869bde30cdf4`。
-- 两次获批的 DOI 契约 availability rerun（2026-08-09T14:10Z、14:29Z）均在第 1 次 HTTP 尝试后以 `ProbeGlobalError` 失败，未写入新 evidence、未形成新的瓶颈结论；对应 ledger reservations 均安全记为 `failed`。
-- Gold 精确可用性 v2 聚合诊断的固定输入为 60/143/139/134，唯一 work availability 为 132 `available`、0 `exact_not_found`、2 个 DOI `integrity_failure`，实际 HTTP 尝试 135/402。该聚合报告及对应 JSON 是此前一次获批在线 probe 的历史证据，保持不改。Task 1 已实现 DOI exact-endpoint acceptance contract，并由离线 `httpx.MockTransport` 合成测试覆盖：HTTP 200 且响应包含有效 OpenAlex Work ID 即为 `available`，顶层 DOI 缺失、不同或不可解析均不影响；OpenAlex-ID 请求仍严格要求规范化 ID 匹配。本次仅记录已实现的离线契约，不刷新历史在线诊断，也不声称已有新的诊断结论。
+- 最新项目 ledger 为 1989 条，根哈希为 `sha256:7e7e63a2e2ed0587d68af5a64792c1ce68949d9c49f7da714d7f14f5b47544f9`。
+- 两次 DOI 契约 availability rerun 曾在第 1 次 HTTP 尝试后失败；网络恢复后第三次获批重试成功，新的证据见 `docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json` 与对应 Markdown：134/134 个唯一 work `available`、0 个完整性失败，`diagnostic_complete=true`，推荐方向为 `retrieval_query_evolution_probe`。旧历史 evidence 保持不改。
+- Gold 精确可用性 v2 的旧聚合诊断固定输入为 60/143/139/134，唯一 work 为 132 `available`、2 个 DOI `integrity_failure`；该报告是历史 evidence，保持不改。Task 1 已实现 DOI exact-endpoint acceptance contract，并由离线 `httpx.MockTransport` 合成测试覆盖：HTTP 200 且响应包含有效 OpenAlex Work ID 即为 `available`，顶层 DOI 缺失、不同或不可解析均不影响；OpenAlex-ID 请求仍严格要求规范化 ID 匹配。新的契约重跑结果已单独写入 retry3 evidence。
 
 ## 3. 活跃文件
 
@@ -33,6 +33,8 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - `docs/quality-gate-root-cause-2026-08-09.md`：Gate 失败根因与已验证闭环；
 - `docs/gold-bottleneck-attribution-2026-08-09.md`：Gold 精确可用性与流水线瓶颈聚合诊断；
 - `docs/evidence/gold-bottleneck-attribution-2026-08-09.json`：同一诊断的固定 schema 证据；
+- `docs/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.md`：新 DOI 契约重跑的完整瓶颈诊断；
+- `docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json`：新 DOI 契约重跑的固定 schema 证据；
 - `configs/title_candidates.yaml`：当前正式实验配置；
 - `runs/candidate.lock.yaml`：本地候选锁；
 - `data/dev/gold.jsonl`：冻结 dev gold。
@@ -49,13 +51,13 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 
 ## 5. 下一步
 
-1. DOI exact-endpoint acceptance contract 已离线决定并由固定合成夹具覆盖：HTTP 200 加有效 OpenAlex Work ID 计为 `available`；顶层 DOI 缺失、不同或不可解析不构成失败；OpenAlex-ID 仍严格匹配。
-2. 保持 `docs/gold-bottleneck-attribution-2026-08-09.md` 与对应 JSON 为此前一次获批在线 probe 的历史证据，不重写、不重跑；当前没有新的诊断方向，除非另行授权在线 rerun。
-3. 只有另行授权在线诊断且离线方案提高 macro F1、保留已有 gold、排序护栏不回退时，才重建锁、运行 readiness 并申请新的 live capture。
+1. DOI exact-endpoint acceptance contract 已离线决定并由固定合成夹具覆盖；新的在线重跑已确认 134/134 个唯一 work 可用，完整性瓶颈已排除。
+2. 当前唯一推荐方向为 `retrieval_query_evolution_probe`：先设计并执行有明确假设、低成本、可回滚的 bounded probe，不直接进入 live capture。
+3. 新方向若要进入正式 capture，仍需先通过离线指标、保留已有 gold、排序护栏和预算检查，并另行授权 readiness/capture。
 
 ## 6. 锁状态
 
-当前 `runs/candidate.lock.yaml` 绑定提交 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`，但其 ledger checkpoint 仍为 1924 条。最新诊断已将 ledger 推进到 1986 条，因此该锁只是已用基线证据，不得用于新 live run。新在线实验前必须重建锁并重跑 readiness；capture、validation 和任何新的在线实验仍需单独授权。
+当前 `runs/candidate.lock.yaml` 绑定提交 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`，但其 ledger checkpoint 仍为 1924 条。最新诊断已将 ledger 推进到 1989 条，因此该锁只是已用基线证据，不得用于新 live run。新在线实验前必须重建锁并重跑 readiness；capture、validation 和任何新的在线实验仍需单独授权。
 
 ## 7. 环境与红线
 

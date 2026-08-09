@@ -7,7 +7,7 @@
 - 已闭环基线宏 F1 为 `0.0050946874`，micro recall 为 `0.0575539568`，召回是主要瓶颈。
 - 标题候选部分成功页修复使候选池 exact gold 从 19 增至 20，但最终 Top-50 仍为 13；既定离线排序变体无一满足晋级条件。
 - Citation、Topic、Embedding、普通 Query Rewrite 和既有 LLM Query Variants 已被实测否决，详见 `experiment-decisions.md`。
-- Gold 精确可用性 v2 聚合探针已执行一次：132 个唯一 work 为 `available`，0 个 `exact_not_found`，2 个 DOI `integrity_failure`。该报告及对应 JSON 是此前一次获批在线 probe 的历史证据，保持不改，不据此启动新的在线诊断方向。Task 1 已实现 DOI exact-endpoint acceptance contract，并由离线 `httpx.MockTransport` 合成测试覆盖：HTTP 200 且有效 OpenAlex Work ID 即为 `available`，顶层 DOI 缺失、不同或不可解析均不影响；OpenAlex-ID 请求仍严格匹配。
+- Gold 精确可用性 v2 的旧聚合探针为 132/134 个唯一 work `available`、2 个 DOI `integrity_failure`；该报告及对应 JSON 是历史 evidence，保持不改。新的 DOI 契约重跑证据见 `docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json`：134/134 个唯一 work `available`、0 个完整性失败，`diagnostic_complete=true`，推荐方向为 `retrieval_query_evolution_probe`。Task 1 的离线 `httpx.MockTransport` 契约测试仍保留。
 
 ## Phase 0：建立干净基线（已完成）
 
@@ -27,17 +27,17 @@
 
 ## Phase 1：两个必要诊断
 
-### 1. Gold 精确可用性（历史 probe 保留，契约已离线固化）
+### 1. Gold 精确可用性（已完成，推荐 Query Evolution bounded probe）
 
 使用 DOI、arXiv ID 和 OpenAlex ID 做只读精确反查，只输出聚合原因。禁止把 gold 标识符转换成检索查询。
 
 现有 P0 探针测量的是生成标题能否搜到 gold，不等同于 gold 是否存在于 OpenAlex。
 
-本次固定输入为 60 个查询、143 条原始 gold 标识、139 个归一化查询–论文关联和 134 个唯一 work。实际使用 135 次 HTTP 尝试（硬上限 402）；历史证据中的 2 个完整性失败均为 DOI 的 HTTP 200 响应。证据见 `docs/gold-bottleneck-attribution-2026-08-09.md` 和对应 JSON；二者均保持为此前一次获批在线 probe 的历史记录，不重写。
+本次固定输入为 60 个查询、143 条原始 gold 标识、139 个归一化查询–论文关联和 134 个唯一 work。新的契约重跑实际使用 135 次 HTTP 尝试（硬上限 402），134 个唯一 work 全部 `available`，0 个 `exact_not_found`，0 个完整性失败。新证据见 `docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json` 及对应 Markdown；旧报告和 JSON 仍作为历史记录保留。
 
 DOI exact-endpoint acceptance contract 已完成离线固化：请求使用规范化 DOI 时，HTTP 200 加有效 OpenAlex Work ID 即为 `available`；响应顶层 DOI 缺失、不同或不可解析不改变该结论。响应缺失或无法解析 Work ID 仍按既有完整性原因失败。请求使用 OpenAlex-ID 时，响应 Work ID 仍必须与请求 ID 严格匹配。该契约由固定合成 `httpx.MockTransport` 测试覆盖，且不改变生产检索、报告 schema、隐私或账本规则。
 
-当前不选择新的诊断方向。两次获批的 DOI 契约 availability rerun 均在第 1 次 HTTP 尝试后以 `ProbeGlobalError` 失败，未写入新聚合报告；历史 evidence 保持不变。当前网络路径或服务访问问题必须在环境侧解决后，才可进行新的在线重试。该离线契约记录不构成新的在线诊断结论。
+诊断已完整闭环：`available_not_retrieved_dominant`，125 个关联未被检索到，6 个在 Top-50 外，8 个已选入 Top-50，推荐方向为 `retrieval_query_evolution_probe`。下一步只设计并执行 bounded probe，不直接重建锁或进入 live capture。
 
 ### 2. 标题候选流失（已完成）
 

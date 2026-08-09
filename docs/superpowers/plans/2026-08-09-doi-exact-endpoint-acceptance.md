@@ -262,7 +262,7 @@ $trackedPython = @(git ls-files '*.py')
 git diff --check
 ```
 
-Observed: `1922 passed / 36 skipped / 2 environment failures`; the two failures are the documented Windows Git ownership and `uv build`/output-decoding issues. Focused tests, Ruff, mypy (93 files), and `git diff --check` are clean. The full-suite green gate remains environment-blocked.
+Observed: `1923 passed / 36 skipped / 1 environment failure`; a process-local Git ownership compatibility setting removes the clone failure, while the remaining failure is Windows GBK-locale decoding of `uv build` UTF-8 output. Focused tests, Ruff, mypy (93 files), and `git diff --check` are clean. The full-suite green gate remains environment-blocked.
 
 + [x] **Step 3: Confirm forbidden side effects did not occur**
 

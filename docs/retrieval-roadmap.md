@@ -7,7 +7,7 @@
 - 已闭环基线宏 F1 为 `0.0050946874`，micro recall 为 `0.0575539568`，召回是主要瓶颈。
 - 标题候选部分成功页修复使候选池 exact gold 从 19 增至 20，但最终 Top-50 仍为 13；既定离线排序变体无一满足晋级条件。
 - Citation、Topic、Embedding、普通 Query Rewrite 和既有 LLM Query Variants 已被实测否决，详见 `experiment-decisions.md`。
-- Gold 精确可用性 v2 聚合探针已执行一次：132 个唯一 work 为 `available`，0 个 `exact_not_found`，2 个 DOI `integrity_failure`。其中 1 个缺少预期 DOI 字段，1 个规范化 DOI 不匹配；因诊断不完整，推荐方向保持 `null`。
+- Gold 精确可用性 v2 聚合探针已执行一次：132 个唯一 work 为 `available`，0 个 `exact_not_found`，2 个 DOI `integrity_failure`。该报告及对应 JSON 是此前一次获批在线 probe 的历史证据，保持不改，不据此启动新的在线诊断方向。Task 1 已实现 DOI exact-endpoint acceptance contract，并由离线 `httpx.MockTransport` 合成测试覆盖：HTTP 200 且有效 OpenAlex Work ID 即为 `available`，顶层 DOI 缺失、不同或不可解析均不影响；OpenAlex-ID 请求仍严格匹配。
 
 ## Phase 0：建立干净基线（已完成）
 
@@ -27,15 +27,17 @@
 
 ## Phase 1：两个必要诊断
 
-### 1. Gold 精确可用性（根因已分类，方向暂停）
+### 1. Gold 精确可用性（历史 probe 保留，契约已离线固化）
 
 使用 DOI、arXiv ID 和 OpenAlex ID 做只读精确反查，只输出聚合原因。禁止把 gold 标识符转换成检索查询。
 
 现有 P0 探针测量的是生成标题能否搜到 gold，不等同于 gold 是否存在于 OpenAlex。
 
-本次固定输入为 60 个查询、143 条原始 gold 标识、139 个归一化查询–论文关联和 134 个唯一 work。实际使用 135 次 HTTP 尝试（硬上限 402）；2 个完整性失败均为 DOI 的 HTTP 200 响应，分别是 1 个预期字段缺失和 1 个规范化标识符不匹配。证据见 `docs/gold-bottleneck-attribution-2026-08-09.md` 和对应 JSON。
+本次固定输入为 60 个查询、143 条原始 gold 标识、139 个归一化查询–论文关联和 134 个唯一 work。实际使用 135 次 HTTP 尝试（硬上限 402）；历史证据中的 2 个完整性失败均为 DOI 的 HTTP 200 响应。证据见 `docs/gold-bottleneck-attribution-2026-08-09.md` 和对应 JSON；二者均保持为此前一次获批在线 probe 的历史记录，不重写。
 
-这不构成 OpenAlex 覆盖不足证据。下一步只需离线决定 DOI 别名/规范化解析的接受契约，并用固定夹具验证；在契约获批前，不选择新数据源、Query Evolution、过滤或排序方向，也不自动重跑在线探针。
+DOI exact-endpoint acceptance contract 已完成离线固化：请求使用规范化 DOI 时，HTTP 200 加有效 OpenAlex Work ID 即为 `available`；响应顶层 DOI 缺失、不同或不可解析不改变该结论。响应缺失或无法解析 Work ID 仍按既有完整性原因失败。请求使用 OpenAlex-ID 时，响应 Work ID 仍必须与请求 ID 严格匹配。该契约由固定合成 `httpx.MockTransport` 测试覆盖，且不改变生产检索、报告 schema、隐私或账本规则。
+
+当前不选择新的诊断方向，也不重跑在线 probe；任何新的在线诊断都需要另行授权。该离线契约记录不刷新历史聚合报告，也不构成新的在线诊断结论。
 
 ### 2. 标题候选流失（已完成）
 

@@ -17,9 +17,9 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - 闭环源提交为 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`；修复链为 `a720bbe` 与 `45ef874`。
 - 标题部分成功页修复已完成；封存离线对照精确重建 60/60 查询和 2,908 个 Top-50 结果。候选池 exact gold 从 19 增至 20，但最终仍为 13，没有排序变体晋级。
 - 15 个既有 mypy 错误已通过只涉及类型收窄和局部命名的最小修复清零；相关 85 个回归测试通过，业务行为未扩张。
-- 最新全量验证为 1916 passed / 36 skipped；Git 已跟踪 Python 文件 Ruff 全部通过，`mypy src scripts/analyze_gold_bottlenecks.py` 为 0 errors。
+- 最新全量验证为 1922 passed / 36 skipped / 2 环境失败；失败是 Git dubious ownership 与 Windows 构建/输出解码等环境/平台问题，不涉及本次文档，不能据此声称全量完全通过。Git 已跟踪 Python 文件 Ruff 全部通过，`mypy src scripts/analyze_gold_bottlenecks.py` 为 0 errors。
 - 最新项目 ledger 为 1986 条，根哈希为 `sha256:9739fc7b5c4ba48cf3b995b70019f58248f890f7f1ded2cd98e4869bde30cdf4`。
-- Gold 精确可用性 v2 聚合诊断已完成：固定输入为 60/143/139/134，唯一 work availability 为 132 `available`、0 `exact_not_found`、2 个 DOI `integrity_failure`，实际 HTTP 尝试 135/402。失败细分为 1 个预期 DOI 字段缺失和 1 个规范化 DOI 不匹配；由于不完整，`recommended_direction=null`。
+- Gold 精确可用性 v2 聚合诊断的固定输入为 60/143/139/134，唯一 work availability 为 132 `available`、0 `exact_not_found`、2 个 DOI `integrity_failure`，实际 HTTP 尝试 135/402。该聚合报告及对应 JSON 是此前一次获批在线 probe 的历史证据，保持不改。Task 1 已实现 DOI exact-endpoint acceptance contract，并由离线 `httpx.MockTransport` 合成测试覆盖：HTTP 200 且响应包含有效 OpenAlex Work ID 即为 `available`，顶层 DOI 缺失、不同或不可解析均不影响；OpenAlex-ID 请求仍严格要求规范化 ID 匹配。本次仅记录已实现的离线契约，不刷新历史在线诊断，也不声称已有新的诊断结论。
 
 ## 3. 活跃文件
 
@@ -48,9 +48,9 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 
 ## 5. 下一步
 
-1. 离线定义 DOI 别名/规范化解析的接受契约：是否允许 exact DOI 端点返回有效 work、但顶层 DOI 缺失或规范化后不同的 HTTP 200 响应计为可用；
-2. 用固定合成夹具完成契约测试并复核隐私与计数守恒，期间不重跑在线探针、不选择提升方向；
-3. 只有诊断完整且离线方案提高 macro F1、保留已有 gold、排序护栏不回退时，才重建锁、运行 readiness 并申请新的 live capture。
+1. DOI exact-endpoint acceptance contract 已离线决定并由固定合成夹具覆盖：HTTP 200 加有效 OpenAlex Work ID 计为 `available`；顶层 DOI 缺失、不同或不可解析不构成失败；OpenAlex-ID 仍严格匹配。
+2. 保持 `docs/gold-bottleneck-attribution-2026-08-09.md` 与对应 JSON 为此前一次获批在线 probe 的历史证据，不重写、不重跑；当前没有新的诊断方向，除非另行授权在线 rerun。
+3. 只有另行授权在线诊断且离线方案提高 macro F1、保留已有 gold、排序护栏不回退时，才重建锁、运行 readiness 并申请新的 live capture。
 
 ## 6. 锁状态
 

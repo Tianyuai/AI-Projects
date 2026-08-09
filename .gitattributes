@@ -1,9 +1,15 @@
-*.json text eol=lf
-*.jsonl text eol=lf
 configs/quality_gates_v1.yaml text eol=lf
 configs/prompts/query_analyze.yaml text eol=crlf
 
 data/manifest.json text eol=lf
 data/splits/*.json text eol=lf
 data/freeze_reports/*.json text eol=lf
+tests/fixtures/evaluation/freeze_v2/**/*.json text eol=lf
+tests/fixtures/evaluation/freeze_v2/**/*.jsonl text eol=lf
+tests/fixtures/formal_run/**/*.json text eol=lf
+tests/fixtures/formal_run/**/*.jsonl text eol=lf
+tests/fixtures/formal_run/**/*.yaml text eol=crlf
+tests/fixtures/formal_run/**/executions.jsonl text eol=crlf
+tests/fixtures/formal_run/**/run.json text eol=crlf
+tests/fixtures/formal_run/**/snapshot-manifest.json text eol=crlf
 tests/fixtures/formal_run/**/snapshots/responses/**/*.bin -text

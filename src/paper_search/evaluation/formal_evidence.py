@@ -570,7 +570,8 @@ def formal_audit_measures(
         "unaccounted_usage_failures": _measure(0 if actual_matches else 1, 1),
         "valid_model_produced_query_analysis_rate": _measure(
             sum(
-                record.query_analysis is not None and record.planner_status == "primary"
+                record.query_analysis is not None
+                and record.planner_status in {"primary", "repaired"}
                 for record in business_results
             ),
             count,

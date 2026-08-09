@@ -7,6 +7,7 @@ import json
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import Field, model_validator
@@ -67,6 +68,9 @@ if TYPE_CHECKING:
 
 
 Analyzer = Callable[[str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]]
+RepairAnalyzer = Callable[
+    [str, str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]
+]
 
 
 _SAFE_CITATION_WARNINGS = frozenset({"unresolved_citation_edge"})
@@ -558,6 +562,65 @@ class MockSearchOrchestrator:
         if self._controller.terminal_outcome(reservation) is None:
             self._controller.fail_closed(reservation)
 
+    def _repair_estimate(self) -> UsageEstimate:
+        """Reserve the remaining bounded LLM budget for one parser repair call."""
+        committed = self._controller.committed_usage
+        budget = self._controller.budget
+        remaining_tokens = max(
+            0,
+            budget.max_total_tokens
+            - committed.input_tokens
+            - committed.output_tokens,
+        )
+        remaining_cost = max(
+            Decimal("0"),
+            Decimal(str(budget.max_cost_cny))
+            - self._controller.known_committed_cost_cny,
+        )
+        remaining_elapsed = max(
+            0,
+            budget.max_elapsed_seconds * 1_000 - committed.elapsed_ms,
+        )
+        return UsageEstimate(
+            llm_calls=max(1, self._analysis_estimate.llm_calls),
+            input_tokens=remaining_tokens,
+            output_tokens=0,
+            cost_cny=remaining_cost,
+            elapsed_ms=remaining_elapsed,
+        )
+
+    def _analysis_repair(
+        self,
+        query: str,
+        diagnostics: list[DependencyDiagnostic],
+    ) -> Callable[[str], Awaitable[ProviderResult[dict[str, Any]]]] | None:
+        repair_method = cast(
+            RepairAnalyzer | None,
+            getattr(self._analyzer, "repair", None),
+        )
+        if not callable(repair_method):
+            return None
+        estimate = self._repair_estimate()
+        if not self._controller.can_reserve(estimate):
+            return None
+
+        async def repair(invalid_analysis: str) -> ProviderResult[dict[str, Any]]:
+            reservation = self._controller.reserve("query.repair", estimate)
+            try:
+                repaired = await repair_method(
+                    query,
+                    invalid_analysis,
+                    reservation,
+                )
+                self._settle_or_verify(reservation, repaired.usage)
+            except Exception:
+                self._fail_closed_if_active(reservation)
+                raise
+            diagnostics.append(self._diagnostic("llm", repaired))
+            return repaired
+
+        return repair
+
     @staticmethod
     def _ranked_paper(
         item: ConstraintScoredPaper,
@@ -638,7 +701,11 @@ class MockSearchOrchestrator:
             warnings.append("analysis: analyzer returned errors")
         diagnostics.append(self._diagnostic("llm", analysis_result))
         try:
-            analysis = await self._parser.parse(query, analysis_result)
+            analysis = await self._parser.parse(
+                query,
+                analysis_result,
+                repair=self._analysis_repair(query, diagnostics),
+            )
         except PlannerDependencyError:
             codes = {error.code for error in analysis_result.errors}
             stop_reason = (

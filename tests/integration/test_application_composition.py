@@ -136,6 +136,29 @@ def _compose_replay(fixture: dict[str, Path]) -> ApplicationBundle:
     )
 
 
+def test_analyzer_bridge_forwards_repair_payload() -> None:
+    adapter = AsyncMock()
+    bridge = composition_module._AnalyzerBridge(adapter=adapter)  # noqa: SLF001
+    reservation = object()
+
+    asyncio.run(
+        bridge.repair(
+            "graph retrieval",
+            "{}",
+            reservation,  # type: ignore[arg-type]
+        )
+    )
+
+    adapter.generate_json.assert_awaited_once_with(
+        prompt_name="query_analyze",
+        payload={
+            "query": "graph retrieval",
+            "invalid_analysis": "{}",
+        },
+        reservation=reservation,
+    )
+
+
 def test_replay_composition_binds_one_snapshot_and_pure_readiness(
     composition_fixture: dict[str, Path],
 ) -> None:

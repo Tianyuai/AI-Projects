@@ -197,6 +197,21 @@ class _AnalyzerBridge:
             reservation=reservation,
         )
 
+    async def repair(
+        self,
+        query: str,
+        invalid_analysis: str,
+        reservation: BudgetReservation,
+    ) -> ProviderResult[dict[str, Any]]:
+        return await self.adapter.generate_json(
+            prompt_name="query_analyze",
+            payload={
+                "query": query,
+                "invalid_analysis": invalid_analysis,
+            },
+            reservation=reservation,
+        )
+
 
 @dataclass(frozen=True)
 class _RequestExperimentDependencies:

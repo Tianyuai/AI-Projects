@@ -2383,6 +2383,56 @@ def test_formal_audit_builder_covers_every_enforced_measure() -> None:
     } <= set(measures)
 
 
+def test_formal_audit_counts_repaired_model_analysis_as_valid() -> None:
+    spec = QuerySpec(
+        original_query="one",
+        research_goal="one",
+        topics=["one"],
+    )
+    business = BusinessResultRecord(
+        query_id="q1",
+        query_analysis=QueryAnalysisResult(
+            query_spec=spec,
+            search_plan=QueryPlanner().finalize(spec, None),
+        ),
+        selected_paper_ids=[],
+        high_relevance=[],
+        partial_relevance=[],
+        citation_edges=[],
+        is_partial=False,
+        planner_status="repaired",
+        planner_fallback=False,
+        warnings=[],
+        stop_reason="completed",
+        hard_failure_code=None,
+    )
+
+    measures = runner_module.formal_audit_measures(
+        frozen_queries=[
+            EvaluationQuery(query_id="q1", query="one", metadata={"split": "dev"})
+        ],
+        executions=[],
+        business_results=[business],
+        failures=[],
+        ledger_report=LedgerReport(
+            run_id="formal-1",
+            reserved=runner_module.UsageEstimate(cost_cny=Decimal("0")),
+            actual=UsageActual(cost_cny=Decimal("0")),
+            run_cap_cny=Decimal("18"),
+            project_actual_cny=Decimal("0"),
+            project_soft_stop_cny=Decimal("160"),
+            project_hard_cap_cny=Decimal("200"),
+            within_caps=True,
+        ),
+    )
+
+    assert measures["valid_model_produced_query_analysis_rate"] == MeasureValue(
+        numerator=1,
+        denominator=1,
+        value=1,
+    )
+
+
 def test_partial_second_reservation_failure_closes_bundle_and_first_query(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

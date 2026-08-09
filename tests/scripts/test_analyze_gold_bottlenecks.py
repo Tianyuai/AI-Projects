@@ -130,6 +130,20 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE_RUN = ROOT / "runs" / "dev-20260809T061903Z-9bd861e90299"
 GOLD_PATH = ROOT / "data" / "dev" / "gold.jsonl"
 ID_MAP_PATH = ROOT / "data" / "identifier-map.json"
+PRICING_PATH = ROOT / "data" / "annotation_work" / "pricing_v1.yaml"
+LOCAL_SEALED_INPUTS = (
+    SOURCE_RUN / "run.json",
+    SOURCE_RUN / "gates.json",
+    SOURCE_RUN / "executions.jsonl",
+    SOURCE_RUN / "business-results.jsonl",
+    GOLD_PATH,
+    ID_MAP_PATH,
+)
+LOCAL_SEALED_INPUTS_AVAILABLE = all(path.is_file() for path in LOCAL_SEALED_INPUTS)
+requires_local_sealed_inputs = pytest.mark.skipif(
+    not LOCAL_SEALED_INPUTS_AVAILABLE,
+    reason="requires ignored local sealed-run inputs",
+)
 
 
 def _synthetic_context() -> OfflineContext:
@@ -205,6 +219,7 @@ def _synthetic_usage() -> DiagnosticUsage:
     )
 
 
+@requires_local_sealed_inputs
 def test_offline_fixed_inputs_rebuild_expected_denominators_and_stages() -> None:
     context = load_offline_context(SOURCE_RUN, GOLD_PATH, ID_MAP_PATH)
 
@@ -486,6 +501,7 @@ def test_atomic_write_preserves_existing_destination_when_replace_fails(
         ({"status": "failed"}, "status"),
     ],
 )
+@requires_local_sealed_inputs
 def test_offline_sealed_run_validation_fails_closed(
     tmp_path: Path,
     mutation: dict[str, Any],
@@ -710,6 +726,10 @@ def test_authentication_failure_is_global_and_reports_attempt_count() -> None:
     assert error.value.attempts == 1
 
 
+@pytest.mark.skipif(
+    not (LOCAL_SEALED_INPUTS_AVAILABLE and PRICING_PATH.is_file()),
+    reason="requires ignored local sealed-run and pricing inputs",
+)
 def test_run_diagnostic_uses_one_aggregate_receipt_and_settles_actual(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -742,7 +762,7 @@ def test_run_diagnostic_uses_one_aggregate_receipt_and_settles_actual(
                 gold_path=GOLD_PATH,
                 id_map_path=ID_MAP_PATH,
                 ledger_path=tmp_path / "formal.sqlite3",
-                pricing_path=ROOT / "data" / "annotation_work" / "pricing_v1.yaml",
+                pricing_path=PRICING_PATH,
                 out_json=out_json,
                 out_report=tmp_path / "report.md",
                 client=client,

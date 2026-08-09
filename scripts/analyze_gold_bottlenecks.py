@@ -848,16 +848,17 @@ def _classify_response(
     if not isinstance(payload, dict):
         return "integrity_failure", "missing_expected_field"
     normalized = normalize_paper_id(identifier)
-    if normalized.startswith("doi:"):
-        response_identifier = payload.get("doi")
-    else:
-        response_identifier = payload.get("id")
+    response_identifier = payload.get("id")
     if not isinstance(response_identifier, str):
         return "integrity_failure", "missing_expected_field"
     try:
         response_normalized = normalize_paper_id(response_identifier)
     except ValueError:
         return "integrity_failure", "unparseable_identifier"
+    if normalized.startswith("doi:"):
+        if not response_normalized.startswith("openalex:"):
+            return "integrity_failure", "unparseable_identifier"
+        return "available", None
     if response_normalized != normalized:
         return "integrity_failure", "canonical_mismatch"
     return "available", None

@@ -673,22 +673,47 @@ def test_low_quota_429_rotates_to_next_key() -> None:
 
 
 @pytest.mark.parametrize(
-    ("response_kwargs", "expected_reason"),
+    "payload",
     [
-        ({"content": b"not-json"}, "missing_expected_field"),
-        ({"json": {"doi": "not-an-identifier"}}, "unparseable_identifier"),
-        (
-            {"json": {"doi": "https://doi.org/10.1000/b"}},
-            "canonical_mismatch",
-        ),
+        {"id": "https://openalex.org/W1", "doi": "https://doi.org/10.1000/a"},
+        {"id": "https://openalex.org/W1"},
+        {"id": "https://openalex.org/W1", "doi": "https://doi.org/10.1000/b"},
+        {"id": "https://openalex.org/W1", "doi": "not-an-identifier"},
     ],
 )
-def test_200_integrity_failures_are_classified(
-    response_kwargs: dict[str, object],
+def test_doi_200_with_valid_work_id_is_available(payload: dict[str, str]) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json=payload)
+
+    async def execute() -> ProbeBatch:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await probe_openalex_exact(
+                ["doi:10.1000/a"],
+                client=client,
+                keys=(SecretStr("k1"),),
+                sleep=lambda seconds: asyncio.sleep(0),
+                clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+            )
+
+    result = asyncio.run(execute())
+    assert result.status_by_work == {"doi:10.1000/a": "available"}
+    assert result.integrity_reason_by_work == {}
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_reason"),
+    [
+        ({"doi": "https://doi.org/10.1000/a"}, "missing_expected_field"),
+        ({"id": "not-an-identifier", "doi": "https://doi.org/10.1000/a"}, "unparseable_identifier"),
+        ({"id": "https://doi.org/10.1000/a"}, "unparseable_identifier"),
+    ],
+)
+def test_doi_200_invalid_work_id_reports_integrity_reason(
+    payload: dict[str, str],
     expected_reason: str,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, request=request, **response_kwargs)
+        return httpx.Response(200, request=request, json=payload)
 
     async def execute() -> ProbeBatch:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
@@ -702,9 +727,47 @@ def test_200_integrity_failures_are_classified(
 
     result = asyncio.run(execute())
     assert result.status_by_work == {"doi:10.1000/a": "integrity_failure"}
-    assert result.integrity_reason_by_work == {
-        "doi:10.1000/a": expected_reason,
-    }
+    assert result.integrity_reason_by_work == {"doi:10.1000/a": expected_reason}
+
+
+@pytest.mark.parametrize(
+    ("identifier", "payload", "expected_status", "expected_reason"),
+    [
+        ("openalex:W1", {"id": "https://openalex.org/W1"}, "available", None),
+        (
+            "openalex:W1",
+            {"id": "https://openalex.org/W2"},
+            "integrity_failure",
+            "canonical_mismatch",
+        ),
+        ("openalex:W1", ["not-an-object"], "integrity_failure", "missing_expected_field"),
+    ],
+)
+def test_200_classification_preserves_openalex_strictness_and_object_requirement(
+    identifier: str,
+    payload: object,
+    expected_status: str,
+    expected_reason: str | None,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json=payload)
+
+    async def execute() -> ProbeBatch:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await probe_openalex_exact(
+                [identifier],
+                client=client,
+                keys=(SecretStr("k1"),),
+                sleep=lambda seconds: asyncio.sleep(0),
+                clock=lambda: datetime(2026, 8, 9, tzinfo=UTC),
+            )
+
+    result = asyncio.run(execute())
+    assert result.status_by_work == {identifier: expected_status}
+    if expected_reason is None:
+        assert result.integrity_reason_by_work == {}
+    else:
+        assert result.integrity_reason_by_work == {identifier: expected_reason}
 
 
 def test_authentication_failure_is_global_and_reports_attempt_count() -> None:

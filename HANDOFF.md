@@ -4,18 +4,19 @@
 
 ## 1. 项目目标
 
-VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建复杂学术查询的论文搜索与推荐系统。内部目标是冻结 dev 宏平均 F1 ≥ 0.30；当前约 0.006。
+VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建复杂学术查询的论文搜索与推荐系统。内部目标是冻结 dev 宏平均 F1 ≥ 0.30；当前已闭环基线为 `0.0050946874`。
 
 正式评测使用 live capture → verify → 零网络 replay → compare。基线必须 gate passed、`provenance_failures=0`，且 capture/replay 业务结果一致。
 
 ## 2. 当前状态
 
-- DeepSeek `deepseek-v4-flash` 查询解析已验证 60/60。
-- 标题候选默认生成 20 个标题并经 OpenAlex 验证。
-- 最近四轮正式 capture 均因 OpenAlex 限流或额度问题 gate failed；已完成查询的 replay 可干净复现。
-- 51/60 查询零命中，最终共命中约 10 篇 gold；召回是主要瓶颈。
-- 全量测试最近记录为 1856 passed / 36 skipped。
-- 当前候选锁已重建并绑定提交 `c427541670e2523f8556a0d204eae964198ef9b1`；readiness 已确认 LLM、OpenAlex、Semantic Scholar 均为 ready。
+- 通过的 live capture：`runs/dev-20260809T061903Z-9bd861e90299`；通过的零网络 replay：`runs/dev-20260809T063333Z-6897d295a3c8`。
+- 两轮均为 `formal_valid: true`、`quality_passed: true`、Gate `passed`；业务结果比较 `equivalent: true`。
+- 查询分析与可解析检索响应均为 60/60；60 条全部使用 primary planner，无 fallback。
+- 基线 macro F1 `0.0050946874`、macro recall `0.0791666667`、micro recall `0.0575539568`；召回仍是主要瓶颈。
+- 闭环源提交为 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`；修复链为 `a720bbe` 与 `45ef874`。
+- 全量测试最近记录为 1859 passed / 35 skipped。
+- live capture 已将项目 ledger 推进到 1984 条，根哈希为 `sha256:3267b17bdff93676ad2d0f793257559f5549ad11aa4ff29ed097d11bbc60495f`。
 
 ## 3. 活跃文件
 
@@ -23,6 +24,8 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - `PRD.md`：固定产品与评测契约；
 - `docs/retrieval-roadmap.md`：当前提升顺序；
 - `docs/experiment-decisions.md`：已验证和已否决实验；
+- `docs/title-candidate-stage-loss-2026-08-09.md`：标题候选同轮逐阶段流失诊断；
+- `docs/quality-gate-root-cause-2026-08-09.md`：Gate 失败根因与已验证闭环；
 - `configs/title_candidates.yaml`：当前正式实验配置；
 - `runs/candidate.lock.yaml`：本地候选锁；
 - `data/dev/gold.jsonl`：冻结 dev gold。
@@ -31,18 +34,18 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 
 Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrite 和既有 LLM Query Variants 均已有负向实测。除非方法或输入发生实质变化并先通过低成本探针，否则不要重复。
 
-标题候选是唯一已有正向召回信号，但当前数据不是同一 run 的阶段对照。后续先验证候选是否在 OpenAlex 验证、融合或最终输出阶段流失。
+标题候选是唯一已有正向召回信号。同轮阶段诊断已完成：标题响应级验证命中 13 个 exact gold，12 个进入合并/RRF 池，11 个进入最终 Top-50。硬过滤无流失；主要问题是标题生成/搜索覆盖不完整和最终截断。
 
 ## 5. 下一步
 
-1. 在单独授权后使用当前候选锁跑 dev capture → verify → replay → compare；
-2. 完成 Gold 精确可用性和标题候选流失诊断；
-3. 优先优化标题候选保留与输出选择；
-4. Query Evolution 仅在重做生产分析组合和预算估计后进行小规模探针。
+1. 先修正标题检索的部分成功处理：单个 `invalid_work` 不应使整页有效论文被丢弃；
+2. 基于已封存候选离线比较标题来源保留/排序策略，重点减少 19 → 13 的 Top-50 流失；
+3. 完成 Gold 精确可用性的聚合报告，再决定是否需要新数据源；
+4. 只有离线指标为正时，才重建锁、运行 readiness 并申请新的 live capture。
 
 ## 6. 锁状态
 
-旧 v21 锁绑定 `c22abf9`，已因源码 SHA 不匹配而废弃。当前候选锁为 v22，绑定提交 `c427541670e2523f8556a0d204eae964198ef9b1` 和最新 ledger checkpoint；readiness 已通过。capture、validation 和任何新的在线实验仍需要单独授权。
+当前 `runs/candidate.lock.yaml` 绑定提交 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`，但其 ledger checkpoint 仍为 1924 条。通过的 live capture 已将 ledger 推进到 1984 条，因此该锁只是已用基线证据，不得用于新 live run。新在线实验前必须重建锁并重跑 readiness；capture、validation 和任何新的在线实验仍需单独授权。
 
 ## 7. 环境与红线
 

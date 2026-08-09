@@ -11,7 +11,7 @@ import re
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Awaitable, Callable, Literal
@@ -39,6 +39,11 @@ AvailabilityStatus = Literal[
     "invalid_identifier",
     "integrity_failure",
 ]
+IntegrityFailureReason = Literal[
+    "missing_expected_field",
+    "unparseable_identifier",
+    "canonical_mismatch",
+]
 PipelineStage = Literal[
     "selected_top50",
     "ranked_outside_top50",
@@ -53,6 +58,12 @@ AVAILABILITY_STATUSES: tuple[AvailabilityStatus, ...] = (
     "invalid_identifier",
     "integrity_failure",
 )
+INTEGRITY_FAILURE_REASONS: tuple[IntegrityFailureReason, ...] = (
+    "missing_expected_field",
+    "unparseable_identifier",
+    "canonical_mismatch",
+)
+IDENTIFIER_KINDS = ("doi", "openalex")
 PIPELINE_STAGES: tuple[PipelineStage, ...] = (
     "selected_top50",
     "ranked_outside_top50",
@@ -118,6 +129,9 @@ class ProbeCounters:
 class ProbeBatch:
     status_by_work: Mapping[str, AvailabilityStatus]
     counters: ProbeCounters
+    integrity_reason_by_work: Mapping[str, IntegrityFailureReason] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -427,6 +441,26 @@ def assemble_report(
         if status not in availability:
             raise ValueError("unknown availability status")
         availability[status] += 1
+    integrity_works = {
+        work
+        for work, status in probe.status_by_work.items()
+        if status == "integrity_failure"
+    }
+    if set(probe.integrity_reason_by_work) != integrity_works:
+        raise ValueError("integrity failure reasons do not match failed works")
+    integrity_failure_breakdown: dict[
+        IntegrityFailureReason, dict[str, int]
+    ] = {
+        reason: {kind: 0 for kind in IDENTIFIER_KINDS}
+        for reason in INTEGRITY_FAILURE_REASONS
+    }
+    for work, reason in probe.integrity_reason_by_work.items():
+        if reason not in integrity_failure_breakdown:
+            raise ValueError("unknown integrity failure reason")
+        identifier_kind = context.gold_index.work_to_identifier_kind[work]
+        if identifier_kind not in IDENTIFIER_KINDS:
+            raise ValueError("integrity failure has unsupported identifier kind")
+        integrity_failure_breakdown[reason][identifier_kind] += 1
 
     pipeline_stages: dict[PipelineStage, int] = {
         stage: 0 for stage in PIPELINE_STAGES
@@ -446,7 +480,7 @@ def assemble_report(
         query_coverage[status][stage].add(query_id)
     complete, direction, reasons = _direction_and_reasons(context, probe)
     payload: dict[str, object] = {
-        "schema_version": "gold-bottleneck-attribution-v1",
+        "schema_version": "gold-bottleneck-attribution-v2",
         "source_run_id": context.source_run_id,
         "source_git_sha": context.source_git_sha,
         "input_hashes": dict(context.input_hashes),
@@ -461,6 +495,7 @@ def assemble_report(
             ),
         },
         "availability": availability,
+        "integrity_failure_breakdown": integrity_failure_breakdown,
         "pipeline_stages": pipeline_stages,
         "cross_tab": cross_tab,
         "query_coverage": {
@@ -518,7 +553,7 @@ def _validate_json_value(value: object, *, key: str | None = None) -> None:
     if key is not None and key.endswith("_sha256") and _SHA256_RE.fullmatch(value):
         return
     if value in {
-        "gold-bottleneck-attribution-v1",
+        "gold-bottleneck-attribution-v2",
         *AVAILABILITY_STATUSES,
         *PIPELINE_STAGES,
         *RECOMMENDATION_DIRECTIONS,
@@ -540,6 +575,7 @@ def assert_safe_report(payload: Mapping[str, object]) -> None:
         "input_hashes",
         "counts",
         "availability",
+        "integrity_failure_breakdown",
         "pipeline_stages",
         "cross_tab",
         "query_coverage",
@@ -551,22 +587,46 @@ def assert_safe_report(payload: Mapping[str, object]) -> None:
     if set(payload) != expected_keys:
         raise ValueError("report has extra keys or missing keys")
     _validate_json_value(dict(payload))
-    if payload["schema_version"] != "gold-bottleneck-attribution-v1":
+    if payload["schema_version"] != "gold-bottleneck-attribution-v2":
         raise ValueError("invalid report schema version")
-    for field in ("availability", "pipeline_stages"):
-        value = payload[field]
-        expected = AVAILABILITY_STATUSES if field == "availability" else PIPELINE_STAGES
+    for section in ("availability", "pipeline_stages"):
+        value = payload[section]
+        expected = (
+            AVAILABILITY_STATUSES
+            if section == "availability"
+            else PIPELINE_STAGES
+        )
         if not isinstance(value, dict) or set(value) != set(expected):
-            raise ValueError(f"invalid {field} keys")
-    for field in ("cross_tab", "query_coverage"):
-        value = payload[field]
+            raise ValueError(f"invalid {section} keys")
+    for section in ("cross_tab", "query_coverage"):
+        value = payload[section]
         if not isinstance(value, dict) or set(value) != set(AVAILABILITY_STATUSES):
-            raise ValueError(f"invalid {field} status keys")
+            raise ValueError(f"invalid {section} status keys")
         if any(
             not isinstance(row, dict) or set(row) != set(PIPELINE_STAGES)
             for row in value.values()
         ):
-            raise ValueError(f"invalid {field} stage keys")
+            raise ValueError(f"invalid {section} stage keys")
+    availability = payload["availability"]
+    breakdown = payload["integrity_failure_breakdown"]
+    if not isinstance(availability, dict) or not isinstance(breakdown, dict):
+        raise ValueError("invalid integrity failure breakdown")
+    if set(breakdown) != set(INTEGRITY_FAILURE_REASONS):
+        raise ValueError("invalid integrity failure reason keys")
+    if any(
+        not isinstance(row, dict)
+        or set(row) != set(IDENTIFIER_KINDS)
+        or any(type(count) is not int or count < 0 for count in row.values())
+        for row in breakdown.values()
+    ):
+        raise ValueError("invalid integrity failure breakdown")
+    breakdown_total = sum(
+        count
+        for row in breakdown.values()
+        for count in row.values()
+    )
+    if breakdown_total != availability.get("integrity_failure"):
+        raise ValueError("integrity failure breakdown does not conserve count")
     direction = payload["recommended_direction"]
     if direction is not None and direction not in RECOMMENDATION_DIRECTIONS:
         raise ValueError("invalid recommended direction")
@@ -646,20 +706,26 @@ def _retry_delay(response: httpx.Response | None, retry_number: int) -> float:
     return min(float(retry_number), 10.0)
 
 
-def _response_matches(identifier: str, payload: object) -> bool:
+def _classify_response(
+    identifier: str,
+    payload: object,
+) -> tuple[AvailabilityStatus, IntegrityFailureReason | None]:
     if not isinstance(payload, dict):
-        return False
+        return "integrity_failure", "missing_expected_field"
     normalized = normalize_paper_id(identifier)
     if normalized.startswith("doi:"):
         response_identifier = payload.get("doi")
     else:
         response_identifier = payload.get("id")
     if not isinstance(response_identifier, str):
-        return False
+        return "integrity_failure", "missing_expected_field"
     try:
-        return normalize_paper_id(response_identifier) == normalized
+        response_normalized = normalize_paper_id(response_identifier)
     except ValueError:
-        return False
+        return "integrity_failure", "unparseable_identifier"
+    if response_normalized != normalized:
+        return "integrity_failure", "canonical_mismatch"
+    return "available", None
 
 
 async def probe_openalex_exact(
@@ -675,6 +741,7 @@ async def probe_openalex_exact(
         raise ProbeGlobalError("OpenAlex keys are missing", attempts=0)
     ordered_ids = sorted(set(work_ids))
     status_by_work: dict[str, AvailabilityStatus] = {}
+    integrity_reason_by_work: dict[str, IntegrityFailureReason] = {}
     status_counts = {"200": 0, "404": 0, "429": 0, "5xx": 0}
     timeout_count = 0
     attempts_total = 0
@@ -720,9 +787,10 @@ async def probe_openalex_exact(
                     payload = response.json()
                 except ValueError:
                     payload = None
-                status_by_work[identifier] = (
-                    "available" if _response_matches(identifier, payload) else "integrity_failure"
-                )
+                status, integrity_reason = _classify_response(identifier, payload)
+                status_by_work[identifier] = status
+                if integrity_reason is not None:
+                    integrity_reason_by_work[identifier] = integrity_reason
                 break
             if response.status_code == 404:
                 status_counts["404"] += 1
@@ -769,6 +837,7 @@ async def probe_openalex_exact(
             timeout_count=timeout_count,
             retries=retries_total,
         ),
+        integrity_reason_by_work=integrity_reason_by_work,
     )
 
 
@@ -801,10 +870,12 @@ def _render_markdown(payload: Mapping[str, object]) -> str:
     availability = payload["availability"]
     stages = payload["pipeline_stages"]
     usage = payload["usage"]
+    integrity_breakdown = payload["integrity_failure_breakdown"]
     assert isinstance(counts, dict)
     assert isinstance(availability, dict)
     assert isinstance(stages, dict)
     assert isinstance(usage, dict)
+    assert isinstance(integrity_breakdown, dict)
     direction = payload["recommended_direction"]
     direction_text = "null" if direction is None else str(direction)
     reason_codes = payload["reason_codes"]
@@ -831,6 +902,14 @@ def _render_markdown(payload: Mapping[str, object]) -> str:
             "## Availability",
             "",
             *[f"- {key}: {availability[key]}" for key in AVAILABILITY_STATUSES],
+            "",
+            "## Integrity failure breakdown",
+            "",
+            *[
+                f"- {reason}: doi={integrity_breakdown[reason]['doi']}, "
+                f"openalex={integrity_breakdown[reason]['openalex']}"
+                for reason in INTEGRITY_FAILURE_REASONS
+            ],
             "",
             "## Pipeline stages",
             "",
@@ -874,11 +953,15 @@ async def run_diagnostic(
     context = load_offline_context(run, gold_path, id_map_path)
     keys = collect_openalex_keys(environ if environ is not None else os.environ)
     pricing = load_pricing_policy(pricing_path)
-    pricer = ActualCostPricer(pricing, valued_at=clock())
+    started_at = clock()
+    pricer = ActualCostPricer(pricing, valued_at=started_at)
     ledger = SQLiteBudgetLedger(ledger_path, clock=clock)
     checkpoint_before = ledger.project_checkpoint()[1]
     estimate = _priced_usage(pricer, 402)
-    diagnostic_run_id = f"{context.source_run_id}-gold-availability"
+    diagnostic_run_id = (
+        f"{context.source_run_id}-gold-availability-"
+        f"{started_at.strftime('%Y%m%dT%H%M%S%fZ')}"
+    )
     reservation = ledger.reserve(
         run_id=diagnostic_run_id,
         query_id="aggregate-gold-availability",

@@ -252,6 +252,7 @@ def test_assemble_report_conserves_denominators_and_reuses_work_status() -> None
         "input_hashes",
         "counts",
         "availability",
+        "integrity_failure_breakdown",
         "pipeline_stages",
         "cross_tab",
         "query_coverage",
@@ -260,8 +261,13 @@ def test_assemble_report_conserves_denominators_and_reuses_work_status() -> None
         "recommended_direction",
         "reason_codes",
     }
-    assert payload["schema_version"] == "gold-bottleneck-attribution-v1"
+    assert payload["schema_version"] == "gold-bottleneck-attribution-v2"
     assert sum(payload["availability"].values()) == 3
+    assert payload["integrity_failure_breakdown"] == {
+        "missing_expected_field": {"doi": 0, "openalex": 0},
+        "unparseable_identifier": {"doi": 0, "openalex": 0},
+        "canonical_mismatch": {"doi": 0, "openalex": 0},
+    }
     assert sum(payload["pipeline_stages"].values()) == 3
     assert sum(
         count
@@ -358,6 +364,54 @@ def test_safe_report_rejects_extra_keys_forbidden_keys_and_forbidden_values() ->
     unsafe["source_run_id"] = "https://example.invalid/secret"
     with pytest.raises(ValueError, match="forbidden string"):
         assert_safe_report(unsafe)
+
+
+def test_report_aggregates_integrity_failure_reason_by_identifier_kind() -> None:
+    probe = ProbeBatch(
+        status_by_work={
+            "doi:10.1000/a": "integrity_failure",
+            "doi:10.1000/b": "available",
+            "openalex:W1": "integrity_failure",
+        },
+        counters=_synthetic_probe().counters,
+        integrity_reason_by_work={
+            "doi:10.1000/a": "canonical_mismatch",
+            "openalex:W1": "missing_expected_field",
+        },
+    )
+
+    payload = assemble_report(_synthetic_context(), probe, _synthetic_usage())
+
+    assert payload["integrity_failure_breakdown"] == {
+        "missing_expected_field": {"doi": 0, "openalex": 1},
+        "unparseable_identifier": {"doi": 0, "openalex": 0},
+        "canonical_mismatch": {"doi": 1, "openalex": 0},
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "reasons"),
+    [
+        ("integrity_failure", {}),
+        ("available", {"doi:10.1000/a": "canonical_mismatch"}),
+    ],
+)
+def test_report_rejects_inconsistent_integrity_failure_reasons(
+    status: AvailabilityStatus,
+    reasons: dict[str, str],
+) -> None:
+    probe = ProbeBatch(
+        status_by_work={
+            "doi:10.1000/a": status,
+            "doi:10.1000/b": "available",
+            "openalex:W1": "available",
+        },
+        counters=_synthetic_probe().counters,
+        integrity_reason_by_work=reasons,
+    )
+
+    with pytest.raises(ValueError, match="integrity failure reasons"):
+        assemble_report(_synthetic_context(), probe, _synthetic_usage())
 
 
 def test_atomic_write_preserves_existing_destination_when_replace_fails(
@@ -553,18 +607,28 @@ def test_low_quota_429_rotates_to_next_key() -> None:
     assert seen_keys == ["k1", "k2"]
 
 
-def test_200_identifier_mismatch_is_integrity_failure() -> None:
+@pytest.mark.parametrize(
+    ("response_kwargs", "expected_reason"),
+    [
+        ({"content": b"not-json"}, "missing_expected_field"),
+        ({"json": {"doi": "not-an-identifier"}}, "unparseable_identifier"),
+        (
+            {"json": {"doi": "https://doi.org/10.1000/b"}},
+            "canonical_mismatch",
+        ),
+    ],
+)
+def test_200_integrity_failures_are_classified(
+    response_kwargs: dict[str, object],
+    expected_reason: str,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(
-            200,
-            json={"id": "https://openalex.org/W999"},
-            request=request,
-        )
+        return httpx.Response(200, request=request, **response_kwargs)
 
     async def execute() -> ProbeBatch:
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             return await probe_openalex_exact(
-                ["openalex:W2"],
+                ["doi:10.1000/a"],
                 client=client,
                 keys=(SecretStr("k1"),),
                 sleep=lambda seconds: asyncio.sleep(0),
@@ -572,7 +636,10 @@ def test_200_identifier_mismatch_is_integrity_failure() -> None:
             )
 
     result = asyncio.run(execute())
-    assert result.status_by_work == {"openalex:W2": "integrity_failure"}
+    assert result.status_by_work == {"doi:10.1000/a": "integrity_failure"}
+    assert result.integrity_reason_by_work == {
+        "doi:10.1000/a": expected_reason,
+    }
 
 
 def test_authentication_failure_is_global_and_reports_attempt_count() -> None:
@@ -623,6 +690,11 @@ def test_run_diagnostic_uses_one_aggregate_receipt_and_settles_actual(
     result = asyncio.run(execute())
     assert requests == 134
     assert result.payload["usage"]["http_attempts"] == 134
+    assert result.payload["schema_version"] == "gold-bottleneck-attribution-v2"
+    persisted = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    assert_safe_report(persisted)
+    assert persisted == result.payload
+    assert result.diagnostic_run_id.endswith("-20260809T000000000000Z")
 
     from paper_search.control.ledger import SQLiteBudgetLedger
 
@@ -641,7 +713,7 @@ def test_cli_stdout_contains_only_fixed_aggregate_fields(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     payload = {
-        "schema_version": "gold-bottleneck-attribution-v1",
+        "schema_version": "gold-bottleneck-attribution-v2",
         "diagnostic_complete": True,
         "counts": {
             "raw_gold_identifier_count": 143,
@@ -678,7 +750,7 @@ def test_cli_stdout_contains_only_fixed_aggregate_fields(
 
     assert exit_code == 0
     assert capsys.readouterr().out.splitlines() == [
-        "schema_version=gold-bottleneck-attribution-v1",
+        "schema_version=gold-bottleneck-attribution-v2",
         "diagnostic_complete=True",
         "counts=143/139/134",
         "recommended_direction=None",

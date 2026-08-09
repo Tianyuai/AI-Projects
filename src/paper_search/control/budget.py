@@ -691,9 +691,10 @@ class HardBudgetController:
             if value > limit:
                 raise BudgetExceededError(f"{label} hard limit exceeded: {value} > {limit}")
         known_cost = _known_cost(usages)
-        if known_cost > self._budget.max_cost_cny:
+        cost_limit = Decimal(str(self._budget.max_cost_cny))
+        if known_cost > cost_limit:
             raise BudgetExceededError(
-                f"cost hard limit exceeded: {known_cost} > {self._budget.max_cost_cny}"
+                f"cost hard limit exceeded: {known_cost} > {cost_limit}"
             )
 
     @staticmethod

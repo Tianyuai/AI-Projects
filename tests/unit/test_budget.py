@@ -223,6 +223,23 @@ def test_can_reserve_allows_exact_hard_limits(
     assert controller.reserved_usage == UsageEstimate()
 
 
+def test_can_reserve_allows_decimal_cost_parts_at_exact_hard_limit() -> None:
+    controller_type, _, _ = budget_preflight_api()
+    controller = controller_type(make_budget(max_cost_cny=0.30))
+    reservation = controller.reserve(
+        "initial",
+        UsageEstimate(cost_cny=Decimal("0.10")),
+    )
+    controller.settle(
+        reservation,
+        UsageActual(cost_cny=Decimal("0.10")),
+    )
+
+    assert controller.can_reserve(
+        UsageEstimate(cost_cny=Decimal("0.20"))
+    ) is True
+
+
 @pytest.mark.parametrize(
     ("reserved", "estimate", "budget_updates"),
     [

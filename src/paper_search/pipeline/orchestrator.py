@@ -572,6 +572,17 @@ class MockSearchOrchestrator:
             - committed.input_tokens
             - committed.output_tokens,
         )
+        estimated_tokens = (
+            self._analysis_estimate.input_tokens
+            + self._analysis_estimate.output_tokens
+        )
+        repair_output_tokens = (
+            remaining_tokens * self._analysis_estimate.output_tokens
+            // estimated_tokens
+            if estimated_tokens > 0
+            else 0
+        )
+        repair_input_tokens = remaining_tokens - repair_output_tokens
         remaining_cost = max(
             Decimal("0"),
             Decimal(str(budget.max_cost_cny))
@@ -583,8 +594,8 @@ class MockSearchOrchestrator:
         )
         return UsageEstimate(
             llm_calls=max(1, self._analysis_estimate.llm_calls),
-            input_tokens=remaining_tokens,
-            output_tokens=0,
+            input_tokens=repair_input_tokens,
+            output_tokens=repair_output_tokens,
             cost_cny=remaining_cost,
             elapsed_ms=remaining_elapsed,
         )

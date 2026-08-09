@@ -148,8 +148,16 @@ class FailedAnalyzer:
 
 
 class RepairableAnalyzer:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ) -> None:
         self.events = events
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
     async def __call__(
         self, query: str, _: object
@@ -158,7 +166,12 @@ class RepairableAnalyzer:
         return _result(
             "llm",
             {},
-            UsageActual(llm_calls=1, cost_cny=0.1),
+            UsageActual(
+                llm_calls=1,
+                input_tokens=self.input_tokens,
+                output_tokens=self.output_tokens,
+                cost_cny=0.1,
+            ),
         ).model_copy(
             update={
                 "errors": [
@@ -203,7 +216,12 @@ class RepairableAnalyzer:
                     "rationale": "synthetic repair",
                 },
             },
-            UsageActual(llm_calls=1, cost_cny=0.1),
+            UsageActual(
+                llm_calls=1,
+                input_tokens=self.input_tokens,
+                output_tokens=self.output_tokens,
+                cost_cny=0.1,
+            ),
         )
 
 
@@ -1833,6 +1851,39 @@ def test_orchestrator_repairs_malformed_analysis_once_before_fallback() -> None:
     assert result.query_analysis.query_spec.research_goal == "find repaired papers"
     assert controller.committed_usage.llm_calls == 2
     assert result.stop_reason == "completed"
+
+
+def test_orchestrator_can_repair_when_cost_reservation_reaches_decimal_cap() -> None:
+    events: list[str] = []
+    controller = HardBudgetController(
+        _budget(max_llm_calls=5, max_cost_cny=0.30)
+    )
+    analyzer = RepairableAnalyzer(
+        events,
+        input_tokens=10,
+        output_tokens=10,
+    )
+    orchestrator = MockSearchOrchestrator(
+        controller=controller,
+        analyzer=analyzer,
+        providers={"openalex": FakeProvider("openalex", events)},
+        config_hash="sha256:" + "a" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(
+            llm_calls=3,
+            input_tokens=80,
+            output_tokens=20,
+            cost_cny=0.1,
+        ),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+    )
+
+    result = asyncio.run(
+        orchestrator.run("graph retrieval", max_provider_results=5)
+    )
+
+    assert events[:2] == ["analyze", "repair"]
+    assert result.query_analysis.planner_status == "repaired"
 
 
 def test_orchestrator_fails_closed_on_analyzer_exception_without_calling_provider() -> None:

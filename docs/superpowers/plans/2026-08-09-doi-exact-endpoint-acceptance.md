@@ -213,7 +213,7 @@ Run:
 $env:PYTHONPATH = (Get-Location).Path
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest tests/scripts/test_analyze_gold_bottlenecks.py -q
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m ruff check scripts/analyze_gold_bottlenecks.py tests/scripts/test_analyze_gold_bottlenecks.py
-& 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m mypy scripts/analyze_gold_bottlenecks.py
+& 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m mypy src scripts/analyze_gold_bottlenecks.py
 ```
 
 Expected: all focused tests pass, Ruff reports no issues, and mypy reports no issues.

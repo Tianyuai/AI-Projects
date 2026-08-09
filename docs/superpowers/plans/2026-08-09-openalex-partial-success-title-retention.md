@@ -285,7 +285,7 @@ For each execution:
    `apply_hard_filters`. Add only accepted canonical IDs to the repaired
    eligibility set; do not re-filter or otherwise change historical candidates.
 
-Before variants, reconstruct historical RRF with title weight `1.0` and compare the full ordered IDs to stored `business-results.jsonl`. Raise `ValueError("historical Top-50 reconstruction mismatch")` on any mismatch or if totals differ from 60 queries / 2,908 results. Also compare the historical source commit with `HEAD` for `src/paper_search/processing/filters.py`; fail closed if that file differs, because only an unchanged filter implementation permits the repaired eligibility expansion.
+Before variants, reconstruct historical RRF with title weight `1.0` and compare the full ordered IDs to stored `business-results.jsonl`. Raise `ValueError("historical Top-50 reconstruction mismatch")` on any mismatch or if totals differ from 60 queries / 2,908 results. Also compare the historical source commit with `HEAD` for `src/paper_search/processing/filter.py`; fail closed if that file differs, because only an unchanged filter implementation permits the repaired eligibility expansion.
 
 - [ ] **Step 6: Implement scoring and promotion guards**
 

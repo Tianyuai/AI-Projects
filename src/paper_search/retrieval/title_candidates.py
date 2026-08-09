@@ -478,7 +478,6 @@ class LLMTitleCandidateStage:
             diagnostics.append(_provider_diagnostic(search))
             if search.errors:
                 search_errors += 1
-                continue
             for paper in search.data:
                 if paper.canonical_id in seen:
                     continue

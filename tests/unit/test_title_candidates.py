@@ -133,9 +133,11 @@ class FakeTitleProvider:
         results: dict[str, list[Paper]] | None = None,
         *,
         failed_queries: set[str] | None = None,
+        error_queries: set[str] | None = None,
     ) -> None:
         self.results = results or {}
         self.failed_queries = failed_queries or set()
+        self.error_queries = error_queries or set()
         self.calls: list[tuple[str, dict[str, object], int, object]] = []
 
     async def search(
@@ -147,6 +149,25 @@ class FakeTitleProvider:
     ) -> ProviderResult[list[Paper]]:
         self.calls.append((query, filters, limit, reservation))
         failed = query in self.failed_queries
+        errors: list[ErrorDetail] = []
+        if failed:
+            errors.append(
+                ErrorDetail(
+                    code="provider_error",
+                    message="synthetic",
+                    retryable=False,
+                    provider="openalex",
+                )
+            )
+        elif query in self.error_queries:
+            errors.append(
+                ErrorDetail(
+                    code="invalid_work",
+                    message="synthetic invalid sibling",
+                    retryable=False,
+                    provider="openalex",
+                )
+            )
         return ProviderResult[list[Paper]](
             data=[] if failed else self.results.get(query, []),
             usage=UsageActual(search_api_calls=1),
@@ -159,18 +180,7 @@ class FakeTitleProvider:
             },
             cache_hit=False,
             latency_ms=1,
-            errors=(
-                [
-                    ErrorDetail(
-                        code="provider_error",
-                        message="synthetic",
-                        retryable=False,
-                        provider="openalex",
-                    )
-                ]
-                if failed
-                else []
-            ),
+            errors=errors,
         )
 
 
@@ -359,6 +369,26 @@ def test_recall_continues_past_a_failed_title_search() -> None:
     assert result.titles_searched == 2
     assert result.diagnostics[-1].errors
     assert result.diagnostics[-1].dependency == "openalex"
+
+
+def test_recall_keeps_valid_papers_from_error_bearing_search() -> None:
+    controller = HardBudgetController(_budget())
+    paper = Paper(canonical_id="openalex:W1", title="Valid sibling")
+    analyzer = FakeTitleAnalyzer({"titles": ["Partial"]})
+    provider = FakeTitleProvider(
+        {"Partial": [paper]},
+        error_queries={"Partial"},
+    )
+    stage = _stage(analyzer, provider)
+
+    result = asyncio.run(stage.recall(_spec(), controller=controller))
+
+    assert result.status == "applied"
+    assert result.provider_result.data == [paper]
+    assert result.titles_searched == 1
+    assert result.diagnostics[-1].errors[0].code == "invalid_work"
+    assert result.provider_result.usage.search_api_calls == 1
+    assert controller.committed_usage.search_api_calls == 1
 
 
 def test_recall_degrades_on_malformed_llm_output() -> None:

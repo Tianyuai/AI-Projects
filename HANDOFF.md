@@ -18,6 +18,7 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - 标题部分成功页修复已完成；封存离线对照精确重建 60/60 查询和 2,908 个 Top-50 结果。候选池 exact gold 从 19 增至 20，但最终仍为 13，没有排序变体晋级。
 - 本轮完整环境验证为 1886 passed / 36 skipped；Ruff 全量通过。mypy 仍有 15 个既有错误，位于本轮未修改的 `query/parser.py`、`application/readiness.py`、`retrieval/snapshot_adapters.py` 和 `llm/snapshot_adapters.py`。
 - live capture 已将项目 ledger 推进到 1984 条，根哈希为 `sha256:3267b17bdff93676ad2d0f793257559f5549ad11aa4ff29ed097d11bbc60495f`。
+- Gold 精确可用性聚合诊断已完成一次：固定输入为 60/143/139/134，唯一 work availability 为 132 `available`、0 `exact_not_found`、2 `integrity_failure`，实际 HTTP 尝试 135/402；由于不完整，`recommended_direction=null`，未选择或实施任何后续方向。
 
 ## 3. 活跃文件
 
@@ -28,6 +29,8 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - `docs/title-candidate-stage-loss-2026-08-09.md`：标题候选同轮逐阶段流失诊断；
 - `docs/title-retention-offline-2026-08-09.md`：部分成功页修复及 Top-50 离线保留决策；
 - `docs/quality-gate-root-cause-2026-08-09.md`：Gate 失败根因与已验证闭环；
+- `docs/gold-bottleneck-attribution-2026-08-09.md`：Gold 精确可用性与流水线瓶颈聚合诊断；
+- `docs/evidence/gold-bottleneck-attribution-2026-08-09.json`：同一诊断的固定 schema 证据；
 - `configs/title_candidates.yaml`：当前正式实验配置；
 - `runs/candidate.lock.yaml`：本地候选锁；
 - `data/dev/gold.jsonl`：冻结 dev gold。
@@ -42,8 +45,8 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 
 ## 5. 下一步
 
-1. 完成 Gold 精确可用性的聚合报告，再决定是否需要新数据源；
-2. 若继续研究 Top-50 选择，只接受与现有权重/保留槽实质不同的离线假设；
+1. 先离线复核 2 个响应完整性失败，期间不重跑在线探针、不选择方向；
+2. 复核完成且证据完整后，才比较是否存在唯一且可恢复的主要损失桶；
 3. 只有离线 macro F1 提升、保留已有 gold 且排序护栏不回退时，才重建锁、运行 readiness 并申请新的 live capture。
 
 ## 6. 锁状态
@@ -53,7 +56,7 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 ## 7. 环境与红线
 
 - 完整测试环境：`D:\AI Projects\Projects\.venv`；
-- 密钥位于 `D:\AI Projects\Projects\.env`，不得读取、打印或提交；
+- 密钥位于 `D:\AI Projects\Projects\.env`，默认不得读取、打印或提交；只有明确授权的单次诊断可将必要 key 临时注入当前进程，执行后不持久化；
 - 正式命令只加载 `LLM_API_KEY`、`OPENALEX_API_KEY`（含 `_2.._7`）和 `SEMANTIC_SCHOLAR_API_KEY`；
 - 不加载 `LLM_BASE_URL`、`LLM_MODEL_PRIMARY`、`LLM_MODEL_FALLBACK`；
 - OpenAlex key 必须从裸名 `OPENALEX_API_KEY` 开始连续编号；余额低于一次 search 成本才轮换，余额充足的 429 按每秒限流退避；

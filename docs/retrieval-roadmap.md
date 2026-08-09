@@ -7,6 +7,7 @@
 - 已闭环基线宏 F1 为 `0.0050946874`，micro recall 为 `0.0575539568`，召回是主要瓶颈。
 - 标题候选部分成功页修复使候选池 exact gold 从 19 增至 20，但最终 Top-50 仍为 13；既定离线排序变体无一满足晋级条件。
 - Citation、Topic、Embedding、普通 Query Rewrite 和既有 LLM Query Variants 已被实测否决，详见 `experiment-decisions.md`。
+- Gold 精确可用性聚合探针已执行一次：132 个唯一 work 为 `available`，0 个 `exact_not_found`，2 个 `integrity_failure`；因诊断不完整，推荐方向保持 `null`。
 
 ## Phase 0：建立干净基线（已完成）
 
@@ -26,11 +27,13 @@
 
 ## Phase 1：两个必要诊断
 
-### 1. Gold 精确可用性
+### 1. Gold 精确可用性（已执行一次，结论暂停）
 
 使用 DOI、arXiv ID 和 OpenAlex ID 做只读精确反查，只输出聚合原因。禁止把 gold 标识符转换成检索查询。
 
 现有 P0 探针测量的是生成标题能否搜到 gold，不等同于 gold 是否存在于 OpenAlex。
+
+本次固定输入为 60 个查询、143 条原始 gold 标识、139 个归一化查询–论文关联和 134 个唯一 work。实际使用 135 次 HTTP 尝试（硬上限 402），其中 2 个响应完整性失败；证据见 `docs/gold-bottleneck-attribution-2026-08-09.md` 和对应 JSON。由于存在 `integrity_failure`，不得据此选择新数据源、Query Evolution、过滤或排序方向，也不得自动重跑在线探针。
 
 ### 2. 标题候选流失（已完成）
 

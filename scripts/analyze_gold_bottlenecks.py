@@ -556,14 +556,14 @@ def assert_safe_report(payload: Mapping[str, object]) -> None:
     for field in ("availability", "pipeline_stages"):
         value = payload[field]
         expected = AVAILABILITY_STATUSES if field == "availability" else PIPELINE_STAGES
-        if not isinstance(value, dict) or tuple(value) != expected:
+        if not isinstance(value, dict) or set(value) != set(expected):
             raise ValueError(f"invalid {field} keys")
     for field in ("cross_tab", "query_coverage"):
         value = payload[field]
-        if not isinstance(value, dict) or tuple(value) != AVAILABILITY_STATUSES:
+        if not isinstance(value, dict) or set(value) != set(AVAILABILITY_STATUSES):
             raise ValueError(f"invalid {field} status keys")
         if any(
-            not isinstance(row, dict) or tuple(row) != PIPELINE_STAGES
+            not isinstance(row, dict) or set(row) != set(PIPELINE_STAGES)
             for row in value.values()
         ):
             raise ValueError(f"invalid {field} stage keys")
@@ -800,9 +800,13 @@ def _render_markdown(payload: Mapping[str, object]) -> str:
     counts = payload["counts"]
     availability = payload["availability"]
     stages = payload["pipeline_stages"]
+    usage = payload["usage"]
     assert isinstance(counts, dict)
     assert isinstance(availability, dict)
     assert isinstance(stages, dict)
+    assert isinstance(usage, dict)
+    direction = payload["recommended_direction"]
+    direction_text = "null" if direction is None else str(direction)
     reason_codes = payload["reason_codes"]
     reason_text = (
         ", ".join(str(item) for item in reason_codes)
@@ -832,8 +836,22 @@ def _render_markdown(payload: Mapping[str, object]) -> str:
             "",
             *[f"- {key}: {stages[key]}" for key in PIPELINE_STAGES],
             "",
-            f"- Recommended direction: `{payload['recommended_direction']}`",
+            "## Usage",
+            "",
+            f"- Planned unique requests: {usage['unique_requests_planned']}",
+            f"- HTTP attempts: {usage['http_attempts']} / 402",
+            f"- Retries: {usage['retries']}",
+            f"- Timeouts: {usage['timeouts']}",
+            "",
+            f"- Recommended direction: `{direction_text}`",
             f"- Reason codes: `{reason_text}`",
+            "",
+            "## Limitations",
+            "",
+            "- Frozen dev run only.",
+            "- Exact DOI/OpenAlex-ID lookup only.",
+            "- One provider only; no alternate-source probe.",
+            "- No live capture, replay, compare, or production change was performed.",
             "",
         ]
     )

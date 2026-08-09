@@ -343,6 +343,11 @@ def test_tie_or_incomplete_diagnostic_has_no_direction() -> None:
 def test_safe_report_rejects_extra_keys_forbidden_keys_and_forbidden_values() -> None:
     payload = assemble_report(_synthetic_context(), _synthetic_probe(), _synthetic_usage())
 
+    sorted_round_trip = json.loads(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    )
+    assert_safe_report(sorted_round_trip)
+
     with pytest.raises(ValueError, match="extra keys"):
         assert_safe_report({**payload, "unexpected": 1})
 

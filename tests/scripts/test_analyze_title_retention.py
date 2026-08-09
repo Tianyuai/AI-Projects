@@ -318,6 +318,10 @@ def test_analyze_run_reconstructs_then_recovers_partial_page(
         "total_selected": 2,
     }
     assert payload["partial_success"]["newly_eligible_papers"] == 1
+    assert payload["partial_success"]["historical_pool_exact_gold"] == 0
+    assert payload["partial_success"]["repaired_pool_exact_gold"] == 1
+    assert payload["partial_success"]["newly_eligible_exact_gold"] == 1
+    assert payload["partial_success"]["newly_eligible_gold_queries"] == 1
     variants = {item["name"]: item for item in payload["variants"]}
     assert variants["historical_rrf"]["exact_gold_count"] == 0
     assert variants["repaired_rrf"]["exact_gold_count"] == 1

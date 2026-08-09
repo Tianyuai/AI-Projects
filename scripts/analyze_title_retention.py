@@ -467,6 +467,13 @@ def analyze_run(
         raise ValueError("run query sets do not match")
     if len(executions) != expected_query_count:
         raise ValueError("unexpected query count")
+    gold = read_jsonl(gold_path, EvaluationQuery)
+    id_map = IdentifierMap.from_path(id_map_path)
+    if {item.query_id for item in gold} != set(execution_by_query):
+        raise ValueError("gold query set does not match run")
+    gold_by_query = {
+        item.query_id: set(item.relevant_paper_ids) for item in gold
+    }
 
     historical: dict[str, list[str]] = {}
     repaired: dict[str, list[str]] = {}
@@ -477,6 +484,7 @@ def analyze_run(
         minimum: {} for minimum in _TITLE_SLOT_MINIMUMS
     }
     repaired_titles: dict[str, list[str]] = {}
+    historical_eligible_by_query: dict[str, set[str]] = {}
     repaired_eligible_by_query: dict[str, set[str]] = {}
     exact_sequences = 0
     error_bearing_responses = 0
@@ -524,6 +532,7 @@ def analyze_run(
         repaired_titles[query_id] = [
             paper.canonical_id for paper in title_repaired
         ]
+        historical_eligible_by_query[query_id] = historical_eligible
         repaired_eligible_by_query[query_id] = repaired_eligible
         error_bearing_responses += query_error_responses
         recovered_valid_papers += query_recovered_papers
@@ -541,13 +550,30 @@ def analyze_run(
                 minimum=minimum,
             )
 
-    gold = read_jsonl(gold_path, EvaluationQuery)
-    id_map = IdentifierMap.from_path(id_map_path)
-    if {item.query_id for item in gold} != set(historical):
-        raise ValueError("gold query set does not match run")
-    gold_by_query = {
-        item.query_id: set(item.relevant_paper_ids) for item in gold
+    def pool_gold_hits(
+        pools: Mapping[str, AbstractSet[str]],
+    ) -> tuple[int, int]:
+        total = 0
+        queries = 0
+        for query_id, pool in pools.items():
+            resolved_gold = {
+                id_map.resolve(item) for item in gold_by_query[query_id]
+            }
+            hits = {id_map.resolve(item) for item in pool} & resolved_gold
+            total += len(hits)
+            queries += bool(hits)
+        return total, queries
+
+    newly_eligible_by_query = {
+        query_id: repaired_eligible_by_query[query_id]
+        - historical_eligible_by_query[query_id]
+        for query_id in historical
     }
+    historical_pool_gold, _ = pool_gold_hits(historical_eligible_by_query)
+    repaired_pool_gold, _ = pool_gold_hits(repaired_eligible_by_query)
+    newly_eligible_gold, newly_eligible_gold_queries = pool_gold_hits(
+        newly_eligible_by_query
+    )
     variants: list[dict[str, object]] = []
     historical_summary = _variant_summary(
         "historical_rrf", historical, gold, id_map
@@ -633,6 +659,10 @@ def analyze_run(
             "error_bearing_responses": error_bearing_responses,
             "recovered_valid_papers": recovered_valid_papers,
             "newly_eligible_papers": newly_eligible_papers,
+            "historical_pool_exact_gold": historical_pool_gold,
+            "repaired_pool_exact_gold": repaired_pool_gold,
+            "newly_eligible_exact_gold": newly_eligible_gold,
+            "newly_eligible_gold_queries": newly_eligible_gold_queries,
         },
         "variants": variants,
         "recommended_variant": (

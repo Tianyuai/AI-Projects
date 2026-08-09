@@ -325,6 +325,8 @@ def test_analyze_run_reconstructs_then_recovers_partial_page(
     variants = {item["name"]: item for item in payload["variants"]}
     assert variants["historical_rrf"]["exact_gold_count"] == 0
     assert variants["repaired_rrf"]["exact_gold_count"] == 1
+    assert variants["repaired_rrf"]["changed_sequence_queries"] == 1
+    assert variants["repaired_rrf"]["changed_set_queries"] == 1
     assert (
         variants["repaired_rrf"]["metrics"]["macro_f1"]
         > variants["historical_rrf"]["metrics"]["macro_f1"]

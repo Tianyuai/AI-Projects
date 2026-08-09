@@ -579,7 +579,12 @@ def analyze_run(
         "historical_rrf", historical, gold, id_map
     )
     historical_summary.update(
-        {"promotable": False, "reason_codes": ["reference_variant"]}
+        {
+            "changed_sequence_queries": 0,
+            "changed_set_queries": 0,
+            "promotable": False,
+            "reason_codes": ["reference_variant"],
+        }
     )
     variants.append(historical_summary)
 
@@ -604,6 +609,14 @@ def analyze_run(
     )
     for name, predictions, parameters in candidate_inputs:
         summary = _variant_summary(name, predictions, gold, id_map)
+        changed_sequence_queries = sum(
+            list(predictions[query_id]) != historical[query_id]
+            for query_id in historical
+        )
+        changed_set_queries = sum(
+            set(predictions[query_id]) != set(historical[query_id])
+            for query_id in historical
+        )
         retains_golds = retains_baseline_golds(
             gold_by_query,
             historical,
@@ -618,6 +631,8 @@ def analyze_run(
         summary.update(
             {
                 "parameters": parameters,
+                "changed_sequence_queries": changed_sequence_queries,
+                "changed_set_queries": changed_set_queries,
                 "retains_baseline_golds": retains_golds,
                 "promotable": promotable,
                 "reason_codes": reasons,

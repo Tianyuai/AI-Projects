@@ -197,6 +197,12 @@ def _write_synthetic_run(root: Path, *, reverse_selected: bool = False) -> None:
             {"id": None, "title": None},
         ],
     }
+    successful_title_oa = {
+        "meta": {"next_cursor": None},
+        "results": [
+            {"id": "https://openalex.org/W4", "title": "Four"},
+        ],
+    }
     (responses / "llm" / "titles.bin").write_text(
         json.dumps(title_llm),
         encoding="utf-8",
@@ -207,6 +213,10 @@ def _write_synthetic_run(root: Path, *, reverse_selected: bool = False) -> None:
     )
     (responses / "openalex" / "partial.bin").write_text(
         json.dumps(partial_oa),
+        encoding="utf-8",
+    )
+    (responses / "openalex" / "successful-title.bin").write_text(
+        json.dumps(successful_title_oa),
         encoding="utf-8",
     )
     diagnostics = [
@@ -229,6 +239,13 @@ def _write_synthetic_run(root: Path, *, reverse_selected: bool = False) -> None:
             "errors": [{"code": "provider_error"}],
             "snapshot_refs": [
                 {"snapshot_path": "responses/openalex/partial.bin"}
+            ],
+        },
+        {
+            "dependency": "openalex",
+            "errors": [],
+            "snapshot_refs": [
+                {"snapshot_path": "responses/openalex/successful-title.bin"}
             ],
         },
     ]

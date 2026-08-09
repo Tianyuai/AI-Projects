@@ -316,8 +316,8 @@ def _query_sources(
 
     title_historical: list[Paper] = []
     title_repaired: list[Paper] = []
+    recovered_from_errors: list[Paper] = []
     error_bearing_responses = 0
-    recovered_valid_papers = 0
     for diagnostic in diagnostics[title_index + 1 :]:
         if diagnostic.get("dependency") != "openalex":
             continue
@@ -327,13 +327,14 @@ def _query_sources(
         has_errors = isinstance(errors, list) and bool(errors)
         if has_errors:
             error_bearing_responses += 1
-            recovered_valid_papers += len(papers)
+            recovered_from_errors.extend(papers)
         else:
             title_historical.extend(papers)
 
     openalex = _deduplicate_ids(openalex)
     title_historical = _deduplicate_ids(title_historical)
     title_repaired = _deduplicate_ids(title_repaired)
+    recovered_from_errors = _deduplicate_ids(recovered_from_errors)
     raw_eligible = execution.get("post_filter_paper_ids")
     if not isinstance(raw_eligible, list) or any(
         not isinstance(item, str) for item in raw_eligible
@@ -353,7 +354,7 @@ def _query_sources(
     spec = QuerySpec.model_validate(query_analysis.get("query_spec"))
     new_papers = [
         paper
-        for paper in title_repaired
+        for paper in recovered_from_errors
         if paper.canonical_id not in historical_retrieved
     ]
     accepted = apply_hard_filters(new_papers, spec).accepted
@@ -367,7 +368,7 @@ def _query_sources(
         historical_eligible,
         repaired_eligible,
         error_bearing_responses,
-        recovered_valid_papers,
+        len(recovered_from_errors),
     )
 
 

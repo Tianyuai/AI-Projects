@@ -47,6 +47,60 @@ def test_synthetic_capture_and_replay_are_valid() -> None:
     assert validate_run_directory(FIXTURE_ROOT / "replay").valid
 
 
+def test_replay_validator_keeps_project_spend_zero_with_replayed_usage(
+    tmp_path: Path,
+) -> None:
+    fixture = tmp_path / "formal_run"
+    shutil.copytree(FIXTURE_ROOT, fixture)
+    run = fixture / "replay"
+    replay_usage = json.loads((run / "usage.json").read_bytes())
+    replay_usage["actual"] = {
+        "cost_cny": "0.20",
+        "elapsed_ms": 20,
+        "input_tokens": 2,
+        "llm_calls": 2,
+        "output_tokens": 4,
+        "search_api_calls": 2,
+    }
+    for receipt in replay_usage["receipts"]:
+        receipt["actual"] = {
+            "cost_cny": "0.10",
+            "elapsed_ms": 10,
+            "input_tokens": 1,
+            "llm_calls": 1,
+            "output_tokens": 2,
+            "search_api_calls": 1,
+        }
+    replay_usage["project_actual_cny"] = "0"
+    replay_usage["project_receipts_sha256"] = validator_module._receipts_sha256(
+        replay_usage["receipts"]
+    )
+    (run / "usage.json").write_text(
+        json.dumps(replay_usage),
+        encoding="utf-8",
+    )
+
+    execution_lines = (run / "executions.jsonl").read_text(encoding="utf-8").splitlines()
+    executions = []
+    for line in execution_lines:
+        execution = json.loads(line)
+        execution["usage"] = replay_usage["receipts"][len(executions)]["actual"]
+        executions.append(execution)
+    (run / "executions.jsonl").write_text(
+        "\n".join(json.dumps(execution) for execution in executions) + "\n",
+        encoding="utf-8",
+    )
+
+    manifest = json.loads((run / "run.json").read_bytes())
+    manifest["project_receipt_count"] = len(replay_usage["receipts"])
+    manifest["project_receipts_sha256"] = replay_usage["project_receipts_sha256"]
+    (run / "run.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    result = validate_run_directory(run)
+
+    assert "ledger_invalid" not in {issue.code for issue in result.issues}
+
+
 def test_prompt_config_sha256_must_not_be_zero() -> None:
     payload = yaml.safe_load(
         (FIXTURE_ROOT / "capture" / "config.lock.yaml").read_bytes()

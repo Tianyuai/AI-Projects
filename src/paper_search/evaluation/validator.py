@@ -473,15 +473,19 @@ def _validate(path: Path) -> tuple[RunValidationResult, bytes | None, str | None
         expected_run_cap = (
             DEV_RUN_CAP_CNY if manifest.split == "dev" else VALIDATION_RUN_CAP_CNY
         )
-        project_actual = sum(
-            (
-                receipt.actual.cost_cny
-                for receipt in usage.receipts
-                if receipt.state in {"settled", "failed"}
-                and receipt.actual is not None
-                and receipt.actual.cost_cny is not None
-            ),
-            Decimal("0"),
+        project_actual = (
+            Decimal("0")
+            if isinstance(lock, ReplayLock)
+            else sum(
+                (
+                    receipt.actual.cost_cny
+                    for receipt in usage.receipts
+                    if receipt.state in {"settled", "failed"}
+                    and receipt.actual is not None
+                    and receipt.actual.cost_cny is not None
+                ),
+                Decimal("0"),
+            )
         )
         project_reserved = sum(
             (

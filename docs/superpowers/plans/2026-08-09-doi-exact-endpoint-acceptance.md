@@ -27,7 +27,7 @@
 - Consumes: `_classify_response(identifier: str, payload: object)` through `probe_openalex_exact(...)`.
 - Produces: the existing `(AvailabilityStatus, IntegrityFailureReason | None)` tuple; no new type or schema.
 
-- [ ] **Step 1: Replace the old DOI-field failure cases with contract tests**
++ [x] **Step 1: Replace the old DOI-field failure cases with contract tests**
 
 Add synthetic `httpx.MockTransport` tests covering these exact outcomes:
 
@@ -162,7 +162,7 @@ def test_200_non_object_payload_remains_integrity_failure() -> None:
 
 Do not call `_classify_response` directly and do not use network access.
 
-- [ ] **Step 2: Run the new focused tests and verify RED**
++ [x] **Step 2: Run the new focused tests and verify RED**
 
 Run:
 
@@ -173,7 +173,7 @@ $env:PYTHONPATH = (Get-Location).Path
 
 Expected: DOI responses with a valid Work ID fail under the old top-level DOI equality rule; missing/non-Work IDs and OpenAlex mismatch retain their expected classifications.
 
-- [ ] **Step 3: Implement the minimal classifier change**
++ [x] **Step 3: Implement the minimal classifier change**
 
 Replace `_classify_response` with the following logic:
 
@@ -205,7 +205,7 @@ def _classify_response(
 
 Do not add alias maps, new report fields, provider-field fallbacks, or logging.
 
-- [ ] **Step 4: Verify GREEN and focused static checks**
++ [x] **Step 4: Verify GREEN and focused static checks**
 
 Run:
 
@@ -218,7 +218,7 @@ $env:PYTHONPATH = (Get-Location).Path
 
 Expected: all focused tests pass, Ruff reports no issues, and mypy reports no issues.
 
-- [ ] **Step 5: Commit the behavior change**
++ [x] **Step 5: Commit the behavior change**
 
 ```powershell
 git add -- scripts/analyze_gold_bottlenecks.py tests/scripts/test_analyze_gold_bottlenecks.py
@@ -237,7 +237,7 @@ git commit -m "fix: accept DOI exact endpoint resolutions"
 - Consumes: the tested classifier behavior from Task 1.
 - Produces: active project-state documents that distinguish the implemented offline contract from the unchanged historical online report.
 
-- [ ] **Step 1: Update active project-state documentation**
++ [x] **Step 1: Update active project-state documentation**
 
 Record only these facts:
 
@@ -249,7 +249,7 @@ Record only these facts:
 
 Remove the obsolete next-step wording that says the DOI acceptance contract is still undecided. Do not claim `diagnostic_complete=true`.
 
-- [ ] **Step 2: Run full offline verification**
++ [x] **Step 2: Run full offline verification**
 
 Run:
 
@@ -262,9 +262,9 @@ $trackedPython = @(git ls-files '*.py')
 git diff --check
 ```
 
-Expected: the full suite passes with only documented platform/online skips; Ruff is clean; mypy reports no issues in 93 or more source files; `git diff --check` is clean.
+Observed: `1922 passed / 36 skipped / 2 environment failures`; the two failures are the documented Windows Git ownership and `uv build`/output-decoding issues. Focused tests, Ruff, mypy (93 files), and `git diff --check` are clean. The full-suite green gate remains environment-blocked.
 
-- [ ] **Step 3: Confirm forbidden side effects did not occur**
++ [x] **Step 3: Confirm forbidden side effects did not occur**
 
 Run:
 
@@ -275,7 +275,7 @@ git diff -- docs/evidence/gold-bottleneck-attribution-2026-08-09.json docs/gold-
 
 Expected: the historical evidence and candidate lock have no diff; existing untracked `data/budget_ledger.sqlite3` and `deliverables/` remain untouched.
 
-- [ ] **Step 4: Commit documentation and verification state**
++ [x] **Step 4: Commit documentation and verification state**
 
 ```powershell
 git add -- HANDOFF.md docs/retrieval-roadmap.md

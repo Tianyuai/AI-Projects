@@ -37,7 +37,7 @@
 
 DOI exact-endpoint acceptance contract 已完成离线固化：请求使用规范化 DOI 时，HTTP 200 加有效 OpenAlex Work ID 即为 `available`；响应顶层 DOI 缺失、不同或不可解析不改变该结论。响应缺失或无法解析 Work ID 仍按既有完整性原因失败。请求使用 OpenAlex-ID 时，响应 Work ID 仍必须与请求 ID 严格匹配。该契约由固定合成 `httpx.MockTransport` 测试覆盖，且不改变生产检索、报告 schema、隐私或账本规则。
 
-当前不选择新的诊断方向。一次获批的 DOI 契约 availability rerun 在第 1 次 HTTP 尝试后以 `ProbeGlobalError` 失败，未写入新聚合报告；历史 evidence 保持不变。后续在线重试仍需单独确认失败原因并重新授权。该离线契约记录不构成新的在线诊断结论。
+当前不选择新的诊断方向。两次获批的 DOI 契约 availability rerun 均在第 1 次 HTTP 尝试后以 `ProbeGlobalError` 失败，未写入新聚合报告；历史 evidence 保持不变。当前网络路径或服务访问问题必须在环境侧解决后，才可进行新的在线重试。该离线契约记录不构成新的在线诊断结论。
 
 ### 2. 标题候选流失（已完成）
 

@@ -323,6 +323,22 @@ class QueryParser:
                 return self._validate(normalized, repaired.data, status="repaired")
             except (ValidationError, ValueError):
                 pass
+            try:
+                normalized_repair = normalize_query_analysis(
+                    repaired.data,
+                    normalized,
+                )
+            except (TypeError, ValueError):
+                normalized_repair = None
+            if normalized_repair is not None:
+                try:
+                    return self._validate(
+                        normalized,
+                        normalized_repair,
+                        status="repaired",
+                    )
+                except (ValidationError, ValueError):
+                    pass
 
         spec = rule_fallback(normalized)
         return ClassifiedQueryAnalysis(

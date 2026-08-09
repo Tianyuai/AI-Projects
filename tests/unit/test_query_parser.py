@@ -393,6 +393,40 @@ def test_invalid_payload_is_repaired_once() -> None:
     assert result.planner_status == "repaired"
 
 
+def test_flexible_repair_payload_is_normalized_before_fallback() -> None:
+    query = "graph retrieval"
+    repaired_payload = {
+        "query_spec": {
+            "original_query": query,
+            "search_terms": ["graph retrieval", "graph search"],
+            "constraints": [],
+            "filters": {},
+            "additional_context": "research papers",
+        },
+        "search_plan": {
+            "subqueries": [
+                "graph retrieval",
+                "graph search",
+                "graph information retrieval",
+            ]
+        },
+    }
+
+    async def repair(_: str) -> ProviderResult[dict]:
+        return _provider_result(repaired_payload)
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(
+            query,
+            _provider_result({}),
+            repair=repair,
+        )
+    )
+
+    assert result.planner_status == "repaired"
+    assert len(result.search_plan.subqueries) == 3
+
+
 def test_failed_repair_uses_deterministic_rule_fallback() -> None:
     query = "graph retrieval without surveys at NeurIPS from 2021 to 2024"
     calls = 0

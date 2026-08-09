@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Awaitable, Callable, Literal
+from typing import Awaitable, Callable, Literal, cast
 from urllib.parse import quote
 
 import httpx
@@ -64,6 +64,37 @@ INTEGRITY_FAILURE_REASONS: tuple[IntegrityFailureReason, ...] = (
     "canonical_mismatch",
 )
 IDENTIFIER_KINDS = ("doi", "openalex")
+INPUT_HASH_FIELDS = {
+    "gold_sha256",
+    "identifier_map_sha256",
+    "executions_sha256",
+    "business_results_sha256",
+    "gates_sha256",
+    "run_sha256",
+}
+COUNT_FIELDS = {
+    "query_count",
+    "raw_gold_identifier_count",
+    "normalized_query_work_count",
+    "unique_work_count",
+    "doi_work_count",
+    "openalex_work_count",
+}
+USAGE_COUNT_FIELDS = {
+    "unique_requests_planned",
+    "http_attempts",
+    "retries",
+    "http_200",
+    "http_404",
+    "http_429",
+    "http_5xx",
+    "timeouts",
+}
+USAGE_FIELDS = {
+    *USAGE_COUNT_FIELDS,
+    "ledger_checkpoint_before_sha256",
+    "ledger_checkpoint_after_sha256",
+}
 PIPELINE_STAGES: tuple[PipelineStage, ...] = (
     "selected_top50",
     "ranked_outside_top50",
@@ -563,6 +594,47 @@ def _validate_json_value(value: object, *, key: str | None = None) -> None:
     raise ValueError("forbidden string value in report")
 
 
+def _fixed_mapping(
+    value: object,
+    expected_keys: set[str],
+    *,
+    section: str,
+) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != expected_keys:
+        raise ValueError(f"invalid {section} keys")
+    return cast(dict[str, object], value)
+
+
+def _fixed_counts(
+    value: object,
+    expected_keys: set[str],
+    *,
+    section: str,
+) -> dict[str, int]:
+    mapping = _fixed_mapping(value, expected_keys, section=section)
+    if any(type(count) is not int or count < 0 for count in mapping.values()):
+        raise ValueError(f"invalid {section} count")
+    return cast(dict[str, int], mapping)
+
+
+def _fixed_count_matrix(
+    value: object,
+    row_keys: set[str],
+    column_keys: set[str],
+    *,
+    section: str,
+) -> dict[str, dict[str, int]]:
+    mapping = _fixed_mapping(value, row_keys, section=section)
+    matrix: dict[str, dict[str, int]] = {}
+    for row_key, row in mapping.items():
+        matrix[row_key] = _fixed_counts(
+            row,
+            column_keys,
+            section=f"{section}.{row_key}",
+        )
+    return matrix
+
+
 def assert_safe_report(payload: Mapping[str, object]) -> None:
     forbidden_top_level = FORBIDDEN_OUTPUT_KEYS.intersection(payload)
     if forbidden_top_level:
@@ -589,47 +661,110 @@ def assert_safe_report(payload: Mapping[str, object]) -> None:
     _validate_json_value(dict(payload))
     if payload["schema_version"] != "gold-bottleneck-attribution-v2":
         raise ValueError("invalid report schema version")
-    for section in ("availability", "pipeline_stages"):
-        value = payload[section]
-        expected = (
-            AVAILABILITY_STATUSES
-            if section == "availability"
-            else PIPELINE_STAGES
-        )
-        if not isinstance(value, dict) or set(value) != set(expected):
-            raise ValueError(f"invalid {section} keys")
-    for section in ("cross_tab", "query_coverage"):
-        value = payload[section]
-        if not isinstance(value, dict) or set(value) != set(AVAILABILITY_STATUSES):
-            raise ValueError(f"invalid {section} status keys")
-        if any(
-            not isinstance(row, dict) or set(row) != set(PIPELINE_STAGES)
-            for row in value.values()
-        ):
-            raise ValueError(f"invalid {section} stage keys")
-    availability = payload["availability"]
-    breakdown = payload["integrity_failure_breakdown"]
-    if not isinstance(availability, dict) or not isinstance(breakdown, dict):
-        raise ValueError("invalid integrity failure breakdown")
-    if set(breakdown) != set(INTEGRITY_FAILURE_REASONS):
-        raise ValueError("invalid integrity failure reason keys")
-    if any(
-        not isinstance(row, dict)
-        or set(row) != set(IDENTIFIER_KINDS)
-        or any(type(count) is not int or count < 0 for count in row.values())
-        for row in breakdown.values()
-    ):
-        raise ValueError("invalid integrity failure breakdown")
-    breakdown_total = sum(
-        count
-        for row in breakdown.values()
-        for count in row.values()
+    _fixed_mapping(payload["input_hashes"], INPUT_HASH_FIELDS, section="input_hashes")
+    counts = _fixed_counts(payload["counts"], COUNT_FIELDS, section="counts")
+    availability = _fixed_counts(
+        payload["availability"],
+        set(AVAILABILITY_STATUSES),
+        section="availability",
     )
-    if breakdown_total != availability.get("integrity_failure"):
+    pipeline_stages = _fixed_counts(
+        payload["pipeline_stages"],
+        set(PIPELINE_STAGES),
+        section="pipeline_stages",
+    )
+    breakdown = _fixed_count_matrix(
+        payload["integrity_failure_breakdown"],
+        set(INTEGRITY_FAILURE_REASONS),
+        set(IDENTIFIER_KINDS),
+        section="integrity_failure_breakdown",
+    )
+    cross_tab = _fixed_count_matrix(
+        payload["cross_tab"],
+        set(AVAILABILITY_STATUSES),
+        set(PIPELINE_STAGES),
+        section="cross_tab",
+    )
+    query_coverage = _fixed_count_matrix(
+        payload["query_coverage"],
+        set(AVAILABILITY_STATUSES),
+        set(PIPELINE_STAGES),
+        section="query_coverage",
+    )
+    usage_mapping = _fixed_mapping(payload["usage"], USAGE_FIELDS, section="usage")
+    usage = {
+        key: cast(int, usage_mapping[key])
+        for key in USAGE_COUNT_FIELDS
+    }
+    if any(type(count) is not int or count < 0 for count in usage.values()):
+        raise ValueError("invalid usage count")
+
+    if sum(availability.values()) != counts["unique_work_count"]:
+        raise ValueError("availability counts do not conserve unique works")
+    if (
+        counts["doi_work_count"]
+        + counts["openalex_work_count"]
+        + availability["invalid_identifier"]
+        != counts["unique_work_count"]
+    ):
+        raise ValueError("identifier kind counts do not conserve unique works")
+    if sum(pipeline_stages.values()) != counts["normalized_query_work_count"]:
+        raise ValueError("pipeline counts do not conserve associations")
+    if (
+        sum(count for row in cross_tab.values() for count in row.values())
+        != counts["normalized_query_work_count"]
+    ):
+        raise ValueError("cross tab does not conserve associations")
+    for stage in PIPELINE_STAGES:
+        if sum(cross_tab[status][stage] for status in AVAILABILITY_STATUSES) != (
+            pipeline_stages[stage]
+        ):
+            raise ValueError("cross tab does not match pipeline counts")
+    if (
+        sum(count for row in breakdown.values() for count in row.values())
+        != availability["integrity_failure"]
+    ):
         raise ValueError("integrity failure breakdown does not conserve count")
+    query_count = counts["query_count"]
+    for status in AVAILABILITY_STATUSES:
+        for stage in PIPELINE_STAGES:
+            coverage = query_coverage[status][stage]
+            if coverage > query_count or coverage > cross_tab[status][stage]:
+                raise ValueError("query coverage exceeds its source counts")
+    if counts["unique_work_count"] > counts["normalized_query_work_count"]:
+        raise ValueError("unique works exceed normalized associations")
+    if counts["normalized_query_work_count"] > counts["raw_gold_identifier_count"]:
+        raise ValueError("normalized associations exceed raw identifiers")
+    if usage["unique_requests_planned"] != counts["unique_work_count"]:
+        raise ValueError("planned requests do not match unique works")
+    if (
+        usage["http_200"]
+        + usage["http_404"]
+        + usage["http_429"]
+        + usage["http_5xx"]
+        + usage["timeouts"]
+        != usage["http_attempts"]
+    ):
+        raise ValueError("HTTP outcomes do not conserve attempts")
+    if usage["retries"] > usage["http_attempts"]:
+        raise ValueError("retries exceed HTTP attempts")
+    if usage["http_attempts"] > usage["unique_requests_planned"] * 3:
+        raise ValueError("HTTP attempts exceed retry policy")
+    expected_complete = all(
+        availability[status] == 0
+        for status in (
+            "unknown_transient",
+            "invalid_identifier",
+            "integrity_failure",
+        )
+    )
+    if payload["diagnostic_complete"] is not expected_complete:
+        raise ValueError("diagnostic completeness does not match availability")
     direction = payload["recommended_direction"]
     if direction is not None and direction not in RECOMMENDATION_DIRECTIONS:
         raise ValueError("invalid recommended direction")
+    if not expected_complete and direction is not None:
+        raise ValueError("incomplete diagnostic cannot recommend a direction")
     reasons = payload["reason_codes"]
     if not isinstance(reasons, list) or any(item not in REASON_CODES for item in reasons):
         raise ValueError("invalid reason codes")
@@ -1018,6 +1153,10 @@ async def run_diagnostic(
             allow_nan=False,
         ) + "\n"
         write_atomic_text(out_json, json_content)
+        persisted_payload = _read_json_object(out_json)
+        assert_safe_report(persisted_payload)
+        if persisted_payload != payload:
+            raise ValueError("persisted diagnostic JSON differs from assembled report")
         write_atomic_text(out_report, _render_markdown(payload))
         return DiagnosticRunResult(diagnostic_run_id, payload)
     finally:

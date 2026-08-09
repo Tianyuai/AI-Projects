@@ -366,6 +366,55 @@ def test_safe_report_rejects_extra_keys_forbidden_keys_and_forbidden_values() ->
         assert_safe_report(unsafe)
 
 
+def test_safe_report_rejects_nested_schema_and_count_invariant_violations() -> None:
+    payload = assemble_report(_synthetic_context(), _synthetic_probe(), _synthetic_usage())
+    invalid_payloads: list[dict[str, object]] = []
+
+    extra_count_key = json.loads(json.dumps(payload))
+    extra_count_key["counts"]["https://example.invalid/doi"] = 1
+    invalid_payloads.append(extra_count_key)
+
+    extra_usage_key = json.loads(json.dumps(payload))
+    extra_usage_key["usage"]["doi:10.1000/private"] = 1
+    invalid_payloads.append(extra_usage_key)
+
+    extra_hash_key = json.loads(json.dumps(payload))
+    extra_hash_key["input_hashes"]["unexpected_sha256"] = "0" * 64
+    invalid_payloads.append(extra_hash_key)
+
+    negative_availability = json.loads(json.dumps(payload))
+    negative_availability["availability"]["available"] = -1
+    invalid_payloads.append(negative_availability)
+
+    floating_integrity_count = json.loads(json.dumps(payload))
+    floating_integrity_count["availability"]["integrity_failure"] = 0.0
+    invalid_payloads.append(floating_integrity_count)
+
+    wrong_unique_count = json.loads(json.dumps(payload))
+    wrong_unique_count["counts"]["unique_work_count"] = 4
+    invalid_payloads.append(wrong_unique_count)
+
+    wrong_pipeline_total = json.loads(json.dumps(payload))
+    wrong_pipeline_total["pipeline_stages"]["selected_top50"] = 2
+    invalid_payloads.append(wrong_pipeline_total)
+
+    negative_cross_tab = json.loads(json.dumps(payload))
+    negative_cross_tab["cross_tab"]["available"]["selected_top50"] = -1
+    invalid_payloads.append(negative_cross_tab)
+
+    excessive_query_coverage = json.loads(json.dumps(payload))
+    excessive_query_coverage["query_coverage"]["available"]["selected_top50"] = 3
+    invalid_payloads.append(excessive_query_coverage)
+
+    wrong_http_total = json.loads(json.dumps(payload))
+    wrong_http_total["usage"]["http_attempts"] = 4
+    invalid_payloads.append(wrong_http_total)
+
+    for invalid in invalid_payloads:
+        with pytest.raises(ValueError):
+            assert_safe_report(invalid)
+
+
 def test_report_aggregates_integrity_failure_reason_by_identifier_kind() -> None:
     probe = ProbeBatch(
         status_by_work={
@@ -663,8 +712,23 @@ def test_authentication_failure_is_global_and_reports_attempt_count() -> None:
 
 def test_run_diagnostic_uses_one_aggregate_receipt_and_settles_actual(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requests = 0
+    persisted_reads = 0
+    out_json = tmp_path / "report.json"
+
+    import scripts.analyze_gold_bottlenecks as module
+
+    original_read_json_object = module._read_json_object
+
+    def track_persisted_read(path: Path) -> dict[str, object]:
+        nonlocal persisted_reads
+        if path == out_json:
+            persisted_reads += 1
+        return original_read_json_object(path)
+
+    monkeypatch.setattr(module, "_read_json_object", track_persisted_read)
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal requests
@@ -679,7 +743,7 @@ def test_run_diagnostic_uses_one_aggregate_receipt_and_settles_actual(
                 id_map_path=ID_MAP_PATH,
                 ledger_path=tmp_path / "formal.sqlite3",
                 pricing_path=ROOT / "data" / "annotation_work" / "pricing_v1.yaml",
-                out_json=tmp_path / "report.json",
+                out_json=out_json,
                 out_report=tmp_path / "report.md",
                 client=client,
                 environ={"OPENALEX_API_KEY": "synthetic-key"},
@@ -691,9 +755,10 @@ def test_run_diagnostic_uses_one_aggregate_receipt_and_settles_actual(
     assert requests == 134
     assert result.payload["usage"]["http_attempts"] == 134
     assert result.payload["schema_version"] == "gold-bottleneck-attribution-v2"
-    persisted = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+    persisted = json.loads(out_json.read_text(encoding="utf-8"))
     assert_safe_report(persisted)
     assert persisted == result.payload
+    assert persisted_reads == 1
     assert result.diagnostic_run_id.endswith("-20260809T000000000000Z")
 
     from paper_search.control.ledger import SQLiteBudgetLedger

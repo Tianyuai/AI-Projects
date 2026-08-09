@@ -400,7 +400,7 @@ Run:
 git diff --check
 ```
 
-Expected: pytest and Ruff pass. If mypy reports only the already documented pre-existing parser errors, record them exactly and do not conflate them with this task; any new error blocks completion.
+Expected: pytest and Ruff pass. Record mypy baseline errors exactly and verify their files are unchanged by this task; any error in a task-modified file blocks completion. Execution found 15 pre-existing errors in four unchanged files: `query/parser.py`, `application/readiness.py`, `retrieval/snapshot_adapters.py`, and `llm/snapshot_adapters.py`.
 
 - [ ] **Step 6: Commit evidence and documentation**
 

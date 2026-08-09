@@ -1,0 +1,352 @@
+{
+  "input_hashes": {
+    "business_results_sha256": "sha256:ec0391011656b005dc123e1f5c4a24ca58ae75af0b7e2f57db19e2ac8a2202e6",
+    "executions_sha256": "sha256:bfd4ab1e01ca1c18b3f59e3db0a91ce8e98405275f476f56853468585fba22c0",
+    "gold_sha256": "sha256:24009cf03ad069131793b9a190024e239082277bd0e48149a1efbbbb7978e215",
+    "identifier_map_sha256": "sha256:6ea6dbcd20a3f572d9f0dd0a0eef938ff01773db792401adf7fde1e489396e82"
+  },
+  "partial_success": {
+    "error_bearing_responses": 15,
+    "historical_pool_exact_gold": 19,
+    "newly_eligible_exact_gold": 1,
+    "newly_eligible_gold_queries": 1,
+    "newly_eligible_papers": 57,
+    "recovered_valid_papers": 80,
+    "repaired_pool_exact_gold": 20
+  },
+  "recommended_variant": null,
+  "reconstruction": {
+    "exact_query_sequences": 60,
+    "query_count": 60,
+    "total_selected": 2908
+  },
+  "run_id": "dev-20260805T035209Z-7af4b103f6cc",
+  "schema_version": "title-retention-offline-v1",
+  "source_git_sha": "e5b6429d3e3cf0fafb09180e2e2faec5f7fb7aa9",
+  "variants": [
+    {
+      "changed_sequence_queries": 0,
+      "changed_set_queries": 0,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.00813534234362943,
+        "macro_mrr": 0.0548500410265116,
+        "macro_ndcg": 0.05322101573986346,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.09472222222222222,
+        "macro_recall_at_10": 0.06166666666666667,
+        "macro_recall_at_20": 0.0775,
+        "macro_recall_at_5": 0.045000000000000005,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "historical_rrf",
+      "promotable": false,
+      "reason_codes": [
+        "reference_variant"
+      ],
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 5,
+      "changed_set_queries": 5,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.00813534234362943,
+        "macro_mrr": 0.0548500410265116,
+        "macro_ndcg": 0.05322101573986346,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.09472222222222222,
+        "macro_recall_at_10": 0.06166666666666667,
+        "macro_recall_at_20": 0.0775,
+        "macro_recall_at_5": 0.045000000000000005,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "repaired_rrf",
+      "parameters": {},
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved"
+      ],
+      "retains_baseline_golds": true,
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 51,
+      "changed_set_queries": 49,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.00813534234362943,
+        "macro_mrr": 0.05665019854095484,
+        "macro_ndcg": 0.054090473901297925,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.09472222222222222,
+        "macro_recall_at_10": 0.06916666666666667,
+        "macro_recall_at_20": 0.08638888888888889,
+        "macro_recall_at_5": 0.0575,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "weighted_rrf_title_1_25",
+      "parameters": {
+        "title_weight": 1.25
+      },
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved"
+      ],
+      "retains_baseline_golds": true,
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 51,
+      "changed_set_queries": 49,
+      "exact_gold_count": 12,
+      "hit_query_count": 10,
+      "metrics": {
+        "macro_f1": 0.00749431670260379,
+        "macro_mrr": 0.05630446623093681,
+        "macro_ndcg": 0.05236467287326553,
+        "macro_precision": 0.003999999999999999,
+        "macro_recall": 0.08638888888888889,
+        "macro_recall_at_10": 0.06916666666666667,
+        "macro_recall_at_20": 0.08638888888888889,
+        "macro_recall_at_5": 0.0575,
+        "micro_f1": 0.007876599934361666,
+        "micro_precision": 0.0041265474552957355,
+        "micro_recall": 0.08633093525179857
+      },
+      "name": "weighted_rrf_title_1_5",
+      "parameters": {
+        "title_weight": 1.5
+      },
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved",
+        "baseline_gold_lost",
+        "macro_ndcg_regressed"
+      ],
+      "retains_baseline_golds": false,
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 51,
+      "changed_set_queries": 49,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.008079112024241216,
+        "macro_mrr": 0.04673093790740849,
+        "macro_ndcg": 0.045693398555553516,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.08876984126984126,
+        "macro_recall_at_10": 0.065,
+        "macro_recall_at_20": 0.08222222222222222,
+        "macro_recall_at_5": 0.04083333333333334,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "weighted_rrf_title_2_0",
+      "parameters": {
+        "title_weight": 2.0
+      },
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved",
+        "baseline_gold_lost",
+        "macro_recall_at_5_regressed",
+        "macro_mrr_regressed",
+        "macro_ndcg_regressed"
+      ],
+      "retains_baseline_golds": false,
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 51,
+      "changed_set_queries": 49,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.008079112024241216,
+        "macro_mrr": 0.04498413036712269,
+        "macro_ndcg": 0.04394657349099219,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.08876984126984126,
+        "macro_recall_at_10": 0.05388888888888889,
+        "macro_recall_at_20": 0.07805555555555556,
+        "macro_recall_at_5": 0.04083333333333334,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "weighted_rrf_title_3_0",
+      "parameters": {
+        "title_weight": 3.0
+      },
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved",
+        "baseline_gold_lost",
+        "macro_recall_at_5_regressed",
+        "macro_recall_at_10_regressed",
+        "macro_mrr_regressed",
+        "macro_ndcg_regressed"
+      ],
+      "retains_baseline_golds": false,
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 5,
+      "changed_set_queries": 5,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.00813534234362943,
+        "macro_mrr": 0.0548500410265116,
+        "macro_ndcg": 0.05322101573986346,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.09472222222222222,
+        "macro_recall_at_10": 0.06166666666666667,
+        "macro_recall_at_20": 0.0775,
+        "macro_recall_at_5": 0.045000000000000005,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "reserved_title_slots_1",
+      "parameters": {
+        "minimum_title_slots": 1
+      },
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved"
+      ],
+      "retains_baseline_golds": true,
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 5,
+      "changed_set_queries": 5,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.00813534234362943,
+        "macro_mrr": 0.0548500410265116,
+        "macro_ndcg": 0.05322101573986346,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.09472222222222222,
+        "macro_recall_at_10": 0.06166666666666667,
+        "macro_recall_at_20": 0.0775,
+        "macro_recall_at_5": 0.045000000000000005,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "reserved_title_slots_2",
+      "parameters": {
+        "minimum_title_slots": 2
+      },
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved"
+      ],
+      "retains_baseline_golds": true,
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 5,
+      "changed_set_queries": 5,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.00813534234362943,
+        "macro_mrr": 0.0548500410265116,
+        "macro_ndcg": 0.05322101573986346,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.09472222222222222,
+        "macro_recall_at_10": 0.06166666666666667,
+        "macro_recall_at_20": 0.0775,
+        "macro_recall_at_5": 0.045000000000000005,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "reserved_title_slots_3",
+      "parameters": {
+        "minimum_title_slots": 3
+      },
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved"
+      ],
+      "retains_baseline_golds": true,
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 5,
+      "changed_set_queries": 5,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.00813534234362943,
+        "macro_mrr": 0.0548500410265116,
+        "macro_ndcg": 0.05322101573986346,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.09472222222222222,
+        "macro_recall_at_10": 0.06166666666666667,
+        "macro_recall_at_20": 0.0775,
+        "macro_recall_at_5": 0.045000000000000005,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "reserved_title_slots_5",
+      "parameters": {
+        "minimum_title_slots": 5
+      },
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved"
+      ],
+      "retains_baseline_golds": true,
+      "selected_count": 2908
+    },
+    {
+      "changed_sequence_queries": 5,
+      "changed_set_queries": 5,
+      "exact_gold_count": 13,
+      "hit_query_count": 11,
+      "metrics": {
+        "macro_f1": 0.00813534234362943,
+        "macro_mrr": 0.0548500410265116,
+        "macro_ndcg": 0.05322101573986346,
+        "macro_precision": 0.004333333333333332,
+        "macro_recall": 0.09472222222222222,
+        "macro_recall_at_10": 0.06166666666666667,
+        "macro_recall_at_20": 0.0775,
+        "macro_recall_at_5": 0.045000000000000005,
+        "micro_f1": 0.00853298326222514,
+        "micro_precision": 0.004470426409903714,
+        "micro_recall": 0.09352517985611511
+      },
+      "name": "reserved_title_slots_10",
+      "parameters": {
+        "minimum_title_slots": 10
+      },
+      "promotable": false,
+      "reason_codes": [
+        "macro_f1_not_improved"
+      ],
+      "retains_baseline_golds": true,
+      "selected_count": 2908
+    }
+  ]
+}

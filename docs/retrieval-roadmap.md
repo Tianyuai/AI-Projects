@@ -5,7 +5,7 @@
 ## 当前判断
 
 - 已闭环基线宏 F1 为 `0.0050946874`，micro recall 为 `0.0575539568`，召回是主要瓶颈。
-- 标题候选同轮诊断显示：标题响应验证到 13 个 exact gold，12 个进入合并/RRF 池，11 个进入最终 Top-50。
+- 标题候选部分成功页修复使候选池 exact gold 从 19 增至 20，但最终 Top-50 仍为 13；既定离线排序变体无一满足晋级条件。
 - Citation、Topic、Embedding、普通 Query Rewrite 和既有 LLM Query Variants 已被实测否决，详见 `experiment-decisions.md`。
 
 ## Phase 0：建立干净基线（已完成）
@@ -44,16 +44,13 @@
 
 详见 `title-candidate-stage-loss-2026-08-09.md`。硬过滤无 exact-gold 流失；已观测到的可操作点是部分成功响应的整页丢弃和最终 Top-50 排序/截断。
 
-## Phase 2：标题候选保留与输出选择（下一阶段）
+## Phase 2：标题候选保留与输出选择（已完成）
 
-- 先保留部分成功 OpenAlex 响应中的有效论文，不因单个 `invalid_work` 丢弃整页；
-- 在同一冻结 dev 上离线比较标题来源保留与排序策略；
-- 标题数量 10/20 仅在预算能覆盖所有验证请求时比较，不再运行未封闭的全量尝试；
-- 离线搜索 `K ∈ {10,20,30,50}`；
-- 离线搜索阈值 `0.45–0.75`，步长 `0.05`；
-- 以宏平均 F1 选择，Precision、Recall、Recall@K、MRR、NDCG 作为护栏。
+- 已保留部分成功 OpenAlex 响应中的有效论文，同时保留 `invalid_work` 诊断和用量账本。
+- 已在同一冻结 dev 上精确重建历史 Top-50，并比较修复后 RRF、标题权重 1.25/1.5/2.0/3.0 和标题保留槽 1/2/3/5/10。
+- 修复新增 57 篇合格候选和 1 个候选池 exact gold，但未增加最终 Top-50 gold；没有变体提高 macro F1 并同时通过全部护栏。
 
-离线无增量的变体不进入 live capture。选定组合在 validation 前冻结。
+因此只保留正确性修复，不修改生产排序，不重建候选锁，不进入 live capture。详见 `title-retention-offline-2026-08-09.md`。标题数量或新排序仅在出现实质不同、可证伪且低成本证据为正的假设时重开。
 
 ## Phase 3：Query Evolution 条件实验
 

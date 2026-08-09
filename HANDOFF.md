@@ -15,7 +15,8 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - 查询分析与可解析检索响应均为 60/60；60 条全部使用 primary planner，无 fallback。
 - 基线 macro F1 `0.0050946874`、macro recall `0.0791666667`、micro recall `0.0575539568`；召回仍是主要瓶颈。
 - 闭环源提交为 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`；修复链为 `a720bbe` 与 `45ef874`。
-- 全量测试最近记录为 1859 passed / 35 skipped。
+- 标题部分成功页修复已完成；封存离线对照精确重建 60/60 查询和 2,908 个 Top-50 结果。候选池 exact gold 从 19 增至 20，但最终仍为 13，没有排序变体晋级。
+- 本轮完整环境验证为 1886 passed / 36 skipped；Ruff 全量通过。mypy 仍有 15 个既有错误，位于本轮未修改的 `query/parser.py`、`application/readiness.py`、`retrieval/snapshot_adapters.py` 和 `llm/snapshot_adapters.py`。
 - live capture 已将项目 ledger 推进到 1984 条，根哈希为 `sha256:3267b17bdff93676ad2d0f793257559f5549ad11aa4ff29ed097d11bbc60495f`。
 
 ## 3. 活跃文件
@@ -25,6 +26,7 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - `docs/retrieval-roadmap.md`：当前提升顺序；
 - `docs/experiment-decisions.md`：已验证和已否决实验；
 - `docs/title-candidate-stage-loss-2026-08-09.md`：标题候选同轮逐阶段流失诊断；
+- `docs/title-retention-offline-2026-08-09.md`：部分成功页修复及 Top-50 离线保留决策；
 - `docs/quality-gate-root-cause-2026-08-09.md`：Gate 失败根因与已验证闭环；
 - `configs/title_candidates.yaml`：当前正式实验配置；
 - `runs/candidate.lock.yaml`：本地候选锁；
@@ -34,14 +36,15 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 
 Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrite 和既有 LLM Query Variants 均已有负向实测。除非方法或输入发生实质变化并先通过低成本探针，否则不要重复。
 
-标题候选是唯一已有正向召回信号。同轮阶段诊断已完成：标题响应级验证命中 13 个 exact gold，12 个进入合并/RRF 池，11 个进入最终 Top-50。硬过滤无流失；主要问题是标题生成/搜索覆盖不完整和最终截断。
+标题候选是唯一已有正向召回信号。部分成功页错误丢弃已修复：15 个含错误响应恢复 80 篇有效论文，57 篇成为新增合格候选，候选池多覆盖 1 个 exact gold。修复后标准 RRF 仍只有 13 个 Top-50 exact gold；权重与保留槽离线变体均未提高 macro F1，因此不得重复或进入 live capture。
+
+本轮实现提交从 `3fabf6d` 到 `70c9c3c`；设计与实施计划提交为 `5a92f2d`、`c5d05bb`。离线分析未发起网络请求，也未修改候选锁或 ledger。
 
 ## 5. 下一步
 
-1. 先修正标题检索的部分成功处理：单个 `invalid_work` 不应使整页有效论文被丢弃；
-2. 基于已封存候选离线比较标题来源保留/排序策略，重点减少 19 → 13 的 Top-50 流失；
-3. 完成 Gold 精确可用性的聚合报告，再决定是否需要新数据源；
-4. 只有离线指标为正时，才重建锁、运行 readiness 并申请新的 live capture。
+1. 完成 Gold 精确可用性的聚合报告，再决定是否需要新数据源；
+2. 若继续研究 Top-50 选择，只接受与现有权重/保留槽实质不同的离线假设；
+3. 只有离线 macro F1 提升、保留已有 gold 且排序护栏不回退时，才重建锁、运行 readiness 并申请新的 live capture。
 
 ## 6. 锁状态
 

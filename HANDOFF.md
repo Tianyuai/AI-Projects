@@ -17,7 +17,7 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - 闭环源提交为 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`；修复链为 `a720bbe` 与 `45ef874`。
 - 标题部分成功页修复已完成；封存离线对照精确重建 60/60 查询和 2,908 个 Top-50 结果。候选池 exact gold 从 19 增至 20，但最终仍为 13，没有排序变体晋级。
 - 15 个既有 mypy 错误已通过只涉及类型收窄和局部命名的最小修复清零；相关 85 个回归测试通过，业务行为未扩张。
-- 最新全量验证为 1915 passed / 36 skipped；Git 已跟踪 Python 文件 Ruff 全部通过，`mypy src scripts/analyze_gold_bottlenecks.py` 为 0 errors。
+- 最新全量验证为 1916 passed / 36 skipped；Git 已跟踪 Python 文件 Ruff 全部通过，`mypy src scripts/analyze_gold_bottlenecks.py` 为 0 errors。
 - 最新项目 ledger 为 1986 条，根哈希为 `sha256:9739fc7b5c4ba48cf3b995b70019f58248f890f7f1ded2cd98e4869bde30cdf4`。
 - Gold 精确可用性 v2 聚合诊断已完成：固定输入为 60/143/139/134，唯一 work availability 为 132 `available`、0 `exact_not_found`、2 个 DOI `integrity_failure`，实际 HTTP 尝试 135/402。失败细分为 1 个预期 DOI 字段缺失和 1 个规范化 DOI 不匹配；由于不完整，`recommended_direction=null`。
 
@@ -44,7 +44,7 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 
 本轮实现提交从 `3fabf6d` 到 `70c9c3c`；设计与实施计划提交为 `5a92f2d`、`c5d05bb`。离线分析未发起网络请求，也未修改候选锁或 ledger。
 
-最新稳定化提交为 `437ba0d`、`44d7aab`、`ff0ea28`：增加 v2 完整性失败聚合、唯一诊断账本运行 ID，并清零原有 15 个目标 mypy 错误。本轮只执行一次获准的 exact-ID 在线诊断，没有运行 readiness、capture、replay、compare 或 validation，也没有修改候选锁。
+最新稳定化提交为 `437ba0d`、`44d7aab`、`ff0ea28`、`1dfac84`：增加 v2 完整性失败聚合、唯一诊断账本运行 ID，清零原有 15 个目标 mypy 错误，并补齐嵌套 schema、计数守恒和写盘重读校验。本轮只执行一次获准的 exact-ID 在线诊断，没有运行 readiness、capture、replay、compare 或 validation，也没有修改候选锁。
 
 ## 5. 下一步
 

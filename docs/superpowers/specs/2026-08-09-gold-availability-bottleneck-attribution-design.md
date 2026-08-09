@@ -1,7 +1,7 @@
 # Gold 可用性与检索瓶颈归因设计
 
 日期：2026-08-09  
-状态：已确认，待实施计划
+状态：已实施；2026-08-09 以 v2 完整性原因聚合补充
 
 ## 目标
 
@@ -60,7 +60,7 @@ CLI 必须先确认该 capture 的 Gate、formal validity 和 provenance 均通�
 - `exact_not_found`：单实体接口明确返回 404；含义仅为“OpenAlex 精确接口未解析该标识符”，不外推为论文不存在；
 - `unknown_transient`：超时、429 或 5xx 经有限重试后仍未得到确定结果；
 - `invalid_identifier`：归一化后不是 DOI 或 OpenAlex ID；当前固定输入中预期为 0；
-- `integrity_failure`：200 响应不可解析或标识符不匹配。该状态阻止形成方向性结论。
+- `integrity_failure`：200 响应不可解析或标识符不匹配。该状态阻止形成方向性结论，并按 `missing_expected_field`、`unparseable_identifier`、`canonical_mismatch` 三个固定原因及 DOI/OpenAlex 标识符类型做聚合计数。
 
 请求方式：
 
@@ -138,10 +138,10 @@ selected_paper_ids ⊆ post_filter_paper_ids ⊆ retrieved_paper_ids
 
 不持久化逐论文中间状态。探针中断时不根据未完成样本作结论；再次执行时重新读取当前项目预算 checkpoint。
 
-聚合 JSON 使用固定 schema `gold-bottleneck-attribution-v1`，完整结构如下；所有字段必填，不允许额外键：
+聚合 JSON 使用固定 schema `gold-bottleneck-attribution-v2`，完整结构如下；所有字段必填，不允许额外键：
 
 ```text
-schema_version: "gold-bottleneck-attribution-v1"
+schema_version: "gold-bottleneck-attribution-v2"
 source_run_id: <固定格式 run ID>
 source_git_sha: <40 位 Git SHA>
 input_hashes:
@@ -164,6 +164,16 @@ availability:
   unknown_transient: <非负整数>
   invalid_identifier: <非负整数>
   integrity_failure: <非负整数>
+integrity_failure_breakdown:
+  missing_expected_field:
+    doi: <非负整数>
+    openalex: <非负整数>
+  unparseable_identifier:
+    doi: <非负整数>
+    openalex: <非负整数>
+  canonical_mismatch:
+    doi: <非负整数>
+    openalex: <非负整数>
 pipeline_stages:
   selected_top50: <非负整数>
   ranked_outside_top50: <非负整数>
@@ -210,7 +220,7 @@ reason_codes: <允许的原因码数组，去重并按词典序排列>
 - `largest_bucket_tie`；
 - `no_recoverable_loss`。
 
-计数必须满足：availability 合计等于 `unique_work_count`；pipeline 与 `cross_tab` 合计均等于 `normalized_query_work_count`；DOI、OpenAlex 与 `invalid_identifier` 数之和等于 `unique_work_count`；HTTP 状态与超时计数之和等于 `http_attempts`。不得接受或透传任意 provider 字段。
+计数必须满足：availability 合计等于 `unique_work_count`；`integrity_failure_breakdown` 合计等于 `availability.integrity_failure`；pipeline 与 `cross_tab` 合计均等于 `normalized_query_work_count`；DOI、OpenAlex 与 `invalid_identifier` 数之和等于 `unique_work_count`；HTTP 状态与超时计数之和等于 `http_attempts`。不得接受或透传任意 provider 字段。
 
 ## 错误处理与隐私
 
@@ -230,6 +240,7 @@ reason_codes: <允许的原因码数组，去重并按词典序排列>
 - 143/139/134 三口径去重规则；
 - DOI 与 OpenAlex ID 请求规划；
 - 200 精确匹配、404、429/5xx/超时重试、认证失败和响应不匹配；
+- 200 响应的预期字段缺失、标识符不可解析和规范化不匹配三类完整性原因；
 - 五个 availability 状态与四个流水线状态的互斥性；
 - 集合不变量和输入哈希变化 fail closed；
 - availability 结果在重复查询关联间复用；

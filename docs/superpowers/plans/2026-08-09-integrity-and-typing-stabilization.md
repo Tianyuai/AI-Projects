@@ -31,21 +31,21 @@
 - 报告新增 `integrity_failure_breakdown[reason][doi|openalex]`，合计必须等于 `availability.integrity_failure`。
 - schema 升级为 `gold-bottleneck-attribution-v2`；`assert_safe_report` 负责固定键、计数守恒和序列化重读校验。
 
-- [ ] **Step 1: 写 RED 测试**
+- [x] **Step 1: 写 RED 测试**
 
   增加三个 200 响应分类测试、非法 reason/status 组合测试、breakdown 守恒测试、JSON 写盘重读测试，以及唯一账本运行 ID 测试。
 
-- [ ] **Step 2: 运行 RED**
+- [x] **Step 2: 运行 RED**
 
   Run: `D:\AI Projects\Projects\.venv\Scripts\python.exe -m pytest tests/scripts/test_analyze_gold_bottlenecks.py -q`
 
   Expected: 新增测试因缺少原因分类、v2 字段或唯一运行 ID 而失败。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
   将布尔 `_response_matches` 改为返回状态和失败原因的纯分类函数；聚合固定矩阵并补齐 schema/隐私/守恒校验；诊断运行 ID 加入 UTC 微秒时间戳。不得增加原始响应日志或第二数据源。
 
-- [ ] **Step 4: 运行 GREEN 与静态检查**
+- [x] **Step 4: 运行 GREEN 与静态检查**
 
   Run: `D:\AI Projects\Projects\.venv\Scripts\python.exe -m pytest tests/scripts/test_analyze_gold_bottlenecks.py -q`
 
@@ -65,20 +65,20 @@
 
 **Interfaces:** 不新增公共行为；只明确已有 Literal、HTTP 参数、可空 snapshot ref 和局部变量作用域。
 
-- [ ] **Step 1: 保留当前 RED 证据**
+- [x] **Step 1: 保留当前 RED 证据**
 
   Run: `D:\AI Projects\Projects\.venv\Scripts\python.exe -m mypy src scripts/analyze_gold_bottlenecks.py`
 
   Expected: 恰好 15 errors / 4 files。
 
-- [ ] **Step 2: 分文件做最小修复**
+- [x] **Step 2: 分文件做最小修复**
 
   - parser：避免同作用域变量重定义，并把模型返回值先保持为 `object` 后再收窄；
   - readiness：从定义模块导入 `DependencyStatus`，为 capability/state 和 HTTP params 使用准确类型；
   - retrieval replay：只有 `SnapshotRef` 非空时才加入 provenance；
   - LLM capture：三个分支使用独立的安全 header 局部变量名。
 
-- [ ] **Step 3: 运行针对性回归和 GREEN**
+- [x] **Step 3: 运行针对性回归和 GREEN**
 
   Run: `D:\AI Projects\Projects\.venv\Scripts\python.exe -m pytest tests/unit/test_query_parser.py tests/application/test_readiness.py tests/unit/test_retrieval_snapshot_adapters.py tests/unit/test_llm_snapshot_adapters.py -q`
 
@@ -91,27 +91,28 @@
 **Files:**
 - Modify: `docs/evidence/gold-bottleneck-attribution-2026-08-09.json`
 - Modify: `docs/gold-bottleneck-attribution-2026-08-09.md`
+- Modify: `docs/superpowers/specs/2026-08-09-gold-availability-bottleneck-attribution-design.md`
 - Modify: `docs/experiment-decisions.md`
 - Modify: `docs/retrieval-roadmap.md`
 - Modify: `HANDOFF.md`
 
-- [ ] **Step 1: 在线前离线门禁**
+- [x] **Step 1: 在线前离线门禁**
 
   重新运行 Task 1 聚焦测试、目标 mypy 和 Ruff；任一失败即停止，不发起网络请求。
 
-- [ ] **Step 2: 运行唯一一次 exact-ID 在线诊断**
+- [x] **Step 2: 运行唯一一次 exact-ID 在线诊断**
 
   在单个子进程中从获准 `.env` 只注入 7 个 OpenAlex key，使用正式 ledger 和冻结 source run，覆盖写出 v2 JSON/Markdown；不回显环境变量。
 
-- [ ] **Step 3: 验证并解释产物**
+- [x] **Step 3: 验证并解释产物**
 
   重新读取 JSON，通过 `assert_safe_report`，确认 60/143/139/134、HTTP 尝试上限、账本前后 checkpoint、breakdown 守恒，并根据失败原因更新 Markdown 和交接文档。若仍有完整性失败，保持 `diagnostic_complete=false`，不擅自选择提升方向。
 
-- [ ] **Step 4: 最终全量验证**
+- [x] **Step 4: 最终全量验证**
 
   Run: `D:\AI Projects\Projects\.venv\Scripts\python.exe -m pytest -q`
 
-  Run: `D:\AI Projects\Projects\.venv\Scripts\python.exe -m ruff check .`
+  Run: `$trackedPython = git ls-files '*.py'; D:\AI Projects\Projects\.venv\Scripts\python.exe -m ruff check -- $trackedPython`
 
   Run: `D:\AI Projects\Projects\.venv\Scripts\python.exe -m mypy src scripts/analyze_gold_bottlenecks.py`
 

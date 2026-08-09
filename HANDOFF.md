@@ -16,9 +16,10 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - 基线 macro F1 `0.0050946874`、macro recall `0.0791666667`、micro recall `0.0575539568`；召回仍是主要瓶颈。
 - 闭环源提交为 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`；修复链为 `a720bbe` 与 `45ef874`。
 - 标题部分成功页修复已完成；封存离线对照精确重建 60/60 查询和 2,908 个 Top-50 结果。候选池 exact gold 从 19 增至 20，但最终仍为 13，没有排序变体晋级。
-- 本轮完整环境验证为 1886 passed / 36 skipped；Ruff 全量通过。mypy 仍有 15 个既有错误，位于本轮未修改的 `query/parser.py`、`application/readiness.py`、`retrieval/snapshot_adapters.py` 和 `llm/snapshot_adapters.py`。
-- live capture 已将项目 ledger 推进到 1984 条，根哈希为 `sha256:3267b17bdff93676ad2d0f793257559f5549ad11aa4ff29ed097d11bbc60495f`。
-- Gold 精确可用性聚合诊断已完成一次：固定输入为 60/143/139/134，唯一 work availability 为 132 `available`、0 `exact_not_found`、2 `integrity_failure`，实际 HTTP 尝试 135/402；由于不完整，`recommended_direction=null`，未选择或实施任何后续方向。
+- 15 个既有 mypy 错误已通过只涉及类型收窄和局部命名的最小修复清零；相关 85 个回归测试通过，业务行为未扩张。
+- 最新全量验证为 1915 passed / 36 skipped；Git 已跟踪 Python 文件 Ruff 全部通过，`mypy src scripts/analyze_gold_bottlenecks.py` 为 0 errors。
+- 最新项目 ledger 为 1986 条，根哈希为 `sha256:9739fc7b5c4ba48cf3b995b70019f58248f890f7f1ded2cd98e4869bde30cdf4`。
+- Gold 精确可用性 v2 聚合诊断已完成：固定输入为 60/143/139/134，唯一 work availability 为 132 `available`、0 `exact_not_found`、2 个 DOI `integrity_failure`，实际 HTTP 尝试 135/402。失败细分为 1 个预期 DOI 字段缺失和 1 个规范化 DOI 不匹配；由于不完整，`recommended_direction=null`。
 
 ## 3. 活跃文件
 
@@ -43,15 +44,17 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 
 本轮实现提交从 `3fabf6d` 到 `70c9c3c`；设计与实施计划提交为 `5a92f2d`、`c5d05bb`。离线分析未发起网络请求，也未修改候选锁或 ledger。
 
+最新稳定化提交为 `437ba0d`、`44d7aab`、`ff0ea28`：增加 v2 完整性失败聚合、唯一诊断账本运行 ID，并清零原有 15 个目标 mypy 错误。本轮只执行一次获准的 exact-ID 在线诊断，没有运行 readiness、capture、replay、compare 或 validation，也没有修改候选锁。
+
 ## 5. 下一步
 
-1. 先离线复核 2 个响应完整性失败，期间不重跑在线探针、不选择方向；
-2. 复核完成且证据完整后，才比较是否存在唯一且可恢复的主要损失桶；
-3. 只有离线 macro F1 提升、保留已有 gold 且排序护栏不回退时，才重建锁、运行 readiness 并申请新的 live capture。
+1. 离线定义 DOI 别名/规范化解析的接受契约：是否允许 exact DOI 端点返回有效 work、但顶层 DOI 缺失或规范化后不同的 HTTP 200 响应计为可用；
+2. 用固定合成夹具完成契约测试并复核隐私与计数守恒，期间不重跑在线探针、不选择提升方向；
+3. 只有诊断完整且离线方案提高 macro F1、保留已有 gold、排序护栏不回退时，才重建锁、运行 readiness 并申请新的 live capture。
 
 ## 6. 锁状态
 
-当前 `runs/candidate.lock.yaml` 绑定提交 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`，但其 ledger checkpoint 仍为 1924 条。通过的 live capture 已将 ledger 推进到 1984 条，因此该锁只是已用基线证据，不得用于新 live run。新在线实验前必须重建锁并重跑 readiness；capture、validation 和任何新的在线实验仍需单独授权。
+当前 `runs/candidate.lock.yaml` 绑定提交 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`，但其 ledger checkpoint 仍为 1924 条。最新诊断已将 ledger 推进到 1986 条，因此该锁只是已用基线证据，不得用于新 live run。新在线实验前必须重建锁并重跑 readiness；capture、validation 和任何新的在线实验仍需单独授权。
 
 ## 7. 环境与红线
 

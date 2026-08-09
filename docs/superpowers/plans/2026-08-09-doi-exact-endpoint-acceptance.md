@@ -98,12 +98,27 @@ def test_doi_exact_200_rejects_missing_or_non_work_id(
     }
 
 
-def test_openalex_exact_200_rejects_different_work_id() -> None:
+@pytest.mark.parametrize(
+    ("response_id", "expected_status", "expected_reason"),
+    [
+        ("https://openalex.org/W2", "available", None),
+        (
+            "https://openalex.org/W3",
+            "integrity_failure",
+            "canonical_mismatch",
+        ),
+    ],
+)
+def test_openalex_exact_200_keeps_strict_work_id_match(
+    response_id: str,
+    expected_status: str,
+    expected_reason: str | None,
+) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
             request=request,
-            json={"id": "https://openalex.org/W3"},
+            json={"id": response_id},
         )
 
     async def execute() -> ProbeBatch:
@@ -117,10 +132,11 @@ def test_openalex_exact_200_rejects_different_work_id() -> None:
             )
 
     result = asyncio.run(execute())
-    assert result.status_by_work == {"openalex:W2": "integrity_failure"}
-    assert result.integrity_reason_by_work == {
-        "openalex:W2": "canonical_mismatch",
-    }
+    assert result.status_by_work == {"openalex:W2": expected_status}
+    expected_reasons = (
+        {} if expected_reason is None else {"openalex:W2": expected_reason}
+    )
+    assert result.integrity_reason_by_work == expected_reasons
 
 
 def test_200_non_object_payload_remains_integrity_failure() -> None:

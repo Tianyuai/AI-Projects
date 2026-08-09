@@ -740,6 +740,12 @@ def test_doi_200_invalid_work_id_reports_integrity_reason(
             "integrity_failure",
             "canonical_mismatch",
         ),
+        (
+            "openalex:W1",
+            {"id": "https://doi.org/10.1000/a"},
+            "integrity_failure",
+            "unparseable_identifier",
+        ),
         ("openalex:W1", ["not-an-object"], "integrity_failure", "missing_expected_field"),
     ],
 )

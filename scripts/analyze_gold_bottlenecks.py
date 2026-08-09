@@ -855,9 +855,9 @@ def _classify_response(
         response_normalized = normalize_paper_id(response_identifier)
     except ValueError:
         return "integrity_failure", "unparseable_identifier"
+    if not response_normalized.startswith("openalex:"):
+        return "integrity_failure", "unparseable_identifier"
     if normalized.startswith("doi:"):
-        if not response_normalized.startswith("openalex:"):
-            return "integrity_failure", "unparseable_identifier"
         return "available", None
     if response_normalized != normalized:
         return "integrity_failure", "canonical_mismatch"

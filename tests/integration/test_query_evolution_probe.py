@@ -60,7 +60,7 @@ def _synthetic_probe_lock(query_ids: tuple[str, ...]) -> probe.ProbeLock:
             path=DEFAULT_PROMPT_CONFIG.relative_to(probe.ROOT).as_posix(),
             sha256=probe._sha256_bytes(prompt_bytes),
             name="query_evolve",
-            version="query-evolve-v1",
+            version="query-evolve-v2",
         ),
         model_id="deepseek-v4-flash",
         endpoint="https://api.deepseek.com/v1",
@@ -419,7 +419,7 @@ def test_preflight_stores_caller_supplied_prompt_binding(tmp_path: Path) -> None
         assert lock.prompt.path == relative_prompt.as_posix()
         assert lock.prompt.sha256 == probe._sha256_bytes(prompt_copy.read_bytes())
         assert lock.prompt.name == "query_evolve"
-        assert lock.prompt.version == "query-evolve-v1"
+        assert lock.prompt.version == "query-evolve-v2"
         assert lock.expected_run_directory == "runs/_diag_query_evolution_task-2-binding"
         assert load_probe_lock(output).prompt == lock.prompt
 
@@ -550,8 +550,8 @@ def test_preflight_rejects_prompt_version_drift(tmp_path: Path) -> None:
         prompt_copy = Path(prompt_dir) / "query_evolve_version_drift.yaml"
         prompt_copy.write_text(
             DEFAULT_PROMPT_CONFIG.read_text(encoding="utf-8").replace(
-                "version: query-evolve-v1",
                 "version: query-evolve-v2",
+                "version: query-evolve-v1",
             ),
             encoding="utf-8",
         )

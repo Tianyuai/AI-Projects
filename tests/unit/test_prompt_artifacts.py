@@ -54,6 +54,10 @@ def test_render_prompt_system_message_is_deterministic_for_existing_prompt_files
             "- Use only facts and facets present in the payload.",
             "- Do not infer gold papers, relevance labels, new venues, new years, or unrelated entities.",
             "- Return zero to two complementary OpenAlex queries as strict JSON.",
+            "- Before returning, verify that each generated text differs after normalization from original_query, the text of every seed_subqueries item, and earlier generated subqueries.",
+            "- Case-only, NFKC-equivalent, whitespace-only, or ?/*-only changes do not make a query novel.",
+            "- Return only valid novel subqueries; one valid subquery is allowed and duplicate candidates must be omitted.",
+            '- No-novel form: {"subqueries":[],"no_op_reason":"no_novel_query"}',
             '- Generated form: {"subqueries":[{"text":"string","source_facets":["exact payload facet"],"strategy":"synonym"}],"no_op_reason":null}',
             '- No-op form: {"subqueries":[],"no_op_reason":"insufficient_grounded_facets"}',
             "- Top-level keys must be exactly subqueries and no_op_reason.",
@@ -65,6 +69,19 @@ def test_render_prompt_system_message_is_deterministic_for_existing_prompt_files
             "- Copy every source_facets value exactly from the payload.",
         ]
     )
+
+
+def test_query_evolve_artifact_requires_v2() -> None:
+    prompt_bytes = Path("configs/prompts/query_evolve.yaml").read_bytes()
+    artifact = load_prompt_artifact(prompt_bytes)
+
+    assert artifact.version == "query-evolve-v2"
+    with pytest.raises(
+        ValidationError, match="query_evolve prompt version must be query-evolve-v2"
+    ):
+        load_prompt_artifact(
+            prompt_bytes.replace(b"version: query-evolve-v2", b"version: query-evolve-v1")
+        )
 
 
 def test_load_prompt_artifact_rejects_malformed_yaml() -> None:

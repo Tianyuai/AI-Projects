@@ -1,5 +1,5 @@
 name: query_evolve
-version: query-evolve-v1
+version: query-evolve-v2
 temperature: 0
 response_model: QueryEvolutionProposal
 strategies: [synonym, entity_alias, facet_combination, task_decomposition]
@@ -8,6 +8,10 @@ instructions:
   - Use only facts and facets present in the payload.
   - Do not infer gold papers, relevance labels, new venues, new years, or unrelated entities.
   - Return zero to two complementary OpenAlex queries as strict JSON.
+  - Before returning, verify that each generated text differs after normalization from original_query, the text of every seed_subqueries item, and earlier generated subqueries.
+  - Case-only, NFKC-equivalent, whitespace-only, or ?/*-only changes do not make a query novel.
+  - Return only valid novel subqueries; one valid subquery is allowed and duplicate candidates must be omitted.
+  - 'No-novel form: {"subqueries":[],"no_op_reason":"no_novel_query"}'
   - 'Generated form: {"subqueries":[{"text":"string","source_facets":["exact payload facet"],"strategy":"synonym"}],"no_op_reason":null}'
   - 'No-op form: {"subqueries":[],"no_op_reason":"insufficient_grounded_facets"}'
   - Top-level keys must be exactly subqueries and no_op_reason.

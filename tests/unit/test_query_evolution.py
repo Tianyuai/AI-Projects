@@ -436,6 +436,35 @@ def test_validate_query_evolution_proposal_rejects_mechanical_violations(
         validate_query_evolution_proposal(raw, _context())
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "ＧＮＮｓ for node classification",
+        "graph neural networks",
+    ],
+    ids=["original-query-after-nfkc", "seed-query"],
+)
+def test_validate_query_evolution_proposal_rejects_existing_queries(
+    text: str,
+) -> None:
+    with pytest.raises(
+        ValueError, match="duplicate subquery text after canonicalization"
+    ):
+        validate_query_evolution_proposal(
+            {
+                "subqueries": [
+                    {
+                        "text": text,
+                        "source_facets": ["Graph Neural Networks"],
+                        "strategy": "synonym",
+                    }
+                ],
+                "no_op_reason": None,
+            },
+            _context(),
+        )
+
+
 def test_query_evolution_generator_returns_generated_result_and_snapshot_refs() -> None:
     analyzer = FakeAnalyzer(
         {

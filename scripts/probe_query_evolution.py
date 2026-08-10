@@ -105,7 +105,7 @@ class ProbePromptBinding(DomainModel):
     path: SafeRelativePath
     sha256: Sha256
     name: Literal["query_evolve"]
-    version: Literal["query-evolve-v1"]
+    version: Literal["query-evolve-v1", "query-evolve-v2"]
 
 
 class ProbeLock(DomainModel):

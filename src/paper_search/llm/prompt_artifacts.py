@@ -25,9 +25,9 @@ class PromptArtifact(DomainModel):
     @model_validator(mode="after")
     def validate_query_evolve_contract(self) -> PromptArtifact:
         if self.name == "query_evolve":
-            if self.version != "query-evolve-v1":
+            if self.version != "query-evolve-v2":
                 raise ValueError(
-                    "query_evolve prompt version must be query-evolve-v1"
+                    "query_evolve prompt version must be query-evolve-v2"
                 )
             if self.response_model != "QueryEvolutionProposal":
                 raise ValueError("query_evolve response model mismatch")

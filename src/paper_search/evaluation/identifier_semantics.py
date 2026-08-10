@@ -15,6 +15,7 @@ from pydantic import Field, ValidationError
 from paper_search.domain.models import DomainModel, NonEmptyStr, NonNegativeInt, Sha256
 from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap, normalize_paper_id
 from paper_search.storage.dependency_snapshot import (
+    DependencyRequestIdentity,
     DependencySnapshotManifestV2,
     DependencySnapshotReader,
 )
@@ -26,6 +27,8 @@ ProofKind = Literal[
     "semantic_scholar_exact",
     "openalex_location_exact",
 ]
+_S2_ARXIV_ADAPTER = "semantic-scholar-identity-arxiv-v1"
+_S2_DOI_ADAPTER = "semantic-scholar-identity-doi-v1"
 
 _PRIVATE_FIELD_NAMES = frozenset(
     {
@@ -204,10 +207,11 @@ def _snapshot_observations(
             manifest_path,
             snapshot_manifest_sha256=expected_manifest_hash,
         )
-        entry_bytes = {
-            entry.entry_id: reader.read(entry.request).response_bytes
-            for entry in manifest.entries
-        }
+        entry_bytes = {}
+        entry_requests = {}
+        for entry in manifest.entries:
+            entry_bytes[entry.entry_id] = reader.read(entry.request).response_bytes
+            entry_requests[entry.entry_id] = entry.request
     except (OSError, ValidationError, ValueError, KeyError):
         raise ValueError("identity snapshot is invalid") from None
 
@@ -261,6 +265,30 @@ def _snapshot_observations(
         }
         if not referenced_entry_ids.issubset(entry_bytes):
             raise ValueError("identity snapshot is invalid")
+        if (
+            s2_arxiv_entry_id is not None
+            and s2_doi_entry_id is not None
+            and s2_arxiv_entry_id == s2_doi_entry_id
+        ):
+            raise ValueError("identity snapshot is invalid")
+        if not _valid_s2_role(
+            (
+                entry_requests.get(s2_arxiv_entry_id)
+                if s2_arxiv_entry_id is not None
+                else None
+            ),
+            expected_adapter=_S2_ARXIV_ADAPTER,
+            required=s2_arxiv_entry_id is not None,
+        ) or not _valid_s2_role(
+            (
+                entry_requests.get(s2_doi_entry_id)
+                if s2_doi_entry_id is not None
+                else None
+            ),
+            expected_adapter=_S2_DOI_ADAPTER,
+            required=s2_doi_entry_id is not None,
+        ):
+            raise ValueError("identity snapshot is invalid")
 
         arxiv_s2 = _decode_s2_response(
             entry_bytes[s2_arxiv_entry_id] if s2_arxiv_entry_id is not None else None,
@@ -302,6 +330,24 @@ def _snapshot_observations(
     return observations, _sha256(manifest_content)
 
 
+def _valid_s2_role(
+    request: DependencyRequestIdentity | None,
+    *,
+    expected_adapter: str,
+    required: bool,
+) -> bool:
+    if not required:
+        return request is None
+    return (
+        request is not None
+        and request.dependency == "semantic_scholar"
+        and request.operation == "batch"
+        and request.method == "POST"
+        and request.endpoint == "/paper/batch"
+        and request.model_or_adapter == expected_adapter
+    )
+
+
 def _decode_s2_response(
     content: bytes | None, item_index: object = None
 ) -> tuple[str | None, dict[str, str]]:
@@ -319,7 +365,7 @@ def _decode_s2_response(
         ):
             raise ValueError("identity snapshot is invalid")
         payload = payload[item_index]
-    elif isinstance(payload, dict) and item_index not in (None, 0):
+    elif isinstance(payload, dict) and item_index is not None:
         raise ValueError("identity snapshot is invalid")
     if not isinstance(payload, dict):
         return None, {}
@@ -346,6 +392,11 @@ def _decode_openalex_arxiv_ids(content: bytes | None) -> list[str]:
         return []
     if not isinstance(payload, dict):
         return []
+    results = payload.get("results")
+    if isinstance(results, list):
+        if len(results) != 1 or not isinstance(results[0], dict):
+            return []
+        payload = results[0]
     locations = payload.get("locations")
     if not isinstance(locations, list):
         return []

@@ -40,7 +40,7 @@ S2_BASE_URL = "https://api.semanticscholar.org"
 S2_ENDPOINT = "/graph/v1/paper/batch"
 S2_API_KEY_ENV = "SEMANTIC_SCHOLAR_API_KEY"
 OPENALEX_BASE_URL = "https://api.openalex.org"
-OPENALEX_ENDPOINT_TEMPLATE = "/works/{id}"
+OPENALEX_ENDPOINT_TEMPLATE = "/works"
 OPENALEX_API_KEY_ENV = "OPENALEX_API_KEY"
 DEFAULT_OUTPUT_ROOT = "data/annotation_work/identifier_semantics"
 REQUEST_COST_CNY = Decimal("0.01")
@@ -78,7 +78,7 @@ class IdentityCaptureLock(DomainModel):
     openalex_exact_ids: list[NonEmptyStr]
     openalex_request_max: NonNegativeInt
     openalex_base_url: Literal["https://api.openalex.org"]
-    openalex_endpoint_template: Literal["/works/{id}"]
+    openalex_endpoint_template: Literal["/works"]
     openalex_api_key_env: Literal["OPENALEX_API_KEY"]
     output_root: SafeRelativePath
     retry_max: Literal[1] = 1
@@ -170,6 +170,7 @@ class IdentifierCaptureRuntime(BaseModel):
     project_root: Path
     inventory_path: Path
     ledger_path: Path
+    expected_lock_sha256: Sha256
     output_root: str
     semantic_scholar_base_url: str
     semantic_scholar_endpoint: str
@@ -375,6 +376,8 @@ def _authorize_capture(
         lock = IdentityCaptureLock.model_validate(lock.model_dump(mode="python"))
     except ValidationError:
         raise ValueError("identity capture authorization mismatch") from None
+    if _lock_hash(lock) != runtime.expected_lock_sha256:
+        raise ValueError("identity capture authorization mismatch")
     locked_values = {
         "semantic_scholar_base_url": lock.semantic_scholar_base_url,
         "semantic_scholar_endpoint": lock.semantic_scholar_endpoint,
@@ -388,11 +391,6 @@ def _authorize_capture(
         raise ValueError("identity capture authorization mismatch")
     if not runtime.allow_network:
         raise ValueError("explicit network authorization is required")
-    if len(lock.openalex_exact_ids) * (lock.retry_max + 1) > lock.openalex_request_max:
-        raise ValueError("identity capture request cap exceeded")
-    maximum_s2_attempts = lock.semantic_scholar_batch_max * (lock.retry_max + 1)
-    if maximum_s2_attempts > lock.semantic_scholar_http_attempt_max:
-        raise ValueError("identity capture request cap exceeded")
     inventory_content = runtime.inventory_path.read_bytes()
     if _sha256(inventory_content) != lock.input_hashes.get("identifier_inventory"):
         raise ValueError("identifier inventory hash mismatch")
@@ -402,6 +400,30 @@ def _authorize_capture(
         inventory = IdentifierInventory.model_validate_json(inventory_content)
     except ValidationError:
         raise ValueError("identifier inventory is invalid") from None
+    expected_arxiv_ids = sorted(
+        {f"ARXIV:{value.removeprefix('arxiv:')}" for value in inventory.arxiv_ids}
+    )
+    expected_openalex_ids = sorted(
+        {
+            alias.removeprefix("openalex:")
+            for alias in inventory.candidate_aliases
+            if alias.startswith("openalex:")
+        }
+    )
+    if (
+        lock.semantic_scholar_arxiv_ids != expected_arxiv_ids
+        or lock.openalex_exact_ids != expected_openalex_ids
+        or lock.semantic_scholar_batch_max != 2
+        or lock.semantic_scholar_http_attempt_max != 4
+        or lock.retry_max != 1
+        or lock.openalex_request_max != len(expected_openalex_ids) * 2
+    ):
+        raise ValueError("identity capture authorization mismatch")
+    if len(lock.openalex_exact_ids) * (lock.retry_max + 1) > lock.openalex_request_max:
+        raise ValueError("identity capture request cap exceeded")
+    maximum_s2_attempts = lock.semantic_scholar_batch_max * (lock.retry_max + 1)
+    if maximum_s2_attempts > lock.semantic_scholar_http_attempt_max:
+        raise ValueError("identity capture request cap exceeded")
     if ledger_checkpoint(runtime.ledger_path) != lock.ledger_checkpoint_sha256:
         raise ValueError("ledger checkpoint mismatch")
     semantic_scholar_key = runtime.credential_values.get(lock.semantic_scholar_api_key_env)
@@ -549,22 +571,30 @@ def _validate_s2_batch(payload: object, expected_ids: Sequence[str]) -> object:
 def _validate_openalex(payload: object, expected_id: str) -> object:
     if not isinstance(payload, dict):
         raise _InvalidProviderResponse
-    response_id = payload.get("id")
+    results = payload.get("results")
+    if not isinstance(results, list) or len(results) != 1:
+        raise _InvalidProviderResponse
+    result = results[0]
+    if not isinstance(result, dict):
+        raise _InvalidProviderResponse
+    response_id = result.get("id")
     if not isinstance(response_id, str) or response_id.rstrip("/").rsplit("/", 1)[-1] != expected_id:
         raise _InvalidProviderResponse
-    locations = payload.get("locations", [])
+    locations = result.get("locations", [])
     if not isinstance(locations, list):
         raise _InvalidProviderResponse
-    return cast(dict[str, object], payload)
+    return cast(dict[str, object], result)
 
 
-def _s2_identity(ids: Sequence[str]) -> DependencyRequestIdentity:
+def _s2_identity(
+    ids: Sequence[str], *, stage: Literal["arxiv", "doi"]
+) -> DependencyRequestIdentity:
     return DependencyRequestIdentity.from_canonical_request(
         dependency="semantic_scholar",
         operation="batch",
         method="POST",
         endpoint="/paper/batch",
-        model_or_adapter="semantic-scholar-identity-v1",
+        model_or_adapter=f"semantic-scholar-identity-{stage}-v1",
         canonical_request={"fields": S2_FIELDS, "ids": list(ids)},
     )
 
@@ -576,7 +606,7 @@ def _openalex_identity(identifier: str) -> DependencyRequestIdentity:
         method="GET",
         endpoint="/works",
         model_or_adapter="openalex-identity-v1",
-        canonical_request={"filter": f"openalex:{identifier}"},
+        canonical_request={"filter": f"openalex:{identifier}", "per_page": "1"},
     )
 
 
@@ -645,7 +675,7 @@ def capture_identity(
     staged_identities: list[DependencyRequestIdentity] = []
     try:
         arxiv_ids = list(lock.semantic_scholar_arxiv_ids)
-        arxiv_identity = _s2_identity(arxiv_ids)
+        arxiv_identity = _s2_identity(arxiv_ids, stage="arxiv")
         arxiv_response, raw_arxiv_records = _request_json(
             provider="semantic_scholar",
             stage="arxiv",
@@ -689,7 +719,7 @@ def capture_identity(
         doi_ref = None
         doi_index_by_id: dict[str, int] = {}
         if derived_doi_ids:
-            doi_identity = _s2_identity(derived_doi_ids)
+            doi_identity = _s2_identity(derived_doi_ids, stage="doi")
             doi_response, _ = _request_json(
                 provider="semantic_scholar",
                 stage="doi",
@@ -737,7 +767,7 @@ def capture_identity(
 
         for openalex_id in lock.openalex_exact_ids:
             openalex_identity = _openalex_identity(openalex_id)
-            endpoint = lock.openalex_endpoint_template.format(id=openalex_id)
+            endpoint = lock.openalex_endpoint_template
             openalex_response, raw_payload = _request_json(
                 provider="openalex",
                 stage=openalex_id,
@@ -747,7 +777,9 @@ def capture_identity(
                 query_params={
                     "api_key": runtime.credential_values[
                         lock.openalex_api_key_env
-                    ].get_secret_value()
+                    ].get_secret_value(),
+                    "filter": f"openalex:{openalex_id}",
+                    "per_page": "1",
                 },
                 json_body=None,
                 runtime=runtime,
@@ -804,11 +836,19 @@ def capture_identity(
         ledger.close()
 
 
-def _load_lock(path: Path) -> IdentityCaptureLock:
+def _load_lock(path: Path, *, expected_lock_sha256: str) -> IdentityCaptureLock:
     try:
-        return IdentityCaptureLock.model_validate_json(path.read_bytes())
+        content = path.read_bytes()
+        if _sha256(content) != expected_lock_sha256:
+            raise ValueError
+        lock = IdentityCaptureLock.model_validate_json(content)
+        if content != _model_bytes(lock) or _lock_hash(lock) != expected_lock_sha256:
+            raise ValueError
+        return lock
     except (OSError, ValidationError):
-        raise ValueError("identity capture lock is invalid") from None
+        raise ValueError("identity capture authorization mismatch") from None
+    except ValueError:
+        raise ValueError("identity capture authorization mismatch") from None
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -825,6 +865,7 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--out-lock", type=Path, required=True)
     run = subparsers.add_parser("run")
     run.add_argument("--lock", type=Path, required=True)
+    run.add_argument("--expected-lock-sha256", required=True)
     run.add_argument("--ledger", type=Path, required=True)
     run.add_argument("--snapshot-root", type=Path)
     run.add_argument("--out-private", type=Path)
@@ -845,7 +886,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             out_lock=args.out_lock,
         )
         return 0
-    lock = _load_lock(args.lock)
+    lock = _load_lock(
+        args.lock,
+        expected_lock_sha256=args.expected_lock_sha256,
+    )
     project_root = Path.cwd()
     output_root = project_root / lock.output_root
     expected_snapshot_root = output_root / "snapshots"
@@ -864,6 +908,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         project_root=project_root,
         inventory_path=output_root / "identifier-inventory.json",
         ledger_path=args.ledger,
+        expected_lock_sha256=args.expected_lock_sha256,
         output_root=lock.output_root,
         semantic_scholar_base_url=lock.semantic_scholar_base_url,
         semantic_scholar_endpoint=lock.semantic_scholar_endpoint,

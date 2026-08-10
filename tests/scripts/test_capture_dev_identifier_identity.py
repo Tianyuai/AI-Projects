@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 import sqlite3
 from collections.abc import Mapping
@@ -9,10 +10,14 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from paper_search.control.ledger import DEV_RUN_CAP_CNY, SQLiteBudgetLedger
 from paper_search.domain.models import UsageActual, UsageEstimate
-from paper_search.storage.dependency_snapshot import DependencySnapshotManifestV2
+from paper_search.storage.dependency_snapshot import (
+    DependencyRequestIdentity,
+    DependencySnapshotManifestV2,
+)
 from scripts.capture_dev_identifier_identity import (
     IdentifierCaptureRuntime,
     IdentifierInventory,
@@ -22,6 +27,7 @@ from scripts.capture_dev_identifier_identity import (
     build_identifier_inventory,
     capture_identity,
     ledger_checkpoint,
+    main,
 )
 
 
@@ -37,8 +43,9 @@ S2_DOI_BYTES = (
     b'{"ArXiv":"2501.00002","DOI":"10.1000/b"}}]'
 )
 OPENALEX_BYTES = (
-    b'{"id":"https://openalex.org/W1","locations":'
-    b'[{"landing_page_url":"https://arxiv.org/abs/2501.00001"}]}'
+    b'{"meta":{"count":1},"results":'
+    b'[{"id":"https://openalex.org/W1","locations":'
+    b'[{"landing_page_url":"https://arxiv.org/abs/2501.00001"}]}]}'
 )
 
 
@@ -57,6 +64,7 @@ class RecordingTransport:
         self.statuses = {key: list(values) for key, values in (statuses or {}).items()}
         self.semantic_scholar_batches: list[list[str]] = []
         self.openalex_ids: list[str] = []
+        self.openalex_urls: list[str] = []
         self.openalex_query_param_names: list[list[str]] = []
 
     def request(
@@ -79,7 +87,9 @@ class RecordingTransport:
             content = self.arxiv_response if route == "s2-arxiv" else self.doi_response
         else:
             route = "openalex"
-            identifier = url.rsplit("/", 1)[-1]
+            self.openalex_urls.append(url)
+            filter_value = (query_params or {})["filter"]
+            identifier = filter_value.removeprefix("openalex:")
             self.openalex_ids.append(identifier)
             self.openalex_query_param_names.append(sorted((query_params or {}).keys()))
             content = self.openalex_response
@@ -147,6 +157,22 @@ def _write_inventory(tmp_path: Path, *, include_openalex: bool = True) -> Path:
     return path
 
 
+def _lock_bytes(lock: IdentityCaptureLock) -> bytes:
+    return (
+        json.dumps(
+            lock.model_dump(mode="json", exclude_none=True),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _lock_digest(lock: IdentityCaptureLock) -> str:
+    return f"sha256:{hashlib.sha256(_lock_bytes(lock)).hexdigest()}"
+
+
 def _empty_ledger(path: Path) -> None:
     ledger = SQLiteBudgetLedger(path)
     ledger.close()
@@ -171,12 +197,13 @@ def _lock_and_runtime(
         project_root=tmp_path,
         inventory_path=inventory_path,
         ledger_path=ledger_path,
+        expected_lock_sha256=_lock_digest(lock),
         output_root="private",
         semantic_scholar_base_url="https://api.semanticscholar.org",
         semantic_scholar_endpoint="/graph/v1/paper/batch",
         semantic_scholar_api_key_env="SEMANTIC_SCHOLAR_API_KEY",
         openalex_base_url="https://api.openalex.org",
-        openalex_endpoint_template="/works/{id}",
+        openalex_endpoint_template="/works",
         openalex_api_key_env="OPENALEX_API_KEY",
         credential_values={
             "SEMANTIC_SCHOLAR_API_KEY": "mock-s2-key",
@@ -250,6 +277,7 @@ def test_preflight_locks_dev_inputs_without_network_or_ledger_mutation(
     assert lock.semantic_scholar_http_attempt_max == 4
     assert lock.semantic_scholar_arxiv_ids == sorted(set(lock.semantic_scholar_arxiv_ids))
     assert lock.openalex_request_max == 2
+    assert lock.openalex_endpoint_template == "/works"
     assert ledger_checkpoint(ledger_path) == before
 
 
@@ -288,7 +316,8 @@ def test_capture_uses_arxiv_batch_then_only_discovered_doi_batch(
         ["DOI:10.1000/a", "DOI:10.1000/b"],
     ]
     assert transport.openalex_ids == ["W1"]
-    assert transport.openalex_query_param_names == [["api_key"]]
+    assert transport.openalex_urls == ["https://api.openalex.org/works"]
+    assert transport.openalex_query_param_names == [["api_key", "filter", "per_page"]]
     assert result.derived_doi_lock.ids == ["DOI:10.1000/a", "DOI:10.1000/b"]
     assert result.semantic_scholar_batch_count == 2
     assert result.semantic_scholar_http_attempt_count == 2
@@ -299,6 +328,27 @@ def test_capture_uses_arxiv_batch_then_only_discovered_doi_batch(
     manifest = DependencySnapshotManifestV2.model_validate_json(
         (snapshot_root / "snapshot-manifest.json").read_bytes()
     )
+    assert {
+        entry.request.model_or_adapter
+        for entry in manifest.entries
+        if entry.request.dependency == "semantic_scholar"
+    } == {
+        "semantic-scholar-identity-arxiv-v1",
+        "semantic-scholar-identity-doi-v1",
+    }
+    openalex_entries = [
+        entry for entry in manifest.entries if entry.request.dependency == "openalex"
+    ]
+    assert [entry.request for entry in openalex_entries] == [
+        DependencyRequestIdentity.from_canonical_request(
+            dependency="openalex",
+            operation="search",
+            method="GET",
+            endpoint="/works",
+            model_or_adapter="openalex-identity-v1",
+            canonical_request={"filter": "openalex:W1", "per_page": "1"},
+        )
+    ]
     raw_responses = {
         (snapshot_root / entry.response_path).read_bytes() for entry in manifest.entries
     }
@@ -354,6 +404,105 @@ def test_runtime_representation_redacts_credentials(tmp_path: Path) -> None:
 
     assert "mock-s2-key" not in repr(runtime)
     assert "mock-openalex-key" not in repr(runtime)
+
+
+def test_runtime_requires_independently_approved_lock_digest(tmp_path: Path) -> None:
+    _, runtime, _ = _lock_and_runtime(tmp_path)
+    payload = runtime.model_dump(mode="python")
+    payload.pop("expected_lock_sha256", None)
+
+    with pytest.raises(ValidationError):
+        IdentifierCaptureRuntime.model_validate(payload)
+
+
+def test_cli_run_requires_independently_approved_lock_digest(tmp_path: Path) -> None:
+    lock, runtime, _ = _lock_and_runtime(tmp_path)
+    lock_path = tmp_path / "capture.lock.json"
+    lock_path.write_bytes(_lock_bytes(lock))
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "run",
+                "--lock",
+                str(lock_path),
+                "--ledger",
+                str(runtime.ledger_path),
+                "--allow-network",
+            ]
+        )
+
+
+def test_cli_rejects_noncanonical_lock_bytes_even_with_matching_digest(
+    tmp_path: Path,
+) -> None:
+    lock, runtime, _ = _lock_and_runtime(tmp_path)
+    lock_path = tmp_path / "capture.lock.json"
+    noncanonical_content = _lock_bytes(lock) + b" "
+    lock_path.write_bytes(noncanonical_content)
+    expected = f"sha256:{hashlib.sha256(noncanonical_content).hexdigest()}"
+
+    with pytest.raises(ValueError) as error:
+        main(
+            [
+                "run",
+                "--lock",
+                str(lock_path),
+                "--expected-lock-sha256",
+                expected,
+                "--ledger",
+                str(runtime.ledger_path),
+                "--allow-network",
+            ]
+        )
+
+    assert str(error.value) == "identity capture authorization mismatch"
+
+
+@pytest.mark.parametrize("mutation", ["identifier_list", "inflated_cap"])
+def test_capture_rederives_inventory_authorization_before_network(
+    tmp_path: Path, mutation: str
+) -> None:
+    lock, runtime, transport = _lock_and_runtime(tmp_path)
+    if mutation == "identifier_list":
+        edited_lock = lock.model_copy(
+            update={
+                "semantic_scholar_arxiv_ids": [
+                    *lock.semantic_scholar_arxiv_ids,
+                    "ARXIV:2501.99999",
+                ]
+            }
+        )
+    else:
+        edited_lock = lock.model_copy(
+            update={"openalex_request_max": lock.openalex_request_max + 1}
+        )
+    runtime = runtime.model_copy(
+        update={"expected_lock_sha256": _lock_digest(edited_lock)}
+    )
+
+    with pytest.raises(ValueError) as error:
+        capture_identity(edited_lock, runtime)
+
+    assert str(error.value) == "identity capture authorization mismatch"
+    assert transport.semantic_scholar_batches == []
+    assert _ledger_states(runtime.ledger_path) == []
+
+
+def test_capture_rejects_wrong_expected_lock_digest_before_network(
+    tmp_path: Path,
+) -> None:
+    lock, runtime, transport = _lock_and_runtime(tmp_path)
+    runtime = runtime.model_copy(
+        update={"expected_lock_sha256": "sha256:" + "f" * 64}
+    )
+
+    with pytest.raises(ValueError) as error:
+        capture_identity(lock, runtime)
+
+    assert str(error.value) == "identity capture authorization mismatch"
+    assert transport.semantic_scholar_batches == []
+    assert _ledger_states(runtime.ledger_path) == []
 
 
 def test_zero_discovered_dois_skips_second_batch_without_empty_request(
@@ -440,7 +589,10 @@ def test_openalex_exact_lookup_rejects_response_identity_mismatch(
     tmp_path: Path,
 ) -> None:
     transport = RecordingTransport(
-        openalex_response=b'{"id":"https://openalex.org/W999","locations":[]}'
+        openalex_response=(
+            b'{"meta":{"count":1},"results":'
+            b'[{"id":"https://openalex.org/W999","locations":[]}]}'
+        )
     )
     lock, runtime, _ = _lock_and_runtime(tmp_path, transport)
 
@@ -452,13 +604,14 @@ def test_openalex_exact_lookup_rejects_response_identity_mismatch(
     assert all(state != "reserved" for state in _ledger_states(runtime.ledger_path))
 
 
-def test_request_cap_overflow_is_rejected_before_ledger_or_transport(
+def test_edited_request_cap_is_rejected_before_ledger_or_transport(
     tmp_path: Path,
 ) -> None:
     lock, runtime, transport = _lock_and_runtime(tmp_path)
     lock = lock.model_copy(update={"openalex_request_max": 0})
+    runtime = runtime.model_copy(update={"expected_lock_sha256": _lock_digest(lock)})
 
-    with pytest.raises(ValueError, match="identity capture request cap exceeded"):
+    with pytest.raises(ValueError, match="identity capture authorization mismatch"):
         capture_identity(lock, runtime)
 
     assert transport.semantic_scholar_batches == []

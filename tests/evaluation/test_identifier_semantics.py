@@ -9,6 +9,7 @@ import pytest
 from paper_search.evaluation.identifier_semantics import (
     IdentifierMapSemanticAudit,
     IdentityObservation,
+    _decode_s2_response,
     assert_public_json_safe,
     audit_identifier_map_semantics,
     classify_relation,
@@ -230,8 +231,9 @@ def test_public_audit_contains_only_aggregate_safe_data(tmp_path: Path) -> None:
     assert_public_json_safe(serialized)
 
 
+@pytest.mark.parametrize("envelope", [False, True])
 def test_audit_verifies_exact_openalex_location_from_sealed_snapshot(
-    tmp_path: Path,
+    tmp_path: Path, envelope: bool
 ) -> None:
     snapshot_root = tmp_path / "snapshots"
     capture = DependencyCaptureStore(
@@ -249,8 +251,13 @@ def test_audit_verifies_exact_openalex_location_from_sealed_snapshot(
     ref = capture.stage_success(
         identity,
         response_bytes=(
-            b'{"locations":[{"landing_page_url":'
-            b'"https://arxiv.org/abs/2501.10120"}]}'
+            b'{"results":[{"id":"https://openalex.org/W1","locations":'
+            b'[{"landing_page_url":"https://arxiv.org/abs/2501.10120"}]}]}'
+            if envelope
+            else (
+                b'{"locations":[{"landing_page_url":'
+                b'"https://arxiv.org/abs/2501.10120"}]}'
+            )
         ),
         safe_headers={},
         captured_at=datetime(2026, 8, 10, tzinfo=UTC),
@@ -286,19 +293,24 @@ def test_audit_verifies_exact_openalex_location_from_sealed_snapshot(
     assert bundle.report.proof_counts == {"openalex_location_exact": 1, "arxiv_datacite_exact": 1}
 
 
-def _semantic_scholar_batch_identity(ids: list[str]) -> DependencyRequestIdentity:
+def _semantic_scholar_batch_identity(
+    ids: list[str], *, model_or_adapter: str
+) -> DependencyRequestIdentity:
     return DependencyRequestIdentity.from_canonical_request(
         dependency="semantic_scholar",
         operation="batch",
         method="POST",
         endpoint="/paper/batch",
-        model_or_adapter="semantic-scholar-identity-v1",
+        model_or_adapter=model_or_adapter,
         canonical_request={"fields": "paperId,externalIds", "ids": ids},
     )
 
 
 def _batched_semantic_scholar_fixture(
     tmp_path: Path,
+    *,
+    arxiv_adapter: str = "semantic-scholar-identity-arxiv-v1",
+    doi_adapter: str = "semantic-scholar-identity-doi-v1",
 ) -> tuple[bytes, bytes, dict[str, object], Path]:
     snapshot_root = tmp_path / "snapshots"
     capture = DependencyCaptureStore(
@@ -306,7 +318,10 @@ def _batched_semantic_scholar_fixture(
         clock=lambda: datetime(2026, 8, 10, tzinfo=UTC),
     )
     arxiv_ref = capture.stage_success(
-        _semantic_scholar_batch_identity(["ARXIV:2501.00001", "ARXIV:2501.00002"]),
+        _semantic_scholar_batch_identity(
+            ["ARXIV:2501.00001", "ARXIV:2501.00002"],
+            model_or_adapter=arxiv_adapter,
+        ),
         response_bytes=json.dumps(
             [
                 {
@@ -324,7 +339,10 @@ def _batched_semantic_scholar_fixture(
         captured_at=datetime(2026, 8, 10, tzinfo=UTC),
     )
     doi_ref = capture.stage_success(
-        _semantic_scholar_batch_identity(["DOI:10.1000/a", "DOI:10.1000/b"]),
+        _semantic_scholar_batch_identity(
+            ["DOI:10.1000/a", "DOI:10.1000/b"],
+            model_or_adapter=doi_adapter,
+        ),
         response_bytes=json.dumps(
             [
                 {
@@ -406,6 +424,42 @@ def test_audit_selects_distinct_items_from_one_sealed_semantic_scholar_batch(
     ]
 
 
+@pytest.mark.parametrize("mutation", ["reuse_arxiv", "swap_roles", "wrong_stage"])
+def test_audit_rejects_reused_or_crosswired_semantic_scholar_roles(
+    tmp_path: Path, mutation: str
+) -> None:
+    arxiv_adapter = (
+        "semantic-scholar-identity-wrong-v1"
+        if mutation == "wrong_stage"
+        else "semantic-scholar-identity-arxiv-v1"
+    )
+    map_bytes, gold_bytes, evidence, snapshot_root = _batched_semantic_scholar_fixture(
+        tmp_path,
+        arxiv_adapter=arxiv_adapter,
+    )
+    refs = evidence["evidence_refs"]
+    assert isinstance(refs, list)
+    for raw_ref in refs:
+        assert isinstance(raw_ref, dict)
+        arxiv_entry_id = raw_ref["semantic_scholar_arxiv_entry_id"]
+        doi_entry_id = raw_ref["semantic_scholar_doi_entry_id"]
+        if mutation == "reuse_arxiv":
+            raw_ref["semantic_scholar_doi_entry_id"] = arxiv_entry_id
+        elif mutation == "swap_roles":
+            raw_ref["semantic_scholar_arxiv_entry_id"] = doi_entry_id
+            raw_ref["semantic_scholar_doi_entry_id"] = arxiv_entry_id
+
+    with pytest.raises(ValueError) as error:
+        audit_identifier_map_semantics(
+            map_bytes=map_bytes,
+            gold_bytes=gold_bytes,
+            evidence_bytes=json.dumps(evidence, sort_keys=True).encode("utf-8"),
+            snapshot_root=snapshot_root,
+        )
+
+    assert str(error.value) == "identity snapshot is invalid"
+
+
 @pytest.mark.parametrize("item_index", [None, -1, 2, "1"])
 def test_audit_rejects_missing_or_invalid_semantic_scholar_batch_indexes(
     tmp_path: Path, item_index: object
@@ -431,6 +485,19 @@ def test_audit_rejects_missing_or_invalid_semantic_scholar_batch_indexes(
         )
 
     assert str(error.value) == "identity snapshot is invalid"
+
+
+def test_dictionary_semantic_scholar_snapshot_rejects_item_index_zero() -> None:
+    content = b'{"paperId":"S2-A","externalIds":{"ArXiv":"2501.00001"}}'
+
+    with pytest.raises(ValueError) as error:
+        _decode_s2_response(content, 0)
+
+    assert str(error.value) == "identity snapshot is invalid"
+    assert _decode_s2_response(content, None) == (
+        "S2-A",
+        {"ArXiv": "2501.00001"},
+    )
 
 
 def test_privacy_scan_allows_aggregate_field_names() -> None:

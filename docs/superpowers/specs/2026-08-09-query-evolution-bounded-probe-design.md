@@ -1,7 +1,7 @@
 # Query Evolution 有限范围探针设计
 
 日期：2026-08-09
-状态：待正式文档复核
+状态：已复核，待实施
 范围：冻结 dev 上的诊断探针，不是正式 live capture 或生产改动
 
 ## 1. 决策摘要
@@ -13,7 +13,7 @@
 - 只覆盖 55 个至少存在一个“可用但未检索到”gold 关联的 dev 查询；
 - 复用冻结主基线的生产 `QuerySpec`、首轮子查询和候选结果，不重新运行首轮分析或检索；
 - 每个查询只允许一次 LLM 演化操作，最多生成两条新的 OpenAlex 查询；
-- gold 标题、gold 标识符和相关性标签只用于队列选择与事后评分，不进入生成器；
+- gold 文件、标识符映射和相关性标签只用于队列选择与封存后的评分；生成上下文不得因 gold 内容增加、删除、排序或标注任何字段。冻结检索证据中的候选标题即使碰巧对应 gold，也只作为无标签候选证据使用，不视为泄漏；
 - 当前正式对照是 `main-baseline`，其中所有可选组件（包括 title candidates）均关闭；
 - 探针不改动生产 `EvolutionSearchOrchestrator`、实验注册、ablation 配置、candidate lock 或正式闭环；
 - Gate B 只证明检索假设产生真实信号；只有 Gate C 通过才允许申请后续正式 capture；
@@ -35,7 +35,8 @@
 - gates：`d22e02e63d43af083fee8d226ea7c5a68bac38c15239a2935f7e00908a4428be`；
 - snapshot manifest：`sha256:0f3d66f8ff9434a80094395876ea25304c894d4f77f864b01dbc4b61a830b287`；
 - dev gold：`24009cf03ad069131793b9a190024e239082277bd0e48149a1efbbbb7978e215`；
-- identifier map：`6ea6dbcd20a3f572d9f0dd0a0eef938ff01773db792401adf7fde1e489396e82`。
+- identifier map：`6ea6dbcd20a3f572d9f0dd0a0eef938ff01773db792401adf7fde1e489396e82`；
+- availability evidence：`docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json`，SHA-256 为 `3f445486d5cf590f3f11a51930153a45916023880e856def379e0f01d053ad04`，schema 与聚合必须继续证明 134/134 唯一 gold work 可用。
 
 基线必须精确重建 60/60 个查询的完整有序 Top-50 序列，总输出数为 2910。之前的标题保留报告绑定另一组 business/execution 哈希和 2908 条结果，不能与本探针证据混用。
 
@@ -72,7 +73,7 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 
 ### 3.1 核心假设
 
-在生成器不接触 gold 内容的前提下，向 LLM 提供原始查询、生产 `QuerySpec`、首轮子查询和有限候选标题摘要，可以生成最多两条互补 OpenAlex 查询，找回至少一个当前属于 `not_retrieved` 的 exact gold 关联，同时保留现有候选池与 Top-50 gold。
+在生成器不读取 gold 数据源、标识符映射或相关性标签，也不根据 gold 改变 payload 的前提下，向 LLM 提供原始查询、生产 `QuerySpec`、首轮子查询和有限的无标签候选标题摘要，可以生成最多两条互补 OpenAlex 查询，找回至少一个当前属于 `not_retrieved` 的 exact gold 关联，同时保留现有候选池与 Top-50 gold。
 
 ### 3.2 结论分级
 
@@ -114,8 +115,10 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 4. 从已校验快照重建 OpenAlex 候选元数据；
 5. 使用现有去重、过滤、融合和排序逻辑精确重建 60/60 有序输出；
 6. 要求总输出为 2910、候选池 exact gold 为 14、Top-50 exact gold 为 8；
-7. 由 `preflight` 使用 gold 生成固定的 55 查询探针队列，并把只含 query ID、不含 gold 内容的队列写入 `probe.lock.json`；
-8. 计算逐逻辑操作和全批次最坏情况预算，并锁定项目账本 checkpoint；真正执行 `run` 时必须重复全部预检，先完成所有逻辑操作的账本预留，再允许第一条网络请求。任何检查或预留失败都在零网络请求状态停止。
+7. 由 `preflight` 使用 gold 和已冻结 availability evidence 筛选 55 个目标查询；队列顺序严格沿冻结 60-query 顺序，只把 query ID 写入 `probe.lock.json`；
+8. 计算逐逻辑操作和全批次最坏情况预算，锁定项目账本 checkpoint，并写入全部来源哈希、availability hash、队列、prompt/config/model、预算与调用上限；另对按 POSIX 路径排序的全部已跟踪 `src/**/*.py` 与 `scripts/probe_query_evolution.py` 计算 `probe_code_sha256`，每项编码为 `UTF-8 path + NUL + decimal byte length + NUL + raw bytes` 后顺序拼接；`lock_sha256` 对省略该字段后的规范化 lock JSON 计算，两个字段格式均为 `sha256:<64 lowercase hex>`；
+9. `run --lock <path>` 只消费并验证现有 lock，不重新选择队列；它在前置检查、capture 和 replay 阶段不打开 availability、gold 或 identifier map，只重复冻结运行产物与 snapshot manifest 哈希、`probe_code_sha256`、60/60 有序基线、2910 总数、prompt/config/model、lock 自身哈希和账本 checkpoint 等无 gold 检查，完成全部逻辑槽预留后才允许第一条网络请求；
+10. 完整技术运行在快照封存并完成禁网重放且 `capture_replay_match=matched` 后，评估层才加载命令行提供的 gold 与 identifier map，先核对 lock 中的哈希和 14/8 基线，再评分；技术失败或 replay mismatch 均不调用该 loader。任何前置检查或预留失败都在零网络请求状态停止。
 
 基线重建的完整有序序列一致性比单纯源文件代码哈希更强；只要当前逻辑无法精确重建，就不得继续。
 
@@ -125,12 +128,12 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 
 - 原始查询和生产 `QuerySpec`；
 - 首轮 3–5 条子查询；
-- 首轮候选总数；
-- 冻结 Top-50 有序序列中最靠前的 10 个去重候选标题；
-- 从原始查询、`QuerySpec` 和首轮 `target_constraints` 确定性提取的用户陈述 facet；
+- 首轮 OpenAlex 有序流按 canonical ID 去重、但尚未做 `QuerySpec` 后过滤和 Top-50 截断时的候选总数；
+- 冻结 Top-50 有序序列中最靠前的 10 个非空去重候选标题；标题先做 Unicode NFKC 和空白折叠，再按 `casefold()` 去重并保留首次出现顺序；
+- 确定性 facet 序列：先放规范化后的 `QuerySpec.original_query`、`research_goal`，再按 `topics`、`methods`、`tasks`、`datasets`、`domains`、`venues`、`must_have`、`should_have` 字段顺序追加，最后按首轮子查询顺序追加 `target_constraints`；全部做 Unicode NFKC 和空白折叠，按 `casefold()` 去重并保留首次出现顺序；
 - 固定生成说明和输出 schema。
 
-不提供摘要全文、query ID、gold ID、gold 标题、命中状态或 gold 缺失数量。
+不提供摘要全文、query ID、gold ID、gold 标签、命中状态、gold 缺失数量或 `SearchPlan.inherited_hard_filters`。冻结候选标题不经过 gold 比对或过滤；执行层单独持有并原样传递 `inherited_hard_filters`。
 
 34/60 个当前 `QuerySpec` 没有结构化强约束，因此“无强约束”不得被解释为“覆盖完整”。原始查询、首轮子查询和用户陈述 facet 始终保留为生成依据。
 
@@ -140,16 +143,16 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 
 - `subqueries`：0–2 个对象；
 - 每个对象包含 `text`、`source_facets` 和固定枚举的 `strategy`；
-- 当 `subqueries` 为空时必须给出固定枚举 `no_op_reason`。
+- `no_op_reason` 始终是必填字段：`subqueries` 非空时必须为 `null`，为空时必须是固定枚举值。
 
 校验规则：
 
-- 规范化后不得重复原始查询、首轮子查询或同批提案；
+- 每条生成文本先做 Unicode NFKC，再调用生产 OpenAlex 使用的同一公开查询 canonicalizer；canonicalizer 删除 `?`、`*` 并折叠空白，结果不得为空，也不得重复原始查询、首轮子查询或同批提案；
 - `source_facets` 必须逐项来自输入 facet 集；
 - prompt policy 禁止引入与输入 facet 无关的新实体、venue 或虚构事实；这是受记录和审计的生成约束，不伪装成无需词表或第二语义模型即可证明的确定性断言；
 - 确定性校验只负责机械可判定条件：严格 schema、`source_facets` 成员关系、规范化去重、长度/字符约束，以及生成文本中显式四位年份不得冲突于冻结年份范围；
 - 执行层必须把冻结 `SearchPlan.inherited_hard_filters` 原样传给 OpenAlex，并继续使用不变的 `QuerySpec` 做后过滤；生成文本不要求逐字重复这些条件；
-- 查询必须满足固定长度、字符和非空约束；
+- 查询必须满足固定长度、字符和 canonical 非空约束；
 - 最多保留两条，顺序由模型输出决定，不做第二轮选择调参；
 - 非法 JSON、非法字段或非法硬约束不是合法 `no_op`，而是完整性失败；
 - 不使用规则式通用改写兜底，也不发起 LLM repair 调用。
@@ -164,6 +167,7 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 - 因此全批次逻辑上限为 55 次 LLM 生成和 110 次 OpenAlex 搜索，HTTP/usage 尝试的最坏上限分别为 165 和 330；
 - 查询按 `probe.lock.json` 固定顺序串行执行，全批次硬耗时上限为 3600 秒；到达上限视为操作者取消，完成在途调用的 fail-close、账本终态和快照密封后停止；
 - 所有重试都计入实际 usage 和账本，不能把逻辑操作数误当成实际调用数；
+- 全批次维护一个只存在于 runner 内的 canonical-request memo：LLM key 绑定模型、endpoint、prompt version/name、payload 和 prompt artifact hash；OpenAlex key 绑定公开 canonicalizer 的结果、冻结 filters、limit 和 adapter。重复 key 不再次发起网络请求；它复制首次结果的 data、errors 和 snapshot provenance，生成当前槽专用的 `ProviderResult(cache_hit=True, usage=0, latency_ms=0)`，释放 request reservation，并以零实际 usage 终结持久账本 receipt，禁止重复累计首次调用的 usage；
 - 一个不可恢复的生成、依赖、结算或证据失败发生后，封存当前失败并停止调度后续查询。
 
 ### 5.5 合并与评分
@@ -178,17 +182,23 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 
 当前主基线只有 OpenAlex 单一检索来源，因此本探针必须先保留冻结首轮 OpenAlex 有序流，再按 proposal 顺序依次追加 `search-1`、`search-2` 结果，并以 canonical ID 首次出现为准去重；合并后仍作为同一个 `openalex` 来源进入现有 RRF。不得把每条新增查询伪装成新的 provider/source，也不得为新增结果设置权重或保留槽。这个固定追加规则让 Gate B 测召回、Gate C 同时暴露现有排序是否能利用召回增量，而不会混入第二个实验变量。
 
-55 查询以外的 5 个查询直接保留冻结有序输出，并要求字节级不变。在线执行层只读取 `probe.lock.json`，不接受或加载 gold 文件；候选、Top-50 和快照封存后，评估层才重新加载 gold 用于评分。
+55 查询以外的 5 个查询直接保留冻结有序输出，并要求字节级不变。在线执行层只读取并验证 `probe.lock.json` 与冻结运行；gold 和 identifier map 路径只交给封存后的 deferred loader，网络阶段不得打开它们。
 
 ### 5.6 零网络重放
 
-新增 LLM 和 OpenAlex 响应通过现有 dependency snapshot v2 存储。在线探针结束后立即：
+新增 LLM 和 OpenAlex 响应通过现有 dependency snapshot v2 存储。只有 55 个查询均以 `generated` 或 `no_op` 完成、账本与快照均完整时，在线探针结束后才立即：
 
 1. 封存快照清单；
 2. 使用 replay adapters 在禁网条件下重新解码；
 3. 重建每查询的规范化生成、候选和 Top-50 投影；
 4. 比较在线与离线规范化业务哈希；
 5. 只有哈希相同才允许 Gate A 通过。
+
+业务哈希固定覆盖一个私有 `ReplayComparableProbe`：lock hash、冻结 query 顺序，以及每查询的 query ID、终态、规范化 proposal、按 `search-1`/`search-2` 顺序排列的规范化 `Paper` 数据和稳定错误字段（provider、code、retryable）、过滤后接收/拒绝的 canonical ID 顺序、候选 canonical ID 顺序和 Top-50 canonical ID 顺序。它不包含时间、usage、headers、provider request ID、snapshot ref 或文件路径。规范化 JSON 使用排序 key、紧凑分隔符、UTF-8、`allow_nan=False` 和末尾换行。`ReplayTrace` 只含有序查询/操作、canonical request identity、snapshot refs 和终态，不含在线 proposal、Paper、候选或 Top-50；replay 只能把它用于定位证据和验证调度，`generated`/`no_op` 终态及其余业务字段必须从快照重新解析并与 trace 核对。
+
+每查询终态只允许 `generated`、`no_op`、`integrity_failure`、`dependency_failure`、`accounting_failure`、`snapshot_failure`、`cancelled`、`not_scheduled`。首次不可恢复失败之后尚未执行的查询写为 `not_scheduled`；它们不是缺失记录。`capture_replay_match` 只允许 `matched`、`mismatched`、`not_evaluated`。技术失败运行封存现有证据，但不伪造缺失操作的 replay：`replay_business_sha256=null`、`capture_replay_match=not_evaluated`，Gate A 直接失败。Gate 状态只允许 `passed`、`failed`、`not_evaluated`：Gate A 失败时 B/C 为 `not_evaluated`，Gate B 失败时 C 为 `not_evaluated`。固定运行原因只保留 `preflight_failed`、`generation_failed`、`dependency_failed`、`accounting_failed`、`snapshot_failed`、`replay_mismatch`、`cancelled`、`gate_b_failed`、`gate_c_failed`。
+
+终态映射固定为：LLM schema/机械约束失败是 `integrity_failure`；请求级错误或重试耗尽是 `dependency_failure`；controller、usage 或 ledger 不一致是 `accounting_failure`；snapshot 写入或密封失败是 `snapshot_failure`；全局超时或操作者取消是 `cancelled`。证据隐私或 replay 哈希问题发生在查询完成后，只作为运行原因使 Gate A 失败，不回写已经确定的查询终态。
 
 该重放是诊断证据检查，不是正式 replay run，也不生成 candidate lock。
 
@@ -202,6 +212,7 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 - temperature 0；
 - 允许的策略和 `no_op_reason`；
 - 严格 JSON 输出说明；
+- `no_op_reason` 始终存在，非空提案时为 `null`；
 - 最多两条查询；
 - 禁止 gold、未陈述硬约束和虚构事实。
 
@@ -219,6 +230,8 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 - 生成诊断和 snapshot refs。
 
 该模块不加载 gold、identifier map、运行目录或公开报告，也不修改现有 `EvolutionCoordinator`。
+
+生产 OpenAlex 的查询 canonicalizer 改为公开、行为不变的纯函数；现有检索适配器和本模块共同复用它。本模块先执行 Unicode NFKC，再调用该函数，避免验证、去重与真实请求 identity 分叉。
 
 ### 6.3 `src/paper_search/evaluation/query_evolution_probe.py`
 
@@ -238,8 +251,8 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 
 负责薄 CLI 和副作用边界：
 
-- `preflight`：只读检查、重建基线、使用 gold 选择队列、生成不含 gold 内容的 probe lock 和最坏预算，不访问网络；
-- `run`：要求显式 live 授权；在线执行层只加载 probe lock 和冻结运行，不加载 gold；在第一条网络请求前核对锁定的项目账本 checkpoint，并为 55 个查询各自的 `evolve`、`search-1`、`search-2` 逻辑操作一次性建立持久账本预留；部分预留失败时把已经建立的预留以零实际 usage 终结并停止；封存快照后再调用评估层完成零网络重放和 Gate 判定；
+- `preflight`：只读检查、重建基线、使用 gold 和冻结 availability evidence 选择队列、生成带自校验哈希但不含 gold 内容的 probe lock 和最坏预算，不访问网络；
+- `run --lock <path>`：要求显式 live 授权；在线执行层只加载 lock 和冻结运行，不打开 availability、gold 或 identifier map，重复无 gold 预检并核对账本 checkpoint，在第一条网络请求前为 55 个查询各自的 `evolve`、`search-1`、`search-2` 逻辑操作一次性建立持久账本预留；部分预留失败时把已经建立的预留以零实际 usage 终结并停止；完整技术运行封存快照、完成禁网重放且哈希 matched 后，再由 deferred loader 打开并核对 gold/identifier map，完成 Gate 判定；技术失败或 replay mismatch 直接判 Gate A 失败；
 - 原子写入私有结果和聚合报告；
 - 所有异常都结算、释放或 fail-close 当前 reservation 后退出。
 
@@ -270,6 +283,7 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 - 合法 proposal、合法 `no_op`、schema 拒绝和硬约束拒绝数量；
 - 生成查询总数、去重数量和平均每查询有效数量；
 - 逻辑 LLM/OpenAlex 操作数与实际 HTTP/usage 尝试数；
+- canonical-request 复用次数及其零 usage 槽数；
 - LLM tokens、OpenAlex 响应率、重试、429、5xx 和 timeout；
 - 实际成本、p50/p95 耗时、预算截断和账本检查点；
 - capture/replay 规范化业务哈希一致性。
@@ -281,7 +295,7 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 必须全部满足：
 
 - 预检中的运行、哈希、60/60 重建、2910 输出和基线指标完全一致；
-- 55/55 查询都有合法 `generated` 或 `no_op` 终态；
+- 55/55 查询都有唯一记录；完整运行时全部为合法 `generated` 或 `no_op`，失败运行则必须包含当前失败终态及其后的 `not_scheduled`；
 - 无未解决的生成、OpenAlex 或 snapshot 失败；
 - 在线与零网络重放的规范化业务哈希一致；
 - `integrity_failure=0`、`provenance_failure=0`、`unaccounted_usage_failure=0`；
@@ -290,7 +304,7 @@ MRR 和 NDCG 不从旧标题实验复制；探针评估器必须用相同输入�
 - 逻辑操作和实际尝试均不超过第 5.4 节上限；
 - 私有产物不逸出 `runs/`，公开结果通过 aggregate-only 检查。
 
-Gate A 失败时，不发布 Gate B/C 的通过结论。
+OpenAlex 页面中可保留有效数据的 `invalid_work` 是已记录的数据质量警告，不属于未解决依赖失败；请求级错误、重试耗尽、snapshot 或结算失败仍使 Gate A 失败。Gate A 失败时，Gate B/C 固定为 `not_evaluated`。
 
 ### 8.2 Gate B：检索假设成立
 
@@ -299,7 +313,7 @@ Gate A 失败时，不发布 Gate B/C 的通过结论。
 - 候选池 exact gold 高于 14；
 - 至少找回 1 个原属于 `not_retrieved` 的 gold 关联；
 - 原有 14 个候选池 gold 全部逐查询保留；
-- 无 gold 内容进入生成器。
+- gold-isolation provenance 断言通过：capture 接口不接受 availability/gold/identifier map，网络阶段未打开它们，payload 没有 gold/标签字段，且候选标题未经过 gold 驱动的增加、删除、排序或标注。
 
 Gate B 通过只表示机制有真实召回信号。
 
@@ -315,7 +329,7 @@ Gate B 通过只表示机制有真实召回信号。
 - 硬过滤绝对召回损失不增加；
 - 生产预算估计非零且在 balanced 限额内。
 
-生产预算估计按每个 usage 维度取“探针最大实际值”和“向上取整的 p95 × 1.2”中的较大值，不得再次使用零估计。
+生产预算估计按操作类型分别统计已调度逻辑操作；一个逻辑操作的样本值包含其全部重试 usage，未调度的零 usage 槽不进入分布。每个 usage 维度取“探针最大实际值”和“向上取整的 p95 × 1.2”中的较大值，不得再次使用零估计。
 
 ## 9. 停止条件
 
@@ -323,7 +337,7 @@ Gate B 通过只表示机制有真实召回信号。
 
 以下任一条件触发零请求停止：
 
-- 输入哈希、运行身份或 snapshot manifest 不一致；
+- lock 自身哈希、availability/input 哈希、运行身份或 snapshot manifest 不一致；
 - 60/60 有序基线或 2910 总数无法精确重建；
 - 55 查询队列或固定分母不一致；
 - prompt/config hash 不一致；
@@ -374,10 +388,10 @@ Gate B 通过只表示机制有真实召回信号。
 
 只保留：
 
-- `probe.lock.json`：来源哈希、55 查询 ID、prompt/config/model、预算和调用上限；
-- `outcomes.jsonl`：逐查询 proposal、检索、候选、Top-50、usage 和 snapshot refs；
+- `probe.lock.json`：lock 自身哈希、probe code hash、全部来源与 availability 哈希、冻结顺序的 55 查询 ID、prompt/config/model、预算、账本 checkpoint 和调用上限；
+- `outcomes.jsonl`：55 个逐查询终态，以及可用时的 proposal、检索、候选、Top-50、usage 和 snapshot refs；失败后未调度查询也必须有 `not_scheduled` 记录；
 - `snapshots/`：dependency snapshot v2 清单及响应；
-- `result.json`：聚合指标、业务哈希、Gate 和建议。
+- `result.json`：聚合指标、可空 replay 业务哈希、`matched`/`mismatched`/`not_evaluated`、三态 Gate、固定运行原因和建议。
 
 ### 11.2 可提交聚合证据
 
@@ -404,9 +418,11 @@ Gate B 通过只表示机制有真实召回信号。
 - 0–2 条提案、合法 no-op 和严格 schema；
 - 空强约束 QuerySpec 的上下文构造；
 - 重复、空白、超长和非法字符查询；
-- 显式年份冲突拒绝、冻结硬过滤原样传递，以及实体/venue 相关性仅作为 prompt policy 而非伪确定性断言；
+- Unicode NFKC 后复用 OpenAlex canonicalizer，覆盖 `foo?`/`foo` 重复和 `*` 规范化为空；
+- 显式年份冲突拒绝、payload 排除 `inherited_hard_filters`，以及实体/venue 相关性仅作为 prompt policy 而非伪确定性断言；
 - `source_facets` 必须来自输入；
-- 生成器模型和序列化 payload 不存在 gold 字段；
+- facet、候选计数和 Top-10 标题的固定构造顺序；生成器模型和序列化 payload 不存在 gold、标签或 `inherited_hard_filters` 字段；
+- `no_op_reason` 始终存在，非空提案为 `null`；
 - 逻辑操作与重试尝试上限；
 - 非零预算估计；
 - Gate A/B/C 所有边界值和 reason codes。
@@ -417,6 +433,7 @@ Gate B 通过只表示机制有真实召回信号。
 
 - 合成 sealed run 的精确基线重建；
 - 输入哈希、snapshot 路径、清单或有序序列不一致时 fail closed；
+- availability hash、lock 自身哈希、冻结队列顺序和 post-seal gold hash 不一致时 fail closed；
 - 新候选复用现有去重、过滤、融合和排序；
 - 冻结 OpenAlex 顺序不变、新结果按 proposal 顺序追加、canonical ID 首次出现优先，且不得拆成虚构来源；
 - 候选池与 Top-50 gold 逐查询保留；
@@ -429,14 +446,18 @@ Gate B 通过只表示机制有真实召回信号。
 新增 `tests/integration/test_query_evolution_probe.py`，使用 `httpx.MockTransport` 覆盖：
 
 - 正常 LLM 两条查询与 OpenAlex 成功；
+- runner 向每条新增搜索原样传递冻结 `inherited_hard_filters`，并继续使用不变的 `QuerySpec` 后过滤；
+- 相同 LLM/OpenAlex canonical request 只访问网络一次，后续逻辑槽复用 snapshot refs 并以零 usage 终结；
 - 合法 no-op；
 - LLM 非法 JSON 或非法硬约束；
 - OpenAlex 部分成功页；
+- `invalid_work` 保留有效数据并只记警告，请求级失败仍阻断 Gate A；
 - 429 后成功、5xx/timeout 重试耗尽；
 - 预算不足、usage 结算不一致和 fail-close；
 - 全批次预留的部分失败回滚、未调度零 usage 终态、3900 秒账本 TTL 和 3600 秒全局取消；
-- snapshot capture 后禁网 replay；
-- 在线与重放规范化业务哈希完全一致。
+- 完整技术运行在 snapshot capture 后禁网 replay；技术失败运行封存证据但不构造缺失操作的 replay/hash；
+- 在线与重放规范化业务哈希完全一致；
+- `ReplayComparableProbe` 字段集合固定，时间、usage、request ID 和 snapshot refs 不参与哈希；失败后的查询全部写为 `not_scheduled`，Gate 使用固定三态和最小运行原因枚举。
 
 自动测试不得读取 `.env` 或访问网络。
 

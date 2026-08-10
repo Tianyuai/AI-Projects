@@ -12,7 +12,6 @@ from typing import Any, Literal, NoReturn, Protocol
 from uuid import uuid4
 
 import httpx
-import yaml
 from pydantic import SecretStr
 
 from paper_search.application.artifacts import ArtifactFactory
@@ -67,6 +66,7 @@ from paper_search.domain.models import (
     UsageEstimate,
 )
 from paper_search.llm.client import OpenAICompatibleLLMClient
+from paper_search.llm.prompt_artifacts import render_prompt_system_message
 from paper_search.llm.snapshot_adapters import (
     LiveCaptureLLMAnalyzer,
     ReplayLLMAnalyzer,
@@ -494,23 +494,7 @@ def _locked_budget_profile(path: str) -> Literal["low", "balanced"]:
 
 def _prompt_system_message(prompt_bytes: bytes) -> str:
     """Build the deterministic system message from the bound prompt artifact."""
-    try:
-        raw = yaml.safe_load(prompt_bytes)
-    except yaml.YAMLError as error:
-        raise ValueError("invalid prompt artifact") from error
-    if not isinstance(raw, dict):
-        raise ValueError("invalid prompt artifact")
-    instructions = raw.get("instructions", [])
-    if not isinstance(instructions, list) or not all(
-        isinstance(item, str) for item in instructions
-    ):
-        raise ValueError("prompt instructions must be a list of strings")
-    lines = ["Respond with a JSON object."]
-    response_model = raw.get("response_model")
-    if isinstance(response_model, str) and response_model:
-        lines.append(f"The JSON object must match the {response_model} contract.")
-    lines.extend(f"- {item}" for item in instructions)
-    return "\n".join(lines)
+    return render_prompt_system_message(prompt_bytes)
 
 
 def _replay_readiness(binding: ModeBinding) -> Callable[[], ReadyHealthResponse]:

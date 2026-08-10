@@ -11,7 +11,7 @@ from paper_search.domain.models import (
     QuerySpec,
     UsageActual,
 )
-from paper_search.evaluation.dataset import EvaluationQuery
+from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap
 from paper_search.evaluation.query_evolution_probe import (
     calculate_production_estimates,
     FrozenProbeInputs,
@@ -53,11 +53,22 @@ def _result(papers: list[Paper], *, errors: list[dict[str, object]] | None = Non
     )
 
 
-def _record(query_id: str, papers: list[Paper], *, source_index: int = 0) -> FrozenQueryRecord:
+def _record(
+    query_id: str,
+    papers: list[Paper],
+    *,
+    retrieved_paper_ids: list[str] | None = None,
+    source_index: int = 0,
+) -> FrozenQueryRecord:
     return FrozenQueryRecord(
         query_id=query_id,
         query_spec=QuerySpec(original_query=query_id, research_goal="find papers"),
         baseline_results=[_result(papers)],
+        retrieved_paper_ids=(
+            retrieved_paper_ids
+            if retrieved_paper_ids is not None
+            else [paper.canonical_id for paper in papers]
+        ),
         source_index=source_index,
     )
 
@@ -107,6 +118,19 @@ def test_selects_available_not_retrieved_queries_in_frozen_order() -> None:
         gold,
         {"openalex:W1": "available", "openalex:W8": "available", "openalex:W9": "not_available"},
     ) == ("q-3",)
+
+
+def test_selection_excludes_gold_already_present_in_full_retrieved_stream() -> None:
+    baseline = _baseline(
+        _record(
+            "q-1",
+            [_paper("openalex:W1")],
+            retrieved_paper_ids=["openalex:W1", "openalex:W9"],
+        )
+    )
+    gold = [EvaluationQuery(query_id="q-1", query="q-1", relevant_paper_ids=["openalex:W9"])]
+
+    assert select_probe_query_ids(baseline, gold, {"openalex:W9": "available"}) == ()
 
 
 def test_merge_preserves_baseline_then_search_1_then_search_2_and_first_id() -> None:
@@ -160,6 +184,95 @@ def test_evaluation_computes_14_8_baseline_and_gate_boundaries() -> None:
     assert evaluation.gate_c == "not_evaluated"
 
 
+def test_gold_associations_are_unique_after_identifier_resolution() -> None:
+    baseline = _baseline(_record("q-1", [_paper("openalex:W1")]))
+    projection = merge_probe_results(baseline, {})
+    gold = [
+        EvaluationQuery(
+            query_id="q-1",
+            query="q-1",
+            relevant_paper_ids=["openalex:W1", "openalex:W2"],
+        )
+    ]
+
+    evaluation = evaluate_probe(
+        baseline,
+        projection,
+        gold,
+        id_map=IdentifierMap({"openalex:W2": "openalex:W1"}),
+        integrity=ProbeIntegrity(capture_replay_match="matched"),
+    )
+
+    assert evaluation.baseline_candidate_gold_count == 1
+    assert evaluation.candidate_candidate_gold_count == 1
+    assert evaluation.baseline_top50_gold_count == 1
+    assert evaluation.candidate_top50_gold_count == 1
+
+
+def test_retrieved_but_unselected_gold_is_retained_not_new() -> None:
+    baseline = _baseline(
+        _record(
+            "q-1",
+            [_paper("openalex:W1")],
+            retrieved_paper_ids=["openalex:W1", "openalex:W2"],
+        )
+    )
+    projection = merge_probe_results(
+        baseline,
+        {"q-1": [_result([_paper("openalex:W2")])]},
+    )
+    gold = [
+        EvaluationQuery(
+            query_id="q-1",
+            query="q-1",
+            relevant_paper_ids=["openalex:W2"],
+        )
+    ]
+
+    evaluation = evaluate_probe(
+        baseline,
+        projection,
+        gold,
+        id_map=None,
+        integrity=ProbeIntegrity(capture_replay_match="matched"),
+    )
+
+    assert evaluation.baseline_candidate_gold_count == 1
+    assert evaluation.candidate_candidate_gold_count == 1
+    assert evaluation.newly_retrieved_count == 0
+    assert evaluation.prior_candidate_gold_retained is True
+
+
+def test_true_retrieval_gain_does_not_change_top50_without_ranking_gain() -> None:
+    selected = [_paper(f"openalex:W{index}") for index in range(1, 51)]
+    baseline = _baseline(_record("q-1", selected))
+    projection = merge_probe_results(
+        baseline,
+        {"q-1": [_result([_paper("openalex:W51")])]},
+    )
+    gold = [
+        EvaluationQuery(
+            query_id="q-1",
+            query="q-1",
+            relevant_paper_ids=["openalex:W51"],
+        )
+    ]
+
+    evaluation = evaluate_probe(
+        baseline,
+        projection,
+        gold,
+        id_map=None,
+        integrity=ProbeIntegrity(capture_replay_match="matched"),
+    )
+
+    assert evaluation.baseline_candidate_gold_count == 0
+    assert evaluation.candidate_candidate_gold_count == 1
+    assert evaluation.newly_retrieved_count == 1
+    assert evaluation.baseline_top50_gold_count == 0
+    assert evaluation.candidate_top50_gold_count == 0
+
+
 def test_invalid_request_failure_fails_gate_a_and_blocks_later_gates() -> None:
     baseline = _baseline(_record("q-1", [_paper("openalex:W1")]))
     projection = merge_probe_results(baseline, {"q-1": []})
@@ -194,6 +307,63 @@ def test_hash_mismatch_fails_gate_a_without_synthesizing_gate_b_or_c() -> None:
     assert evaluation.gate_a == "failed"
     assert evaluation.gate_b == "not_evaluated"
     assert evaluation.gate_c == "not_evaluated"
+
+
+def test_gate_a_compares_locked_probe_count_with_terminal_count() -> None:
+    records = [
+        _record(
+            f"q-{index:02d}",
+            [
+                _paper(f"openalex:W{index * 100 + offset + 1}")
+                for offset in range(50 if index < 30 else 47)
+            ],
+        )
+        for index in range(60)
+    ]
+    baseline = _baseline(*records)
+    projection = merge_probe_results(baseline, {})
+    gold = [
+        EvaluationQuery(
+            query_id=record.query_id,
+            query=record.query_id,
+            relevant_paper_ids=[record.baseline_results[0].data[0].canonical_id],
+        )
+        for record in records
+    ]
+
+    evaluation = evaluate_probe(
+        baseline,
+        projection,
+        gold,
+        id_map=None,
+        integrity=ProbeIntegrity(
+            capture_replay_match="matched",
+            locked_query_count=55,
+            terminal_count=55,
+        ),
+    )
+
+    assert evaluation.gate_a == "passed"
+
+
+def test_gate_a_rejects_incomplete_locked_probe_terminals() -> None:
+    baseline = _baseline(_record("q-1", [_paper("openalex:W1")]))
+    projection = merge_probe_results(baseline, {})
+    gold = [EvaluationQuery(query_id="q-1", query="q-1", relevant_paper_ids=["openalex:W1"])]
+
+    evaluation = evaluate_probe(
+        baseline,
+        projection,
+        gold,
+        id_map=None,
+        integrity=ProbeIntegrity(
+            capture_replay_match="matched",
+            locked_query_count=55,
+            terminal_count=54,
+        ),
+    )
+
+    assert evaluation.gate_a == "failed"
 
 
 def test_public_report_is_aggregate_only_and_finite() -> None:
@@ -235,4 +405,3 @@ def test_production_estimates_ignore_unscheduled_zero_usage_slots() -> None:
 
     assert estimates["search-1"].search_api_calls == 4
     assert estimates["search-1"].elapsed_ms == 12
-    calculate_production_estimates,

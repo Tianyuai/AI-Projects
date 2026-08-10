@@ -286,11 +286,170 @@ def test_audit_verifies_exact_openalex_location_from_sealed_snapshot(
     assert bundle.report.proof_counts == {"openalex_location_exact": 1, "arxiv_datacite_exact": 1}
 
 
+def _semantic_scholar_batch_identity(ids: list[str]) -> DependencyRequestIdentity:
+    return DependencyRequestIdentity.from_canonical_request(
+        dependency="semantic_scholar",
+        operation="batch",
+        method="POST",
+        endpoint="/paper/batch",
+        model_or_adapter="semantic-scholar-identity-v1",
+        canonical_request={"fields": "paperId,externalIds", "ids": ids},
+    )
+
+
+def _batched_semantic_scholar_fixture(
+    tmp_path: Path,
+) -> tuple[bytes, bytes, dict[str, object], Path]:
+    snapshot_root = tmp_path / "snapshots"
+    capture = DependencyCaptureStore(
+        snapshot_root,
+        clock=lambda: datetime(2026, 8, 10, tzinfo=UTC),
+    )
+    arxiv_ref = capture.stage_success(
+        _semantic_scholar_batch_identity(["ARXIV:2501.00001", "ARXIV:2501.00002"]),
+        response_bytes=json.dumps(
+            [
+                {
+                    "paperId": "S2-A",
+                    "externalIds": {"ArXiv": "2501.00001", "DOI": "10.1000/a"},
+                },
+                {
+                    "paperId": "S2-B",
+                    "externalIds": {"ArXiv": "2501.00002", "DOI": "10.1000/b"},
+                },
+            ],
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        safe_headers={},
+        captured_at=datetime(2026, 8, 10, tzinfo=UTC),
+    )
+    doi_ref = capture.stage_success(
+        _semantic_scholar_batch_identity(["DOI:10.1000/a", "DOI:10.1000/b"]),
+        response_bytes=json.dumps(
+            [
+                {
+                    "paperId": "S2-A",
+                    "externalIds": {"ArXiv": "2501.00001", "DOI": "10.1000/a"},
+                },
+                {
+                    "paperId": "S2-B",
+                    "externalIds": {"ArXiv": "2501.00002", "DOI": "10.1000/b"},
+                },
+            ],
+            separators=(",", ":"),
+        ).encode("utf-8"),
+        safe_headers={},
+        captured_at=datetime(2026, 8, 10, tzinfo=UTC),
+    )
+    capture.seal()
+    evidence: dict[str, object] = {
+        "schema_version": "identifier-identity-evidence-v1",
+        "scope": "dev",
+        "snapshot_manifest_sha256": capture.manifest_sha256,
+        "evidence_refs": [
+            {
+                "arxiv_id": "arxiv:2501.00001",
+                "alias": "doi:10.1000/a",
+                "semantic_scholar_arxiv_entry_id": arxiv_ref.entry_id,
+                "semantic_scholar_arxiv_item_index": 0,
+                "semantic_scholar_doi_entry_id": doi_ref.entry_id,
+                "semantic_scholar_doi_item_index": 0,
+            },
+            {
+                "arxiv_id": "arxiv:2501.00002",
+                "alias": "doi:10.1000/b",
+                "semantic_scholar_arxiv_entry_id": arxiv_ref.entry_id,
+                "semantic_scholar_arxiv_item_index": 1,
+                "semantic_scholar_doi_entry_id": doi_ref.entry_id,
+                "semantic_scholar_doi_item_index": 1,
+            },
+        ],
+    }
+    return (
+        (
+            b'{"arxiv:2501.00001":"doi:10.48550/arxiv.2501.00001",'
+            b'"doi:10.1000/a":"doi:10.48550/arxiv.2501.00001",'
+            b'"arxiv:2501.00002":"doi:10.48550/arxiv.2501.00002",'
+            b'"doi:10.1000/b":"doi:10.48550/arxiv.2501.00002"}\n'
+        ),
+        (
+            b'{"query_id":"q1","query":"example","relevant_paper_ids":'
+            b'["arxiv:2501.00001","arxiv:2501.00002"]}\n'
+        ),
+        evidence,
+        snapshot_root,
+    )
+
+
+def test_audit_selects_distinct_items_from_one_sealed_semantic_scholar_batch(
+    tmp_path: Path,
+) -> None:
+    map_bytes, gold_bytes, evidence, snapshot_root = _batched_semantic_scholar_fixture(
+        tmp_path
+    )
+
+    bundle = audit_identifier_map_semantics(
+        map_bytes=map_bytes,
+        gold_bytes=gold_bytes,
+        evidence_bytes=json.dumps(evidence, sort_keys=True).encode("utf-8"),
+        snapshot_root=snapshot_root,
+    )
+
+    semantic_relations = [
+        relation
+        for relation in bundle.private_relations
+        if relation.proof_kind == "semantic_scholar_exact"
+    ]
+    assert [(relation.arxiv_id, relation.alias) for relation in semantic_relations] == [
+        ("arxiv:2501.00001", "doi:10.1000/a"),
+        ("arxiv:2501.00002", "doi:10.1000/b"),
+    ]
+
+
+@pytest.mark.parametrize("item_index", [None, -1, 2, "1"])
+def test_audit_rejects_missing_or_invalid_semantic_scholar_batch_indexes(
+    tmp_path: Path, item_index: object
+) -> None:
+    map_bytes, gold_bytes, evidence, snapshot_root = _batched_semantic_scholar_fixture(
+        tmp_path
+    )
+    refs = evidence["evidence_refs"]
+    assert isinstance(refs, list)
+    first_ref = refs[0]
+    assert isinstance(first_ref, dict)
+    if item_index is None:
+        first_ref.pop("semantic_scholar_arxiv_item_index")
+    else:
+        first_ref["semantic_scholar_arxiv_item_index"] = item_index
+
+    with pytest.raises(ValueError) as error:
+        audit_identifier_map_semantics(
+            map_bytes=map_bytes,
+            gold_bytes=gold_bytes,
+            evidence_bytes=json.dumps(evidence, sort_keys=True).encode("utf-8"),
+            snapshot_root=snapshot_root,
+        )
+
+    assert str(error.value) == "identity snapshot is invalid"
+
+
 def test_privacy_scan_allows_aggregate_field_names() -> None:
     assert_public_json_safe(
         b'{"query_count":60,"query_identity_count":141,"doi_count":128,'
         b'"arxiv_count":141,"openalex_request_count":6}'
     )
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "semantic_scholar_arxiv_item_index",
+        "semantic_scholar_doi_item_index",
+    ],
+)
+def test_privacy_scan_rejects_private_semantic_scholar_item_indexes(field: str) -> None:
+    with pytest.raises(ValueError, match="private field"):
+        assert_public_json_safe(json.dumps({field: 0}).encode("utf-8"))
 
 
 def test_audit_rejects_tampered_raw_snapshot(tmp_path: Path) -> None:

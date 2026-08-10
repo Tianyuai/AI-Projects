@@ -38,6 +38,8 @@ _PRIVATE_FIELD_NAMES = frozenset(
         "evidence_refs",
         "semantic_scholar_arxiv_paper_id",
         "semantic_scholar_doi_paper_id",
+        "semantic_scholar_arxiv_item_index",
+        "semantic_scholar_doi_item_index",
         "semantic_scholar_arxiv_external_ids",
         "semantic_scholar_doi_external_ids",
         "openalex_arxiv_ids",
@@ -222,14 +224,32 @@ def _snapshot_observations(
             raise ValueError("identity evidence is invalid")
         s2_arxiv_entry_id = raw_ref.get("semantic_scholar_arxiv_entry_id")
         s2_doi_entry_id = raw_ref.get("semantic_scholar_doi_entry_id")
+        s2_arxiv_item_index = raw_ref.get("semantic_scholar_arxiv_item_index")
+        s2_doi_item_index = raw_ref.get("semantic_scholar_doi_item_index")
         openalex_entry_ids = raw_ref.get("openalex_entry_ids", [])
         if (
             (s2_arxiv_entry_id is not None and not isinstance(s2_arxiv_entry_id, str))
             or (s2_doi_entry_id is not None and not isinstance(s2_doi_entry_id, str))
+            or (
+                s2_arxiv_item_index is not None
+                and (
+                    type(s2_arxiv_item_index) is not int
+                    or s2_arxiv_item_index < 0
+                )
+            )
+            or (
+                s2_doi_item_index is not None
+                and (
+                    type(s2_doi_item_index) is not int
+                    or s2_doi_item_index < 0
+                )
+            )
+            or (s2_arxiv_entry_id is None and s2_arxiv_item_index is not None)
+            or (s2_doi_entry_id is None and s2_doi_item_index is not None)
             or not isinstance(openalex_entry_ids, list)
             or not all(isinstance(entry_id, str) for entry_id in openalex_entry_ids)
         ):
-            raise ValueError("identity evidence is invalid")
+            raise ValueError("identity snapshot is invalid")
         referenced_entry_ids = {
             entry_id
             for entry_id in (
@@ -243,10 +263,12 @@ def _snapshot_observations(
             raise ValueError("identity snapshot is invalid")
 
         arxiv_s2 = _decode_s2_response(
-            entry_bytes[s2_arxiv_entry_id] if s2_arxiv_entry_id is not None else None
+            entry_bytes[s2_arxiv_entry_id] if s2_arxiv_entry_id is not None else None,
+            s2_arxiv_item_index,
         )
         doi_s2 = _decode_s2_response(
-            entry_bytes[s2_doi_entry_id] if s2_doi_entry_id is not None else None
+            entry_bytes[s2_doi_entry_id] if s2_doi_entry_id is not None else None,
+            s2_doi_item_index,
         )
         openalex_ids: list[str] = []
         for entry_id in openalex_entry_ids:
@@ -280,7 +302,9 @@ def _snapshot_observations(
     return observations, _sha256(manifest_content)
 
 
-def _decode_s2_response(content: bytes | None) -> tuple[str | None, dict[str, str]]:
+def _decode_s2_response(
+    content: bytes | None, item_index: object = None
+) -> tuple[str | None, dict[str, str]]:
     if content is None:
         return None, {}
     try:
@@ -288,7 +312,15 @@ def _decode_s2_response(content: bytes | None) -> tuple[str | None, dict[str, st
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None, {}
     if isinstance(payload, list):
-        payload = payload[0] if len(payload) == 1 else None
+        if (
+            type(item_index) is not int
+            or item_index < 0
+            or item_index >= len(payload)
+        ):
+            raise ValueError("identity snapshot is invalid")
+        payload = payload[item_index]
+    elif isinstance(payload, dict) and item_index not in (None, 0):
+        raise ValueError("identity snapshot is invalid")
     if not isinstance(payload, dict):
         return None, {}
     paper_id = payload.get("paperId")

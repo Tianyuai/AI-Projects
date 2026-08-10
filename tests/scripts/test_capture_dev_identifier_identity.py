@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
@@ -59,11 +60,15 @@ class RecordingTransport:
         doi_response: bytes = S2_DOI_BYTES,
         openalex_response: bytes = OPENALEX_BYTES,
         statuses: Mapping[str, list[int]] | None = None,
+        request_errors: Mapping[str, list[BaseException]] | None = None,
     ) -> None:
         self.arxiv_response = arxiv_response
         self.doi_response = doi_response
         self.openalex_response = openalex_response
         self.statuses = {key: list(values) for key, values in (statuses or {}).items()}
+        self.request_errors = {
+            key: list(values) for key, values in (request_errors or {}).items()
+        }
         self.semantic_scholar_batches: list[list[str]] = []
         self.semantic_scholar_requests: list[tuple[dict[str, str], dict[str, object]]] = []
         self.openalex_ids: list[str] = []
@@ -99,6 +104,9 @@ class RecordingTransport:
             self.openalex_ids.append(identifier)
             self.openalex_query_param_names.append(sorted((query_params or {}).keys()))
             content = self.openalex_response
+        route_errors = self.request_errors.get(route, [])
+        if route_errors:
+            raise route_errors.pop(0)
         route_statuses = self.statuses.get(route, [])
         status_code = route_statuses.pop(0) if route_statuses else 200
         if status_code >= 400:
@@ -586,8 +594,87 @@ def test_terminal_http_failure_has_value_free_error_and_no_reserved_receipts(
     with pytest.raises(ValueError) as error:
         capture_identity(lock, runtime)
 
-    assert str(error.value) == "semantic scholar request failed"
+    assert str(error.value) == "semantic scholar request failed: server_error"
     assert "10.9999" not in str(error.value)
+    assert _ledger_states(runtime.ledger_path) == ["failed", "failed"]
+
+
+@pytest.mark.parametrize(
+    ("statuses", "request_errors", "category"),
+    [
+        ([429, 429], None, "rate_limited"),
+        ([400, 404], None, "client_error"),
+        ([500, 503], None, "server_error"),
+        ([300, 304], None, "unexpected_status"),
+        (
+            None,
+            [
+                httpx.TimeoutException(
+                    "private timeout detail",
+                    request=httpx.Request("POST", "https://private.example/secret"),
+                ),
+                httpx.TimeoutException(
+                    "different private timeout detail",
+                    request=httpx.Request("POST", "https://private.example/secret"),
+                ),
+            ],
+            "timeout",
+        ),
+        (
+            None,
+            [
+                httpx.ConnectError(
+                    "private network detail",
+                    request=httpx.Request("POST", "https://private.example/secret"),
+                ),
+                httpx.ConnectError(
+                    "different private network detail",
+                    request=httpx.Request("POST", "https://private.example/secret"),
+                ),
+            ],
+            "network_error",
+        ),
+        (None, [RuntimeError("private provider text"), RuntimeError("secret")], "network_error"),
+    ],
+    ids=[
+        "429",
+        "other-4xx",
+        "5xx",
+        "other-non-2xx",
+        "timeout",
+        "request-error",
+        "generic-exception",
+    ],
+)
+def test_terminal_request_failure_raises_only_fixed_value_free_category(
+    tmp_path: Path,
+    statuses: list[int] | None,
+    request_errors: list[BaseException] | None,
+    category: str,
+) -> None:
+    transport = RecordingTransport(
+        statuses={"s2-arxiv": statuses} if statuses is not None else None,
+        request_errors=(
+            {"s2-arxiv": request_errors} if request_errors is not None else None
+        ),
+    )
+    lock, runtime, _ = _lock_and_runtime(tmp_path, transport, include_openalex=False)
+
+    with pytest.raises(ValueError) as error:
+        capture_identity(lock, runtime)
+
+    assert str(error.value) == f"semantic scholar request failed: {category}"
+    assert _ledger_states(runtime.ledger_path) == ["failed", "failed"]
+
+
+def test_exhausted_retry_raises_final_attempt_category(tmp_path: Path) -> None:
+    transport = RecordingTransport(statuses={"s2-arxiv": [500, 429]})
+    lock, runtime, _ = _lock_and_runtime(tmp_path, transport, include_openalex=False)
+
+    with pytest.raises(ValueError) as error:
+        capture_identity(lock, runtime)
+
+    assert str(error.value) == "semantic scholar request failed: rate_limited"
     assert _ledger_states(runtime.ledger_path) == ["failed", "failed"]
 
 

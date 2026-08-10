@@ -55,6 +55,14 @@ _SAFE_RESPONSE_HEADERS = frozenset(
         "x-ratelimit-reset",
     }
 )
+RequestFailureCategory = Literal[
+    "timeout",
+    "network_error",
+    "rate_limited",
+    "client_error",
+    "server_error",
+    "unexpected_status",
+]
 
 
 class IdentifierInventory(DomainModel):
@@ -459,6 +467,22 @@ def _terminalize(
         ledger.settle(reservation, actual)
 
 
+def _exception_failure_category(error: BaseException) -> RequestFailureCategory:
+    if isinstance(error, httpx.TimeoutException):
+        return "timeout"
+    return "network_error"
+
+
+def _status_failure_category(status_code: int) -> RequestFailureCategory:
+    if status_code == 429:
+        return "rate_limited"
+    if 400 <= status_code < 500:
+        return "client_error"
+    if 500 <= status_code < 600:
+        return "server_error"
+    return "unexpected_status"
+
+
 def _request_json(
     *,
     provider: Literal["semantic_scholar", "openalex"],
@@ -509,15 +533,17 @@ def _request_json(
                 query_params=query_params,
                 json_body=json_body,
             )
-        except BaseException:
+        except BaseException as error:
             _terminalize(ledger, reservation, failed=True)
             if retry_index == lock.retry_max:
-                raise ValueError(error_message) from None
+                category = _exception_failure_category(error)
+                raise ValueError(f"{error_message}: {category}") from None
             continue
         if not 200 <= response.status_code < 300:
             _terminalize(ledger, reservation, failed=True)
             if retry_index == lock.retry_max:
-                raise ValueError(error_message)
+                category = _status_failure_category(response.status_code)
+                raise ValueError(f"{error_message}: {category}")
             continue
         try:
             payload = json.loads(response.content)

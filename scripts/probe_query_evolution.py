@@ -16,7 +16,7 @@ from typing import Annotated, Literal, cast
 
 import httpx
 from dotenv import dotenv_values
-from pydantic import Field, StringConstraints
+from pydantic import Field, StringConstraints, ValidationError
 
 from paper_search.control.budget import HardBudgetController
 from paper_search.control.ledger import (
@@ -93,6 +93,10 @@ SafeRunId = Annotated[
 
 
 class LiveNotAuthorized(RuntimeError):
+    pass
+
+
+class CanaryAccountingError(RuntimeError):
     pass
 
 
@@ -440,18 +444,22 @@ def load_probe_lock(path: Path) -> ProbeLock:
     return lock
 
 
-def _load_locked_prompt(lock: ProbeLock) -> tuple[bytes, str]:
-    path = (ROOT / lock.prompt.path).resolve(strict=True)
+def _load_prompt_binding(prompt: ProbePromptBinding) -> tuple[bytes, str]:
+    path = (ROOT / prompt.path).resolve(strict=True)
     root = ROOT.resolve(strict=True)
     if not path.is_file() or not path.is_relative_to(root):
         raise ValueError("locked prompt path is invalid")
     prompt_bytes = path.read_bytes()
-    if _sha256_bytes(prompt_bytes) != lock.prompt.sha256:
+    if _sha256_bytes(prompt_bytes) != prompt.sha256:
         raise ValueError("locked prompt hash mismatch")
     artifact = load_prompt_artifact(prompt_bytes)
-    if artifact.name != lock.prompt.name or artifact.version != lock.prompt.version:
+    if artifact.name != prompt.name or artifact.version != prompt.version:
         raise ValueError("locked prompt identity mismatch")
     return prompt_bytes, render_prompt_system_message(prompt_bytes)
+
+
+def _load_locked_prompt(lock: ProbeLock | CanaryLock) -> tuple[bytes, str]:
+    return _load_prompt_binding(lock.prompt)
 
 
 def _derive_run_directory(lock: ProbeLock) -> Path:
@@ -463,6 +471,34 @@ def _derive_run_directory(lock: ProbeLock) -> Path:
     if not run_dir.is_relative_to(root):
         raise ValueError("expected run directory escapes root")
     return run_dir
+
+
+def _derive_canary_run_directory_values(
+    canary_run_id: str,
+    expected_run_directory: str,
+) -> Path:
+    root = ROOT.resolve(strict=True)
+    expected = f"runs/_diag_query_evolution_{canary_run_id}"
+    if expected_run_directory != expected:
+        raise ValueError("expected run directory mismatch")
+    run_dir = (root / expected).resolve()
+    if not run_dir.is_relative_to(root):
+        raise ValueError("expected run directory escapes root")
+    return run_dir
+
+
+def _derive_canary_run_directory(lock: CanaryLock) -> Path:
+    return _derive_canary_run_directory_values(
+        lock.canary_run_id,
+        lock.expected_run_directory,
+    )
+
+
+def _json_object(path: Path) -> dict[str, object]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must be a JSON object")
+    return payload
 
 
 def reserve_probe_operations(lock: ProbeLock, ledger: SQLiteBudgetLedger) -> ProbeReservations:
@@ -726,19 +762,31 @@ def preflight_canary(
     return lock
 
 
-def _load_secrets(env_file: Path) -> tuple[str, tuple[str, ...], str | None]:
+def load_canary_lock(path: Path) -> CanaryLock:
+    payload = _json_object(path)
+    lock = CanaryLock.model_validate(payload)
+    if lock.lock_sha256 != _self_hash(payload):
+        raise ValueError("canary lock self-hash mismatch")
+    return lock
+
+
+def _load_llm_secret(env_file: Path) -> str:
     values = dotenv_values(env_file)
     llm_key = values.get("LLM_API_KEY") or os.environ.get("LLM_API_KEY")
-    openalex_keys = [
-        values.get(name) or os.environ.get(name)
-        for name in ("OPENALEX_API_KEY", *[f"OPENALEX_API_KEY_{index}" for index in range(2, 8)])
-    ]
-    keys = tuple(value for value in openalex_keys if value)
     if not llm_key:
         raise ValueError("LLM_API_KEY is missing from the authorized env file")
+    return llm_key
+
+
+def _load_openalex_secrets(env_file: Path) -> tuple[tuple[str, ...], str | None]:
+    values = dotenv_values(env_file)
+    names = ("OPENALEX_API_KEY", *(f"OPENALEX_API_KEY_{index}" for index in range(2, 8)))
+    keys = tuple(
+        value for name in names if (value := values.get(name) or os.environ.get(name))
+    )
     if not keys:
         raise ValueError("OPENALEX_API_KEY is missing from the authorized env file")
-    return llm_key, keys, values.get("OPENALEX_MAILTO") or os.environ.get("OPENALEX_MAILTO")
+    return keys, values.get("OPENALEX_MAILTO") or os.environ.get("OPENALEX_MAILTO")
 
 
 def _settle_ledger(
@@ -753,6 +801,407 @@ def _settle_ledger(
 def _fail_ledger(ledger: SQLiteBudgetLedger, reservation: LedgerReservation) -> None:
     ledger.fail(reservation, UsageActual(cost_cny=Decimal("0")))
 
+
+def _private_operation_id(query_id: str, operation: str) -> str:
+    return f"{hashlib.sha256(query_id.encode('utf-8')).hexdigest()[:16]}:{operation}"
+
+
+def reserve_canary_operations(
+    lock: CanaryLock,
+    ledger: SQLiteBudgetLedger,
+) -> dict[str, LedgerReservation]:
+    expected = {
+        query_id: _private_operation_id(query_id, "evolve")
+        for query_id in lock.query_ids
+    }
+    try:
+        receipts = ledger.report(lock.canary_run_id).receipts
+    except LedgerReservationError:
+        receipts = []
+    if receipts:
+        if (
+            len(receipts) == len(expected)
+            and all(receipt.state == "reserved" and receipt.actual is None for receipt in receipts)
+            and {receipt.query_id for receipt in receipts} == set(expected.values())
+        ):
+            restored: dict[str, LedgerReservation] = {}
+            by_private = {value: key for key, value in expected.items()}
+            for receipt in receipts:
+                restored[by_private[receipt.query_id]] = LedgerReservation(
+                    reservation_id=receipt.reservation_id,
+                    run_id=receipt.run_id,
+                    query_id=receipt.query_id,
+                    estimate=receipt.estimate,
+                    state="reserved",
+                )
+            return restored
+        raise LedgerReservationError("canary ledger contains an incomplete or terminal reservation set")
+    created: dict[str, LedgerReservation] = {}
+    try:
+        for query_id in lock.query_ids:
+            created[query_id] = ledger.reserve(
+                run_id=lock.canary_run_id,
+                query_id=expected[query_id],
+                estimate=_canary_evolve_estimate(lock),
+                run_cap_cny=DEV_RUN_CAP_CNY,
+            )
+    except BaseException:
+        for reservation in created.values():
+            ledger.fail(reservation, UsageActual(cost_cny="0"))
+        raise
+    return created
+
+
+def _zero_usage() -> UsageActual:
+    return UsageActual(cost_cny=Decimal("0"))
+
+
+def _canary_evolve_estimate(lock: CanaryLock) -> UsageEstimate:
+    return UsageEstimate.model_validate(
+        {**lock.evolve_estimate.model_dump(mode="python"), "cost_cny": "0.01"}
+    )
+
+
+def _sum_usage(values: Sequence[UsageActual]) -> UsageActual:
+    total = UsageActual(cost_cny=Decimal("0"))
+    for value in values:
+        left = Decimal("0") if total.cost_cny is None else Decimal(total.cost_cny)
+        right = Decimal("0") if value.cost_cny is None else Decimal(value.cost_cny)
+        total = UsageActual(
+            search_api_calls=total.search_api_calls + value.search_api_calls,
+            llm_calls=total.llm_calls + value.llm_calls,
+            input_tokens=total.input_tokens + value.input_tokens,
+            output_tokens=total.output_tokens + value.output_tokens,
+            elapsed_ms=total.elapsed_ms + value.elapsed_ms,
+            cost_cny=left + right,
+        )
+    return total
+
+
+def _canary_terminal_counts(
+    outcomes: Sequence[Mapping[str, object]],
+) -> dict[str, int]:
+    generated = sum(1 for outcome in outcomes if outcome.get("terminal") == "generated")
+    no_op = sum(1 for outcome in outcomes if outcome.get("terminal") == "no_op")
+    return {
+        "generated": generated,
+        "no_op": no_op,
+        "failed": len(outcomes) - generated - no_op,
+    }
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(content)
+    temporary.replace(path)
+
+
+def _write_jsonl(path: Path, records: Sequence[Mapping[str, object]]) -> None:
+    content = b"".join(_canonical_json(record) for record in records)
+    _atomic_write_bytes(path, content)
+
+
+def _write_canary_result(
+    *,
+    run_dir: Path,
+    reason: CanaryReason,
+    promoted: bool,
+    outcomes: Sequence[Mapping[str, object]],
+    aggregate_usage: UsageActual,
+    snapshot_manifest_sha256: str | None,
+    snapshot_set_id: str | None,
+    ledger_checkpoint_sha256: str,
+) -> None:
+    payload = {
+        "schema_version": "query-evolution-contract-canary-result-v1",
+        "reason": reason,
+        "promoted": promoted,
+        "terminal_counts": _canary_terminal_counts(outcomes),
+        "aggregate_usage": aggregate_usage.model_dump(mode="json"),
+        "snapshot_manifest_sha256": snapshot_manifest_sha256,
+        "snapshot_set_id": snapshot_set_id,
+        "ledger_checkpoint_sha256": ledger_checkpoint_sha256,
+    }
+    _atomic_write_bytes(
+        run_dir / "result.json",
+        _canonical_json(payload),
+    )
+
+
+def _ledger_checkpoint_sha256(ledger_path: Path) -> str:
+    if ledger_path.exists():
+        ledger = SQLiteBudgetLedger(
+            ledger_path,
+            reservation_ttl_seconds=PROBE_LEDGER_TTL_SECONDS,
+        )
+        return ledger.project_checkpoint()[1]
+    return _sha256_bytes(b"")
+
+
+def _verify_canary_source_hashes(lock: CanaryLock) -> dict[str, dict[str, object]]:
+    run_dir = _source_run_directory(lock.source_run_id)
+    business_path = run_dir / "business-results.jsonl"
+    executions_path = run_dir / "executions.jsonl"
+    run_path = run_dir / "run.json"
+    snapshot_path = run_dir / "snapshot-manifest.json"
+    if not snapshot_path.exists():
+        snapshot_path = run_dir / "snapshots" / "snapshot-manifest.json"
+    expected = {
+        "business_results_sha256": business_path,
+        "executions_sha256": executions_path,
+        "run_sha256": run_path,
+        "snapshot_manifest_sha256": snapshot_path,
+    }
+    for key, path in expected.items():
+        locked = lock.source_hashes.get(key)
+        if locked is None:
+            raise ValueError(f"canary lock is missing {key}")
+        if _sha256_file(path) != locked:
+            raise ValueError("source hash mismatch")
+    business_by_query = {
+        record["query_id"]: record
+        for record in _jsonl_objects(business_path)
+        if isinstance(record.get("query_id"), str)
+    }
+    executions_by_query = {
+        record["query_id"]: record
+        for record in _jsonl_objects(executions_path)
+        if isinstance(record.get("query_id"), str)
+    }
+    raw_records: dict[str, dict[str, object]] = {}
+    for query_id in lock.query_ids:
+        if query_id not in business_by_query:
+            raise ValueError(f"frozen business result query is missing for {query_id}")
+        raw_records[query_id] = {
+            "business": business_by_query[query_id],
+            "execution": executions_by_query.get(query_id, {}),
+        }
+    return raw_records
+
+
+def _classify_canary_outcomes(outcomes: Sequence[Mapping[str, object]]) -> CanaryReason:
+    terminals = {outcome.get("terminal") for outcome in outcomes}
+    if "integrity_failure" in terminals:
+        return "contract_canary_failed"
+    if "dependency_failure" in terminals:
+        return "canary_dependency_failed"
+    return "passed"
+
+
+def _snapshot_refs_in_manifest(
+    outcomes: Sequence[Mapping[str, object]],
+    manifest_entry_ids: set[str],
+) -> bool:
+    for outcome in outcomes:
+        refs = outcome.get("snapshot_refs")
+        if not isinstance(refs, list) or not refs:
+            return False
+        for ref in refs:
+            if not isinstance(ref, Mapping):
+                return False
+            entry_id = ref.get("entry_id")
+            if not isinstance(entry_id, str) or entry_id not in manifest_entry_ids:
+                return False
+    return True
+
+
+def _canary_outcome_record(
+    query_id: str,
+    result: object,
+) -> dict[str, object]:
+    if not hasattr(result, "status") or not hasattr(result, "snapshot_refs"):
+        raise TypeError("unexpected canary result type")
+    snapshot_refs = getattr(result, "snapshot_refs")
+    proposal = getattr(result, "proposal")
+    diagnostics = getattr(result, "diagnostics")
+    usage = getattr(result, "usage")
+    return {
+        "query_id": query_id,
+        "terminal": getattr(result, "status"),
+        "proposal": _comparable(proposal),
+        "diagnostics": [_comparable(item) for item in diagnostics],
+        "snapshot_refs": [_comparable(item) for item in snapshot_refs],
+        "usage": _comparable(usage),
+    }
+
+
+async def _run_canary_batch(
+    *,
+    lock: CanaryLock,
+    llm_key: str,
+    raw_records: Mapping[str, Mapping[str, object]],
+    prompt_instructions: str,
+    capture_store: DependencyCaptureStore,
+    ledger: SQLiteBudgetLedger,
+    persistent: Mapping[str, LedgerReservation],
+    outcomes: list[dict[str, object]],
+    usages: list[UsageActual],
+) -> None:
+    contexts = {
+        query_id: build_probe_context(query_id, raw_records[query_id])
+        for query_id in lock.query_ids
+    }
+    policy = load_pricing_policy(DEFAULT_PRICING_POLICY)
+    pricer = ActualCostPricer(policy)
+    llm_http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=30.0))
+    try:
+        client = OpenAICompatibleLLMClient(
+            client=llm_http,
+            base_url=lock.endpoint,
+            model=lock.model_id,
+            api_key=llm_key,
+            prompt_version=lock.prompt.version,
+        )
+        async with asyncio.timeout(lock.limits.global_timeout_seconds):
+            for query_id in lock.query_ids:
+                estimate = _canary_evolve_estimate(lock)
+                controller = _controller("evolve", estimate)
+                reservation = controller.reserve(
+                    "query-evolution",
+                    estimate,
+                )
+                generator = QueryEvolutionGenerator(
+                    analyzer=LiveCaptureLLMAnalyzer(
+                        client=client,
+                        capture_store=capture_store,
+                        pricer=pricer,
+                        controller=HardBudgetSettlementAdapter(controller),
+                        prompt_artifact_sha256=lock.prompt.sha256,
+                        prompt_instructions=prompt_instructions,
+                    )
+                )
+                result = await generator.generate(contexts[query_id], reservation)
+                outcome = _canary_outcome_record(query_id, result)
+                outcomes.append(outcome)
+                usages.append(result.usage)
+                try:
+                    _settle_ledger(ledger, persistent[query_id], result.usage)
+                except Exception as error:
+                    raise CanaryAccountingError("canary ledger settlement failed") from error
+    finally:
+        await llm_http.aclose()
+
+
+def run_canary(lock_path: Path, runtime: ProbeRuntime) -> None:
+    if not runtime.allow_live:
+        raise LiveNotAuthorized("canary-run --lock requires --allow-live")
+    payload = _json_object(lock_path)
+    run_dir = _derive_canary_run_directory_values(
+        str(payload.get("canary_run_id", "")),
+        str(payload.get("expected_run_directory", "")),
+    )
+    if run_dir.exists():
+        raise FileExistsError(f"canary output already exists: {run_dir}")
+    run_dir.mkdir(parents=True)
+    outcomes: list[dict[str, object]] = []
+    usages: list[UsageActual] = []
+    capture_store: DependencyCaptureStore | None = None
+    snapshot_manifest_sha256: str | None = None
+    snapshot_set_id: str | None = None
+    reason: CanaryReason = "canary_preflight_failed"
+    promoted = False
+    try:
+        try:
+            lock = load_canary_lock(lock_path)
+            if lock.probe_code_sha256 != _probe_code_sha256():
+                raise ValueError("probe code hash mismatch")
+            if lock.limits != CanaryLimits():
+                raise ValueError("canary limits mismatch")
+            if _ledger_checkpoint_sha256(runtime.ledger_path) != lock.ledger_checkpoint_sha256:
+                raise ValueError("ledger checkpoint mismatch")
+            _, prompt_instructions = _load_locked_prompt(lock)
+            raw_records = _verify_canary_source_hashes(lock)
+            llm_key = _load_llm_secret(runtime.env_file)
+        except ValidationError:
+            reason = "canary_preflight_failed"
+            raise
+        except ValueError as error:
+            reason = (
+                "prompt_binding_failed"
+                if "prompt" in str(error)
+                else "canary_preflight_failed"
+            )
+            raise
+
+        _atomic_write_bytes(run_dir / "canary.lock.json", lock_path.read_bytes())
+        capture_root = run_dir / "snapshots"
+        capture_root.mkdir(parents=True, exist_ok=True)
+        capture_store = DependencyCaptureStore(capture_root)
+        ledger = SQLiteBudgetLedger(
+            runtime.ledger_path,
+            reservation_ttl_seconds=PROBE_LEDGER_TTL_SECONDS,
+        )
+        try:
+            persistent = reserve_canary_operations(lock, ledger)
+        except LedgerReservationError:
+            reason = "canary_accounting_failed"
+            raise
+        try:
+            asyncio.run(
+                _run_canary_batch(
+                    lock=lock,
+                    llm_key=llm_key,
+                    raw_records=raw_records,
+                    prompt_instructions=prompt_instructions,
+                    capture_store=capture_store,
+                    ledger=ledger,
+                    persistent=persistent,
+                    outcomes=outcomes,
+                    usages=usages,
+                )
+            )
+        except TimeoutError:
+            reason = "canary_cancelled"
+        except CanaryAccountingError:
+            reason = "canary_accounting_failed"
+        else:
+            reason = _classify_canary_outcomes(outcomes)
+        _write_jsonl(run_dir / "outcomes.jsonl", outcomes)
+        if capture_store is not None:
+            try:
+                manifest = capture_store.seal()
+            except OSError:
+                reason = "canary_snapshot_failed"
+            else:
+                snapshot_manifest_sha256 = capture_store.manifest_sha256
+                snapshot_set_id = manifest.snapshot_set_id
+                manifest_entry_ids = {entry.entry_id for entry in manifest.entries}
+                report = ledger.report(lock.canary_run_id)
+                receipts = report.receipts
+                promoted = (
+                    reason == "passed"
+                    and len(outcomes) == lock.limits.query_count
+                    and all(
+                        outcome.get("terminal") in {"generated", "no_op"}
+                        for outcome in outcomes
+                    )
+                    and len(receipts) == lock.limits.query_count
+                    and all(
+                        receipt.state in {"settled", "failed"} and receipt.actual is not None
+                        for receipt in receipts
+                    )
+                    and _snapshot_refs_in_manifest(outcomes, manifest_entry_ids)
+                )
+                if reason == "passed" and not promoted:
+                    reason = (
+                        "canary_snapshot_failed"
+                        if not _snapshot_refs_in_manifest(outcomes, manifest_entry_ids)
+                        else "canary_accounting_failed"
+                    )
+    except (ValidationError, ValueError, LedgerReservationError):
+        pass
+    finally:
+        _write_canary_result(
+            run_dir=run_dir,
+            reason=reason,
+            promoted=promoted,
+            outcomes=outcomes,
+            aggregate_usage=_sum_usage(usages),
+            snapshot_manifest_sha256=snapshot_manifest_sha256,
+            snapshot_set_id=snapshot_set_id,
+            ledger_checkpoint_sha256=_ledger_checkpoint_sha256(runtime.ledger_path),
+        )
 
 def _comparable(value: object) -> object:
     if isinstance(value, ProviderResult):
@@ -810,7 +1259,8 @@ async def _run_live_probe(
 ) -> None:
     if runtime.ledger_path.resolve() == run_dir.resolve():
         raise ValueError("ledger path must not be the probe output directory")
-    llm_key, openalex_keys, openalex_mailto = _load_secrets(runtime.env_file)
+    llm_key = _load_llm_secret(runtime.env_file)
+    openalex_keys, openalex_mailto = _load_openalex_secrets(runtime.env_file)
     frozen_inputs, raw_records = _frozen_inputs(lock)
     business_by_id: dict[str, Mapping[str, object]] = {
         query_id: cast(Mapping[str, object], raw_records[query_id]["business"])
@@ -1054,6 +1504,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--allow-live", action="store_true")
     run.add_argument("--env-file", type=Path, default=ProbeRuntime.model_fields["env_file"].default)
     run.add_argument("--ledger", type=Path, default=ProbeRuntime.model_fields["ledger_path"].default)
+    canary_run = subparsers.add_parser("canary-run")
+    canary_run.add_argument("--lock", type=Path, required=True)
+    canary_run.add_argument("--allow-live", action="store_true")
+    canary_run.add_argument("--env-file", type=Path, default=ProbeRuntime.model_fields["env_file"].default)
+    canary_run.add_argument("--ledger", type=Path, default=ProbeRuntime.model_fields["ledger_path"].default)
     return parser
 
 
@@ -1084,6 +1539,22 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_path=args.out,
             )
             return 0
+        if command == "canary-run":
+            run_canary(
+                args.lock,
+                ProbeRuntime(
+                    allow_live=args.allow_live,
+                    env_file=args.env_file,
+                    ledger_path=args.ledger,
+                ),
+            )
+            payload = _json_object(args.lock)
+            run_dir = _derive_canary_run_directory_values(
+                str(payload.get("canary_run_id", "")),
+                str(payload.get("expected_run_directory", "")),
+            )
+            result = _json_object(run_dir / "result.json")
+            return 0 if result.get("promoted") is True else 1
         run_probe(
             args.lock,
             ProbeRuntime(

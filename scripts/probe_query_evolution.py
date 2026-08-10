@@ -413,6 +413,17 @@ def _load_locked_prompt(lock: ProbeLock) -> tuple[bytes, str]:
     return prompt_bytes, render_prompt_system_message(prompt_bytes)
 
 
+def _derive_run_directory(lock: ProbeLock) -> Path:
+    root = ROOT.resolve(strict=True)
+    expected_run_directory = f"runs/_diag_query_evolution_{lock.probe_run_id}"
+    if lock.expected_run_directory != expected_run_directory:
+        raise ValueError("expected run directory mismatch")
+    run_dir = (root / expected_run_directory).resolve()
+    if not run_dir.is_relative_to(root):
+        raise ValueError("expected run directory escapes root")
+    return run_dir
+
+
 def reserve_probe_operations(lock: ProbeLock, ledger: SQLiteBudgetLedger) -> ProbeReservations:
     """Reserve every logical slot before any future live request."""
     expected: dict[tuple[str, str], str] = {
@@ -625,7 +636,7 @@ async def _run_live_probe(
     prompt_sha: str,
     prompt_instructions: str,
 ) -> None:
-    if runtime.ledger_path.resolve() == Path(lock.expected_run_directory).resolve():
+    if runtime.ledger_path.resolve() == run_dir.resolve():
         raise ValueError("ledger path must not be the probe output directory")
     llm_key, openalex_keys, openalex_mailto = _load_secrets(runtime.env_file)
     frozen_inputs, raw_records = _frozen_inputs(lock)
@@ -832,11 +843,11 @@ def run_probe(lock_path: Path, runtime: ProbeRuntime) -> None:
     if lock.probe_code_sha256 != _probe_code_sha256():
         raise ValueError("probe code hash mismatch")
     _, prompt_instructions = _load_locked_prompt(lock)
+    run_dir = _derive_run_directory(lock)
     if runtime.ledger_path.exists():
         ledger = SQLiteBudgetLedger(runtime.ledger_path, reservation_ttl_seconds=PROBE_LEDGER_TTL_SECONDS)
         if ledger.project_checkpoint()[1] != lock.ledger_checkpoint_sha256:
             raise ValueError("ledger checkpoint mismatch")
-    run_dir = ROOT / lock.expected_run_directory
     lock_bytes = lock_path.read_bytes()
     if run_dir.exists():
         if not _can_resume_partial_run(run_dir):

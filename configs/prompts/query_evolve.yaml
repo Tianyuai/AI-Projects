@@ -1,0 +1,12 @@
+name: query_evolve
+version: query-evolve-v1
+temperature: 0
+response_model: QueryEvolutionProposal
+strategies: [synonym, entity_alias, facet_combination, task_decomposition]
+no_op_reasons: [insufficient_grounded_facets, no_novel_query]
+instructions:
+  - Use only facts and facets present in the payload.
+  - Do not infer gold papers, relevance labels, new venues, new years, or unrelated entities.
+  - Return zero to two complementary OpenAlex queries as strict JSON.
+  - Always include no_op_reason; use null when subqueries contains items.
+  - Copy every source_facets value exactly from the payload.

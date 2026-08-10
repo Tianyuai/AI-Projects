@@ -15,6 +15,7 @@ from paper_search.domain.models import BudgetReservation, ProviderResult, UsageE
 from paper_search.retrieval.openalex import (
     OPENALEX_SELECT_FIELDS,
     OpenAlexProvider,
+    canonicalize_openalex_search_query,
     decode_openalex_page,
 )
 from paper_search.storage.cache import SQLiteResponseCache
@@ -113,6 +114,13 @@ def test_search_removes_openalex_wildcards_and_collapses_whitespace(
     )
 
     assert seen[0].url.params["search"] == "graph retrieval methods"
+
+
+def test_public_canonicalizer_preserves_openalex_query_normalization() -> None:
+    assert (
+        canonicalize_openalex_search_query("  graph?   retrieval* methods  ")
+        == "graph retrieval methods"
+    )
 
 
 def test_search_includes_mailto_when_explicitly_configured(

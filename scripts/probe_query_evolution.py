@@ -22,6 +22,9 @@ DEFAULT_RUN = ROOT / "runs" / "dev-20260809T061903Z-9bd861e90299"
 DEFAULT_GOLD = ROOT / "data" / "dev" / "gold.jsonl"
 DEFAULT_ID_MAP = ROOT / "data" / "identifier-map.json"
 DEFAULT_AVAILABILITY = ROOT / "docs" / "evidence" / "gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json"
+DEFAULT_PROMPT_CONFIG = ROOT / "configs" / "prompts" / "query_evolve.yaml"
+DEFAULT_BUDGET_CONFIG = ROOT / "configs" / "budget_balanced.yaml"
+DEFAULT_PRICING_POLICY = ROOT / "data" / "annotation_work" / "pricing_v1.yaml"
 DEFAULT_LOCK = ROOT / "runs" / "_diag_query_evolution_preflight" / "probe.lock.json"
 EXPECTED_AVAILABILITY_SHA256 = "sha256:3f445486d5cf590f3f11a51930153a45916023880e856def379e0f01d053ad04"
 PROBE_GLOBAL_TIMEOUT_SECONDS = 3600
@@ -357,6 +360,9 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--gold", type=Path, default=DEFAULT_GOLD)
     preflight.add_argument("--id-map", type=Path, default=DEFAULT_ID_MAP)
     preflight.add_argument("--availability", type=Path, default=DEFAULT_AVAILABILITY)
+    preflight.add_argument("--prompt-config", type=Path, default=DEFAULT_PROMPT_CONFIG)
+    preflight.add_argument("--budget-config", type=Path, default=DEFAULT_BUDGET_CONFIG)
+    preflight.add_argument("--pricing-policy", type=Path, default=DEFAULT_PRICING_POLICY)
     preflight.add_argument("--ledger", type=Path, default=ROOT / "data" / "budget_ledger.sqlite3")
     preflight.add_argument("--out", type=Path, default=DEFAULT_LOCK)
     run = subparsers.add_parser("run")
@@ -370,6 +376,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = args.command or "preflight"
     try:
         if command == "preflight":
+            for config_path in (args.prompt_config, args.budget_config, args.pricing_policy):
+                if not config_path.is_file():
+                    raise FileNotFoundError(f"preflight config missing: {config_path}")
             preflight_probe(
                 frozen_run=args.run,
                 gold_path=args.gold,

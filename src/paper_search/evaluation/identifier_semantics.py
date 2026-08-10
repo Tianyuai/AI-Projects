@@ -29,6 +29,7 @@ ProofKind = Literal[
 ]
 _S2_ARXIV_ADAPTER = "semantic-scholar-identity-arxiv-v1"
 _S2_DOI_ADAPTER = "semantic-scholar-identity-doi-v1"
+_OPENALEX_ADAPTER = "openalex-identity-v1"
 
 _PRIVATE_FIELD_NAMES = frozenset(
     {
@@ -298,9 +299,25 @@ def _snapshot_observations(
             entry_bytes[s2_doi_entry_id] if s2_doi_entry_id is not None else None,
             s2_doi_item_index,
         )
+        s2_arxiv_complete = s2_arxiv_entry_id is not None and _s2_arxiv_item_matches(
+            arxiv_s2[1],
+            arxiv_id=arxiv_id,
+            alias=alias,
+        )
+        s2_doi_complete = s2_doi_entry_id is not None and _s2_doi_item_matches(
+            doi_s2[1],
+            alias=alias,
+        )
         openalex_ids: list[str] = []
         for entry_id in openalex_entry_ids:
-            openalex_ids.extend(_decode_openalex_arxiv_ids(entry_bytes.get(entry_id)))
+            if not _valid_openalex_role(entry_requests.get(entry_id), alias=alias):
+                raise ValueError("identity snapshot is invalid")
+            openalex_ids.extend(
+                _decode_openalex_arxiv_ids(
+                    entry_bytes.get(entry_id),
+                    expected_alias=alias,
+                )
+            )
         try:
             observation = IdentityObservation(
                 arxiv_id=arxiv_id,
@@ -309,8 +326,8 @@ def _snapshot_observations(
                 semantic_scholar_doi_paper_id=doi_s2[0],
                 semantic_scholar_arxiv_external_ids=arxiv_s2[1],
                 semantic_scholar_doi_external_ids=doi_s2[1],
-                semantic_scholar_arxiv_complete=s2_arxiv_entry_id is not None,
-                semantic_scholar_doi_complete=s2_doi_entry_id is not None,
+                semantic_scholar_arxiv_complete=s2_arxiv_complete,
+                semantic_scholar_doi_complete=s2_doi_complete,
                 openalex_complete=bool(openalex_entry_ids),
                 openalex_arxiv_ids=openalex_ids,
                 snapshot_sha256s=[
@@ -348,6 +365,48 @@ def _valid_s2_role(
     )
 
 
+def _s2_arxiv_item_matches(
+    external_ids: dict[str, str], *, arxiv_id: str, alias: str
+) -> bool:
+    normalized = _normalized_external_ids(external_ids)
+    try:
+        expected_arxiv_id = normalize_paper_id(arxiv_id, kind="arxiv")
+        expected_alias = normalize_paper_id(alias, kind="doi")
+    except ValueError:
+        return False
+    return (
+        normalized.get("arxiv") == expected_arxiv_id
+        and normalized.get("doi") == expected_alias
+    )
+
+
+def _s2_doi_item_matches(external_ids: dict[str, str], *, alias: str) -> bool:
+    normalized = _normalized_external_ids(external_ids)
+    try:
+        expected_alias = normalize_paper_id(alias, kind="doi")
+    except ValueError:
+        return False
+    return normalized.get("doi") == expected_alias
+
+
+def _valid_openalex_role(
+    request: DependencyRequestIdentity | None, *, alias: str
+) -> bool:
+    try:
+        expected_alias = normalize_paper_id(alias, kind="openalex")
+        expected_request = DependencyRequestIdentity.from_canonical_request(
+            dependency="openalex",
+            operation="search",
+            method="GET",
+            endpoint="/works",
+            model_or_adapter=_OPENALEX_ADAPTER,
+            canonical_request={"filter": expected_alias, "per_page": "1"},
+        )
+    except ValueError:
+        return False
+    return request == expected_request
+
+
 def _decode_s2_response(
     content: bytes | None, item_index: object = None
 ) -> tuple[str | None, dict[str, str]]:
@@ -383,7 +442,9 @@ def _decode_s2_response(
     )
 
 
-def _decode_openalex_arxiv_ids(content: bytes | None) -> list[str]:
+def _decode_openalex_arxiv_ids(
+    content: bytes | None, *, expected_alias: str
+) -> list[str]:
     if content is None:
         return []
     try:
@@ -393,10 +454,21 @@ def _decode_openalex_arxiv_ids(content: bytes | None) -> list[str]:
     if not isinstance(payload, dict):
         return []
     results = payload.get("results")
-    if isinstance(results, list):
-        if len(results) != 1 or not isinstance(results[0], dict):
+    if not isinstance(results, list) or len(results) != 1:
+        return []
+    payload = results[0]
+    if not isinstance(payload, dict):
+        return []
+    work_id = payload.get("id")
+    if not isinstance(work_id, str):
+        return []
+    try:
+        if normalize_paper_id(work_id, kind="openalex") != normalize_paper_id(
+            expected_alias, kind="openalex"
+        ):
             return []
-        payload = results[0]
+    except ValueError:
+        return []
     locations = payload.get("locations")
     if not isinstance(locations, list):
         return []

@@ -76,3 +76,12 @@ DOI exact-endpoint acceptance contract 已完成离线固化：请求使用规�
 - 新数据源：仅在 Gold 精确可用性诊断证明 OpenAlex 覆盖不足后引入。
 
 每个晋升改动必须是单变量实验，使用独立配置、锁和 capture/replay/compare 证据。
+
+## Phase 4: Query Evolution bounded probe（离线实现完成）
+
+- 已加入严格的 query-evolution 契约、仅聚合评估，以及 offline-first bounded runner。
+- preflight 已针对冻结 run 通过，按原始顺序选出 55 个查询，并重建基线 `60/2910/14/8`。
+- 锁定上限为 55/110 logical operations、165/330 attempts、3600 秒全局超时和 3900 秒 ledger TTL。
+- 专项测试、全量离线测试、Ruff、mypy 与 diff 检查通过：专项 `29 passed`；全量 `1954 passed, 36 skipped`。
+- 锁文件为 `runs/_diag_query_evolution_preflight/probe.lock.json`；历史 evidence 与 `runs/candidate.lock.yaml` 未改变。
+- 本阶段未执行 live capture、replay、compare、readiness、候选锁重建、validation、网络请求、`.env` 读取或 ledger reservation；下一步是对该锁单独授权 bounded `run`。

@@ -73,3 +73,14 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - capture 与 replay 之间不得提交代码；
 - 不在聊天或公开文档中写入冻结查询文本；
 - validation 不可撤销，必须单独授权。
+
+## 8. Query Evolution bounded probe implementation (2026-08-10)
+
+- Implementation commits: `a3d2cd9`, `b8cce03`, `a522d5d`, and `47012d3`.
+- Offline verification: focused tests `29 passed`; full suite `1954 passed, 36 skipped`; Ruff and mypy passed; `git diff --check` passed.
+- Zero-network preflight: `preflight_complete=true`; 55 queued queries in frozen order; baseline `60/2910/14/8` reconstructed.
+- Preflight lock: `runs/_diag_query_evolution_preflight/probe.lock.json`; `probe_run_id=query-evolution-preflight`; future run directory `runs/_diag_query_evolution_query-evolution-preflight`.
+- Limits: 55/110 logical operations, 165/330 attempt caps, 3600-second global timeout, 3900-second ledger TTL.
+- Evidence hashes: availability `sha256:3f445486d5cf590f3f11a51930153a45916023880e856def379e0f01d053ad04`; probe code `sha256:07ce27806bd93a73ac4a8d499c3ca0e3ded83fbf4f7c702880e8ff6ba54a29d2`; lock `sha256:dc261edb560915f1907149f371e2266be54fb328a3c2019076da226ea96117d2`.
+- This phase did not read `.env`, make reservations, rebuild the candidate lock, run readiness, or execute live capture/replay/compare/validation. The live bounded run remains separately authorized work.
+- User-owned untracked `data/budget_ledger.sqlite3` and `deliverables/` were preserved.

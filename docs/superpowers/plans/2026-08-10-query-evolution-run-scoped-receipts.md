@@ -6,7 +6,7 @@
 
 **Architecture:** Keep `SQLiteBudgetLedger.report()` unchanged. Add one private probe helper that filters `LedgerReport.receipts` by `run_id`, then use it for canary/full-probe recovery, canary finalization, and promotion checks.
 
-**Tech Stack:** Python 3.12, SQLite, Pydantic v2, pytest, httpx MockTransport, Ruff, mypy.
+**Tech Stack:** Python 3.11, SQLite, Pydantic v2, pytest, httpx MockTransport, Ruff, mypy.
 
 ## Global Constraints
 
@@ -23,7 +23,7 @@
 - Modify `scripts/probe_query_evolution.py`: define the run-scoped receipt selector and replace the five run-local uses of project-wide receipts.
 - Modify `tests/integration/test_query_evolution_probe.py`: seed unrelated historical receipts and cover canary execution, canary recovery/cleanup, and full-probe recovery.
 - Read only `src/paper_search/control/ledger.py`: retain and verify its project-wide `LedgerReport.receipts` contract.
-- Read only `runs/_diag_query_evolution_contract-canary-20260810/outcomes.jsonl`: verify the archived outcome classification without rewriting evidence.
+- Read only `runs/_diag_query_evolution_contract-canary-20260810/result.json` and `outcomes.jsonl`: verify the archived outcome classification without rewriting evidence.
 
 ---
 
@@ -41,7 +41,7 @@
 
 - [ ] **Step 1: Record the user-ledger fingerprint and add shared historical-ledger test setup**
 
-Before editing, record the SHA-256 shown by this read-only command in the task notes:
+Before editing, record the SHA-256 shown by this read-only command in the task output; do not create a repository file for it:
 
 ```powershell
 Get-FileHash data/budget_ledger.sqlite3 -Algorithm SHA256
@@ -211,7 +211,7 @@ Run:
   -k "project_has_history or recovery_ignores_other_runs or marks_accounting_failure or marks_timeout" -q
 ```
 
-Expected: FAIL because project-wide receipt counts overwrite `passed`, `contract_canary_failed`, and `canary_cancelled`, and both recovery calls reject unrelated history.
+Expected: FAIL. The mocked canary cases stop in `reserve_canary_operations` with `canary_accounting_failed` before any LLM call, while both recovery tests reject the project-wide receipt collection.
 
 - [ ] **Step 4: Implement the single run-scoped selector and replace all five misuse sites**
 
@@ -254,7 +254,8 @@ final_receipts = _run_receipts(ledger, lock.canary_run_id)
 # reserve_canary_operations
 receipts = _run_receipts(ledger, lock.canary_run_id)
 
-# run_canary promotion check
+# run_canary promotion check: replace both the existing report assignment
+# and the following receipts assignment with this single line
 receipts = _run_receipts(ledger, lock.canary_run_id)
 ```
 
@@ -285,10 +286,12 @@ $env:PYTHONIOENCODING = 'utf-8'
   tests/integration/test_query_evolution_probe.py
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m mypy `
   src scripts/probe_query_evolution.py
+rg -n "ledger\.report\([^)]*\)\.receipts|receipts = report\.receipts" `
+  scripts/probe_query_evolution.py
 git diff --check
 ```
 
-Expected: all tests pass; Ruff, mypy, and diff check exit `0`. Do not run full-repository Ruff because the untouched user-owned `deliverables/project-docs/edit_docx.py` has a known unrelated F401.
+Expected: all tests pass; Ruff, mypy, and diff check exit `0`; the static search reports only the intentional `ledger.report(run_id).receipts` read inside `_run_receipts` and no `receipts = report.receipts`. If any gate fails, stop before staging or committing. Do not run full-repository Ruff because the untouched user-owned `deliverables/project-docs/edit_docx.py` has a known unrelated F401.
 
 - [ ] **Step 7: Reclassify archived outcomes read-only and commit**
 

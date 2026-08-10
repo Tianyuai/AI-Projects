@@ -1,7 +1,7 @@
 # Query Evolution Run-Scoped Receipts 修复设计
 
 日期：2026-08-10
-状态：待用户复核
+状态：已批准，待实施
 
 ## 1. 背景与根因
 

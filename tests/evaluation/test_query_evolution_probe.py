@@ -179,8 +179,8 @@ def test_evaluation_computes_14_8_baseline_and_gate_boundaries() -> None:
     assert evaluation.baseline_candidate_gold_count == 3
     assert evaluation.candidate_candidate_gold_count == 4
     assert evaluation.newly_retrieved_count == 1
-    assert evaluation.gate_a == "passed"
-    assert evaluation.gate_b == "failed"  # the frozen 14 association threshold is not met
+    assert evaluation.gate_a == "failed"
+    assert evaluation.gate_b == "not_evaluated"
     assert evaluation.gate_c == "not_evaluated"
 
 

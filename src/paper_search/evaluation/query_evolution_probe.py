@@ -435,9 +435,9 @@ def _delta(candidate: float, baseline: float) -> float:
 
 
 def _gate_a(baseline: FrozenProbeBaseline, integrity: ProbeIntegrity) -> bool:
-    if baseline.expected_query_count is not None and baseline.expected_query_count != 60:
+    if baseline.query_count != 60 or baseline.expected_query_count != 60:
         return False
-    if baseline.expected_total_selected is not None and baseline.expected_total_selected != 2910:
+    if baseline.total_selected != 2910 or baseline.expected_total_selected != 2910:
         return False
     probe_counts_match = integrity.locked_query_count is None and integrity.terminal_count is None
     if integrity.locked_query_count is not None and integrity.terminal_count is not None:

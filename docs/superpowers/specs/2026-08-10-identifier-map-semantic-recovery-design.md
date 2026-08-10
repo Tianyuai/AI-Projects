@@ -33,9 +33,10 @@ live capture 实验。
 
 ## 方案选择
 
-采用“语义校验契约 + split-scoped 私有等价映射 + 密封产物离线重算”。该方案
-保留现有 `IdentifierMap` 在评分和去重中的接口，只为新 dev freeze 增加可验证的
-语义前置条件和证据绑定，改动范围小于立即把整个领域模型改造成多标识集合。
+采用“语义校验契约 + dev 私有等价映射 + 密封产物离线重算”。该方案保留现有
+`IdentifierMap` 在评分和去重中的接口，先恢复可信 dev 漏斗，再决定后续算法实验。
+本阶段不迁移 freeze、candidate lock、runner 或 Gate 0；它们只在语义恢复成功且准备
+下一次正式 live 实验时，以独立版本化方案接入。
 
 未采用的方案：
 
@@ -56,8 +57,10 @@ live capture 实验。
 
 1. `arxiv_datacite_exact`：`10.48550/arxiv.<id>` 中的规范化编号与 arXiv alias
    完全一致；
-2. `semantic_scholar_exact`：以 arXiv 和目标 DOI 精确反查得到同一 Semantic
-   Scholar paper ID，且返回的 external IDs 不与源标识冲突；
+2. `semantic_scholar_exact`：先以 `ARXIV:<id>` 精确批量查询发现目标 DOI，再以发现的
+   `DOI:<doi>` 做第二次精确批量查询；两次响应必须解析为同一 Semantic Scholar
+   paper ID，arXiv 侧 external IDs 必须明确包含该目标 DOI，且两侧 external IDs 不与
+   源标识冲突。只有 arXiv 侧响应、只有 DOI 侧响应或第一阶段未返回该 DOI 均不足以通过；
 3. `openalex_location_exact`：目标 DOI/OpenAlex work 的位置或外部标识中包含完全
    相同的规范化 arXiv ID。
 
@@ -79,23 +82,32 @@ paper ID 不单独判错，因为供应商可能存在重复记录；它记为�
 
 一个有界、单用途采集器只接收规范化标识，不接收查询文本、相关性标签、排名或
 候选列表。它优先复用已有不可变 provider snapshot；缺失的精确身份元数据需要单独
-在线授权，并使用项目账本、固定请求上限、重试上限和不可变私有 snapshot。网络响应
-不得直接决定通过，必须先封存再由离线审计器消费。
+在线授权，并使用项目账本、固定请求上限、重试上限和不可变私有 snapshot。Semantic
+Scholar 最多执行两个锁定批次：第一批只含 `ARXIV:<id>`，第二批只含第一批实际发现的
+`DOI:<doi>`；OpenAlex 只查询锁中列出的精确 DOI/OpenAlex 标识。第二批的成员集合和
+请求上限必须在第一批封存后确定，不得接受手工追加。“两个批次”指两个逻辑阶段；
+每批最多一次固定重试，因此 Semantic Scholar 总 HTTP 尝试上限为 4，且不得产生第三
+个逻辑批次。预检锁还必须固定 provider 主机/端点、凭据变量名、输出根目录和账本检查点；
+任一变化都使授权失效。网络响应不得直接决定通过，必须先封存再由离线审计器消费。
 
 私有证据保存在已忽略的 `data/annotation_work/` 下。它可以包含身份对应关系，但不
 提交 Git，也不进入聊天、公开 Markdown 或聚合 JSON。
 
 ### 离线语义审计
 
-纯离线审计器一次读取 identifier map、dev gold 和私有身份 snapshot，先验证各自
-字节哈希，再执行规范化和三态判定。它不得访问网络，也不得根据 gold 增删或排序
-候选。审计结果分为：
+纯离线审计器一次读取 identifier map、dev gold、私有证据索引和底层不可变 identity
+snapshot，先验证 manifest、每个响应和各输入的字节哈希，再从原始响应重新构造
+observation，最后执行规范化和三态判定。派生 evidence 不能替代原始 snapshot，也
+不能单独决定通过。审计器不得访问网络，也不得根据 gold 增删或排序候选。审计结果
+分为：
 
 - 私有逐关系结果：用于修图和复核，保持在忽略目录；
-- 公开聚合报告 `identifier-map-semantic-audit-v1`：只包含输入哈希、总数、三态
-  计数、证据类型计数、直接 arXiv 命中 sanity check、原因码和通过状态。
+- 公开聚合报告 `identifier-map-semantic-audit-v1`：只包含 map、dev gold、私有证据
+  索引和 snapshot manifest 的哈希，总数、三态计数、证据类型计数、原因码和通过状态。
 
 公开报告禁止包含任何论文标识、标题、作者、查询 ID、查询文本或逐项位置索引。
+它不读取、不绑定历史 predictions，也不负责证明 12 个直接命中；该断言属于后续
+密封重评分报告。
 
 ### 私有 map 重建
 
@@ -104,9 +116,10 @@ alias 的 terminal 固定为由自身编号确定的 `doi:10.48550/arxiv.<same-i
 稳定的内部等价组锚点，不要求它成为生产检索请求。由此 terminal 选择不再依赖供应商
 返回顺序、某个“首选 DOI”或人工排序。
 
-从现有密封 baseline、标题候选和 Query Evolution 产物收集到的 DOI/OpenAlex alias，
-以及精确身份元数据返回的其他 provider alias，只有在它们与该 arXiv 锚点的关系得到
-精确证明后才加入同一组。每个 dev gold 组还必须完成规定的 provider 身份检查；
+待审 alias 只来自 dev gold、当前待审 identifier map 和精确身份元数据返回的 provider
+alias；不得从历史 predictions 扩充 map。它们只有在与该 arXiv 锚点的关系得到精确
+证明后才加入同一组。历史 predictions 只在重评分阶段作为被评分输入，不进入 map、
+identity inventory 或语义审计证据链。每个 dev gold 组还必须完成规定的 provider 身份检查；
 provider 元数据缺失或互相冲突时，该组仍为 `unresolved`，不能仅凭锚点自映射宣称
 正式语义审计通过。映射不得依赖输入顺序、列表位置、标题相似度或搜索排名。
 
@@ -115,32 +128,24 @@ provider 元数据缺失或互相冲突时，该组仍为 `unresolved`，不能�
 `data/manifest.json` 保持原字节不变；新 map 使用新文件名和新哈希，且不得包含为
 validation 构建或推断的映射。
 
-### 正式绑定
+### 条件式正式绑定（本阶段之外）
 
-新建 split-scoped freeze identity，不迁移现有 V2 manifest。新 schema 为 dev 分区
-绑定独立的 map、语义审计报告和私有证据集合哈希；本阶段不创建 validation 绑定。
-新文件写入独立路径，现有 `data/manifest.json` 不修改。V2 loader 继续只用于验证
-历史 artifact；新的 candidate lock 必须使用 split-scoped schema，validation lock 在
-缺少独立 validation 语义绑定时必须拒绝创建。
+当前 `integrated-lock-v1`、`FrozenDataBinding`、V2 manifest、历史 run 和旧 map 保持
+原 schema 与原字节不变；不得向 `integrated-lock-v1` 增加可选语义字段。语义恢复
+成功只代表可信 dev 基线重新建立，不自动授权 candidate lock、readiness 或 live
+capture。
 
-候选锁和正式运行必须同时绑定 dev map 哈希、语义审计报告哈希及其私有证据集合
-哈希。runner 和 Gate 0 在 provider 构造前只验证 lock 选定的 dev 分区，不读取
-validation partition，并验证：
-
-- 审计报告 schema、状态和哈希有效；
-- 报告绑定的 map、gold split 和证据集合与本次输入完全一致；
-- map、报告和证据均为 dev scope，且不宣称 validation 结论；
-- map 的覆盖、格式和语义状态全部通过。
-
-缺失、过期、错 scope、哈希不一致或非 `passed` 的报告均以固定、无标识值的错误
-停止。历史 run、V2 manifest 和旧 map 不迁移、不重写，只在 HANDOFF 和路线图中
-标注其质量结论已被取代。
+仅当语义审计和密封重评分均通过、且即将准备下一次正式 live 实验时，另行设计并
+实现显式的 `integrated-lock-v2` / freeze-v3。届时用可判别联合保持 v1 读取兼容，并
+让新版本绑定 dev map、语义审计和私有证据集合哈希；validation 仍需独立设计与授权。
+该迁移必须有单独的 TDD 实施计划，不属于本次恢复计划的完成条件。
 
 ### 离线重算与算法决策
 
 新 map 通过后，按相同代码和密封输入离线重算：当前正式 baseline、标题候选历史
 对照和 Prompt-v2 Query Evolution。每组结果单独绑定原始 run 哈希、新 map 哈希和
-语义审计哈希，不跨历史运行混用候选口径。
+语义审计哈希，不跨历史运行混用候选口径。语义审计本身不读取 predictions；重评分
+报告独立验证历史产物绑定和命中恢复。
 
 直接可确认的 12 个同 arXiv 编号命中必须全部进入评分；否则语义恢复仍失败。重算
 后重新统计 retrieved、post-filter、Top-50 和 macro/micro 指标：
@@ -153,7 +158,10 @@ validation partition，并验证：
 
 - 所有语义失败均使用固定原因码，异常消息不包含标识值；
 - 私有 map、逐关系证据和 unresolved 清单必须继续被 Git 忽略；
-- 日志和公开报告在写盘后重新读取并执行禁止字段/标识模式扫描；
+- 日志和公开 JSON 在写盘后重新读取，递归拒绝精确键名 `query_id`、`query_text`，
+  并扫描字符串值中的真实查询哨兵和 DOI/arXiv/OpenAlex 标识模式；Markdown 使用
+  字段边界和同一组值模式扫描。允许 `query_count`、`query_identity_count`、`doi_count`、
+  `arxiv_count`、`openalex_request_count` 等不含私有值的聚合术语；
 - 在线身份采集与正式 live capture 是两种独立授权，前者获批不自动授权后者；
 - 不读取 `.env`，除非用户明确授权某次有界身份采集；只把必要 key 临时注入该进程；
 - 不读取或评分 validation 查询。未来 validation 需要单独设计、单独 map audit 和单独
@@ -168,13 +176,14 @@ validation partition，并验证：
 3. 单独的 S2 paper-ID 分歧只产生 unresolved，不误判为确定错配；
 4. 模糊标题、搜索排名、目标存在和缺失证据均不能通过；
 5. 错误链、冲突链及未经验证的预测 alias 不能诱发假命中；
-6. 聚合报告不泄露任何私有标识或查询信息；
-7. map、gold、证据或报告任一字节变化都会使绑定失败；
-8. 审计失败发生在 provider 构造和任何网络调用之前；
-9. split-scoped dev Gate 不读取 validation partition，缺少独立语义绑定时不能创建
-   validation lock；
+6. Semantic Scholar 必须完成 ARXIV 与 DOI 两侧精确查询，且 external IDs 不冲突；
+   任一侧缺失或冲突均不能通过；
+7. 聚合报告不泄露任何私有标识或查询信息，也不误拒绝允许的聚合字段；
+8. map、gold、证据索引、snapshot manifest 或原始响应任一字节变化都会使语义审计失败；
+9. 语义审计不读取历史 predictions，且在任何网络调用之前 fail closed；
 10. 旧 V2 artifact 保持可验证但被标记为历史语义未认证；
-11. 密封输出中的 12 个直接 arXiv 命中全部计入新评分。
+11. 密封重评分中的 12 个直接 arXiv 命中全部计入新评分；
+12. 本阶段不改变 `integrated-lock-v1`、freeze、Gate 0、runner 或 validator。
 
 专项测试通过后运行受影响测试、Ruff、mypy、完整离线 pytest 和 `git diff --check`。
 在线接口只用确定性 mock 测试；真实身份采集不属于单元测试。
@@ -184,7 +193,7 @@ validation partition，并验证：
 语义恢复只有同时满足以下条件才完成：
 
 - dev map 的所有评分关系均为 `verified`，无 mismatch、无 unresolved；
-- 语义报告、map、dev gold 和私有证据哈希闭合；
+- 语义报告、map、dev gold 和私有证据哈希闭合，且报告不依赖 predictions；
 - 公开产物通过隐私扫描；
 - 12 个直接同 arXiv 命中全部被计入；
 - 当前 baseline 和历史候选均完成离线重算，漏斗可解释；

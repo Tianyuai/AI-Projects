@@ -23,6 +23,7 @@ from scripts.capture_dev_identifier_identity import (
     IdentifierInventory,
     IdentityCaptureLock,
     TransportResponse,
+    _load_lock,
     build_capture_lock,
     build_identifier_inventory,
     capture_identity,
@@ -271,7 +272,7 @@ def test_preflight_locks_dev_inputs_without_network_or_ledger_mutation(
         output_root="private",
     )
 
-    assert lock.schema_version == "identifier-identity-capture-lock-v1"
+    assert lock.schema_version == "identifier-identity-capture-lock-v2"
     assert lock.scope == "dev"
     assert lock.semantic_scholar_batch_max == 2
     assert lock.semantic_scholar_http_attempt_max == 4
@@ -302,6 +303,31 @@ def test_preflight_writes_canonical_lock_with_exclusive_create(tmp_path: Path) -
             output_root="private",
             out_lock=lock_path,
         )
+
+
+def test_lock_loader_rejects_v1_schema_even_with_matching_digest(
+    tmp_path: Path,
+) -> None:
+    lock, _, _ = _lock_and_runtime(tmp_path)
+    payload = lock.model_dump(mode="json")
+    payload["schema_version"] = "identifier-identity-capture-lock-v1"
+    content = (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    lock_path = tmp_path / "v1-capture.lock.json"
+    lock_path.write_bytes(content)
+    expected_digest = f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+    with pytest.raises(ValueError) as error:
+        _load_lock(lock_path, expected_lock_sha256=expected_digest)
+
+    assert str(error.value) == "identity capture authorization mismatch"
 
 
 def test_capture_uses_arxiv_batch_then_only_discovered_doi_batch(
@@ -585,14 +611,26 @@ def test_missing_semantic_scholar_side_is_preserved_without_false_evidence(
     ]
 
 
-def test_openalex_exact_lookup_rejects_response_identity_mismatch(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "results",
+    [
+        [],
+        [
+            {"id": "https://openalex.org/W1", "locations": []},
+            {"id": "https://openalex.org/W2", "locations": []},
+        ],
+        [{"id": "https://openalex.org/W999", "locations": []}],
+    ],
+    ids=["zero", "multiple", "mismatch"],
+)
+def test_openalex_exact_lookup_rejects_non_exact_result_envelope(
+    tmp_path: Path, results: list[dict[str, object]]
 ) -> None:
     transport = RecordingTransport(
-        openalex_response=(
-            b'{"meta":{"count":1},"results":'
-            b'[{"id":"https://openalex.org/W999","locations":[]}]}'
-        )
+        openalex_response=json.dumps(
+            {"meta": {"count": len(results)}, "results": results},
+            separators=(",", ":"),
+        ).encode("utf-8")
     )
     lock, runtime, _ = _lock_and_runtime(tmp_path, transport)
 
@@ -602,6 +640,27 @@ def test_openalex_exact_lookup_rejects_response_identity_mismatch(
     assert str(error.value) == "openalex response is invalid"
     assert transport.openalex_ids == ["W1", "W1"]
     assert all(state != "reserved" for state in _ledger_states(runtime.ledger_path))
+
+
+def test_openalex_exact_lookup_accepts_one_matching_result(tmp_path: Path) -> None:
+    transport = RecordingTransport(
+        openalex_response=(
+            b'{"meta":{"count":1},"results":'
+            b'[{"id":"https://openalex.org/W1","locations":'
+            b'[{"landing_page_url":"https://arxiv.org/abs/2501.00001"}]}]}'
+        )
+    )
+    lock, runtime, _ = _lock_and_runtime(tmp_path, transport)
+
+    result = capture_identity(lock, runtime)
+
+    assert transport.openalex_ids == ["W1"]
+    assert [
+        (ref.arxiv_id, ref.alias)
+        for ref in result.evidence_refs
+        if ref.alias.startswith("openalex:")
+    ] == [("arxiv:2501.00001", "openalex:W1")]
+    assert all(state == "settled" for state in _ledger_states(runtime.ledger_path))
 
 
 def test_edited_request_cap_is_rejected_before_ledger_or_transport(

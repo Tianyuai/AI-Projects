@@ -66,7 +66,7 @@ class IdentifierInventory(DomainModel):
 
 
 class IdentityCaptureLock(DomainModel):
-    schema_version: Literal["identifier-identity-capture-lock-v1"]
+    schema_version: Literal["identifier-identity-capture-lock-v2"]
     scope: Literal["dev"]
     input_hashes: dict[NonEmptyStr, Sha256]
     semantic_scholar_arxiv_ids: list[NonEmptyStr]
@@ -333,7 +333,7 @@ def build_capture_lock(
         }
     )
     lock = IdentityCaptureLock(
-        schema_version="identifier-identity-capture-lock-v1",
+        schema_version="identifier-identity-capture-lock-v2",
         scope="dev",
         input_hashes={
             "identifier_inventory": _sha256(inventory_content),

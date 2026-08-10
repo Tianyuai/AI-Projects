@@ -50,6 +50,7 @@ class FrozenQueryRecord(DomainModel):
     query_spec: QuerySpec
     search_plan: SearchPlan | None = None
     baseline_results: list[ProviderResult[list[Paper]]]
+    retrieved_paper_ids: list[str]
     source_index: int = Field(strict=True, ge=0)
 
 
@@ -91,13 +92,21 @@ class FrozenProbeBaseline(DomainModel):
     @property
     def total_selected(self) -> int:
         return sum(
-            len(_project_query(record.query_spec, record.baseline_results, ()).top50_ids)
+            len(
+                _project_query(
+                    record.query_spec,
+                    record.baseline_results,
+                    (),
+                    retrieved_paper_ids=record.retrieved_paper_ids,
+                ).top50_ids
+            )
             for record in self.queries
         )
 
 
 class QueryProjection(DomainModel):
     candidate_papers: list[Paper]
+    retrieved_ids: list[str]
     top50_ids: list[str]
     fusion_sources: tuple[str, ...]
     hard_filter_rejections: int = Field(strict=True, ge=0)
@@ -241,6 +250,8 @@ def _project_query(
     spec: QuerySpec,
     baseline_results: Sequence[ProviderResult[list[Paper]]],
     additions: Sequence[ProviderResult[list[Paper]]],
+    *,
+    retrieved_paper_ids: Sequence[str] | None = None,
 ) -> QueryProjection:
     ordered: list[Paper] = []
     seen: set[str] = set()
@@ -252,8 +263,23 @@ def _project_query(
     filtered = apply_hard_filters(ordered, spec)
     accepted = {item.paper.canonical_id for item in filtered.accepted}
     fused = fuse_provider_results({"openalex": _offline_provider_result(ordered)}, method="rrf")
+    retrieved: list[str] = []
+    seen_retrieved: set[str] = set()
+    baseline_retrieved = retrieved_paper_ids if retrieved_paper_ids is not None else (
+        paper.canonical_id for result in baseline_results for paper in result.data
+    )
+    for identifier in baseline_retrieved:
+        if identifier not in seen_retrieved:
+            seen_retrieved.add(identifier)
+            retrieved.append(identifier)
+    for result in additions:
+        for paper in result.data:
+            if paper.canonical_id not in seen_retrieved:
+                seen_retrieved.add(paper.canonical_id)
+                retrieved.append(paper.canonical_id)
     return QueryProjection(
         candidate_papers=ordered,
+        retrieved_ids=retrieved,
         top50_ids=[item.paper.canonical_id for item in fused if item.paper.canonical_id in accepted][:50],
         fusion_sources=("openalex",),
         hard_filter_rejections=len(filtered.rejected),
@@ -309,7 +335,14 @@ def select_probe_query_ids(
         gold_record = gold_by_id.get(record.query_id)
         if gold_record is None:
             continue
-        retrieved = set(_project_query(record.query_spec, record.baseline_results, []).candidate_ids)
+        retrieved = set(
+            _project_query(
+                record.query_spec,
+                record.baseline_results,
+                [],
+                retrieved_paper_ids=record.retrieved_paper_ids,
+            ).retrieved_ids
+        )
         available = _availability_ids(availability, record.query_id)
         if any(identifier in available and identifier not in retrieved for identifier in gold_record.relevant_paper_ids):
             selected.append(record.query_id)
@@ -327,6 +360,7 @@ def merge_probe_results(
             record.query_spec,
             record.baseline_results,
             additions.get(record.query_id, ()),
+            retrieved_paper_ids=record.retrieved_paper_ids,
         )
     unknown = set(additions).difference(projected)
     if unknown:
@@ -348,19 +382,29 @@ def _resolved(identifier: str, id_map: IdentifierMap | None) -> str:
     return id_map.resolve(identifier) if id_map is not None else identifier
 
 
-def _gold_count(
+def _gold_associations(
     gold: Sequence[EvaluationQuery],
-    projections: Mapping[str, QueryProjection],
+    identifiers_by_query: Mapping[str, Sequence[str]],
     id_map: IdentifierMap | None,
-    *,
-    top50: bool,
-) -> int:
-    count = 0
+) -> set[tuple[str, str]]:
+    associations: set[tuple[str, str]] = set()
     for record in gold:
-        identifiers = set(projections[record.query_id].top50_ids if top50 else projections[record.query_id].candidate_ids)
-        resolved = {_resolved(identifier, id_map) for identifier in identifiers}
-        count += sum(_resolved(identifier, id_map) in resolved for identifier in record.relevant_paper_ids)
-    return count
+        retrieved = {_resolved(identifier, id_map) for identifier in identifiers_by_query[record.query_id]}
+        associations.update(
+            (record.query_id, resolved)
+            for identifier in record.relevant_paper_ids
+            if (resolved := _resolved(identifier, id_map)) in retrieved
+        )
+    return associations
+
+
+def count_gold_associations(
+    gold: Sequence[EvaluationQuery],
+    identifiers_by_query: Mapping[str, Sequence[str]],
+    id_map: IdentifierMap | None,
+) -> int:
+    """Count unique resolved ``(query_id, paper_id)`` gold associations."""
+    return len(_gold_associations(gold, identifiers_by_query, id_map))
 
 
 def _retains_prior_gold(
@@ -372,8 +416,8 @@ def _retains_prior_gold(
     top50: bool,
 ) -> bool:
     for record in gold:
-        before = set(baseline[record.query_id].top50_ids if top50 else baseline[record.query_id].candidate_ids)
-        after = set(candidate[record.query_id].top50_ids if top50 else candidate[record.query_id].candidate_ids)
+        before = set(baseline[record.query_id].top50_ids if top50 else baseline[record.query_id].retrieved_ids)
+        after = set(candidate[record.query_id].top50_ids if top50 else candidate[record.query_id].retrieved_ids)
         before_resolved = {_resolved(value, id_map) for value in before}
         after_resolved = {_resolved(value, id_map) for value in after}
         prior_gold = {
@@ -391,10 +435,13 @@ def _delta(candidate: float, baseline: float) -> float:
 
 
 def _gate_a(baseline: FrozenProbeBaseline, integrity: ProbeIntegrity) -> bool:
-    if baseline.expected_query_count is not None and baseline.expected_query_count != 60:
+    if baseline.query_count != 60 or baseline.expected_query_count != 60:
         return False
-    if baseline.expected_total_selected is not None and baseline.expected_total_selected != 2910:
+    if baseline.total_selected != 2910 or baseline.expected_total_selected != 2910:
         return False
+    probe_counts_match = integrity.locked_query_count is None and integrity.terminal_count is None
+    if integrity.locked_query_count is not None and integrity.terminal_count is not None:
+        probe_counts_match = integrity.locked_query_count > 0 and integrity.locked_query_count == integrity.terminal_count
     return all(
         (
             integrity.exact_baseline,
@@ -409,8 +456,7 @@ def _gate_a(baseline: FrozenProbeBaseline, integrity: ProbeIntegrity) -> bool:
             not integrity.post_seal_gold_hash_mismatch,
             integrity.limits_respected,
             integrity.aggregate_only,
-            integrity.locked_query_count is None or integrity.locked_query_count == baseline.query_count,
-            integrity.terminal_count is None or integrity.terminal_count == baseline.query_count,
+            probe_counts_match,
         )
     )
 
@@ -433,22 +479,18 @@ def evaluate_probe(
     baseline_ranking = evaluate_ranking(gold, _predictions(query_ids, baseline_projection.by_query), id_map=id_map)
     candidate_ranking = evaluate_ranking(gold, _predictions(query_ids, projection.by_query), id_map=id_map)
 
-    baseline_candidate_gold = _gold_count(gold, baseline_projection.by_query, id_map, top50=False)
-    candidate_candidate_gold = _gold_count(gold, projection.by_query, id_map, top50=False)
-    baseline_top50_gold = _gold_count(gold, baseline_projection.by_query, id_map, top50=True)
-    candidate_top50_gold = _gold_count(gold, projection.by_query, id_map, top50=True)
-    baseline_gold_pairs = {
-        (record.query_id, _resolved(identifier, id_map))
-        for record in gold
-        for identifier in record.relevant_paper_ids
-        if _resolved(identifier, id_map) in {_resolved(value, id_map) for value in baseline_projection.by_query[record.query_id].candidate_ids}
-    }
-    candidate_gold_pairs = {
-        (record.query_id, _resolved(identifier, id_map))
-        for record in gold
-        for identifier in record.relevant_paper_ids
-        if _resolved(identifier, id_map) in {_resolved(value, id_map) for value in projection.by_query[record.query_id].candidate_ids}
-    }
+    baseline_retrieved = {query_id: item.retrieved_ids for query_id, item in baseline_projection.by_query.items()}
+    candidate_retrieved = {query_id: item.retrieved_ids for query_id, item in projection.by_query.items()}
+    baseline_top50 = {query_id: item.top50_ids for query_id, item in baseline_projection.by_query.items()}
+    candidate_top50 = {query_id: item.top50_ids for query_id, item in projection.by_query.items()}
+    baseline_gold_pairs = _gold_associations(gold, baseline_retrieved, id_map)
+    candidate_gold_pairs = _gold_associations(gold, candidate_retrieved, id_map)
+    baseline_top50_pairs = _gold_associations(gold, baseline_top50, id_map)
+    candidate_top50_pairs = _gold_associations(gold, candidate_top50, id_map)
+    baseline_candidate_gold = len(baseline_gold_pairs)
+    candidate_candidate_gold = len(candidate_gold_pairs)
+    baseline_top50_gold = len(baseline_top50_pairs)
+    candidate_top50_gold = len(candidate_top50_pairs)
     metric_deltas = {
         "macro_f1": _delta(candidate_metrics.summary.macro_f1, baseline_metrics.summary.macro_f1),
         "macro_recall": _delta(candidate_metrics.summary.macro_recall, baseline_metrics.summary.macro_recall),
@@ -517,6 +559,7 @@ __all__ = [
     "PublicProbeReport",
     "QueryProjection",
     "QueryTerminal",
+    "count_gold_associations",
     "evaluate_probe",
     "merge_probe_results",
     "calculate_production_estimates",

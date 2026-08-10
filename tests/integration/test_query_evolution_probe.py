@@ -149,6 +149,17 @@ def _synthetic_raw_record(query_label: str, extra_topics: int, candidate_count: 
     }
 
 
+def _copy_frozen_run(destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    (destination / "snapshots").mkdir()
+    for name in ("business-results.jsonl", "executions.jsonl", "run.json"):
+        shutil.copy2(DEFAULT_RUN / name, destination / name)
+    shutil.copy2(
+        DEFAULT_RUN / "snapshots" / "snapshot-manifest.json",
+        destination / "snapshots" / "snapshot-manifest.json",
+    )
+
+
 def _seed_settled_receipt(
     ledger: probe.SQLiteBudgetLedger,
     *,
@@ -334,12 +345,238 @@ def test_offline_preflight_reconstructs_fixed_queue_and_self_hash(tmp_path: Path
     assert lock.preflight_complete is True
     assert lock.query_count == 60
     assert lock.total_selected == 2910
+    assert lock.baseline_candidate_gold_count == 14
+    assert lock.baseline_top50_gold_count == 8
     assert len(lock.query_ids) == 55
     assert lock.query_ids == tuple(lock.query_ids)
     assert lock.probe_code_sha256.startswith("sha256:")
     assert lock.lock_sha256.startswith("sha256:")
     assert output.exists()
     assert load_probe_lock(output).lock_sha256 == lock.lock_sha256
+
+
+def test_preflight_rejects_derived_baseline_gold_count_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counts = iter((13, 8))
+    monkeypatch.setattr(probe, "count_gold_associations", lambda *_: next(counts))
+
+    with pytest.raises(ValueError, match="baseline gold counts"):
+        preflight_probe(
+            frozen_run=DEFAULT_RUN,
+            gold_path=DEFAULT_GOLD,
+            id_map_path=DEFAULT_ID_MAP,
+            availability_path=DEFAULT_AVAILABILITY,
+            prompt_config=DEFAULT_PROMPT_CONFIG,
+            probe_run_id="query-evolution-preflight-drift",
+            ledger_path=tmp_path / "ledger.sqlite3",
+            output_path=tmp_path / "probe.lock.json",
+        )
+
+
+def test_preflight_rejects_incomplete_execution_record_set(tmp_path: Path) -> None:
+    frozen_run = tmp_path / "frozen-run"
+    _copy_frozen_run(frozen_run)
+    execution_path = frozen_run / "executions.jsonl"
+    records = execution_path.read_text(encoding="utf-8").splitlines()
+    execution_path.write_text("\n".join(records[:-1]) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="execution record set"):
+        preflight_probe(
+            frozen_run=frozen_run,
+            gold_path=DEFAULT_GOLD,
+            id_map_path=DEFAULT_ID_MAP,
+            availability_path=DEFAULT_AVAILABILITY,
+            prompt_config=DEFAULT_PROMPT_CONFIG,
+            probe_run_id="query-evolution-incomplete-executions",
+            ledger_path=tmp_path / "ledger.sqlite3",
+            output_path=tmp_path / "probe.lock.json",
+        )
+
+
+def test_preflight_rejects_missing_retrieved_stream(tmp_path: Path) -> None:
+    frozen_run = tmp_path / "frozen-run"
+    _copy_frozen_run(frozen_run)
+    execution_path = frozen_run / "executions.jsonl"
+    executions = [json.loads(line) for line in execution_path.read_text(encoding="utf-8").splitlines()]
+    executions[0].pop("retrieved_paper_ids")
+    execution_path.write_text(
+        "".join(json.dumps(record) + "\n" for record in executions),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="invalid retrieved IDs"):
+        preflight_probe(
+            frozen_run=frozen_run,
+            gold_path=DEFAULT_GOLD,
+            id_map_path=DEFAULT_ID_MAP,
+            availability_path=DEFAULT_AVAILABILITY,
+            prompt_config=DEFAULT_PROMPT_CONFIG,
+            probe_run_id="query-evolution-missing-retrieved-stream",
+            ledger_path=tmp_path / "ledger.sqlite3",
+            output_path=tmp_path / "probe.lock.json",
+        )
+
+
+def test_frozen_inputs_read_the_lock_bound_source_run(tmp_path: Path) -> None:
+    with TemporaryDirectory(dir=probe.ROOT / "runs") as source_directory:
+        frozen_run = Path(source_directory)
+        _copy_frozen_run(frozen_run)
+        run_path = frozen_run / "run.json"
+        run_record = json.loads(run_path.read_text(encoding="utf-8"))
+        run_record["run_id"] = frozen_run.name
+        run_path.write_text(json.dumps(run_record), encoding="utf-8")
+        execution_path = frozen_run / "executions.jsonl"
+        executions = [json.loads(line) for line in execution_path.read_text(encoding="utf-8").splitlines()]
+        sentinel = "openalex:W999999999999"
+        executions[0]["retrieved_paper_ids"].append(sentinel)
+        execution_path.write_text(
+            "".join(json.dumps(record) + "\n" for record in executions),
+            encoding="utf-8",
+        )
+        lock_path = tmp_path / "bound-source.lock.json"
+        lock = preflight_probe(
+            frozen_run=frozen_run,
+            gold_path=DEFAULT_GOLD,
+            id_map_path=DEFAULT_ID_MAP,
+            availability_path=DEFAULT_AVAILABILITY,
+            prompt_config=DEFAULT_PROMPT_CONFIG,
+            probe_run_id="query-evolution-bound-source",
+            ledger_path=tmp_path / "ledger.sqlite3",
+            output_path=lock_path,
+        )
+
+        frozen_inputs, _ = probe._frozen_inputs(lock)
+
+        assert sentinel in frozen_inputs.queries[0].retrieved_paper_ids
+
+
+def test_run_rejects_source_hash_drift_before_creating_output_or_live_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with TemporaryDirectory(dir=probe.ROOT / "runs") as source_directory:
+        frozen_run = Path(source_directory)
+        _copy_frozen_run(frozen_run)
+        run_path = frozen_run / "run.json"
+        run_record = json.loads(run_path.read_text(encoding="utf-8"))
+        run_record["run_id"] = frozen_run.name
+        run_path.write_text(json.dumps(run_record), encoding="utf-8")
+        probe_run_id = _run_id("source-drift", tmp_path)
+        lock_path = tmp_path / "source-drift.lock.json"
+        lock = preflight_probe(
+            frozen_run=frozen_run,
+            gold_path=DEFAULT_GOLD,
+            id_map_path=DEFAULT_ID_MAP,
+            availability_path=DEFAULT_AVAILABILITY,
+            prompt_config=DEFAULT_PROMPT_CONFIG,
+            probe_run_id=probe_run_id,
+            ledger_path=tmp_path / "ledger.sqlite3",
+            output_path=lock_path,
+        )
+        execution_path = frozen_run / "executions.jsonl"
+        execution_path.write_text(
+            execution_path.read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
+        run_dir = (probe.ROOT / lock.expected_run_directory).resolve()
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        live_started = False
+
+        async def fail_live(*_: object, **__: object) -> None:
+            nonlocal live_started
+            live_started = True
+
+        monkeypatch.setattr(probe, "_run_live_probe", fail_live)
+        try:
+            with pytest.raises(ValueError, match="frozen executions hash mismatch"):
+                run_probe(
+                    lock_path,
+                    ProbeRuntime(
+                        allow_live=True,
+                        env_file=tmp_path / "unused.env",
+                        ledger_path=tmp_path / "runtime-ledger.sqlite3",
+                    ),
+                )
+            assert live_started is False
+            assert not run_dir.exists()
+        finally:
+            if run_dir.exists():
+                shutil.rmtree(run_dir)
+
+
+@pytest.mark.parametrize(
+    ("field", "label", "message"),
+    [
+        ("gold_sha256", "gold", "frozen gold hash mismatch"),
+        ("identifier_map_sha256", "id-map", "frozen identifier map hash mismatch"),
+        ("availability_sha256", "availability", "frozen availability hash mismatch"),
+    ],
+)
+def test_run_rejects_external_evidence_hash_drift_before_output_or_live_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    label: str,
+    message: str,
+) -> None:
+    probe_run_id = _run_id(label, tmp_path)
+    lock_path = tmp_path / f"{field}.lock.json"
+    lock = preflight_probe(
+        frozen_run=DEFAULT_RUN,
+        gold_path=DEFAULT_GOLD,
+        id_map_path=DEFAULT_ID_MAP,
+        availability_path=DEFAULT_AVAILABILITY,
+        prompt_config=DEFAULT_PROMPT_CONFIG,
+        probe_run_id=probe_run_id,
+        ledger_path=tmp_path / "ledger.sqlite3",
+        output_path=lock_path,
+    )
+    payload = lock.model_dump(mode="json")
+    payload[field] = _sha("drifted")
+    payload["lock_sha256"] = probe._self_hash(payload)
+    lock_path.write_bytes(probe._canonical_json(payload))
+    run_dir = (probe.ROOT / lock.expected_run_directory).resolve()
+    if run_dir.exists():
+        shutil.rmtree(run_dir)
+    live_started = False
+
+    async def fail_live(*_: object, **__: object) -> None:
+        nonlocal live_started
+        live_started = True
+
+    monkeypatch.setattr(probe, "_run_live_probe", fail_live)
+    try:
+        with pytest.raises(ValueError, match=message):
+            run_probe(
+                lock_path,
+                ProbeRuntime(
+                    allow_live=True,
+                    env_file=tmp_path / "unused.env",
+                    ledger_path=tmp_path / "runtime-ledger.sqlite3",
+                ),
+            )
+        assert live_started is False
+        assert not run_dir.exists()
+    finally:
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+
+
+def test_probe_integrity_uses_locked_queue_count() -> None:
+    lock = _synthetic_probe_lock(("q1", "q2"))
+
+    integrity = probe._probe_integrity(
+        lock,
+        capture_replay_match="matched",
+        terminal_count=2,
+        request_failures=0,
+    )
+
+    assert integrity.locked_query_count == 2
+    assert integrity.terminal_count == 2
 
 
 def test_lock_bytes_are_canonical_and_do_not_contain_gold_content(tmp_path: Path) -> None:

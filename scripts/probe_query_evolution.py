@@ -50,6 +50,7 @@ from paper_search.evaluation.query_evolution_probe import (
     FrozenProbeInputs,
     FrozenQueryRecord,
     ProbeIntegrity,
+    count_gold_associations,
     evaluate_probe,
     merge_probe_results,
     public_probe_report,
@@ -319,22 +320,44 @@ def _build_lock_payload(
     if len(business) != 60:
         raise ValueError("frozen business result query count must be 60")
     total_selected = 0
+    selected_by_query: dict[str, list[str]] = {}
     for value in business:
+        query_id = value.get("query_id")
         selected_ids = value.get("selected_paper_ids", [])
-        if not isinstance(selected_ids, list):
-            raise ValueError("selected_paper_ids must be a list")
+        if not isinstance(query_id, str) or not isinstance(selected_ids, list) or not all(
+            isinstance(identifier, str) for identifier in selected_ids
+        ):
+            raise ValueError("frozen selected paper IDs are invalid")
+        selected_by_query[query_id] = selected_ids
         total_selected += len(selected_ids)
+    if len(selected_by_query) != 60:
+        raise ValueError("frozen business query IDs must be unique")
     if total_selected != 2910:
         raise ValueError("frozen selected total must be 2910")
     gold = read_jsonl(gold_path, EvaluationQuery)
     identifier_map = IdentifierMap.from_path(id_map_path)
     executions = _jsonl_objects(executions_path)
-    retrieved_by_query: dict[str, Sequence[object]] = {}
+    if len(executions) != 60:
+        raise ValueError("frozen execution record set must contain 60 queries")
+    retrieved_by_query: dict[str, list[str]] = {}
     for value in executions:
         query_id = value.get("query_id")
-        retrieved_ids = value.get("retrieved_paper_ids", [])
-        if isinstance(query_id, str) and isinstance(retrieved_ids, list):
-            retrieved_by_query[query_id] = retrieved_ids
+        retrieved_ids = value.get("retrieved_paper_ids")
+        if "retrieved_paper_ids" not in value or not isinstance(query_id, str) or not isinstance(retrieved_ids, list) or not all(
+            isinstance(identifier, str) for identifier in retrieved_ids
+        ):
+            raise ValueError("frozen execution record set contains invalid retrieved IDs")
+        if query_id in retrieved_by_query:
+            raise ValueError("frozen execution record set contains duplicate query IDs")
+        retrieved_by_query[query_id] = retrieved_ids
+    expected_query_ids = set(selected_by_query)
+    gold_query_ids = {record.query_id for record in gold}
+    if set(retrieved_by_query) != expected_query_ids or gold_query_ids != expected_query_ids:
+        raise ValueError("frozen execution record set does not match business and gold queries")
+    baseline_candidate_gold_count = count_gold_associations(gold, retrieved_by_query, identifier_map)
+    baseline_top50_gold_count = count_gold_associations(gold, selected_by_query, identifier_map)
+    if (baseline_candidate_gold_count, baseline_top50_gold_count) != (14, 8):
+        raise ValueError("frozen baseline gold counts do not match sealed evidence")
     availability_sha256 = _sha256_file(availability_path)
     if availability_sha256 != EXPECTED_AVAILABILITY_SHA256:
         raise ValueError("availability evidence hash mismatch")
@@ -373,8 +396,8 @@ def _build_lock_payload(
         "query_ids": list(query_ids),
         "query_count": 60,
         "total_selected": 2910,
-        "baseline_candidate_gold_count": 14,
-        "baseline_top50_gold_count": 8,
+        "baseline_candidate_gold_count": baseline_candidate_gold_count,
+        "baseline_top50_gold_count": baseline_top50_gold_count,
         "prompt": prompt_binding.model_dump(mode="json"),
         "model_id": "deepseek-v4-flash",
         "endpoint": "https://api.deepseek.com/v1",
@@ -607,11 +630,15 @@ def _placeholder_results(ids: Sequence[object]) -> ProviderResult[list[Paper]]:
 
 
 def _frozen_inputs(lock: ProbeLock) -> tuple[FrozenProbeInputs, dict[str, dict[str, object]]]:
-    business = {record["query_id"]: record for record in _jsonl_objects(DEFAULT_RUN / "business-results.jsonl") if isinstance(record.get("query_id"), str)}
-    executions = {record["query_id"]: record for record in _jsonl_objects(DEFAULT_RUN / "executions.jsonl") if isinstance(record.get("query_id"), str)}
+    source_run = _verify_probe_source_bindings(lock)
+    business_path = source_run / "business-results.jsonl"
+    executions_path = source_run / "executions.jsonl"
+    business_records = _jsonl_objects(business_path)
+    business = {record["query_id"]: record for record in business_records if isinstance(record.get("query_id"), str)}
+    executions = {record["query_id"]: record for record in _jsonl_objects(executions_path) if isinstance(record.get("query_id"), str)}
     records: list[FrozenQueryRecord] = []
     for index, query_id in enumerate(
-        [record["query_id"] for record in _jsonl_objects(DEFAULT_RUN / "business-results.jsonl")]
+        [record["query_id"] for record in business_records]
     ):
         raw = business[query_id]
         analysis = raw.get("query_analysis")
@@ -622,12 +649,21 @@ def _frozen_inputs(lock: ProbeLock) -> tuple[FrozenProbeInputs, dict[str, dict[s
         selected = raw.get("selected_paper_ids", [])
         if not isinstance(selected, list):
             raise ValueError(f"frozen selected paper IDs are invalid for {query_id}")
+        execution = executions.get(query_id)
+        if not isinstance(execution, Mapping):
+            raise ValueError(f"frozen execution is missing for {query_id}")
+        retrieved = execution.get("retrieved_paper_ids")
+        if "retrieved_paper_ids" not in execution or not isinstance(retrieved, list) or not all(
+            isinstance(identifier, str) for identifier in retrieved
+        ):
+            raise ValueError(f"frozen retrieved paper IDs are invalid for {query_id}")
         records.append(
             FrozenQueryRecord(
                 query_id=query_id,
                 query_spec=spec,
                 search_plan=plan,
                 baseline_results=[_placeholder_results(selected)],
+                retrieved_paper_ids=retrieved,
                 source_index=index,
             )
         )
@@ -689,6 +725,35 @@ def _source_run_directory(source_run_id: str) -> Path:
     root = ROOT.resolve(strict=True)
     if not run_dir.is_dir() or not run_dir.is_relative_to(root):
         raise ValueError("source run directory is invalid")
+    return run_dir
+
+
+def _verify_probe_source_bindings(lock: ProbeLock) -> Path:
+    run_dir = _source_run_directory(lock.source_run_id)
+    snapshot_path = run_dir / "snapshot-manifest.json"
+    if not snapshot_path.exists():
+        snapshot_path = run_dir / "snapshots" / "snapshot-manifest.json"
+    source_paths = {
+        "business_results_sha256": run_dir / "business-results.jsonl",
+        "executions_sha256": run_dir / "executions.jsonl",
+        "run_sha256": run_dir / "run.json",
+        "snapshot_manifest_sha256": snapshot_path,
+    }
+    for key, path in source_paths.items():
+        expected = lock.source_hashes.get(key)
+        if expected is None:
+            raise ValueError(f"probe lock is missing {key}")
+        if _sha256_file(path) != expected:
+            label = key.removesuffix("_sha256").replace("_", " ")
+            raise ValueError(f"frozen {label} hash mismatch")
+    external_paths = (
+        (DEFAULT_GOLD, lock.gold_sha256, "gold"),
+        (DEFAULT_ID_MAP, lock.identifier_map_sha256, "identifier map"),
+        (DEFAULT_AVAILABILITY, lock.availability_sha256, "availability"),
+    )
+    for path, expected, label in external_paths:
+        if _sha256_file(path) != expected:
+            raise ValueError(f"frozen {label} hash mismatch")
     return run_dir
 
 
@@ -1299,6 +1364,23 @@ def _capture_replay_hash(lock: ProbeLock, outcomes: Mapping[str, Mapping[str, ob
     )
 
 
+def _probe_integrity(
+    lock: ProbeLock,
+    *,
+    capture_replay_match: Literal["matched", "mismatched"],
+    terminal_count: int,
+    request_failures: int,
+) -> ProbeIntegrity:
+    return ProbeIntegrity(
+        capture_replay_match=capture_replay_match,
+        locked_query_count=len(lock.query_ids),
+        terminal_count=terminal_count,
+        request_failures=request_failures,
+        balanced_production_estimate=Decimal("0.01"),
+        run_reason=None if capture_replay_match == "matched" else "replay_mismatch",
+    )
+
+
 def _can_resume_partial_run(run_dir: Path) -> bool:
     lock_copy = run_dir / "probe.lock.json"
     snapshot_root = run_dir / "snapshots"
@@ -1462,15 +1544,13 @@ async def _run_live_probe(
     projection = merge_probe_results(baseline, additions)
     gold = read_jsonl(DEFAULT_GOLD, EvaluationQuery)
     id_map = IdentifierMap.from_path(DEFAULT_ID_MAP)
-    integrity = ProbeIntegrity(
+    integrity = _probe_integrity(
+        lock,
         capture_replay_match="matched" if match else "mismatched",
-        locked_query_count=baseline.expected_query_count,
         terminal_count=len(replayed),
         request_failures=sum(
             1 for query_id in lock.query_ids if replayed[query_id]["terminal"] in {"dependency_failure", "integrity_failure"}
         ),
-        balanced_production_estimate=Decimal("0.01"),
-        run_reason=None if match else "replay_mismatch",
     )
     evaluation = evaluate_probe(baseline=baseline, projection=projection, gold=gold, id_map=id_map, integrity=integrity)
     (run_dir / "outcomes.jsonl").write_text(
@@ -1513,6 +1593,7 @@ def run_probe(lock_path: Path, runtime: ProbeRuntime) -> None:
         raise LiveNotAuthorized("run --lock requires --allow-live")
     if lock.probe_code_sha256 != _probe_code_sha256():
         raise ValueError("probe code hash mismatch")
+    _verify_probe_source_bindings(lock)
     _, prompt_instructions = _load_locked_prompt(lock)
     run_dir = _derive_run_directory(lock)
     if runtime.ledger_path.exists():

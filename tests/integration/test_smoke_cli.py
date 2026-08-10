@@ -21,6 +21,7 @@ from paper_search.application.contracts import (
 from paper_search.application.locks import CandidateLock, ReplayLock, lock_sha256
 from paper_search.cli import build_parser, main
 from paper_search.domain.models import StructuredSearchResponse, UsageActual
+from paper_search.llm.prompt_artifacts import load_prompt_artifact
 from paper_search.retrieval.openalex import OPENALEX_SELECT_FIELDS
 from paper_search.retrieval.semantic_scholar import _FIELDS
 from paper_search.storage.dependency_snapshot import (
@@ -62,7 +63,9 @@ def _smoke_fixture(tmp_path: Path) -> dict[str, Path]:
     payloads = {
         "data/manifest.json": b"{}\n",
         "data/identifier-map.json": b"{}\n",
-        "configs/prompts/query_analyze.yaml": b"prompt: smoke fixture\n",
+        "configs/prompts/query_analyze.yaml": Path(
+            "configs/prompts/query_analyze.yaml"
+        ).read_bytes(),
         "configs/budget_balanced.yaml": Path("configs/budget_balanced.yaml").read_bytes(),
         "configs/pricing_v1.yaml": b"""schema_version: pricing-policy-v1
 currency: CNY
@@ -260,6 +263,17 @@ def _fake_live_client_factory(fixture: dict[str, Path]) -> object:
         return real_client(transport=httpx.MockTransport(handler), **kwargs)
 
     return client_factory
+
+
+def test_smoke_fixture_uses_the_valid_repository_prompt_artifact(tmp_path: Path) -> None:
+    fixture = _smoke_fixture(tmp_path)
+    prompt_path = fixture["root"] / "configs/prompts/query_analyze.yaml"
+    prompt_bytes = prompt_path.read_bytes()
+
+    artifact = load_prompt_artifact(prompt_bytes)
+
+    assert artifact.name == "query_analyze"
+    assert prompt_bytes == Path("configs/prompts/query_analyze.yaml").read_bytes()
 
 
 def _success_execution(*, run_id: str = "smoke-live-1") -> SearchExecutionResult:

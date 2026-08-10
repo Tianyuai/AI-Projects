@@ -21,4 +21,4 @@
 
 ## 当前结论
 
-召回仍是主要瓶颈。部分成功页正确性问题已修复，但既定权重和保留槽策略均未改善最终 macro F1，不进入 live capture；详见 `title-retention-offline-2026-08-09.md`。Gold 精确可用性 v2 聚合诊断仍为 132/134 个唯一 work 可用、0 个精确未找到和 2 个 DOI 完整性失败：1 个 HTTP 200 响应缺少预期 DOI 字段，1 个规范化 DOI 不匹配，实际 135 次 HTTP 尝试；推荐方向为 `null`。这不能证明 OpenAlex 覆盖不足；在 DOI 别名/规范化接受契约完成离线定义与验证前，不选择新数据源或其他提升方向，也不重跑在线探针。
+召回仍是主要瓶颈。新的 DOI 契约重跑确认 134/134 个唯一 work 可用、0 个完整性失败；关联级损失为 125 个未被检索到、6 个排名在 Top-50 外、8 个已选入 Top-50。诊断完整，当前唯一推荐方向为 `retrieval_query_evolution_probe`。下一步应先提出可证伪的 Query Evolution 假设并执行低成本 bounded probe；在离线指标、gold 保留、排序护栏和预算检查通过前，不进入正式 live capture。

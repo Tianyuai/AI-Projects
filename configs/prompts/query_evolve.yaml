@@ -1,0 +1,19 @@
+name: query_evolve
+version: query-evolve-v1
+temperature: 0
+response_model: QueryEvolutionProposal
+strategies: [synonym, entity_alias, facet_combination, task_decomposition]
+no_op_reasons: [insufficient_grounded_facets, no_novel_query]
+instructions:
+  - Use only facts and facets present in the payload.
+  - Do not infer gold papers, relevance labels, new venues, new years, or unrelated entities.
+  - Return zero to two complementary OpenAlex queries as strict JSON.
+  - 'Generated form: {"subqueries":[{"text":"string","source_facets":["exact payload facet"],"strategy":"synonym"}],"no_op_reason":null}'
+  - 'No-op form: {"subqueries":[],"no_op_reason":"insufficient_grounded_facets"}'
+  - Top-level keys must be exactly subqueries and no_op_reason.
+  - Each subquery must contain exactly text, source_facets, and strategy.
+  - Allowed strategy values are synonym, entity_alias, facet_combination, and task_decomposition.
+  - Allowed no_op_reason values are insufficient_grounded_facets and no_novel_query.
+  - Do not return payload or prompt_name wrappers, Markdown, or extra fields.
+  - Always include no_op_reason; use null when subqueries contains items.
+  - Copy every source_facets value exactly from the payload.

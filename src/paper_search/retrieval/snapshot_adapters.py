@@ -32,7 +32,7 @@ from paper_search.errors import ProtectedExecutionError
 from paper_search.retrieval.openalex import (
     OPENALEX_SELECT_FIELDS,
     _filter_expression,
-    _normalize_search_query,
+    canonicalize_openalex_search_query,
     decode_openalex_page,
 )
 from paper_search.retrieval.semantic_scholar import (
@@ -611,7 +611,7 @@ class LiveCaptureSearchProvider:
         limit: int,
         operation: _LiveOperation,
     ) -> ProviderResult[list[Paper]]:
-        normalized_query = _normalize_search_query(query)
+        normalized_query = canonicalize_openalex_search_query(query)
         if not normalized_query:
             raise ValueError("query must not be empty")
         if type(limit) is not int or not 1 <= limit <= 300:
@@ -1078,7 +1078,7 @@ class ReplaySearchProvider:
         filters: dict[str, object],
         limit: int,
     ) -> ProviderResult[list[Paper]]:
-        normalized_query = _normalize_search_query(query)
+        normalized_query = canonicalize_openalex_search_query(query)
         if not normalized_query:
             raise ValueError("query must not be empty")
         if type(limit) is not int or not 1 <= limit <= 300:

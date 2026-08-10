@@ -304,11 +304,7 @@ class LiveCaptureLLMAnalyzer:
                     response = await self._client.request_response(
                         prompt_name=prompt_name,
                         payload=payload,
-                        prompt_instructions=(
-                            self._prompt_instructions
-                            if prompt_name == "query_analyze"
-                            else None
-                        ),
+                        prompt_instructions=self._prompt_instructions,
                     )
                 except httpx.TimeoutException:
                     code, message, retryable = (

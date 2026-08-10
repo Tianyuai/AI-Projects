@@ -7,7 +7,7 @@
 - 已闭环基线宏 F1 为 `0.0050946874`，micro recall 为 `0.0575539568`，召回是主要瓶颈。
 - 标题候选部分成功页修复使候选池 exact gold 从 19 增至 20，但最终 Top-50 仍为 13；既定离线排序变体无一满足晋级条件。
 - Citation、Topic、Embedding、普通 Query Rewrite 和既有 LLM Query Variants 已被实测否决，详见 `experiment-decisions.md`。
-- Gold 精确可用性 v2 聚合探针已执行一次：132 个唯一 work 为 `available`，0 个 `exact_not_found`，2 个 DOI `integrity_failure`。其中 1 个缺少预期 DOI 字段，1 个规范化 DOI 不匹配；因诊断不完整，推荐方向保持 `null`。
+- Gold 精确可用性 v2 的旧聚合探针为 132/134 个唯一 work `available`、2 个 DOI `integrity_failure`；该报告及对应 JSON 是历史 evidence，保持不改。新的 DOI 契约重跑证据见 `docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json`：134/134 个唯一 work `available`、0 个完整性失败，`diagnostic_complete=true`，推荐方向为 `retrieval_query_evolution_probe`。Task 1 的离线 `httpx.MockTransport` 契约测试仍保留。
 
 ## Phase 0：建立干净基线（已完成）
 
@@ -27,15 +27,17 @@
 
 ## Phase 1：两个必要诊断
 
-### 1. Gold 精确可用性（根因已分类，方向暂停）
+### 1. Gold 精确可用性（已完成，推荐 Query Evolution bounded probe）
 
 使用 DOI、arXiv ID 和 OpenAlex ID 做只读精确反查，只输出聚合原因。禁止把 gold 标识符转换成检索查询。
 
 现有 P0 探针测量的是生成标题能否搜到 gold，不等同于 gold 是否存在于 OpenAlex。
 
-本次固定输入为 60 个查询、143 条原始 gold 标识、139 个归一化查询–论文关联和 134 个唯一 work。实际使用 135 次 HTTP 尝试（硬上限 402）；2 个完整性失败均为 DOI 的 HTTP 200 响应，分别是 1 个预期字段缺失和 1 个规范化标识符不匹配。证据见 `docs/gold-bottleneck-attribution-2026-08-09.md` 和对应 JSON。
+本次固定输入为 60 个查询、143 条原始 gold 标识、139 个归一化查询–论文关联和 134 个唯一 work。新的契约重跑实际使用 135 次 HTTP 尝试（硬上限 402），134 个唯一 work 全部 `available`，0 个 `exact_not_found`，0 个完整性失败。新证据见 `docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json` 及对应 Markdown；旧报告和 JSON 仍作为历史记录保留。
 
-这不构成 OpenAlex 覆盖不足证据。下一步只需离线决定 DOI 别名/规范化解析的接受契约，并用固定夹具验证；在契约获批前，不选择新数据源、Query Evolution、过滤或排序方向，也不自动重跑在线探针。
+DOI exact-endpoint acceptance contract 已完成离线固化：请求使用规范化 DOI 时，HTTP 200 加有效 OpenAlex Work ID 即为 `available`；响应顶层 DOI 缺失、不同或不可解析不改变该结论。响应缺失或无法解析 Work ID 仍按既有完整性原因失败。请求使用 OpenAlex-ID 时，响应 Work ID 仍必须与请求 ID 严格匹配。该契约由固定合成 `httpx.MockTransport` 测试覆盖，且不改变生产检索、报告 schema、隐私或账本规则。
+
+诊断已完整闭环：`available_not_retrieved_dominant`，125 个关联未被检索到，6 个在 Top-50 外，8 个已选入 Top-50，推荐方向为 `retrieval_query_evolution_probe`。下一步只设计并执行 bounded probe，不直接重建锁或进入 live capture。
 
 ### 2. 标题候选流失（已完成）
 
@@ -74,3 +76,35 @@
 - 新数据源：仅在 Gold 精确可用性诊断证明 OpenAlex 覆盖不足后引入。
 
 每个晋升改动必须是单变量实验，使用独立配置、锁和 capture/replay/compare 证据。
+
+## Phase 4: Query Evolution bounded probe（离线实现完成）
+
+- 已加入严格的 query-evolution 契约、仅聚合评估，以及 offline-first bounded runner。
+- preflight 已针对冻结 run 通过，按原始顺序选出 55 个查询，并重建基线 `60/2910/14/8`。
+- 锁定上限为 55/110 logical operations、165/330 attempts、3600 秒全局超时和 3900 秒 ledger TTL。
+- 专项测试、全量离线测试、Ruff、mypy 与 diff 检查通过：专项 `29 passed`；全量 `1954 passed, 36 skipped`。
+- 锁文件为 `runs/_diag_query_evolution_preflight/probe.lock.json`；历史 evidence 与 `runs/candidate.lock.yaml` 未改变。
+- 本阶段未执行 live capture、replay、compare、readiness、候选锁重建、validation、网络请求、`.env` 读取或 ledger reservation；下一步是对该锁单独授权 bounded `run`。
+
+## Phase 5：Query Evolution bounded probe 实际结果
+
+- 已执行 55 个锁定查询；capture 与零网络 replay 的业务 hash 一致。
+- 生成并封存 55 个 LLM 快照与 55 条结果；由于 55 个 LLM 输出均未通过 `query-evolution-proposal-v1` 严格契约，OpenAlex 阶段按 fail-closed 规则未启动。
+- Gate A `failed`，Gate B/C `not_evaluated`；账本 165 个槽位全部终态，无遗留 reservation。
+- 本次结果是 Query Evolution 输出契约的负向诊断，不支持晋级或排名改动。下一步应先修订/验证 proposal 输出契约，再以独立锁运行变体；不得原样重跑。
+
+## Phase 6：Query Evolution prompt-contract canary 准备（离线完成）
+
+- 已固化 prompt artifact、live probe 绑定、source/canary lock、三查询选择和 LLM-only bounded canary runner；Task 4 的账本终态缺陷已补测修复并通过独立复审。
+- 离线质量门：专项 `106 passed`；全量 `1984 passed, 36 skipped`；`mypy src scripts/probe_query_evolution.py` 为 0 errors；`git diff --check` 通过。全仓库 Ruff 仅受未触碰的 `deliverables/project-docs/edit_docx.py` 中既有 F401 阻塞。
+- source lock 为 `runs/_locks/query_evolution_contract-v2-source-20260810/probe.lock.json`，canary lock 为 `runs/_locks/query_evolution_contract-20260810/canary.lock.json`。canary 固定 3 个确定性查询、3 个 logical operations、最多 9 次 LLM attempts 和 600 秒全局超时；ledger checkpoint 为 `sha256:0d3774553fc1bf7b67ba2794ed9d73522112463d63965cff8283083c082a3adc`。
+- 本阶段只运行离线 preflight，没有读取 `.env`、没有 reservation、没有 OpenAlex provider/client、没有网络请求，也没有创建 canary run directory；历史失败 evidence 与用户未跟踪文件保持不变。
+- 下一步仅是对该 canary lock 单独授权三查询 DeepSeek live canary。未获授权前不得执行 `canary-run`；更不得直接执行完整 55-query probe。canary 若未晋级，按固定失败原因停止，不得原样重跑。
+
+## Phase 7：Query Evolution 三查询 canary 结果（未晋级）
+
+- 已按 canary lock 执行一次三查询 DeepSeek live canary，证据目录为 `runs/_diag_query_evolution_contract-canary-20260810/`。
+- 实际调用为 3 次 LLM、0 次 OpenAlex/search；结果为 2 条 `generated`、1 条 `integrity_failure`。失败原因是 canonicalization 后出现重复子查询文本。
+- `result.json` 的 `promoted=false`，固定 reason 为 `canary_accounting_failed`；聚合用量为 3 次 LLM、2,541 input tokens、345 output tokens、3,877 ms、`0.003231` CNY。
+- 账本离线回读确认 3/3 回执均为 `settled`、actual 完整、无遗留 `reserved`，且回执用量与 aggregate usage 一致。因此 result reason 与账本事实之间存在需解释的诊断不一致。
+- 该结果不支持晋级、修改排名或直接执行 55-query probe。下一步只做离线 reason/accounting 路径诊断；在原因解释并形成独立新锁前，不得重跑原 canary。

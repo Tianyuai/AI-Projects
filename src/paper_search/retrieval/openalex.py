@@ -143,7 +143,7 @@ class OpenAlexPageDecode:
     raw_count: int
 
 
-def _normalize_search_query(query: str) -> str:
+def canonicalize_openalex_search_query(query: str) -> str:
     return " ".join(query.replace("?", " ").replace("*", " ").split())
 
 
@@ -346,7 +346,7 @@ class OpenAlexProvider:
         reservation: BudgetReservation,
     ) -> ProviderResult[list[Paper]]:
         """Return normalized OpenAlex Works without exceeding the reservation."""
-        normalized_query = _normalize_search_query(query)
+        normalized_query = canonicalize_openalex_search_query(query)
         if not normalized_query:
             raise ValueError("query must not be empty")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 300:

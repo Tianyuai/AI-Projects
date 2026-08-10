@@ -59,6 +59,19 @@ rates:
 """
 
 
+def _query_analyze_prompt_artifact() -> bytes:
+    return b"""name: query_analyze
+version: query-analyze-v1
+temperature: 0
+response_model: QueryAnalysisResult
+instructions:
+  - Preserve the original query and every explicit hard constraint.
+  - Return one QuerySpec and one SearchPlan as a JSON object.
+  - Generate three to five targeted subqueries.
+  - Do not infer facts that are not stated by the user.
+"""
+
+
 @pytest.fixture
 def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
     artifact_root = tmp_path / "artifacts"
@@ -66,7 +79,7 @@ def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
     payloads = {
         "data/manifest.json": b"{}",
         "data/identifier-map.json": b"{}",
-        "configs/prompts/query_analyze.yaml": b"prompt: composition fixture\n",
+        "configs/prompts/query_analyze.yaml": _query_analyze_prompt_artifact(),
         "configs/budget_balanced.yaml": (
             Path("configs/budget_balanced.yaml").read_bytes()
         ),
@@ -133,6 +146,21 @@ def _compose_replay(fixture: dict[str, Path]) -> ApplicationBundle:
         output_root=fixture["output_root"],
         snapshot_manifest_path=fixture["manifest_path"],
         environ={},
+    )
+
+
+def test_prompt_system_message_keeps_query_analyze_output_stable() -> None:
+    assert composition_module._prompt_system_message(  # noqa: SLF001
+        Path("configs/prompts/query_analyze.yaml").read_bytes()
+    ) == "\n".join(
+        [
+            "Respond with a JSON object.",
+            "The JSON object must match the QueryAnalysisResult contract.",
+            "- Preserve the original query and every explicit hard constraint.",
+            "- Return one QuerySpec and one SearchPlan as a JSON object.",
+            "- Generate three to five targeted subqueries.",
+            "- Do not infer facts that are not stated by the user.",
+        ]
     )
 
 

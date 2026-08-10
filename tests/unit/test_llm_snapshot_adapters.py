@@ -92,6 +92,7 @@ async def _live(
     controller: object,
     reservation: BudgetReservation | None = None,
     *,
+    prompt_name: str = "query_analyze",
     prompt_instructions: str | None = None,
 ) -> tuple[object, DependencyCaptureStore]:
     store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
@@ -113,7 +114,7 @@ async def _live(
             prompt_instructions=prompt_instructions,
         )
         result = await analyzer.generate_json(
-            prompt_name="query_analyze",
+            prompt_name=prompt_name,
             payload={"query": "graph retrieval"},
             reservation=reservation or _reservation(),
         )
@@ -149,6 +150,38 @@ def test_live_analyzer_sends_bound_prompt_instructions(tmp_path: Path) -> None:
         "prompt_name": "query_analyze",
         "payload": {"query": "graph retrieval"},
     }
+
+
+def test_live_analyzer_sends_bound_instructions_for_query_evolve(
+    tmp_path: Path,
+) -> None:
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            content=_response_bytes(
+                {"subqueries": [], "no_op_reason": "no_novel_query"}
+            ),
+            request=request,
+        )
+
+    asyncio.run(
+        _live(
+            tmp_path,
+            httpx.MockTransport(handler),
+            SettlementRecorder(),
+            prompt_name="query_evolve",
+            prompt_instructions=(
+                "Respond with the QueryEvolutionProposal JSON contract."
+            ),
+        )
+    )
+
+    assert seen[0]["messages"][0]["content"] == (
+        "Respond with the QueryEvolutionProposal JSON contract."
+    )
 
 
 def _budget_controller(*, formal_live: bool = True) -> HardBudgetController:

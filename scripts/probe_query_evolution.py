@@ -12,11 +12,11 @@ from decimal import Decimal
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import Annotated, Literal, cast
 
 import httpx
 from dotenv import dotenv_values
-from pydantic import Field
+from pydantic import Field, StringConstraints
 
 from paper_search.control.budget import HardBudgetController
 from paper_search.control.ledger import (
@@ -26,8 +26,18 @@ from paper_search.control.ledger import (
     SQLiteBudgetLedger,
 )
 from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
-from paper_search.domain.models import Paper, ProviderResult, QuerySpec, SearchBudget, SearchPlan
-from paper_search.domain.models import DomainModel, UsageActual, UsageEstimate
+from paper_search.domain.models import (
+    DomainModel,
+    Paper,
+    ProviderResult,
+    QuerySpec,
+    SafeRelativePath,
+    SearchBudget,
+    SearchPlan,
+    Sha256,
+    UsageActual,
+    UsageEstimate,
+)
 from paper_search.evolution.query_evolution import (
     QueryEvolutionGenerator,
     build_query_evolution_context,
@@ -43,6 +53,10 @@ from paper_search.evaluation.query_evolution_probe import (
     reconstruct_frozen_baseline,
 )
 from paper_search.llm.client import OpenAICompatibleLLMClient
+from paper_search.llm.prompt_artifacts import (
+    load_prompt_artifact,
+    render_prompt_system_message,
+)
 from paper_search.llm.snapshot_adapters import (
     HardBudgetSettlementAdapter,
     LiveCaptureLLMAnalyzer,
@@ -70,16 +84,29 @@ EXPECTED_AVAILABILITY_SHA256 = "sha256:3f445486d5cf590f3f11a51930153a45916023880
 PROBE_GLOBAL_TIMEOUT_SECONDS = 3600
 PROBE_LEDGER_TTL_SECONDS = 3900
 OPERATIONS = ("evolve", "search-1", "search-2")
+SafeRunId = Annotated[
+    str,
+    StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$"),
+]
 
 
 class LiveNotAuthorized(RuntimeError):
     pass
 
 
+class ProbePromptBinding(DomainModel):
+    path: SafeRelativePath
+    sha256: Sha256
+    name: Literal["query_evolve"]
+    version: Literal["query-evolve-v1"]
+
+
 class ProbeLock(DomainModel):
-    schema_version: Literal["query-evolution-probe-lock-v1"] = "query-evolution-probe-lock-v1"
+    schema_version: Literal["query-evolution-probe-lock-v2"] = (
+        "query-evolution-probe-lock-v2"
+    )
     preflight_complete: bool
-    probe_run_id: str = Field(min_length=1)
+    probe_run_id: SafeRunId
     source_run_id: str = Field(min_length=1)
     source_hashes: dict[str, str]
     source_git_sha: str = Field(min_length=1)
@@ -91,8 +118,7 @@ class ProbeLock(DomainModel):
     total_selected: int = Field(strict=True, ge=0)
     baseline_candidate_gold_count: int = Field(strict=True, ge=0)
     baseline_top50_gold_count: int = Field(strict=True, ge=0)
-    prompt_version: Literal["query-evolve-v1"]
-    prompt_sha256: str
+    prompt: ProbePromptBinding
     model_id: Literal["deepseek-v4-flash"]
     endpoint: Literal["https://api.deepseek.com/v1"]
     probe_code_sha256: str
@@ -205,14 +231,33 @@ def _select_queue(
     return tuple(selected)
 
 
+def _build_prompt_binding(prompt_config: Path) -> ProbePromptBinding:
+    root = ROOT.resolve(strict=True)
+    try:
+        prompt_path = (ROOT / prompt_config).resolve(strict=True)
+    except FileNotFoundError as error:
+        raise ValueError("prompt path is invalid") from error
+    if not prompt_path.is_file() or not prompt_path.is_relative_to(root):
+        raise ValueError("prompt path is invalid")
+    prompt_bytes = prompt_path.read_bytes()
+    artifact = load_prompt_artifact(prompt_bytes)
+    return ProbePromptBinding(
+        path=prompt_path.relative_to(root).as_posix(),
+        sha256=_sha256_bytes(prompt_bytes),
+        name=artifact.name,
+        version=artifact.version,
+    )
+
+
 def _build_lock_payload(
     *,
     frozen_run: Path,
     gold_path: Path,
     id_map_path: Path,
     availability_path: Path,
+    prompt_config: Path,
+    probe_run_id: SafeRunId,
     ledger_path: Path,
-    output_path: Path,
 ) -> dict[str, object]:
     business_path = frozen_run / "business-results.jsonl"
     executions_path = frozen_run / "executions.jsonl"
@@ -253,9 +298,7 @@ def _build_lock_payload(
     query_ids = _select_queue(business, gold, identifier_map, retrieved_by_query=retrieved_by_query)
     if len(query_ids) != 55:
         raise ValueError("frozen queue must contain 55 available-but-not-retrieved queries")
-    prompt_path = ROOT / "configs" / "prompts" / "query_evolve.yaml"
-    if not prompt_path.exists():
-        raise ValueError("query evolution prompt artifact is missing")
+    prompt_binding = _build_prompt_binding(prompt_config)
     run_record = json.loads(run_path.read_text(encoding="utf-8"))
     source_git_sha = run_record.get("source_git_sha")
     if not isinstance(source_git_sha, str) or not source_git_sha:
@@ -272,9 +315,9 @@ def _build_lock_payload(
     else:
         empty_checkpoint = _sha256_bytes(b"")
     return {
-        "schema_version": "query-evolution-probe-lock-v1",
+        "schema_version": "query-evolution-probe-lock-v2",
         "preflight_complete": True,
-        "probe_run_id": "query-evolution-preflight",
+        "probe_run_id": probe_run_id,
         "source_run_id": str(run_record.get("run_id", frozen_run.name)),
         "source_hashes": source_hashes,
         "source_git_sha": source_git_sha,
@@ -286,8 +329,7 @@ def _build_lock_payload(
         "total_selected": 2910,
         "baseline_candidate_gold_count": 14,
         "baseline_top50_gold_count": 8,
-        "prompt_version": "query-evolve-v1",
-        "prompt_sha256": _sha256_file(prompt_path),
+        "prompt": prompt_binding.model_dump(mode="json"),
         "model_id": "deepseek-v4-flash",
         "endpoint": "https://api.deepseek.com/v1",
         "probe_code_sha256": _probe_code_sha256(),
@@ -306,7 +348,7 @@ def _build_lock_payload(
             "search-2": {"search_api_calls": 3, "elapsed_ms": 60000},
         },
         "ledger_checkpoint_sha256": empty_checkpoint,
-        "expected_run_directory": "runs/_diag_query_evolution_query-evolution-preflight",
+        "expected_run_directory": f"runs/_diag_query_evolution_{probe_run_id}",
         "lock_sha256": "sha256:" + "0" * 64,
     }
 
@@ -323,6 +365,8 @@ def preflight_probe(
     gold_path: Path,
     id_map_path: Path,
     availability_path: Path,
+    prompt_config: Path,
+    probe_run_id: SafeRunId,
     ledger_path: Path,
     output_path: Path,
 ) -> ProbeLock:
@@ -334,8 +378,9 @@ def preflight_probe(
         gold_path=gold_path,
         id_map_path=id_map_path,
         availability_path=availability_path,
+        prompt_config=prompt_config,
+        probe_run_id=probe_run_id,
         ledger_path=ledger_path,
-        output_path=output_path,
     )
     payload["lock_sha256"] = _self_hash(payload)
     lock = ProbeLock.model_validate(payload)
@@ -352,6 +397,20 @@ def load_probe_lock(path: Path) -> ProbeLock:
     if lock.lock_sha256 != _self_hash(payload):
         raise ValueError("probe lock self-hash mismatch")
     return lock
+
+
+def _load_locked_prompt(lock: ProbeLock) -> tuple[bytes, str]:
+    path = (ROOT / lock.prompt.path).resolve(strict=True)
+    root = ROOT.resolve(strict=True)
+    if not path.is_file() or not path.is_relative_to(root):
+        raise ValueError("locked prompt path is invalid")
+    prompt_bytes = path.read_bytes()
+    if _sha256_bytes(prompt_bytes) != lock.prompt.sha256:
+        raise ValueError("locked prompt hash mismatch")
+    artifact = load_prompt_artifact(prompt_bytes)
+    if artifact.name != lock.prompt.name or artifact.version != lock.prompt.version:
+        raise ValueError("locked prompt identity mismatch")
+    return prompt_bytes, render_prompt_system_message(prompt_bytes)
 
 
 def reserve_probe_operations(lock: ProbeLock, ledger: SQLiteBudgetLedger) -> ProbeReservations:
@@ -558,7 +617,14 @@ def _can_resume_partial_run(run_dir: Path) -> bool:
     )
 
 
-async def _run_live_probe(lock: ProbeLock, runtime: ProbeRuntime, run_dir: Path) -> None:
+async def _run_live_probe(
+    lock: ProbeLock,
+    runtime: ProbeRuntime,
+    run_dir: Path,
+    *,
+    prompt_sha: str,
+    prompt_instructions: str,
+) -> None:
     if runtime.ledger_path.resolve() == Path(lock.expected_run_directory).resolve():
         raise ValueError("ledger path must not be the probe output directory")
     llm_key, openalex_keys, openalex_mailto = _load_secrets(runtime.env_file)
@@ -567,7 +633,6 @@ async def _run_live_probe(lock: ProbeLock, runtime: ProbeRuntime, run_dir: Path)
         query_id: cast(Mapping[str, object], raw_records[query_id]["business"])
         for query_id in lock.query_ids
     }
-    prompt_sha = lock.prompt_sha256
     policy = load_pricing_policy(DEFAULT_PRICING_POLICY)
     pricer = ActualCostPricer(policy)
     ledger = SQLiteBudgetLedger(runtime.ledger_path, reservation_ttl_seconds=PROBE_LEDGER_TTL_SECONDS)
@@ -584,7 +649,7 @@ async def _run_live_probe(lock: ProbeLock, runtime: ProbeRuntime, run_dir: Path)
             base_url="https://api.deepseek.com/v1",
             model=lock.model_id,
             api_key=llm_key,
-            prompt_version=lock.prompt_version,
+            prompt_version=lock.prompt.version,
         )
         for query_id in lock.query_ids:
             raw = business_by_id[query_id]
@@ -609,6 +674,7 @@ async def _run_live_probe(lock: ProbeLock, runtime: ProbeRuntime, run_dir: Path)
                     pricer=pricer,
                     controller=HardBudgetSettlementAdapter(evolve_controller),
                     prompt_artifact_sha256=prompt_sha,
+                    prompt_instructions=prompt_instructions,
                 )
             )
             try:
@@ -688,7 +754,7 @@ async def _run_live_probe(lock: ProbeLock, runtime: ProbeRuntime, run_dir: Path)
                 reader=reader,
                 model_id=lock.model_id,
                 prompt_artifact_sha256=prompt_sha,
-                prompt_version=lock.prompt_version,
+                prompt_version=lock.prompt.version,
             )
         )
         generated = await generator.generate(context, reservation)
@@ -765,6 +831,7 @@ def run_probe(lock_path: Path, runtime: ProbeRuntime) -> None:
         raise LiveNotAuthorized("run --lock requires --allow-live")
     if lock.probe_code_sha256 != _probe_code_sha256():
         raise ValueError("probe code hash mismatch")
+    _, prompt_instructions = _load_locked_prompt(lock)
     if runtime.ledger_path.exists():
         ledger = SQLiteBudgetLedger(runtime.ledger_path, reservation_ttl_seconds=PROBE_LEDGER_TTL_SECONDS)
         if ledger.project_checkpoint()[1] != lock.ledger_checkpoint_sha256:
@@ -779,7 +846,15 @@ def run_probe(lock_path: Path, runtime: ProbeRuntime) -> None:
         run_dir.mkdir(parents=True)
         (run_dir / "probe.lock.json").write_bytes(lock_bytes)
     try:
-        asyncio.run(_run_live_probe(lock, runtime, run_dir))
+        asyncio.run(
+            _run_live_probe(
+                lock,
+                runtime,
+                run_dir,
+                prompt_sha=lock.prompt.sha256,
+                prompt_instructions=prompt_instructions,
+            )
+        )
     except BaseException:
         raise
 
@@ -810,7 +885,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     command = args.command or "preflight"
     try:
         if command == "preflight":
-            for config_path in (args.prompt_config, args.budget_config, args.pricing_policy):
+            for config_path in (args.budget_config, args.pricing_policy):
                 if not config_path.is_file():
                     raise FileNotFoundError(f"preflight config missing: {config_path}")
             preflight_probe(
@@ -818,6 +893,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 gold_path=args.gold,
                 id_map_path=args.id_map,
                 availability_path=args.availability,
+                prompt_config=args.prompt_config,
+                probe_run_id="query-evolution-preflight",
                 ledger_path=args.ledger,
                 output_path=args.out,
             )

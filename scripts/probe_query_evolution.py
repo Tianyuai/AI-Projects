@@ -21,6 +21,7 @@ from pydantic import Field, StringConstraints, ValidationError
 from paper_search.control.budget import HardBudgetController
 from paper_search.control.ledger import (
     DEV_RUN_CAP_CNY,
+    LedgerReceipt,
     LedgerReservation,
     LedgerReservationError,
     SQLiteBudgetLedger,
@@ -501,6 +502,17 @@ def _json_object(path: Path) -> dict[str, object]:
     return payload
 
 
+def _run_receipts(
+    ledger: SQLiteBudgetLedger,
+    run_id: str,
+) -> list[LedgerReceipt]:
+    return [
+        receipt
+        for receipt in ledger.report(run_id).receipts
+        if receipt.run_id == run_id
+    ]
+
+
 def reserve_probe_operations(lock: ProbeLock, ledger: SQLiteBudgetLedger) -> ProbeReservations:
     """Reserve every logical slot before any future live request."""
     expected: dict[tuple[str, str], str] = {
@@ -509,7 +521,7 @@ def reserve_probe_operations(lock: ProbeLock, ledger: SQLiteBudgetLedger) -> Pro
         for operation in OPERATIONS
     }
     try:
-        receipts = ledger.report(lock.probe_run_id).receipts
+        receipts = _run_receipts(ledger, lock.probe_run_id)
     except LedgerReservationError:
         receipts = []
     if receipts:
@@ -817,7 +829,7 @@ def _finalize_canary_reservations(
     }
     receipts = {
         receipt.reservation_id: receipt
-        for receipt in ledger.report(lock.canary_run_id).receipts
+        for receipt in _run_receipts(ledger, lock.canary_run_id)
     }
     cleanup_errors: list[Exception] = []
     for query_id, reservation in reservations.items():
@@ -829,7 +841,7 @@ def _finalize_canary_reservations(
         except Exception as error:
             cleanup_errors.append(error)
 
-    final_receipts = ledger.report(lock.canary_run_id).receipts
+    final_receipts = _run_receipts(ledger, lock.canary_run_id)
     if (
         cleanup_errors
         or len(final_receipts) != lock.limits.query_count
@@ -854,7 +866,7 @@ def reserve_canary_operations(
         for query_id in lock.query_ids
     }
     try:
-        receipts = ledger.report(lock.canary_run_id).receipts
+        receipts = _run_receipts(ledger, lock.canary_run_id)
     except LedgerReservationError:
         receipts = []
     if receipts:
@@ -1217,8 +1229,7 @@ def run_canary(lock_path: Path, runtime: ProbeRuntime) -> None:
                 snapshot_manifest_sha256 = capture_store.manifest_sha256
                 snapshot_set_id = manifest.snapshot_set_id
                 manifest_entry_ids = {entry.entry_id for entry in manifest.entries}
-                report = ledger.report(lock.canary_run_id)
-                receipts = report.receipts
+                receipts = _run_receipts(ledger, lock.canary_run_id)
                 promoted = (
                     reason == "passed"
                     and len(outcomes) == lock.limits.query_count

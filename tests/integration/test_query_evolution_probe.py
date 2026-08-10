@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from tempfile import TemporaryDirectory
 from pathlib import Path
+from decimal import Decimal
+from tempfile import TemporaryDirectory
 
 import httpx
 import pytest
@@ -148,7 +149,31 @@ def _synthetic_raw_record(query_label: str, extra_topics: int, candidate_count: 
     }
 
 
-def _write_canary_lock(tmp_path: Path, label: str) -> tuple[Path, probe.CanaryLock, Path]:
+def _seed_settled_receipt(
+    ledger: probe.SQLiteBudgetLedger,
+    *,
+    run_id: str = "prior-run",
+    query_id: str = "prior:evolve",
+) -> probe.LedgerReservation:
+    estimate = probe.UsageEstimate(llm_calls=1, cost_cny=Decimal("0.01"))
+    actual = probe.UsageActual(llm_calls=1, cost_cny=Decimal("0.001"))
+    reservation = ledger.reserve(
+        run_id=run_id,
+        query_id=query_id,
+        estimate=estimate,
+        run_cap_cny=probe.DEV_RUN_CAP_CNY,
+    )
+    ledger.checkpoint_actual(reservation, actual)
+    ledger.settle(reservation, actual)
+    return reservation
+
+
+def _write_canary_lock(
+    tmp_path: Path,
+    label: str,
+    *,
+    ledger_path: Path | None = None,
+) -> tuple[Path, probe.CanaryLock, Path]:
     probe_lock_path = tmp_path / f"{label}-probe.lock.json"
     probe.preflight_probe(
         frozen_run=DEFAULT_RUN,
@@ -161,9 +186,10 @@ def _write_canary_lock(tmp_path: Path, label: str) -> tuple[Path, probe.CanaryLo
         output_path=probe_lock_path,
     )
     canary_lock_path = tmp_path / f"{label}-canary.lock.json"
+    canary_ledger_path = ledger_path or tmp_path / f"{label}-canary-ledger.sqlite3"
     lock = probe.preflight_canary(
         probe_lock_path=probe_lock_path,
-        ledger_path=tmp_path / f"{label}-canary-ledger.sqlite3",
+        ledger_path=canary_ledger_path,
         canary_run_id=_run_id(label, tmp_path),
         output_path=canary_lock_path,
     )
@@ -764,6 +790,109 @@ def test_canary_run_records_contract_failure_for_strict_schema_violation(
     assert result["terminal_counts"]["failed"] == 1
 
 
+@pytest.mark.parametrize(
+    ("behaviors", "expected_reason", "expected_promoted"),
+    [
+        pytest.param(
+            ["generated", "no_op", "generated"],
+            "passed",
+            True,
+            id="promoted",
+        ),
+        pytest.param(
+            ["generated", "integrity", "generated"],
+            "contract_canary_failed",
+            False,
+            id="contract-failed",
+        ),
+    ],
+)
+def test_canary_uses_only_current_run_receipts_when_project_has_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    behaviors: list[str],
+    expected_reason: str,
+    expected_promoted: bool,
+) -> None:
+    ledger_path = tmp_path / "ledger.sqlite3"
+    ledger = probe.SQLiteBudgetLedger(
+        ledger_path,
+        reservation_ttl_seconds=probe.PROBE_LEDGER_TTL_SECONDS,
+    )
+    prior = _seed_settled_receipt(ledger)
+    lock_path, lock, run_dir = _write_canary_lock(
+        tmp_path,
+        "project-history",
+        ledger_path=ledger_path,
+    )
+    env_file = tmp_path / "canary.env"
+    env_file.write_text("LLM_API_KEY=test-llm-key\n", encoding="utf-8")
+    _install_mock_llm_client(monkeypatch, _mock_llm_transport(behaviors, []))
+    _install_openalex_guards(monkeypatch)
+
+    probe.run_canary(
+        lock_path,
+        ProbeRuntime(
+            allow_live=True,
+            env_file=env_file,
+            ledger_path=ledger_path,
+        ),
+    )
+
+    result = _read_result(run_dir)
+    receipts = ledger.report(lock.canary_run_id).receipts
+    current = [receipt for receipt in receipts if receipt.run_id == lock.canary_run_id]
+    assert result["reason"] == expected_reason
+    assert result["promoted"] is expected_promoted
+    assert len(receipts) == 4
+    assert len(current) == 3
+    assert all(receipt.state == "settled" for receipt in current)
+    assert (
+        next(
+            receipt
+            for receipt in receipts
+            if receipt.reservation_id == prior.reservation_id
+        ).state
+        == "settled"
+    )
+
+
+def test_canary_reservation_recovery_ignores_other_runs(tmp_path: Path) -> None:
+    ledger_path = tmp_path / "ledger.sqlite3"
+    ledger = probe.SQLiteBudgetLedger(ledger_path)
+    _seed_settled_receipt(ledger)
+    _, lock, _ = _write_canary_lock(
+        tmp_path,
+        "canary-resume",
+        ledger_path=ledger_path,
+    )
+    created = probe.reserve_canary_operations(lock, ledger)
+
+    restored = probe.reserve_canary_operations(lock, ledger)
+
+    assert set(restored) == set(created)
+    assert {
+        key: value.reservation_id for key, value in restored.items()
+    } == {
+        key: value.reservation_id for key, value in created.items()
+    }
+
+
+def test_full_probe_reservation_recovery_ignores_other_runs(tmp_path: Path) -> None:
+    ledger = probe.SQLiteBudgetLedger(tmp_path / "ledger.sqlite3")
+    _seed_settled_receipt(ledger)
+    lock = _synthetic_probe_lock(("q1", "q2"))
+    created = probe.reserve_probe_operations(lock, ledger)
+
+    restored = probe.reserve_probe_operations(lock, ledger)
+
+    assert {
+        key: value.reservation_id for key, value in restored.values.items()
+    } == {
+        key: value.reservation_id for key, value in created.values.items()
+    }
+
+
 def test_canary_run_stops_after_nine_retryable_attempts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -797,7 +926,17 @@ def test_canary_run_marks_accounting_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lock_path, lock, run_dir = _write_canary_lock(tmp_path, "accounting")
+    ledger_path = tmp_path / "ledger.sqlite3"
+    ledger = probe.SQLiteBudgetLedger(
+        ledger_path,
+        reservation_ttl_seconds=probe.PROBE_LEDGER_TTL_SECONDS,
+    )
+    prior = _seed_settled_receipt(ledger)
+    lock_path, lock, run_dir = _write_canary_lock(
+        tmp_path,
+        "accounting",
+        ledger_path=ledger_path,
+    )
     env_file = tmp_path / "canary.env"
     env_file.write_text("LLM_API_KEY=test-llm-key\n", encoding="utf-8")
     _install_mock_llm_client(
@@ -816,21 +955,20 @@ def test_canary_run_marks_accounting_failure(
         ProbeRuntime(
             allow_live=True,
             env_file=env_file,
-            ledger_path=tmp_path / "ledger.sqlite3",
+            ledger_path=ledger_path,
         ),
     )
 
     result = _read_result(run_dir)
     assert result["reason"] == "canary_accounting_failed"
     assert result["promoted"] is False
-    ledger = probe.SQLiteBudgetLedger(
-        tmp_path / "ledger.sqlite3",
-        reservation_ttl_seconds=probe.PROBE_LEDGER_TTL_SECONDS,
-    )
     receipts = ledger.report(lock.canary_run_id).receipts
-    assert len(receipts) == 3
-    assert all(receipt.state == "failed" for receipt in receipts)
-    assert all(receipt.actual is not None for receipt in receipts)
+    current = [receipt for receipt in receipts if receipt.run_id == lock.canary_run_id]
+    assert len(receipts) == 4
+    assert len(current) == 3
+    assert all(receipt.state == "failed" for receipt in current)
+    assert all(receipt.actual is not None for receipt in current)
+    assert next(receipt for receipt in receipts if receipt.reservation_id == prior.reservation_id).state == "settled"
 
 
 def test_canary_run_marks_snapshot_failure(
@@ -869,7 +1007,17 @@ def test_canary_run_marks_timeout_as_cancelled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lock_path, lock, run_dir = _write_canary_lock(tmp_path, "cancelled")
+    ledger_path = tmp_path / "ledger.sqlite3"
+    ledger = probe.SQLiteBudgetLedger(
+        ledger_path,
+        reservation_ttl_seconds=probe.PROBE_LEDGER_TTL_SECONDS,
+    )
+    prior = _seed_settled_receipt(ledger)
+    lock_path, lock, run_dir = _write_canary_lock(
+        tmp_path,
+        "cancelled",
+        ledger_path=ledger_path,
+    )
     env_file = tmp_path / "canary.env"
     env_file.write_text("LLM_API_KEY=test-llm-key\n", encoding="utf-8")
     calls: list[str] = []
@@ -893,7 +1041,7 @@ def test_canary_run_marks_timeout_as_cancelled(
         ProbeRuntime(
             allow_live=True,
             env_file=env_file,
-            ledger_path=tmp_path / "ledger.sqlite3",
+            ledger_path=ledger_path,
         ),
     )
 
@@ -901,14 +1049,13 @@ def test_canary_run_marks_timeout_as_cancelled(
     assert calls == []
     assert result["reason"] == "canary_cancelled"
     assert result["promoted"] is False
-    ledger = probe.SQLiteBudgetLedger(
-        tmp_path / "ledger.sqlite3",
-        reservation_ttl_seconds=probe.PROBE_LEDGER_TTL_SECONDS,
-    )
     receipts = ledger.report(lock.canary_run_id).receipts
-    assert len(receipts) == 3
-    assert all(receipt.state == "failed" for receipt in receipts)
-    assert all(receipt.actual is not None for receipt in receipts)
+    current = [receipt for receipt in receipts if receipt.run_id == lock.canary_run_id]
+    assert len(receipts) == 4
+    assert len(current) == 3
+    assert all(receipt.state == "failed" for receipt in current)
+    assert all(receipt.actual is not None for receipt in current)
+    assert next(receipt for receipt in receipts if receipt.reservation_id == prior.reservation_id).state == "settled"
 
 
 @pytest.mark.parametrize(

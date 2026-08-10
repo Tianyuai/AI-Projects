@@ -28,6 +28,7 @@ from paper_search.control.ledger import (
 from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
 from paper_search.domain.models import (
     DomainModel,
+    NonEmptyStr,
     Paper,
     ProviderResult,
     QuerySpec,
@@ -40,6 +41,7 @@ from paper_search.domain.models import (
 )
 from paper_search.evolution.query_evolution import (
     QueryEvolutionGenerator,
+    QueryEvolutionContext,
     build_query_evolution_context,
 )
 from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap, read_jsonl
@@ -133,6 +135,45 @@ class ProbeRuntime(DomainModel):
     allow_live: bool = False
     env_file: Path = Path(r"D:\AI Projects\Projects\.env")
     ledger_path: Path = ROOT / "data" / "budget_ledger.sqlite3"
+
+
+CanaryReason = Literal[
+    "passed",
+    "canary_preflight_failed",
+    "prompt_binding_failed",
+    "contract_canary_failed",
+    "canary_dependency_failed",
+    "canary_accounting_failed",
+    "canary_snapshot_failed",
+    "canary_cancelled",
+]
+
+
+class CanaryLimits(DomainModel):
+    query_count: Literal[3] = 3
+    llm_logical_operations: Literal[3] = 3
+    llm_attempts: Literal[9] = 9
+    global_timeout_seconds: Literal[600] = 600
+
+
+class CanaryLock(DomainModel):
+    schema_version: Literal["query-evolution-contract-canary-lock-v1"] = (
+        "query-evolution-contract-canary-lock-v1"
+    )
+    canary_run_id: SafeRunId
+    source_probe_lock_sha256: Sha256
+    source_run_id: NonEmptyStr
+    source_hashes: dict[str, Sha256]
+    probe_code_sha256: Sha256
+    prompt: ProbePromptBinding
+    model_id: Literal["deepseek-v4-flash"]
+    endpoint: Literal["https://api.deepseek.com/v1"]
+    query_ids: tuple[str, str, str]
+    limits: CanaryLimits
+    evolve_estimate: UsageEstimate
+    ledger_checkpoint_sha256: Sha256
+    expected_run_directory: SafeRelativePath
+    lock_sha256: Sha256
 
 
 class ReplayTrace(DomainModel):
@@ -554,6 +595,137 @@ def _frozen_inputs(lock: ProbeLock) -> tuple[FrozenProbeInputs, dict[str, dict[s
     )
 
 
+def build_probe_context(
+    query_id: str,
+    raw_record: Mapping[str, object],
+) -> QueryEvolutionContext:
+    business = raw_record.get("business")
+    if not isinstance(business, Mapping):
+        raise ValueError(f"frozen business record is missing for {query_id}")
+    analysis = business.get("query_analysis")
+    if not isinstance(analysis, Mapping):
+        raise ValueError(f"frozen query analysis is missing for {query_id}")
+    spec = QuerySpec.model_validate(analysis.get("query_spec"))
+    plan = SearchPlan.model_validate(analysis.get("search_plan"))
+    execution = raw_record.get("execution")
+    if not isinstance(execution, Mapping):
+        execution = {}
+    retrieved = execution.get("retrieved_paper_ids", [])
+    candidate_count = len(retrieved) if isinstance(retrieved, list) else 0
+    return build_query_evolution_context(spec, plan, candidate_count, [])
+
+
+def select_canary_query_ids(
+    lock: ProbeLock,
+    raw_records: Mapping[str, Mapping[str, object]],
+) -> tuple[str, str, str]:
+    ranked = sorted(
+        lock.query_ids,
+        key=lambda query_id: (
+            len(
+                _canonical_json(
+                    build_probe_context(query_id, raw_records[query_id]).model_dump(mode="json")
+                )
+            ),
+            query_id,
+        ),
+    )
+    selected = (ranked[0], ranked[len(ranked) // 2], ranked[-1])
+    if len(set(selected)) != 3:
+        raise ValueError("canary selection must produce exactly three distinct query IDs")
+    return selected
+
+
+def _source_run_directory(source_run_id: str) -> Path:
+    run_dir = (ROOT / "runs" / source_run_id).resolve(strict=True)
+    root = ROOT.resolve(strict=True)
+    if not run_dir.is_dir() or not run_dir.is_relative_to(root):
+        raise ValueError("source run directory is invalid")
+    return run_dir
+
+
+def _load_canary_raw_records(lock: ProbeLock) -> dict[str, dict[str, object]]:
+    run_dir = _source_run_directory(lock.source_run_id)
+    business_path = run_dir / "business-results.jsonl"
+    executions_path = run_dir / "executions.jsonl"
+    expected_business = lock.source_hashes.get("business_results_sha256")
+    expected_executions = lock.source_hashes.get("executions_sha256")
+    if expected_business is None or expected_executions is None:
+        raise ValueError("probe lock is missing frozen business or execution hashes")
+    if _sha256_file(business_path) != expected_business:
+        raise ValueError("frozen business results hash mismatch")
+    if _sha256_file(executions_path) != expected_executions:
+        raise ValueError("frozen executions hash mismatch")
+    business_by_query = {
+        record["query_id"]: record
+        for record in _jsonl_objects(business_path)
+        if isinstance(record.get("query_id"), str)
+    }
+    executions_by_query = {
+        record["query_id"]: record
+        for record in _jsonl_objects(executions_path)
+        if isinstance(record.get("query_id"), str)
+    }
+    raw_records: dict[str, dict[str, object]] = {}
+    for query_id in lock.query_ids:
+        if query_id not in business_by_query:
+            raise ValueError(f"frozen business result query is missing for {query_id}")
+        raw_records[query_id] = {
+            "business": business_by_query[query_id],
+            "execution": executions_by_query.get(query_id, {}),
+        }
+    return raw_records
+
+
+def preflight_canary(
+    probe_lock_path: Path,
+    ledger_path: Path,
+    canary_run_id: SafeRunId,
+    output_path: Path,
+) -> CanaryLock:
+    if output_path.exists():
+        raise FileExistsError(f"canary preflight output already exists: {output_path}")
+    probe_lock = load_probe_lock(probe_lock_path)
+    _load_locked_prompt(probe_lock)
+    raw_records = _load_canary_raw_records(probe_lock)
+    selected = select_canary_query_ids(probe_lock, raw_records)
+    if ledger_path.exists():
+        ledger = SQLiteBudgetLedger(
+            ledger_path,
+            reservation_ttl_seconds=PROBE_LEDGER_TTL_SECONDS,
+        )
+        _, checkpoint = ledger.project_checkpoint()
+    else:
+        checkpoint = _sha256_bytes(b"")
+    payload: dict[str, object] = {
+        "schema_version": "query-evolution-contract-canary-lock-v1",
+        "canary_run_id": canary_run_id,
+        "source_probe_lock_sha256": _sha256_bytes(probe_lock_path.read_bytes()),
+        "source_run_id": probe_lock.source_run_id,
+        "source_hashes": dict(probe_lock.source_hashes),
+        "probe_code_sha256": _probe_code_sha256(),
+        "prompt": probe_lock.prompt.model_dump(mode="json"),
+        "model_id": probe_lock.model_id,
+        "endpoint": probe_lock.endpoint,
+        "query_ids": list(selected),
+        "limits": CanaryLimits().model_dump(mode="json"),
+        "evolve_estimate": UsageEstimate.model_validate(
+            probe_lock.estimates["evolve"]
+        ).model_dump(mode="json"),
+        "ledger_checkpoint_sha256": checkpoint,
+        "expected_run_directory": f"runs/_diag_query_evolution_{canary_run_id}",
+        "lock_sha256": "sha256:" + "0" * 64,
+    }
+    payload["lock_sha256"] = _self_hash(payload)
+    lock = CanaryLock.model_validate(payload)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_bytes = _canonical_json(lock.model_dump(mode="json"))
+    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    temp_path.write_bytes(lock_bytes)
+    temp_path.replace(output_path)
+    return lock
+
+
 def _load_secrets(env_file: Path) -> tuple[str, tuple[str, ...], str | None]:
     values = dotenv_values(env_file)
     llm_key = values.get("LLM_API_KEY") or os.environ.get("LLM_API_KEY")
@@ -667,14 +839,8 @@ async def _run_live_probe(
             analysis = raw.get("query_analysis")
             if not isinstance(analysis, Mapping):
                 raise ValueError(f"frozen query analysis is missing for {query_id}")
-            spec = QuerySpec.model_validate(analysis["query_spec"])
             plan = SearchPlan.model_validate(analysis["search_plan"])
-            execution = raw_records[query_id].get("execution")
-            if not isinstance(execution, Mapping):
-                execution = {}
-            retrieved = execution.get("retrieved_paper_ids", [])
-            candidate_count = len(retrieved) if isinstance(retrieved, list) else 0
-            context = build_query_evolution_context(spec, plan, candidate_count, [])
+            context = build_probe_context(query_id, raw_records[query_id])
             evolve_controller = _controller("evolve", _estimate(lock, "evolve"))
             evolve_reservation = evolve_controller.reserve("query-evolution", _estimate(lock, "evolve"))
             evolve_persistent = persistent[(query_id, "evolve")]
@@ -750,14 +916,8 @@ async def _run_live_probe(
         analysis = raw.get("query_analysis")
         if not isinstance(analysis, Mapping):
             raise ValueError(f"frozen query analysis is missing for {query_id}")
-        spec = QuerySpec.model_validate(analysis["query_spec"])
         plan = SearchPlan.model_validate(analysis["search_plan"])
-        execution = raw_records[query_id].get("execution")
-        if not isinstance(execution, Mapping):
-            execution = {}
-        retrieved = execution.get("retrieved_paper_ids", [])
-        candidate_count = len(retrieved) if isinstance(retrieved, list) else 0
-        context = build_query_evolution_context(spec, plan, candidate_count, [])
+        context = build_probe_context(query_id, raw_records[query_id])
         controller = _controller("evolve", _estimate(lock, "evolve"))
         reservation = controller.reserve("replay", _estimate(lock, "evolve"))
         generator = QueryEvolutionGenerator(
@@ -883,6 +1043,12 @@ def build_parser() -> argparse.ArgumentParser:
     preflight.add_argument("--pricing-policy", type=Path, default=DEFAULT_PRICING_POLICY)
     preflight.add_argument("--ledger", type=Path, default=ROOT / "data" / "budget_ledger.sqlite3")
     preflight.add_argument("--out", type=Path, default=DEFAULT_LOCK)
+    preflight.add_argument("--probe-run-id", default="query-evolution-preflight")
+    canary_preflight = subparsers.add_parser("canary-preflight")
+    canary_preflight.add_argument("--probe-lock", type=Path, required=True)
+    canary_preflight.add_argument("--ledger", type=Path, default=ROOT / "data" / "budget_ledger.sqlite3")
+    canary_preflight.add_argument("--canary-run-id", required=True)
+    canary_preflight.add_argument("--out", type=Path, required=True)
     run = subparsers.add_parser("run")
     run.add_argument("--lock", type=Path, required=True)
     run.add_argument("--allow-live", action="store_true")
@@ -905,8 +1071,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 id_map_path=args.id_map,
                 availability_path=args.availability,
                 prompt_config=args.prompt_config,
-                probe_run_id="query-evolution-preflight",
+                probe_run_id=args.probe_run_id,
                 ledger_path=args.ledger,
+                output_path=args.out,
+            )
+            return 0
+        if command == "canary-preflight":
+            preflight_canary(
+                probe_lock_path=args.probe_lock,
+                ledger_path=args.ledger,
+                canary_run_id=args.canary_run_id,
                 output_path=args.out,
             )
             return 0

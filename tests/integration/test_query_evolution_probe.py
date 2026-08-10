@@ -22,6 +22,124 @@ from scripts.probe_query_evolution import (
 )
 
 
+def _sha(value: str) -> str:
+    return probe._sha256_bytes(value.encode("utf-8"))
+
+
+def _synthetic_probe_lock(query_ids: tuple[str, ...]) -> probe.ProbeLock:
+    prompt_bytes = DEFAULT_PROMPT_CONFIG.read_bytes()
+    return probe.ProbeLock(
+        preflight_complete=True,
+        probe_run_id="task-3-probe-lock",
+        source_run_id=DEFAULT_RUN.name,
+        source_hashes={
+            "business_results_sha256": _sha("business"),
+            "executions_sha256": _sha("executions"),
+            "run_sha256": _sha("run"),
+            "snapshot_manifest_sha256": _sha("snapshot"),
+        },
+        source_git_sha="deadbeef",
+        gold_sha256=_sha("gold"),
+        identifier_map_sha256=_sha("identifier-map"),
+        availability_sha256=_sha("availability"),
+        query_ids=query_ids,
+        query_count=60,
+        total_selected=2910,
+        baseline_candidate_gold_count=14,
+        baseline_top50_gold_count=8,
+        prompt=probe.ProbePromptBinding(
+            path=DEFAULT_PROMPT_CONFIG.relative_to(probe.ROOT).as_posix(),
+            sha256=probe._sha256_bytes(prompt_bytes),
+            name="query_evolve",
+            version="query-evolve-v1",
+        ),
+        model_id="deepseek-v4-flash",
+        endpoint="https://api.deepseek.com/v1",
+        probe_code_sha256=probe._probe_code_sha256(),
+        limits={
+            "query_count": 55,
+            "llm_logical_operations": 55,
+            "openalex_logical_operations": 110,
+            "llm_attempts": 165,
+            "openalex_attempts": 330,
+            "global_timeout_seconds": probe.PROBE_GLOBAL_TIMEOUT_SECONDS,
+            "ledger_ttl_seconds": probe.PROBE_LEDGER_TTL_SECONDS,
+        },
+        estimates={
+            "evolve": {
+                "llm_calls": 3,
+                "input_tokens": 20000,
+                "output_tokens": 4000,
+                "cost_cny": "0.01",
+                "elapsed_ms": 60000,
+            },
+            "search-1": {"search_api_calls": 3, "cost_cny": "0.01", "elapsed_ms": 60000},
+            "search-2": {"search_api_calls": 3, "cost_cny": "0.01", "elapsed_ms": 60000},
+        },
+        ledger_checkpoint_sha256=_sha("ledger"),
+        expected_run_directory="runs/_diag_query_evolution_task-3-probe-lock",
+        lock_sha256=_sha("lock"),
+    )
+
+
+def _synthetic_raw_record(query_label: str, extra_topics: int, candidate_count: int = 2) -> dict[str, object]:
+    topics = [f"{query_label}-topic-{index}" for index in range(extra_topics)]
+    return {
+        "business": {
+            "query_id": query_label,
+            "query_analysis": {
+                "query_spec": {
+                    "original_query": f"{query_label} original query",
+                    "research_goal": f"{query_label} research goal",
+                    "topics": topics,
+                    "methods": [f"{query_label} method"],
+                    "tasks": [f"{query_label} task"],
+                    "datasets": [f"{query_label} dataset"],
+                    "domains": [f"{query_label} domain"],
+                    "venues": [f"{query_label} venue"],
+                    "must_have": [f"{query_label} must-have"],
+                    "should_have": [f"{query_label} should-have"],
+                },
+                "search_plan": {
+                    "subqueries": [
+                        {
+                            "query_id": f"{query_label}-subquery-1",
+                            "text": f"{query_label} exact",
+                            "query_type": "exact",
+                            "target_constraints": [f"{query_label} constraint 1"],
+                            "priority": 1,
+                            "provider_hint": "openalex",
+                        },
+                        {
+                            "query_id": f"{query_label}-subquery-2",
+                            "text": f"{query_label} expanded",
+                            "query_type": "expanded",
+                            "target_constraints": [f"{query_label} constraint 2"],
+                            "priority": 2,
+                            "provider_hint": "openalex",
+                        },
+                        {
+                            "query_id": f"{query_label}-subquery-3",
+                            "text": f"{query_label} decomposed",
+                            "query_type": "decomposed",
+                            "target_constraints": [f"{query_label} constraint 3"],
+                            "priority": 3,
+                            "provider_hint": "openalex",
+                        },
+                    ],
+                    "inherited_hard_filters": {"from_year": 2020},
+                    "rationale": f"{query_label} rationale",
+                },
+            },
+            "selected_paper_ids": [f"{query_label}-paper-{index}" for index in range(candidate_count)],
+        },
+        "execution": {
+            "query_id": query_label,
+            "retrieved_paper_ids": [f"{query_label}-paper-{index}" for index in range(candidate_count)],
+        },
+    }
+
+
 def test_offline_preflight_reconstructs_fixed_queue_and_self_hash(tmp_path: Path) -> None:
     output = tmp_path / "probe.lock.json"
 
@@ -316,3 +434,86 @@ def test_run_rejects_locked_prompt_hash_drift_before_live_probe(
             )
 
         assert live_probe_started is False
+
+
+def test_canary_selects_minimum_median_and_maximum_canonical_payload() -> None:
+    assert hasattr(probe, "select_canary_query_ids")
+    assert hasattr(probe, "build_probe_context")
+
+    lock = _synthetic_probe_lock(("qa", "qb", "qc", "qd", "qe"))
+    raw_records = {
+        "qa": _synthetic_raw_record("qa", extra_topics=1),
+        "qb": _synthetic_raw_record("qa", extra_topics=1),
+        "qc": _synthetic_raw_record("qc", extra_topics=3),
+        "qd": _synthetic_raw_record("qd", extra_topics=5),
+        "qe": _synthetic_raw_record("qe", extra_topics=7),
+    }
+
+    selected = probe.select_canary_query_ids(lock, raw_records)
+    ranked = sorted(
+        lock.query_ids,
+        key=lambda query_id: (
+            len(
+                probe._canonical_json(
+                    probe.build_probe_context(query_id, raw_records[query_id]).model_dump(mode="json")
+                )
+            ),
+            query_id,
+        ),
+    )
+
+    assert ranked[:2] == ["qa", "qb"]
+    assert selected == (ranked[0], ranked[len(ranked) // 2], ranked[-1])
+    assert len(set(selected)) == 3
+
+
+def test_canary_preflight_is_gold_blind_and_writes_self_hashed_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert hasattr(probe, "preflight_canary")
+
+    probe_lock_path = tmp_path / "probe.lock.json"
+    probe_lock = preflight_probe(
+        frozen_run=DEFAULT_RUN,
+        gold_path=DEFAULT_GOLD,
+        id_map_path=DEFAULT_ID_MAP,
+        availability_path=DEFAULT_AVAILABILITY,
+        prompt_config=DEFAULT_PROMPT_CONFIG,
+        probe_run_id="task-3-source-lock",
+        ledger_path=tmp_path / "probe-ledger.sqlite3",
+        output_path=probe_lock_path,
+    )
+
+    def fail_read_jsonl(*_: object, **__: object) -> None:
+        raise AssertionError("canary preflight must not read gold data")
+
+    def fail_identifier_map(*_: object, **__: object) -> None:
+        raise AssertionError("canary preflight must not read identifier data")
+
+    monkeypatch.setattr(probe, "read_jsonl", fail_read_jsonl)
+    monkeypatch.setattr(probe.IdentifierMap, "from_path", fail_identifier_map)
+
+    output = tmp_path / "canary.lock.json"
+    lock = probe.preflight_canary(
+        probe_lock_path=probe_lock_path,
+        ledger_path=tmp_path / "canary-ledger.sqlite3",
+        canary_run_id="task-3-canary-lock",
+        output_path=output,
+    )
+
+    assert lock.schema_version == "query-evolution-contract-canary-lock-v1"
+    assert lock.source_probe_lock_sha256 == probe._sha256_bytes(probe_lock_path.read_bytes())
+    assert lock.source_run_id == probe_lock.source_run_id
+    assert lock.prompt == probe_lock.prompt
+    assert lock.query_ids == tuple(lock.query_ids)
+    assert len(lock.query_ids) == 3
+    assert lock.limits.query_count == 3
+    assert lock.limits.llm_logical_operations == 3
+    assert lock.limits.llm_attempts == 9
+    assert lock.limits.global_timeout_seconds == 600
+    assert output.exists()
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["lock_sha256"] == lock.lock_sha256
+    assert probe._self_hash(payload) == lock.lock_sha256

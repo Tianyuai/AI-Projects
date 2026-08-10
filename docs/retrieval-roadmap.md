@@ -92,3 +92,11 @@ DOI exact-endpoint acceptance contract 已完成离线固化：请求使用规�
 - 生成并封存 55 个 LLM 快照与 55 条结果；由于 55 个 LLM 输出均未通过 `query-evolution-proposal-v1` 严格契约，OpenAlex 阶段按 fail-closed 规则未启动。
 - Gate A `failed`，Gate B/C `not_evaluated`；账本 165 个槽位全部终态，无遗留 reservation。
 - 本次结果是 Query Evolution 输出契约的负向诊断，不支持晋级或排名改动。下一步应先修订/验证 proposal 输出契约，再以独立锁运行变体；不得原样重跑。
+
+## Phase 6：Query Evolution prompt-contract canary 准备（离线完成）
+
+- 已固化 prompt artifact、live probe 绑定、source/canary lock、三查询选择和 LLM-only bounded canary runner；Task 4 的账本终态缺陷已补测修复并通过独立复审。
+- 离线质量门：专项 `106 passed`；全量 `1984 passed, 36 skipped`；`mypy src scripts/probe_query_evolution.py` 为 0 errors；`git diff --check` 通过。全仓库 Ruff 仅受未触碰的 `deliverables/project-docs/edit_docx.py` 中既有 F401 阻塞。
+- source lock 为 `runs/_locks/query_evolution_contract-v2-source-20260810/probe.lock.json`，canary lock 为 `runs/_locks/query_evolution_contract-20260810/canary.lock.json`。canary 固定 3 个确定性查询、3 个 logical operations、最多 9 次 LLM attempts 和 600 秒全局超时；ledger checkpoint 为 `sha256:0d3774553fc1bf7b67ba2794ed9d73522112463d63965cff8283083c082a3adc`。
+- 本阶段只运行离线 preflight，没有读取 `.env`、没有 reservation、没有 OpenAlex provider/client、没有网络请求，也没有创建 canary run directory；历史失败 evidence 与用户未跟踪文件保持不变。
+- 下一步仅是对该 canary lock 单独授权三查询 DeepSeek live canary。未获授权前不得执行 `canary-run`；更不得直接执行完整 55-query probe。canary 若未晋级，按固定失败原因停止，不得原样重跑。

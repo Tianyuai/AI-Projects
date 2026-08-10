@@ -93,3 +93,15 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - Gate result: Gate A `failed`, Gate B/C `not_evaluated`; all 55 terminals were `integrity_failure`.
 - Ledger closed all 165 slots: 55 settled LLM slots and 110 zero-usage failed search slots; actual usage was 55 LLM calls, 29,772 input tokens, 16,212 output tokens, cost `0.062196` CNY; no reserved slots remain.
 - This is a valid negative probe result, not evidence for a ranking change. Do not rerun the same prompt unchanged; first diagnose or revise the proposal-output contract, then create a new separately locked variant.
+
+## 10. Query Evolution prompt-contract canary preparation (2026-08-10)
+
+- The offline implementation is complete in commits `7c46689`, `53c82ac`, `151c2c4`, `f3d2174`, `b52292b`, `55ec90b`, and the smoke-fixture compatibility fix `380bd29`.
+- Task 4 initially exposed a real accounting defect: cancellation and accounting failure could leave canary receipts reserved. The finalizer and regression tests now force all three receipts to terminal state; independent re-review approved the fix.
+- Offline verification: focused contract/canary suite `106 passed`; full suite `1984 passed, 36 skipped`; `mypy src scripts/probe_query_evolution.py` reports 0 errors across 96 source files; `git diff --check` passed.
+- Full-repository Ruff is not green only because the untouched user-owned `deliverables/project-docs/edit_docx.py` has a pre-existing unused `shutil` import. It was not modified.
+- Offline source lock: `runs/_locks/query_evolution_contract-v2-source-20260810/probe.lock.json`; embedded lock hash `sha256:68801ce497cb2f409eafaa18588c08233dcb5bac8bc407873b81ff0fa95f8a74`; physical file hash `sha256:ac3413e0ecdec73495487acfff2d000434bc6f4b64c76158b6f8f1fcc882193e`.
+- Offline canary lock: `runs/_locks/query_evolution_contract-20260810/canary.lock.json`; embedded lock hash `sha256:72579944c679ef03d42d0dd8771019aad070da2c036cb54344bf931852392df5`; physical file hash `sha256:44b580e3fa865825e72147f003a27650c205ab0ae08077b9191b41a092613cb5`.
+- The canary lock selects exactly 3 deterministic query IDs and fixes 3 logical operations, 9 LLM attempts, and a 600-second global timeout. Its ledger checkpoint is `sha256:0d3774553fc1bf7b67ba2794ed9d73522112463d63965cff8283083c082a3adc`.
+- This preparation ran without reading `.env`, making ledger reservations, constructing an OpenAlex provider, or sending network requests. It created only the two offline lock files.
+- Next action is a separately authorized three-query DeepSeek canary using the exact canary lock. Do not run it, and do not run the full 55-query probe, until the user grants live authorization. If the canary is not promoted, stop on its fixed failure reason and do not rerun unchanged.

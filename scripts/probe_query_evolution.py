@@ -802,6 +802,45 @@ def _fail_ledger(ledger: SQLiteBudgetLedger, reservation: LedgerReservation) -> 
     ledger.fail(reservation, UsageActual(cost_cny=Decimal("0")))
 
 
+def _finalize_canary_reservations(
+    *,
+    lock: CanaryLock,
+    ledger: SQLiteBudgetLedger,
+    reservations: Mapping[str, LedgerReservation],
+    outcomes: Sequence[Mapping[str, object]],
+) -> None:
+    usage_by_query = {
+        outcome["query_id"]: UsageActual.model_validate(outcome["usage"])
+        for outcome in outcomes
+        if isinstance(outcome.get("query_id"), str)
+        and isinstance(outcome.get("usage"), Mapping)
+    }
+    receipts = {
+        receipt.reservation_id: receipt
+        for receipt in ledger.report(lock.canary_run_id).receipts
+    }
+    cleanup_errors: list[Exception] = []
+    for query_id, reservation in reservations.items():
+        receipt = receipts.get(reservation.reservation_id)
+        if receipt is None or receipt.state != "reserved":
+            continue
+        try:
+            ledger.fail(reservation, usage_by_query.get(query_id, _zero_usage()))
+        except Exception as error:
+            cleanup_errors.append(error)
+
+    final_receipts = ledger.report(lock.canary_run_id).receipts
+    if (
+        cleanup_errors
+        or len(final_receipts) != lock.limits.query_count
+        or any(
+            receipt.state == "reserved" or receipt.actual is None
+            for receipt in final_receipts
+        )
+    ):
+        raise CanaryAccountingError("canary ledger receipts are not terminal")
+
+
 def _private_operation_id(query_id: str, operation: str) -> str:
     return f"{hashlib.sha256(query_id.encode('utf-8')).hexdigest()[:16]}:{operation}"
 
@@ -1138,25 +1177,36 @@ def run_canary(lock_path: Path, runtime: ProbeRuntime) -> None:
             reason = "canary_accounting_failed"
             raise
         try:
-            asyncio.run(
-                _run_canary_batch(
-                    lock=lock,
-                    llm_key=llm_key,
-                    raw_records=raw_records,
-                    prompt_instructions=prompt_instructions,
-                    capture_store=capture_store,
-                    ledger=ledger,
-                    persistent=persistent,
-                    outcomes=outcomes,
-                    usages=usages,
+            try:
+                asyncio.run(
+                    _run_canary_batch(
+                        lock=lock,
+                        llm_key=llm_key,
+                        raw_records=raw_records,
+                        prompt_instructions=prompt_instructions,
+                        capture_store=capture_store,
+                        ledger=ledger,
+                        persistent=persistent,
+                        outcomes=outcomes,
+                        usages=usages,
+                    )
                 )
-            )
-        except TimeoutError:
-            reason = "canary_cancelled"
-        except CanaryAccountingError:
-            reason = "canary_accounting_failed"
-        else:
-            reason = _classify_canary_outcomes(outcomes)
+            except TimeoutError:
+                reason = "canary_cancelled"
+            except CanaryAccountingError:
+                reason = "canary_accounting_failed"
+            else:
+                reason = _classify_canary_outcomes(outcomes)
+        finally:
+            try:
+                _finalize_canary_reservations(
+                    lock=lock,
+                    ledger=ledger,
+                    reservations=persistent,
+                    outcomes=outcomes,
+                )
+            except CanaryAccountingError:
+                reason = "canary_accounting_failed"
         _write_jsonl(run_dir / "outcomes.jsonl", outcomes)
         if capture_store is not None:
             try:

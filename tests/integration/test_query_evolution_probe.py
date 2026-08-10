@@ -797,7 +797,7 @@ def test_canary_run_marks_accounting_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lock_path, _, run_dir = _write_canary_lock(tmp_path, "accounting")
+    lock_path, lock, run_dir = _write_canary_lock(tmp_path, "accounting")
     env_file = tmp_path / "canary.env"
     env_file.write_text("LLM_API_KEY=test-llm-key\n", encoding="utf-8")
     _install_mock_llm_client(
@@ -823,6 +823,14 @@ def test_canary_run_marks_accounting_failure(
     result = _read_result(run_dir)
     assert result["reason"] == "canary_accounting_failed"
     assert result["promoted"] is False
+    ledger = probe.SQLiteBudgetLedger(
+        tmp_path / "ledger.sqlite3",
+        reservation_ttl_seconds=probe.PROBE_LEDGER_TTL_SECONDS,
+    )
+    receipts = ledger.report(lock.canary_run_id).receipts
+    assert len(receipts) == 3
+    assert all(receipt.state == "failed" for receipt in receipts)
+    assert all(receipt.actual is not None for receipt in receipts)
 
 
 def test_canary_run_marks_snapshot_failure(
@@ -861,7 +869,7 @@ def test_canary_run_marks_timeout_as_cancelled(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    lock_path, _, run_dir = _write_canary_lock(tmp_path, "cancelled")
+    lock_path, lock, run_dir = _write_canary_lock(tmp_path, "cancelled")
     env_file = tmp_path / "canary.env"
     env_file.write_text("LLM_API_KEY=test-llm-key\n", encoding="utf-8")
     calls: list[str] = []
@@ -893,6 +901,14 @@ def test_canary_run_marks_timeout_as_cancelled(
     assert calls == []
     assert result["reason"] == "canary_cancelled"
     assert result["promoted"] is False
+    ledger = probe.SQLiteBudgetLedger(
+        tmp_path / "ledger.sqlite3",
+        reservation_ttl_seconds=probe.PROBE_LEDGER_TTL_SECONDS,
+    )
+    receipts = ledger.report(lock.canary_run_id).receipts
+    assert len(receipts) == 3
+    assert all(receipt.state == "failed" for receipt in receipts)
+    assert all(receipt.actual is not None for receipt in receipts)
 
 
 @pytest.mark.parametrize(

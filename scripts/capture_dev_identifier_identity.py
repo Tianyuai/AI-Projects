@@ -686,8 +686,8 @@ def capture_identity(
                     lock.semantic_scholar_api_key_env
                 ].get_secret_value()
             },
-            query_params=None,
-            json_body={"ids": arxiv_ids, "fields": S2_FIELDS},
+            query_params={"fields": S2_FIELDS},
+            json_body={"ids": arxiv_ids},
             runtime=runtime,
             lock=lock,
             ledger=ledger,
@@ -730,8 +730,8 @@ def capture_identity(
                         lock.semantic_scholar_api_key_env
                     ].get_secret_value()
                 },
-                query_params=None,
-                json_body={"ids": derived_doi_ids, "fields": S2_FIELDS},
+                query_params={"fields": S2_FIELDS},
+                json_body={"ids": derived_doi_ids},
                 runtime=runtime,
                 lock=lock,
                 ledger=ledger,

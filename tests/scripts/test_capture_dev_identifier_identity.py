@@ -19,6 +19,7 @@ from paper_search.storage.dependency_snapshot import (
     DependencySnapshotManifestV2,
 )
 from scripts.capture_dev_identifier_identity import (
+    S2_FIELDS,
     IdentifierCaptureRuntime,
     IdentifierInventory,
     IdentityCaptureLock,
@@ -64,6 +65,7 @@ class RecordingTransport:
         self.openalex_response = openalex_response
         self.statuses = {key: list(values) for key, values in (statuses or {}).items()}
         self.semantic_scholar_batches: list[list[str]] = []
+        self.semantic_scholar_requests: list[tuple[dict[str, str], dict[str, object]]] = []
         self.openalex_ids: list[str] = []
         self.openalex_urls: list[str] = []
         self.openalex_query_param_names: list[list[str]] = []
@@ -80,6 +82,9 @@ class RecordingTransport:
         del headers
         if method == "POST":
             assert isinstance(json_body, dict)
+            self.semantic_scholar_requests.append(
+                (dict(query_params or {}), dict(json_body))
+            )
             ids = json_body["ids"]
             assert isinstance(ids, list)
             normalized_ids = [str(identifier) for identifier in ids]
@@ -340,6 +345,16 @@ def test_capture_uses_arxiv_batch_then_only_discovered_doi_batch(
     assert transport.semantic_scholar_batches == [
         ["ARXIV:2501.00001", "ARXIV:2501.00002"],
         ["DOI:10.1000/a", "DOI:10.1000/b"],
+    ]
+    assert transport.semantic_scholar_requests == [
+        (
+            {"fields": S2_FIELDS},
+            {"ids": ["ARXIV:2501.00001", "ARXIV:2501.00002"]},
+        ),
+        (
+            {"fields": S2_FIELDS},
+            {"ids": ["DOI:10.1000/a", "DOI:10.1000/b"]},
+        ),
     ]
     assert transport.openalex_ids == ["W1"]
     assert transport.openalex_urls == ["https://api.openalex.org/works"]

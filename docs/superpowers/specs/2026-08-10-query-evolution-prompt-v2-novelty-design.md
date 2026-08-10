@@ -77,6 +77,8 @@
 
 `src/paper_search/llm/prompt_artifacts.py` 对 `query_evolve` 只接受 `query-evolve-v2`。artifact 的字段结构由现有 `PromptArtifact` Pydantic schema 校验；`query_analyze` 行为不变。
 
+`scripts/probe_query_evolution.py` 中 `ProbePromptBinding.version` 允许解析 `query-evolve-v1` 和 `query-evolve-v2`，以保留历史 lock 的只读可解析性。由于 `_build_prompt_binding()` 必须先通过只接受 v2 的 artifact loader，新 preflight 只能生成 v2 lock；v1 lock 在运行时仍会因当前 artifact 的哈希或版本身份不匹配而在 reservation 前停止。除该兼容性边界外，不修改 lock schema、字段或运行流程。
+
 ### 5.3 Query Evolution validator
 
 `src/paper_search/evolution/query_evolution.py` 不修改。它继续以当前 canonicalization 比较 original、seed 和同批生成项，并将重复项判为 `integrity_failure`。Prompt v2 不能替代或绕过该机器判定。
@@ -95,7 +97,7 @@
 
 ## 6. 修改范围、历史证据与错误处理
 
-- 实施只允许修改 `configs/prompts/query_evolve.yaml`、`src/paper_search/llm/prompt_artifacts.py`、`tests/unit/test_prompt_artifacts.py` 和 `tests/unit/test_query_evolution.py`；若旧 lock 前置失败断言无法在现有测试中表达，可同时修改 `tests/integration/test_query_evolution_probe.py`。实施计划另存于 `docs/superpowers/plans/`。
+- 实施只允许修改 `configs/prompts/query_evolve.yaml`、`src/paper_search/llm/prompt_artifacts.py`、`scripts/probe_query_evolution.py`、`tests/unit/test_prompt_artifacts.py`、`tests/unit/test_query_evolution.py` 和 `tests/integration/test_query_evolution_probe.py`。实施计划另存于 `docs/superpowers/plans/`。
 - 封存目录 `runs/_diag_query_evolution_contract-canary-20260810/` 保持原样；聚合诊断只用于只读验收输出，不新增证据文件，也不在可提交文档中写入冻结 query 文本、query ID、proposal 文本或 provider request ID。
 - 历史响应在当前 validator 下仍应失败。这是预期的特征证明，不应通过修改历史数据变成成功。
 - `query-evolve-v1` lock 只作为历史证据，不得用于新 canary。
@@ -107,7 +109,7 @@
 实施顺序保持最小但完整：
 
 1. 先修改 prompt artifact 测试，要求 `query-evolve-v2`，并精确断言最终渲染的 system message 包含 original/seed/同批排重、机械变化不算新查询、部分成功和两个 no-op reason 的规则；观察测试在现有代码上按预期失败。
-2. 修改 prompt YAML 和 `PromptArtifact` 的 query-evolve 版本约束，使测试转绿。
+2. 修改 prompt YAML 和 `PromptArtifact` 的版本约束，并让 `ProbePromptBinding` 同时解析历史 v1 与当前 v2，使新 preflight 只生成 v2，同时保留历史 lock 的只读解析。
 3. 增加或补齐 validator 特征测试，分别证明 original 重复、seed 重复和同批重复仍被拒绝；这些测试不得要求修改 validator。
 4. 使用临时 lock/ledger 和网络 guard 证明 v1 或哈希不匹配在网络调用与 reservation 前失败，不创建仓库内的新 lock。
 5. 运行 prompt artifact、Query Evolution 和 canary/probe 聚焦测试，再运行受影响文件 Ruff、`mypy src scripts/probe_query_evolution.py`、全量离线 pytest 和 `git diff --check`。
@@ -117,7 +119,7 @@
 
 ## 8. 验收标准
 
-- `query_evolve` artifact 版本为 `query-evolve-v2`，最终渲染的 system message 完整包含第 4 节规则；
+- `query_evolve` artifact 与新 preflight 生成的 binding 版本均为 `query-evolve-v2`，历史 v1 lock 仍可只读解析，最终渲染的 system message 完整包含第 4 节规则；
 - 临时 fixture 证明旧版本或错误哈希在网络调用和 reservation 前失效；
 - original、seed 和同批重复仍被测试证明为 `integrity_failure`；
 - 聚焦测试、Ruff、mypy、全量离线测试和 diff 检查通过；
@@ -126,4 +128,4 @@
 
 ## 9. 完成边界
 
-本设计的实施阶段仅包含第 6 节列出的 prompt、装载版本约束和离线测试文件。schema、validator、预算、重试、超时、样本选择和晋级条件保持不变；不读取 `.env`，不联网，不创建仓库内 lock，也不运行 live canary。实施完成并验证通过后，重建 source/canary lock 与三查询 live canary 仍需单独决定和明确授权。
+本设计的实施阶段仅包含第 6 节列出的 prompt、artifact/lock 版本约束和离线测试文件。lock schema、validator、预算、重试、超时、样本选择和晋级条件保持不变；不读取 `.env`，不联网，不创建仓库内 lock，也不运行 live canary。实施完成并验证通过后，重建 source/canary lock 与三查询 live canary 仍需单独决定和明确授权。

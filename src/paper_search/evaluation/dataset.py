@@ -338,6 +338,10 @@ class IdentifierMap:
         normalized = normalize_paper_id(value)
         return self._resolved.get(normalized, normalized)
 
+    def resolved_pairs(self) -> tuple[tuple[str, str], ...]:
+        """Return normalized resolved pairs for private in-process auditing."""
+        return tuple(sorted(self._resolved.items()))
+
 
 def answer_count_bucket(count: int) -> Literal["1", "2-3", "4-7", "8+"]:
     """Return the approved PaSa answer-count stratum."""

@@ -10,6 +10,7 @@ from pydantic import ValidationError
 import paper_search.evaluation.dataset as dataset_module
 from paper_search.evaluation.dataset import (
     EvaluationQuery,
+    IdentifierMap,
     PredictionRecord,
     normalize_paper_id,
     normalize_title,
@@ -108,6 +109,18 @@ def test_prediction_record_normalizes_but_preserves_ranked_duplicates() -> None:
     )
 
     assert record.predicted_paper_ids == ["doi:10.1000/a", "doi:10.1000/a"]
+
+
+def test_identifier_map_exposes_sorted_resolved_pairs() -> None:
+    identifier_map = IdentifierMap.from_bytes(
+        b'{"arxiv:2501.00002":"doi:10.48550/arxiv.2501.00002",'
+        b'"doi:10.1000/example":"doi:10.48550/arxiv.2501.00002"}\n'
+    )
+
+    assert identifier_map.resolved_pairs() == (
+        ("arxiv:2501.00002", "doi:10.48550/arxiv.2501.00002"),
+        ("doi:10.1000/example", "doi:10.48550/arxiv.2501.00002"),
+    )
 
 
 def test_read_jsonl_loads_valid_models(tmp_path: Path) -> None:

@@ -84,11 +84,13 @@ paper ID 不单独判错，因为供应商可能存在重复记录；它记为�
 候选列表。它优先复用已有不可变 provider snapshot；缺失的精确身份元数据需要单独
 在线授权，并使用项目账本、固定请求上限、重试上限和不可变私有 snapshot。Semantic
 Scholar 最多执行两个锁定批次：第一批只含 `ARXIV:<id>`，第二批只含第一批实际发现的
-`DOI:<doi>`；OpenAlex 只查询锁中列出的精确 DOI/OpenAlex 标识。第二批的成员集合和
+`DOI:<doi>`；OpenAlex 使用 `GET /works` 加锁定 ID 的精确 filter，只查询锁中列出的
+DOI/OpenAlex 标识，并要求响应恰好一条且返回 work ID 与锁定 ID 完全一致。第二批的成员集合和
 请求上限必须在第一批封存后确定，不得接受手工追加。“两个批次”指两个逻辑阶段；
 每批最多一次固定重试，因此 Semantic Scholar 总 HTTP 尝试上限为 4，且不得产生第三
 个逻辑批次。预检锁还必须固定 provider 主机/端点、凭据变量名、输出根目录和账本检查点；
-任一变化都使授权失效。网络响应不得直接决定通过，必须先封存再由离线审计器消费。
+任一变化都使授权失效。该私有采集契约使用 `identifier-identity-capture-lock-v2`；未执行过
+真实采集的 v1 不迁移、不兼容读取。网络响应不得直接决定通过，必须先封存再由离线审计器消费。
 
 私有证据保存在已忽略的 `data/annotation_work/` 下。它可以包含身份对应关系，但不
 提交 Git，也不进入聊天、公开 Markdown 或聚合 JSON。

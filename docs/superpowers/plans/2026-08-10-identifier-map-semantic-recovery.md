@@ -18,7 +18,7 @@
 - Keep per-paper evidence, the rebuilt map, relation audit, and unresolved rows under ignored `data/annotation_work/identifier_semantics/`.
 - Public outputs may contain aggregate counts and hashes only. Recursively reject exact JSON keys `query_id` and `query_text`; scan string values and Markdown field boundaries for injected query sentinels and DOI/arXiv/OpenAlex identifier patterns.
 - Tasks 1, 2, Task 3 Steps 1-4, and Task 4 are zero-network. Task 3 Step 5 may use the network only after explicit authorization of one exact lock hash, its endpoints, caps, credential names, and single run.
-- Semantic Scholar capture is limited to two logical batches: locked `ARXIV:<id>` inputs followed by only the DOI values discovered and sealed from batch 1. Each batch permits one retry, so the total S2 HTTP-attempt cap is 4; no third logical batch is allowed. OpenAlex accepts only exact locked identifiers.
+- Semantic Scholar capture is limited to two logical batches: locked `ARXIV:<id>` inputs followed by only the DOI values discovered and sealed from batch 1. Each batch permits one retry, so the total S2 HTTP-attempt cap is 4; no third logical batch is allowed. OpenAlex uses `GET /works` with an exact locked-ID filter and accepts exactly one response whose work ID matches the lock.
 - A semantic audit consumes only dev gold, the candidate map, and private identity evidence. It never consumes historical predictions.
 - The 12 direct same-arXiv hits are a rescoring acceptance check, not a map-audit condition.
 - Do not build a candidate lock, run readiness, run live capture, or access validation in this plan.
@@ -327,7 +327,7 @@ def test_preflight_locks_dev_inputs_without_network_or_ledger_mutation(tmp_path:
         ledger_path=LEDGER_PATH,
     )
 
-    assert lock.schema_version == "identifier-identity-capture-lock-v1"
+    assert lock.schema_version == "identifier-identity-capture-lock-v2"
     assert lock.scope == "dev"
     assert lock.semantic_scholar_batch_max == 2
     assert lock.semantic_scholar_arxiv_ids == sorted(set(lock.semantic_scholar_arxiv_ids))
@@ -384,7 +384,7 @@ Expected: collection FAIL because the script is absent.
 
 ```python
 class IdentityCaptureLock(DomainModel):
-    schema_version: Literal["identifier-identity-capture-lock-v1"]
+    schema_version: Literal["identifier-identity-capture-lock-v2"]
     scope: Literal["dev"]
     input_hashes: dict[NonEmptyStr, Sha256]
     semantic_scholar_arxiv_ids: list[NonEmptyStr]
@@ -396,7 +396,7 @@ class IdentityCaptureLock(DomainModel):
     openalex_exact_ids: list[NonEmptyStr]
     openalex_request_max: NonNegativeInt
     openalex_base_url: Literal["https://api.openalex.org"]
-    openalex_endpoint_template: Literal["/works/{id}"]
+    openalex_endpoint_template: Literal["/works"]
     openalex_api_key_env: Literal["OPENALEX_API_KEY"]
     output_root: SafeRelativePath
     retry_max: Literal[1] = 1
@@ -453,8 +453,9 @@ rejected before ledger reservation or network access.
 - [ ] **Step 3: Implement exact adapters and fail-closed accounting**
 
 Use Semantic Scholar `POST /graph/v1/paper/batch` with only the fields needed to compare `paperId`
-and `externalIds`; preserve both sides' external IDs in the sealed raw responses. Use exact OpenAlex
-work lookups; do not use title search. Reuse
+and `externalIds`; preserve both sides' external IDs in the sealed raw responses. Use OpenAlex
+`GET /works` with an exact locked-ID filter and `per_page=1`; require exactly one result and an exact
+work-ID match, and do not use title search. This private lock is v2; reject v1 rather than migrating it. Reuse
 `SQLiteBudgetLedger` and the dependency snapshot writer. Every reserved operation must end settled
 or failed, even on HTTP, decode, or sealing errors. A retry consumes the fixed `retry_max=1` allowance;
 two logical batches may therefore make at most four HTTP attempts, and there is no third stage or

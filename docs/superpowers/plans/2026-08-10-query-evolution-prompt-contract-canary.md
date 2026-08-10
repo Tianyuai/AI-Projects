@@ -16,8 +16,8 @@
 - Do not relax `QueryEvolutionProposal`, mechanical validation, Gate A/B/C, retrieval merging, filtering, RRF, or evidence privacy.
 - Do not add compatibility parsing, LLM repair, rules fallback, prompt auto-tuning, or unrelated refactoring.
 - Offline implementation and verification must not read `D:\AI Projects\Projects\.env` or access the network.
-- A later instruction to “execute the plan” authorizes Tasks 1–5 only. Task 6 requires separate authorization for three DeepSeek calls; Task 7 requires another authorization for the 55-query DeepSeek/OpenAlex probe.
-- The canary reads no gold, identifier map, availability evidence, or OpenAlex credentials; it creates exactly three `evolve` reservations and zero search reservations.
+- A later instruction to “execute the plan” authorizes Tasks 1–5 only. Task 6 requires separate authorization for three DeepSeek logical operations with at most nine retry-inclusive requests; Task 7 requires another authorization for the 55-query DeepSeek/OpenAlex probe.
+- The canary reads no gold, identifier map, availability evidence, or OpenAlex credentials; it creates exactly three `evolve` reservations and zero search reservations, allows at most nine LLM attempts, and has a 600-second global timeout.
 - Any canary failure stops the workflow. Do not change the prompt, replace samples, or rerun without a new decision.
 - Keep the existing failed 55-query run and ledger receipts unchanged.
 
@@ -247,7 +247,7 @@ class ProbePromptBinding(DomainModel):
 
 ```
 
-Change `ProbeLock.schema_version` from `query-evolution-probe-lock-v1` to `query-evolution-probe-lock-v2`, remove `prompt_sha256` and `prompt_version`, and add `prompt: ProbePromptBinding`. Keep every existing frozen-source, queue, budget, endpoint, limit, ledger, output and self-hash field unchanged. Change `_build_lock_payload` and `preflight_probe` to receive `prompt_config` and `probe_run_id`. Resolve the prompt under `ROOT`, reject paths outside `ROOT`, parse it through Task 1, and write the actual path/hash/name/version. Derive `expected_run_directory` only from the validated run ID. Wire the CLI’s existing `--prompt-config` argument into this function instead of merely checking that the path exists.
+Define `SafeRunId = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")]` and use it for probe and canary run IDs. Change `ProbeLock.schema_version` from `query-evolution-probe-lock-v1` to `query-evolution-probe-lock-v2`, remove `prompt_sha256` and `prompt_version`, and add `prompt: ProbePromptBinding`. Keep every existing frozen-source, queue, budget, endpoint, limit, ledger, output and self-hash field unchanged. Change `_build_lock_payload` and `preflight_probe` to receive `prompt_config` and `probe_run_id`. Resolve the prompt under `ROOT`, reject paths outside `ROOT`, parse it through Task 1, and write the actual path/hash/name/version. Set `expected_run_directory = f"runs/_diag_query_evolution_{probe_run_id}"`. Wire the CLI’s existing `--prompt-config` argument into this function instead of merely checking that the path exists.
 
 - [ ] **Step 4: Verify the locked artifact before reservations or network**
 
@@ -330,29 +330,42 @@ Use strict diagnostic-only models:
 ```python
 CanaryReason = Literal[
     "passed",
+    "canary_preflight_failed",
     "prompt_binding_failed",
     "contract_canary_failed",
     "canary_dependency_failed",
     "canary_accounting_failed",
     "canary_snapshot_failed",
+    "canary_cancelled",
 ]
+
+
+class CanaryLimits(DomainModel):
+    query_count: Literal[3]
+    llm_logical_operations: Literal[3]
+    llm_attempts: Literal[9]
+    global_timeout_seconds: Literal[600]
 
 
 class CanaryLock(DomainModel):
     schema_version: Literal["query-evolution-contract-canary-lock-v1"]
-    canary_run_id: NonEmptyStr
+    canary_run_id: SafeRunId
     source_probe_lock_sha256: Sha256
+    source_run_id: NonEmptyStr
     source_hashes: dict[str, Sha256]
+    probe_code_sha256: Sha256
     prompt: ProbePromptBinding
     model_id: Literal["deepseek-v4-flash"]
     endpoint: Literal["https://api.deepseek.com/v1"]
     query_ids: tuple[str, str, str]
+    limits: CanaryLimits
+    evolve_estimate: UsageEstimate
     ledger_checkpoint_sha256: Sha256
     expected_run_directory: SafeRelativePath
     lock_sha256: Sha256
 ```
 
-`preflight_canary` loads and verifies the v2 probe lock, verifies only frozen business/execution source hashes and the locked prompt, validates and stores the explicit `canary_run_id`, selects the three IDs, records the current ledger checkpoint, and atomically writes canonical JSON. It must not accept gold, identifier-map, availability, or env paths.
+`preflight_canary` loads and verifies the v2 probe lock, verifies only frozen business/execution source hashes and the locked prompt, validates and stores the explicit `canary_run_id`, copies the source run ID and current probe code hash, selects the three IDs, copies the locked `evolve` estimate, records the 3/9/600 limits and current ledger checkpoint, and atomically writes canonical JSON. Set `expected_run_directory = f"runs/_diag_query_evolution_{canary_run_id}"`. It must not accept gold, identifier-map, availability, or env paths.
 
 - [ ] **Step 4: Verify and commit**
 
@@ -379,7 +392,7 @@ git commit -m "feat: add query evolution canary lock"
 
 - [ ] **Step 1: Write failing mocked runner tests**
 
-Use `httpx.MockTransport` only. Cover exactly three valid generated/no-op outcomes; one strict-schema failure; dependency, accounting, and snapshot failures; prompt or checkpoint drift before dispatch; three terminal ledger receipts; sealed snapshot refs; atomic evidence writes; no retry beyond the existing adapter limit; and zero construction or invocation of `LiveCaptureSearchProvider`.
+Use `httpx.MockTransport` only. Cover exactly three valid generated/no-op outcomes; one strict-schema failure; dependency, accounting, snapshot and 600-second cancellation failures; source run/hash, probe code, prompt, fixed-limit or checkpoint drift before dispatch; three terminal ledger receipts; sealed snapshot refs; atomic evidence writes; no retry beyond nine total attempts; and zero construction or invocation of `LiveCaptureSearchProvider`.
 
 Add a secret-boundary test that supplies only `LLM_API_KEY` in a temporary env file and makes every OpenAlex environment lookup raise. The canary must still succeed.
 
@@ -417,9 +430,9 @@ The full probe calls both functions; canary calls only `_load_llm_secret`.
 
 - [ ] **Step 3: Implement reservations, capture, evidence, and stop logic**
 
-Before network, verify the canary lock self-hash, probe source/code hashes, prompt binding, output non-existence, and ledger checkpoint. Reserve exactly one `evolve` slot per selected query under the canary run ID. Reuse `QueryEvolutionGenerator` with `LiveCaptureLLMAnalyzer(prompt_instructions=locked_message)` and settle every slot with actual usage.
+Before network, verify the canary lock self-hash, source run and hashes, probe code hash, prompt binding, 3/9/600 limits, output non-existence, and ledger checkpoint. Reserve exactly one `evolve` slot per selected query under the canary run ID. Wrap the three-operation batch in `asyncio.timeout(600)`. Reuse `QueryEvolutionGenerator` with `LiveCaptureLLMAnalyzer(prompt_instructions=locked_message)` and settle every slot with actual usage.
 
-The run directory may already contain the exact `canary.lock.json` written by `canary-preflight`; in that case it is usable only when no snapshot or result evidence exists. Any other pre-existing content fails closed.
+Require the locked run directory not to exist, create it, and copy the validated external canary lock into it byte-for-byte before capture. This avoids partial-run ambiguity.
 
 Write only:
 
@@ -434,7 +447,7 @@ result.json
 
 - [ ] **Step 4: Wire CLI boundaries and verify mocked behavior**
 
-`canary-run` returns exit `2` without `--allow-live`, exit `1` for fixed failures, and `0` only when `promoted=true`. Automated tests must patch transports and must not read the real `.env`.
+`canary-run` returns exit `2` without `--allow-live`, exit `1` for fixed failures including `canary_preflight_failed` and `canary_cancelled`, and `0` only when `promoted=true`. Automated tests must patch transports and must not read the real `.env`.
 
 ```powershell
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest tests/integration/test_query_evolution_probe.py -k canary -q
@@ -480,17 +493,17 @@ Use unique, explicit run IDs and no env file:
   --budget-config configs/budget_balanced.yaml `
   --pricing-policy data/annotation_work/pricing_v1.yaml `
   --ledger data/budget_ledger.sqlite3 `
-  --probe-run-id query-evolution-contract-v2-source-20260810 `
-  --out runs/_diag_query_evolution_contract_v2_source_20260810/probe.lock.json
+  --probe-run-id contract-v2-source-20260810 `
+  --out runs/_locks/query_evolution_contract-v2-source-20260810/probe.lock.json
 
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' scripts/probe_query_evolution.py canary-preflight `
-  --probe-lock runs/_diag_query_evolution_contract_v2_source_20260810/probe.lock.json `
+  --probe-lock runs/_locks/query_evolution_contract-v2-source-20260810/probe.lock.json `
   --ledger data/budget_ledger.sqlite3 `
-  --canary-run-id query-evolution-contract-canary-20260810 `
-  --out runs/_diag_query_evolution_contract_canary_20260810/canary.lock.json
+  --canary-run-id contract-canary-20260810 `
+  --out runs/_locks/query_evolution_contract-canary-20260810/canary.lock.json
 ```
 
-Expected: both locks validate; canary lock contains exactly three deterministic query IDs and the current empty/non-mutating ledger checkpoint. There is no reservation, `.env` read, or network request.
+Expected: both locks validate; canary lock contains exactly three deterministic query IDs, source run/code bindings, 3/9/600 limits, and the current unchanged ledger checkpoint. There is no reservation, `.env` read, or network request.
 
 - [ ] **Step 3: Update the handoff and commit**
 
@@ -510,7 +523,7 @@ Stop and request authorization for Task 6.
 ### Task 6: Authorization gate — run the real three-query canary
 
 **Files:**
-- Private ignored evidence only: `runs/_diag_query_evolution_contract_canary_20260810/`
+- Private ignored evidence only: `runs/_diag_query_evolution_contract-canary-20260810/`
 - Modify after result: `HANDOFF.md`
 - Modify after result: `docs/retrieval-roadmap.md`
 
@@ -520,13 +533,13 @@ Stop and request authorization for Task 6.
 
 ```powershell
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' scripts/probe_query_evolution.py canary-run `
-  --lock runs/_diag_query_evolution_contract_canary_20260810/canary.lock.json `
+  --lock runs/_locks/query_evolution_contract-canary-20260810/canary.lock.json `
   --env-file 'D:\AI Projects\Projects\.env' `
   --ledger data/budget_ledger.sqlite3 `
   --allow-live
 ```
 
-Expected for promotion: 3/3 strict-valid `generated` or `no_op`, three terminal receipts, sealed LLM snapshots, zero OpenAlex requests, and `promoted=true`.
+Expected for promotion: 3/3 strict-valid `generated` or `no_op`, three terminal receipts, no more than nine LLM attempts within 600 seconds, sealed LLM snapshots, zero OpenAlex requests, and `promoted=true`.
 
 - [ ] **Step 2: Apply the stop rule**
 
@@ -546,7 +559,7 @@ Stop and request separate authorization for Task 7.
 ### Task 7: Authorization gate — rebuild and execute the full 55-query probe
 
 **Files:**
-- Private ignored evidence: `runs/_diag_query_evolution_contract_v2_full_20260810/`
+- Private ignored evidence: `runs/_diag_query_evolution_contract-v2-full-20260810/`
 - Aggregate evidence and status files only after a completed run.
 
 **Authorization:** Do not execute this task unless Task 6 produced `promoted=true` and the user separately authorizes the 55-query DeepSeek/OpenAlex probe.
@@ -565,8 +578,8 @@ Do not reuse the source or canary lock because their ledger checkpoint predates 
   --budget-config configs/budget_balanced.yaml `
   --pricing-policy data/annotation_work/pricing_v1.yaml `
   --ledger data/budget_ledger.sqlite3 `
-  --probe-run-id query-evolution-contract-v2-full-20260810 `
-  --out runs/_diag_query_evolution_contract_v2_full_20260810/probe.lock.json
+  --probe-run-id contract-v2-full-20260810 `
+  --out runs/_locks/query_evolution_contract-v2-full-20260810/probe.lock.json
 ```
 
 Expected: the lock records the post-canary project checkpoint and a new self-hash.
@@ -575,7 +588,7 @@ Expected: the lock records the post-canary project checkpoint and a new self-has
 
 ```powershell
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' scripts/probe_query_evolution.py run `
-  --lock runs/_diag_query_evolution_contract_v2_full_20260810/probe.lock.json `
+  --lock runs/_locks/query_evolution_contract-v2-full-20260810/probe.lock.json `
   --env-file 'D:\AI Projects\Projects\.env' `
   --ledger data/budget_ledger.sqlite3 `
   --allow-live
@@ -601,6 +614,7 @@ Commit only aggregate, privacy-safe evidence and status updates after verifying 
 - [ ] The canary selection is deterministic min/median/max over canonical payload bytes with query-ID tie-breaking.
 - [ ] Canary preflight and run accept no gold, identifier-map, availability, or OpenAlex inputs.
 - [ ] The canary creates exactly three LLM ledger slots and zero search slots.
+- [ ] The canary lock binds source run/hash, probe code, prompt, ledger checkpoint, estimate, and 3/9/600 limits.
 - [ ] Existing schema/mechanical validation and Gate A/B/C are unchanged.
 - [ ] Automated tests use mocked transports and never read the real `.env`.
 - [ ] Task 5 stops before network; Tasks 6 and 7 each require a distinct explicit authorization.

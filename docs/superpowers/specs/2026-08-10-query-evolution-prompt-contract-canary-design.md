@@ -138,6 +138,9 @@ Canary 从新 lock 的 55 个冻结目标查询中选择 3 条，但选择过程
 
 Canary 使用独立 run ID、输出目录和账本预留，只建立 3 个 `evolve` 逻辑操作：
 
+- probe/canary run ID 只允许小写字母、数字和连字符，最长 64 字符；输出目录由固定前缀和已验证 run ID 唯一推导；
+- canary lock 绑定来源运行 ID、来源哈希、当前 probe code hash、提示词 binding 和账本 checkpoint；
+- 固定上限为 3 个 LLM 逻辑操作、每操作最多 3 次尝试、合计最多 9 次 retry-inclusive 请求，以及 600 秒全局超时；
 - 读取用户已授权的 `.env` 中必要的 LLM 凭据；
 - 最多执行现有每操作重试上限；
 - 写入 LLM 请求/响应快照、逐条 outcome、usage 和账本终态；
@@ -156,7 +159,7 @@ Canary 使用独立 run ID、输出目录和账本预留，只建立 3 个 `evol
 - 所有账本预留均为终态，实际 usage 完整结算；
 - sealed snapshot manifest 可读取且与 outcome refs 一致。
 
-任何条件失败都停止。不得自动修改提示词、放宽验证、补发修复请求或更换样本重试。网络或供应商故障单独记为 dependency failure，不被误判为契约失败；是否另行重试需新的明确决定。
+任何条件失败都停止。内建请求重试耗尽后不得自动修改提示词、放宽验证、补发修复请求、更换样本或启动第二轮 canary。网络或供应商故障单独记为 dependency failure，不被误判为契约失败；是否另行运行新的 canary 需新的明确决定。
 
 ## 6. 完整探针
 
@@ -182,7 +185,7 @@ Canary 晋级后才执行以下一次性流程：
 
 只保留：
 
-- `canary.lock.json`：来源哈希、提示词 binding、确定性样本选择和预算上限；
+- `canary.lock.json`：来源运行与哈希、probe code hash、提示词 binding、确定性样本选择、账本 checkpoint 和 3/9/600 固定上限；
 - `outcomes.jsonl`：3 条终态、proposal、usage 和 snapshot refs；
 - `snapshots/`：sealed dependency snapshot；
 - `result.json`：晋级/停止结论和固定 reason code。
@@ -196,10 +199,12 @@ Canary 晋级后才执行以下一次性流程：
 ## 8. 错误处理与固定结论
 
 - 提示词路径、哈希、name/version 或配置结构不一致：网络前停止，记 `prompt_binding_failed`；
+- canary lock、来源运行、来源哈希、probe code hash、账本 checkpoint 或固定上限不一致：网络前停止，记 `canary_preflight_failed`；
 - canonical request 未包含绑定 system message：离线测试失败，不允许 canary；
 - canary schema/机械约束失败：记 `contract_canary_failed`，停止；
 - canary 依赖失败：记 `canary_dependency_failed`，停止，不评价契约；
 - canary 账本或快照失败：分别记 `canary_accounting_failed` 或 `canary_snapshot_failed`，停止；
+- canary 全局超时或操作者取消：记 `canary_cancelled`，停止；
 - 完整探针 Gate A 失败：Gate B/C 为 `not_evaluated`；
 - Gate B 失败：否决当前 Query Evolution 检索假设，不继续提示词变体、排序调整或正式 capture；
 - Gate B 通过而 Gate C 失败：只记录召回与排序瓶颈，不进入正式 capture；
@@ -213,7 +218,7 @@ Canary 晋级后才执行以下一次性流程：
 2. lock/preflight 单元或集成测试：传入的 prompt path 确实被绑定，路径和哈希不一致在网络前失败；
 3. analyzer 单元测试：`query_evolve` 接收绑定 system message，现有 `query_analyze` 行为不回归；
 4. canary 选择单元测试：min/median/max、并列排序、去重和 gold-blind；
-5. canary 端到端模拟测试：3 条成功、schema 失败、dependency 失败、账本失败、快照失败，并断言 OpenAlex 零调用；
+5. canary 端到端模拟测试：3 条成功、schema/dependency/账本/快照/超时失败、来源/代码/固定上限/checkpoint 漂移，并断言 OpenAlex 零调用；
 6. 既有 query evolution probe 聚焦测试；
 7. Ruff、mypy 和全量离线测试；
 8. 离线 canonical request 审计通过后，才允许一次真实 canary。
@@ -224,7 +229,7 @@ Canary 晋级后才执行以下一次性流程：
 
 实施阶段可以修改代码、配置、测试和设计对应文档，但在线动作分两级：
 
-1. 真实 3 条 LLM-only canary 需要明确授权；
+1. 真实 3 条 LLM-only canary 需要明确授权；它包含 3 个逻辑操作，最多 9 次 retry-inclusive 请求；
 2. canary 晋级后的完整 55 条 DeepSeek/OpenAlex 探针需要再次明确授权。
 
 任何阶段都不得打印、写入快照或提交 `.env` 中的密钥。旧的未跟踪账本和 `deliverables/` 不属于本设计的修改范围。
@@ -237,6 +242,7 @@ Canary 晋级后才执行以下一次性流程：
 - `query_evolve` canonical request 包含完整且可核验的 system message；
 - 现有严格验证器和 Gate 契约未被放宽；
 - 3 条 canary 选择确定、gold-blind、OpenAlex 零调用；
+- canary lock 绑定来源、代码、提示词、账本和 3/9/600 固定上限；
 - canary 失败会停止，成功才允许建立新完整 lock；
 - 所有聚焦测试、Ruff、mypy 和全量离线测试通过；
 - 在线结果只依据实际快照、账本和 Gate 输出报告，不以人工解释替代机器判定。

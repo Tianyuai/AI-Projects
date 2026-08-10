@@ -12,7 +12,7 @@
 根因不是校验器过严，也不是账本、OpenAlex 或重试路径故障，而是 prompt 只要求“complementary”查询，没有明确告诉模型：
 
 - 输出不得复制 `original_query` 或任一 `seed_subqueries[*].text`；
-- 大小写、空白或标点变化不构成新查询；
+- 仅改变大小写、NFKC 等价形式、空白或 `?`/`*` 不构成新查询；
 - 无法基于现有 facets 形成合格新查询时，应返回 `no_novel_query`，而不是复述已有查询。
 
 本设计采用单变量修订：升级 `query_evolve` prompt 至 v2，补齐新颖性与 no-op 指令；保持 schema、校验器、runner、预算和晋级门槛不变。
@@ -57,7 +57,7 @@
 `configs/prompts/query_evolve.yaml` 保持文件名、response model、temperature、strategy 枚举和 no-op 枚举不变，将版本升级为 `query-evolve-v2`，并增加以下语义：
 
 1. 每个生成的 `text` 必须与 `original_query`、所有 `seed_subqueries[*].text` 以及同一响应中较早的生成项不同。
-2. 大小写、Unicode 表现、连续空白或标点的机械变化不构成新查询；最终机器判定唯一以 `src/paper_search/evolution/query_evolution.py` 的 `_canonical_query()` 为准，该函数先执行 NFKC 和空白折叠，再调用 `canonicalize_openalex_search_query()`。
+2. 仅改变大小写、NFKC 等价形式、连续空白或 `?`/`*` 不构成新查询；最终机器判定唯一以 `src/paper_search/evolution/query_evolution.py` 的 `_canonical_query()` 为准，该函数先执行 NFKC 和空白折叠，再调用只移除 `?`/`*` 的 `canonicalize_openalex_search_query()`。
 3. 模型应在返回前检查每个候选是否满足上述新颖性要求。
 4. 仍允许返回零至两条子查询。只有一条合格时返回该一条；某个候选重复时不应输出该候选；没有候选合格时返回：
 
@@ -101,14 +101,14 @@
 - 封存目录 `runs/_diag_query_evolution_contract-canary-20260810/` 保持原样；聚合诊断只用于只读验收输出，不新增证据文件，也不在可提交文档中写入冻结 query 文本、query ID、proposal 文本或 provider request ID。
 - 历史响应在当前 validator 下仍应失败。这是预期的特征证明，不应通过修改历史数据变成成功。
 - `query-evolve-v1` lock 只作为历史证据，不得用于新 canary。
-- 离线 fixture 必须证明 prompt 路径、版本或哈希不匹配时，在网络调用和账本 reservation 前停止；artifact 字段结构错误则由 `PromptArtifact` 解析直接拒绝。
+- 离线 fixture 必须证明 prompt 版本或哈希不匹配时，在网络调用和账本 reservation 前停止；既有路径约束不在本次修订中扩张，artifact 字段结构错误则由 `PromptArtifact` 解析直接拒绝。
 - 新 prompt 不能保证真实模型一定遵守契约；真实遵守情况只能由另行授权的新三查询 live canary 判断。
 
 ## 7. TDD 与离线测试策略
 
 实施顺序保持最小但完整：
 
-1. 先修改 prompt artifact 测试，要求 `query-evolve-v2`，并精确断言最终渲染的 system message 包含 original/seed/同批排重、机械变化不算新查询、部分成功和两个 no-op reason 的规则；观察测试在现有代码上按预期失败。
+1. 先修改 prompt artifact 测试，要求 `query-evolve-v2`，并精确断言最终渲染的 system message 包含 original/seed/同批排重、当前规范化范围内的机械变化不算新查询、部分成功和两个 no-op reason 的规则；观察测试在现有代码上按预期失败。
 2. 修改 prompt YAML 和 `PromptArtifact` 的版本约束，并让 `ProbePromptBinding` 同时解析历史 v1 与当前 v2，使新 preflight 只生成 v2，同时保留历史 lock 的只读解析。
 3. 增加或补齐 validator 特征测试，分别证明 original 重复、seed 重复和同批重复仍被拒绝；这些测试不得要求修改 validator。
 4. 使用临时 lock/ledger 和网络 guard 证明 v1 或哈希不匹配在网络调用与 reservation 前失败，不创建仓库内的新 lock。

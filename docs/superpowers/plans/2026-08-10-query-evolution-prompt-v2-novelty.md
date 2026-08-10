@@ -78,8 +78,8 @@ def test_query_evolve_artifact_requires_v2() -> None:
 Update the exact `evolve_message` expectation in `test_render_prompt_system_message_is_deterministic_for_existing_prompt_files()` by inserting these four rendered lines immediately after the existing zero-to-two instruction:
 
 ```python
-"- Before returning, verify that each generated text is novel after canonicalization against original_query, every seed_subqueries text, and earlier generated subqueries.",
-"- Case, Unicode, whitespace, or punctuation-only changes do not make a query novel.",
+"- Before returning, verify that each generated text differs after normalization from original_query, the text of every seed_subqueries item, and earlier generated subqueries.",
+"- Case-only, NFKC-equivalent, whitespace-only, or ?/*-only changes do not make a query novel.",
 "- Return only valid novel subqueries; one valid subquery is allowed and duplicate candidates must be omitted.",
 '- No-novel form: {"subqueries":[],"no_op_reason":"no_novel_query"}',
 ```
@@ -106,7 +106,7 @@ Run:
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest tests/unit/test_prompt_artifacts.py::test_query_evolve_artifact_requires_v2 tests/unit/test_prompt_artifacts.py::test_render_prompt_system_message_is_deterministic_for_existing_prompt_files tests/integration/test_query_evolution_probe.py::test_preflight_stores_caller_supplied_prompt_binding -q
 ```
 
-Expected: FAIL because the current YAML, artifact validator, and `ProbePromptBinding` still require `query-evolve-v1`. If the tests pass, stop and correct the tests before implementation.
+Expected: FAIL because the YAML is still v1, the rendered message lacks the four new instructions, and preflight still reports a v1 binding. `ProbePromptBinding` is not expected to be an independent failure in this RED set. If the tests pass, stop and correct the tests before implementation.
 
 - [ ] **Step 3: Implement the minimal v2 artifact and version guards**
 
@@ -117,8 +117,8 @@ version: query-evolve-v2
 ```
 
 ```yaml
-  - Before returning, verify that each generated text is novel after canonicalization against original_query, every seed_subqueries text, and earlier generated subqueries.
-  - Case, Unicode, whitespace, or punctuation-only changes do not make a query novel.
+  - Before returning, verify that each generated text differs after normalization from original_query, the text of every seed_subqueries item, and earlier generated subqueries.
+  - Case-only, NFKC-equivalent, whitespace-only, or ?/*-only changes do not make a query novel.
   - Return only valid novel subqueries; one valid subquery is allowed and duplicate candidates must be omitted.
   - 'No-novel form: {"subqueries":[],"no_op_reason":"no_novel_query"}'
 ```
@@ -326,7 +326,7 @@ Expected: all commands exit `0`.
 Run:
 
 ```powershell
-& 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest -q
+& 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest -m "not online" -q
 Get-FileHash -LiteralPath data/budget_ledger.sqlite3 -Algorithm SHA256
 ```
 

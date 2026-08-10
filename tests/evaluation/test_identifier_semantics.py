@@ -128,6 +128,32 @@ def test_equal_s2_paper_id_with_conflicting_external_ids_is_not_proof() -> None:
     )
 
 
+def test_mismatched_observation_arxiv_id_is_unresolved() -> None:
+    observation = _observation().model_copy(update={"arxiv_id": "arxiv:2409.00001"})
+
+    result = classify_relation(
+        alias="doi:10.1000/example",
+        arxiv_id="arxiv:2501.10120",
+        observation=observation,
+    )
+
+    assert result.state == "unresolved"
+    assert result.reason_code == "observation_binding_mismatch"
+
+
+def test_mismatched_observation_alias_is_unresolved() -> None:
+    observation = _observation().model_copy(update={"alias": "doi:10.1000/other"})
+
+    result = classify_relation(
+        alias="doi:10.1000/example",
+        arxiv_id="arxiv:2501.10120",
+        observation=observation,
+    )
+
+    assert result.state == "unresolved"
+    assert result.reason_code == "observation_binding_mismatch"
+
+
 def _audit_fixture(tmp_path: Path) -> tuple[bytes, bytes, bytes, Path]:
     snapshot_root = tmp_path / "snapshots"
     capture = DependencyCaptureStore(

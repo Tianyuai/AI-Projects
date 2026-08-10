@@ -361,6 +361,23 @@ def classify_relation(
         )
 
     if observation is not None:
+        try:
+            observation_arxiv_id = normalize_paper_id(observation.arxiv_id, kind="arxiv")
+            observation_alias = normalize_paper_id(observation.alias)
+        except ValueError:
+            observation_arxiv_id = ""
+            observation_alias = ""
+        if (
+            observation_arxiv_id != normalized_arxiv_id
+            or observation_alias != normalized_alias
+        ):
+            return _relation(
+                arxiv_id=normalized_arxiv_id,
+                alias=normalized_alias,
+                state="unresolved",
+                proof_kind=None,
+                reason_code="observation_binding_mismatch",
+            )
         arxiv_external_ids = _normalized_external_ids(
             observation.semantic_scholar_arxiv_external_ids
         )

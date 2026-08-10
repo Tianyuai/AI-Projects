@@ -85,3 +85,10 @@ DOI exact-endpoint acceptance contract 已完成离线固化：请求使用规�
 - 专项测试、全量离线测试、Ruff、mypy 与 diff 检查通过：专项 `29 passed`；全量 `1954 passed, 36 skipped`。
 - 锁文件为 `runs/_diag_query_evolution_preflight/probe.lock.json`；历史 evidence 与 `runs/candidate.lock.yaml` 未改变。
 - 本阶段未执行 live capture、replay、compare、readiness、候选锁重建、validation、网络请求、`.env` 读取或 ledger reservation；下一步是对该锁单独授权 bounded `run`。
+
+## Phase 5：Query Evolution bounded probe 实际结果
+
+- 已执行 55 个锁定查询；capture 与零网络 replay 的业务 hash 一致。
+- 生成并封存 55 个 LLM 快照与 55 条结果；由于 55 个 LLM 输出均未通过 `query-evolution-proposal-v1` 严格契约，OpenAlex 阶段按 fail-closed 规则未启动。
+- Gate A `failed`，Gate B/C `not_evaluated`；账本 165 个槽位全部终态，无遗留 reservation。
+- 本次结果是 Query Evolution 输出契约的负向诊断，不支持晋级或排名改动。下一步应先修订/验证 proposal 输出契约，再以独立锁运行变体；不得原样重跑。

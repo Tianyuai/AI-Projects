@@ -84,3 +84,12 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - Evidence hashes: availability `sha256:3f445486d5cf590f3f11a51930153a45916023880e856def379e0f01d053ad04`; probe code `sha256:07ce27806bd93a73ac4a8d499c3ca0e3ded83fbf4f7c702880e8ff6ba54a29d2`; lock `sha256:dc261edb560915f1907149f371e2266be54fb328a3c2019076da226ea96117d2`.
 - This phase did not read `.env`, make reservations, rebuild the candidate lock, run readiness, or execute live capture/replay/compare/validation. The live bounded run remains separately authorized work.
 - User-owned untracked `data/budget_ledger.sqlite3` and `deliverables/` were preserved.
+
+## 9. Query Evolution live bounded probe result (2026-08-10)
+
+- Executed with `probe.lock.live6.json`; output is `runs/_diag_query_evolution_query-evolution-preflight/`.
+- Capture and zero-network replay matched: `sha256:037e4f6cb6758061f1ab4e22fd586162277feb9c291ce3dc5ab22216c14edef7`.
+- 55 LLM snapshots and 55 outcomes were sealed; OpenAlex was correctly not called because every LLM proposal failed the strict `query-evolution-proposal-v1` integrity contract.
+- Gate result: Gate A `failed`, Gate B/C `not_evaluated`; all 55 terminals were `integrity_failure`.
+- Ledger closed all 165 slots: 55 settled LLM slots and 110 zero-usage failed search slots; actual usage was 55 LLM calls, 29,772 input tokens, 16,212 output tokens, cost `0.062196` CNY; no reserved slots remain.
+- This is a valid negative probe result, not evidence for a ranking change. Do not rerun the same prompt unchanged; first diagnose or revise the proposal-output contract, then create a new separately locked variant.

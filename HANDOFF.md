@@ -105,3 +105,13 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - The canary lock selects exactly 3 deterministic query IDs and fixes 3 logical operations, 9 LLM attempts, and a 600-second global timeout. Its ledger checkpoint is `sha256:0d3774553fc1bf7b67ba2794ed9d73522112463d63965cff8283083c082a3adc`.
 - This preparation ran without reading `.env`, making ledger reservations, constructing an OpenAlex provider, or sending network requests. It created only the two offline lock files.
 - Next action is a separately authorized three-query DeepSeek canary using the exact canary lock. Do not run it, and do not run the full 55-query probe, until the user grants live authorization. If the canary is not promoted, stop on its fixed failure reason and do not rerun unchanged.
+
+## 11. Query Evolution three-query canary result (2026-08-10)
+
+- The authorized canary used `runs/_locks/query_evolution_contract-20260810/canary.lock.json` and wrote evidence to `runs/_diag_query_evolution_contract-canary-20260810/`.
+- It made exactly 3 DeepSeek LLM calls and 0 OpenAlex/search calls. The evidence contains 3 LLM snapshots and no OpenAlex snapshot.
+- Outcomes were 2 `generated` and 1 `integrity_failure`; the failed query was rejected for duplicate subquery text after canonicalization. The canary result is `promoted=false` with fixed reason `canary_accounting_failed`.
+- Aggregate usage was 3 LLM calls, 2,541 input tokens, 345 output tokens, 3,877 ms, and `0.003231` CNY. Ledger readback shows 3/3 receipts `settled`, actual usage present, no remaining `reserved` receipt, and the per-receipt sums match the aggregate usage.
+- Snapshot manifest hash is `sha256:a3582e00ac3ebe24dcc78539e60a7fe843e52eefac85675c861e51be38fb4729`; snapshot set ID is `sha256:eefba557af57d4c33a9671412346ac9b36d522bae4ee65787a0bd378fcdd5fcb`.
+- The mismatch between the fixed result reason (`canary_accounting_failed`) and the terminal, numerically consistent ledger readback is now a diagnostic item. It must be explained before any new live run; this result does not support promotion, prompt editing, or a rerun.
+- Apply the stop rule: do not rerun this canary unchanged and do not execute the full 55-query probe. The next work is offline diagnosis of the reason classification/accounting path, followed by a new independently reviewed lock only if a changed hypothesis is justified.

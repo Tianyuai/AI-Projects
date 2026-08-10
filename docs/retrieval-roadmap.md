@@ -100,3 +100,11 @@ DOI exact-endpoint acceptance contract 已完成离线固化：请求使用规�
 - source lock 为 `runs/_locks/query_evolution_contract-v2-source-20260810/probe.lock.json`，canary lock 为 `runs/_locks/query_evolution_contract-20260810/canary.lock.json`。canary 固定 3 个确定性查询、3 个 logical operations、最多 9 次 LLM attempts 和 600 秒全局超时；ledger checkpoint 为 `sha256:0d3774553fc1bf7b67ba2794ed9d73522112463d63965cff8283083c082a3adc`。
 - 本阶段只运行离线 preflight，没有读取 `.env`、没有 reservation、没有 OpenAlex provider/client、没有网络请求，也没有创建 canary run directory；历史失败 evidence 与用户未跟踪文件保持不变。
 - 下一步仅是对该 canary lock 单独授权三查询 DeepSeek live canary。未获授权前不得执行 `canary-run`；更不得直接执行完整 55-query probe。canary 若未晋级，按固定失败原因停止，不得原样重跑。
+
+## Phase 7：Query Evolution 三查询 canary 结果（未晋级）
+
+- 已按 canary lock 执行一次三查询 DeepSeek live canary，证据目录为 `runs/_diag_query_evolution_contract-canary-20260810/`。
+- 实际调用为 3 次 LLM、0 次 OpenAlex/search；结果为 2 条 `generated`、1 条 `integrity_failure`。失败原因是 canonicalization 后出现重复子查询文本。
+- `result.json` 的 `promoted=false`，固定 reason 为 `canary_accounting_failed`；聚合用量为 3 次 LLM、2,541 input tokens、345 output tokens、3,877 ms、`0.003231` CNY。
+- 账本离线回读确认 3/3 回执均为 `settled`、actual 完整、无遗留 `reserved`，且回执用量与 aggregate usage 一致。因此 result reason 与账本事实之间存在需解释的诊断不一致。
+- 该结果不支持晋级、修改排名或直接执行 55-query probe。下一步只做离线 reason/accounting 路径诊断；在原因解释并形成独立新锁前，不得重跑原 canary。

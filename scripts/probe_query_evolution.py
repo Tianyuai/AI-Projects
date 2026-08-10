@@ -3,19 +3,59 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
+import os
 import subprocess
+from decimal import Decimal
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
+import httpx
+from dotenv import dotenv_values
 from pydantic import Field
 
-from paper_search.control.ledger import DEV_RUN_CAP_CNY, LedgerReservation, SQLiteBudgetLedger
+from paper_search.control.budget import HardBudgetController
+from paper_search.control.ledger import (
+    DEV_RUN_CAP_CNY,
+    LedgerReservation,
+    LedgerReservationError,
+    SQLiteBudgetLedger,
+)
+from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
+from paper_search.domain.models import Paper, ProviderResult, QuerySpec, SearchBudget, SearchPlan
 from paper_search.domain.models import DomainModel, UsageActual, UsageEstimate
+from paper_search.evolution.query_evolution import (
+    QueryEvolutionGenerator,
+    build_query_evolution_context,
+)
 from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap, read_jsonl
+from paper_search.evaluation.query_evolution_probe import (
+    FrozenProbeInputs,
+    FrozenQueryRecord,
+    ProbeIntegrity,
+    evaluate_probe,
+    merge_probe_results,
+    public_probe_report,
+    reconstruct_frozen_baseline,
+)
+from paper_search.llm.client import OpenAICompatibleLLMClient
+from paper_search.llm.snapshot_adapters import (
+    HardBudgetSettlementAdapter,
+    LiveCaptureLLMAnalyzer,
+    ReplayLLMAnalyzer,
+)
+from paper_search.retrieval.snapshot_adapters import (
+    LiveCaptureSearchProvider,
+    ReplaySearchProvider,
+)
+from paper_search.storage.dependency_snapshot import (
+    DependencyCaptureStore,
+    DependencySnapshotReader,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUN = ROOT / "runs" / "dev-20260809T061903Z-9bd861e90299"
@@ -65,6 +105,8 @@ class ProbeLock(DomainModel):
 
 class ProbeRuntime(DomainModel):
     allow_live: bool = False
+    env_file: Path = Path(r"D:\AI Projects\Projects\.env")
+    ledger_path: Path = ROOT / "data" / "budget_ledger.sqlite3"
 
 
 class ReplayTrace(DomainModel):
@@ -224,7 +266,11 @@ def _build_lock_payload(
         "run_sha256": _sha256_file(run_path),
         "snapshot_manifest_sha256": _sha256_file(snapshot_path),
     }
-    empty_checkpoint = _sha256_file(ledger_path) if ledger_path.exists() else _sha256_bytes(b"")
+    if ledger_path.exists():
+        ledger = SQLiteBudgetLedger(ledger_path, reservation_ttl_seconds=PROBE_LEDGER_TTL_SECONDS)
+        _, empty_checkpoint = ledger.project_checkpoint()
+    else:
+        empty_checkpoint = _sha256_bytes(b"")
     return {
         "schema_version": "query-evolution-probe-lock-v1",
         "preflight_complete": True,
@@ -310,6 +356,34 @@ def load_probe_lock(path: Path) -> ProbeLock:
 
 def reserve_probe_operations(lock: ProbeLock, ledger: SQLiteBudgetLedger) -> ProbeReservations:
     """Reserve every logical slot before any future live request."""
+    expected: dict[tuple[str, str], str] = {
+        (query_id, operation): f"{hashlib.sha256(query_id.encode('utf-8')).hexdigest()[:16]}:{operation}"
+        for query_id in lock.query_ids
+        for operation in OPERATIONS
+    }
+    try:
+        receipts = ledger.report(lock.probe_run_id).receipts
+    except LedgerReservationError:
+        receipts = []
+    if receipts:
+        if (
+            len(receipts) == len(expected)
+            and all(receipt.state == "reserved" and receipt.actual is None for receipt in receipts)
+            and {receipt.query_id for receipt in receipts} == set(expected.values())
+        ):
+            return ProbeReservations(
+                {
+                    next(key for key, query_id in expected.items() if query_id == receipt.query_id): LedgerReservation(
+                        reservation_id=receipt.reservation_id,
+                        run_id=receipt.run_id,
+                        query_id=receipt.query_id,
+                        estimate=receipt.estimate,
+                        state="reserved",
+                    )
+                    for receipt in receipts
+                }
+            )
+        raise LedgerReservationError("probe ledger contains an incomplete or terminal reservation set")
     created: dict[tuple[str, str], LedgerReservation] = {}
     try:
         for query_id in lock.query_ids:
@@ -330,11 +404,352 @@ def reserve_probe_operations(lock: ProbeLock, ledger: SQLiteBudgetLedger) -> Pro
     return ProbeReservations(created)
 
 
+def _estimate(lock: ProbeLock, operation: str) -> UsageEstimate:
+    return UsageEstimate.model_validate({**lock.estimates[operation], "cost_cny": "0.01"})
+
+
+def _controller(operation: str, estimate: UsageEstimate) -> HardBudgetController:
+    is_llm = operation == "evolve"
+    budget = SearchBudget(
+        max_search_api_calls=estimate.search_api_calls if not is_llm else 1,
+        target_search_api_calls=estimate.search_api_calls if not is_llm else 0,
+        max_llm_calls=estimate.llm_calls if is_llm else 1,
+        target_llm_calls=estimate.llm_calls if is_llm else 0,
+        max_total_tokens=max(1, estimate.input_tokens + estimate.output_tokens),
+        max_cost_cny=0.30,
+        max_elapsed_seconds=800,
+        soft_deadline_seconds=790,
+    )
+    return HardBudgetController(budget, reservation_ttl_seconds=800, formal_live=True)
+
+
+def _placeholder_results(ids: Sequence[object]) -> ProviderResult[list[Paper]]:
+    papers = [
+        Paper(canonical_id=str(identifier), title=str(identifier))
+        for identifier in ids
+        if isinstance(identifier, str)
+    ]
+    return ProviderResult(
+        data=papers,
+        usage=UsageActual(),
+        provenance={
+            "provider": "openalex",
+            "endpoint": "frozen-baseline",
+            "model_id": "openalex-works-v1",
+            "requested_at": "2026-08-10T00:00:00+00:00",
+            "response_hash": _sha256_bytes(
+                _canonical_json([paper.model_dump(mode="json") for paper in papers])
+            ),
+        },
+        cache_hit=True,
+        latency_ms=0,
+        errors=[],
+    )
+
+
+def _frozen_inputs(lock: ProbeLock) -> tuple[FrozenProbeInputs, dict[str, dict[str, object]]]:
+    business = {record["query_id"]: record for record in _jsonl_objects(DEFAULT_RUN / "business-results.jsonl") if isinstance(record.get("query_id"), str)}
+    executions = {record["query_id"]: record for record in _jsonl_objects(DEFAULT_RUN / "executions.jsonl") if isinstance(record.get("query_id"), str)}
+    records: list[FrozenQueryRecord] = []
+    for index, query_id in enumerate(
+        [record["query_id"] for record in _jsonl_objects(DEFAULT_RUN / "business-results.jsonl")]
+    ):
+        raw = business[query_id]
+        analysis = raw.get("query_analysis")
+        if not isinstance(analysis, Mapping):
+            raise ValueError(f"frozen query analysis is missing for {query_id}")
+        spec = QuerySpec.model_validate(analysis.get("query_spec"))
+        plan = SearchPlan.model_validate(analysis.get("search_plan"))
+        selected = raw.get("selected_paper_ids", [])
+        if not isinstance(selected, list):
+            raise ValueError(f"frozen selected paper IDs are invalid for {query_id}")
+        records.append(
+            FrozenQueryRecord(
+                query_id=query_id,
+                query_spec=spec,
+                search_plan=plan,
+                baseline_results=[_placeholder_results(selected)],
+                source_index=index,
+            )
+        )
+    return (
+        FrozenProbeInputs(
+            queries=records,
+            source_run_id=lock.source_run_id,
+            source_hashes=lock.source_hashes,
+            expected_query_count=lock.query_count,
+            expected_total_selected=lock.total_selected,
+        ),
+        {query_id: {"business": business[query_id], "execution": executions.get(query_id, {})} for query_id in lock.query_ids},
+    )
+
+
+def _load_secrets(env_file: Path) -> tuple[str, tuple[str, ...], str | None]:
+    values = dotenv_values(env_file)
+    llm_key = values.get("LLM_API_KEY") or os.environ.get("LLM_API_KEY")
+    openalex_keys = [
+        values.get(name) or os.environ.get(name)
+        for name in ("OPENALEX_API_KEY", *[f"OPENALEX_API_KEY_{index}" for index in range(2, 8)])
+    ]
+    keys = tuple(value for value in openalex_keys if value)
+    if not llm_key:
+        raise ValueError("LLM_API_KEY is missing from the authorized env file")
+    if not keys:
+        raise ValueError("OPENALEX_API_KEY is missing from the authorized env file")
+    return llm_key, keys, values.get("OPENALEX_MAILTO") or os.environ.get("OPENALEX_MAILTO")
+
+
+def _settle_ledger(
+    ledger: SQLiteBudgetLedger,
+    reservation: LedgerReservation,
+    actual: UsageActual,
+) -> None:
+    ledger.checkpoint_actual(reservation, actual)
+    ledger.settle(reservation, actual)
+
+
+def _fail_ledger(ledger: SQLiteBudgetLedger, reservation: LedgerReservation) -> None:
+    ledger.fail(reservation, UsageActual(cost_cny=Decimal("0")))
+
+
+def _comparable(value: object) -> object:
+    if isinstance(value, ProviderResult):
+        return {
+            "data": [item.model_dump(mode="json") for item in value.data],
+            "errors": [
+                {"provider": item.provider, "code": item.code, "retryable": item.retryable}
+                for item in value.errors
+            ],
+        }
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    return value
+
+
+def _capture_replay_hash(lock: ProbeLock, outcomes: Mapping[str, Mapping[str, object]]) -> str:
+    return _sha256_bytes(
+        _canonical_json(
+            {
+                "lock_sha256": lock.lock_sha256,
+                "queries": [
+                    {
+                        "query_id": query_id,
+                        **{
+                            key: value
+                            for key, value in outcomes[query_id].items()
+                            if key != "additions"
+                        },
+                    }
+                    for query_id in lock.query_ids
+                ],
+            }
+        )
+    )
+
+
+def _can_resume_partial_run(run_dir: Path) -> bool:
+    lock_copy = run_dir / "probe.lock.json"
+    snapshot_root = run_dir / "snapshots"
+    if not run_dir.is_dir() or not lock_copy.is_file() or not snapshot_root.is_dir():
+        return False
+    return not any(snapshot_root.iterdir()) and not any(
+        item.name not in {"probe.lock.json", "snapshots"}
+        for item in run_dir.iterdir()
+    )
+
+
+async def _run_live_probe(lock: ProbeLock, runtime: ProbeRuntime, run_dir: Path) -> None:
+    if runtime.ledger_path.resolve() == Path(lock.expected_run_directory).resolve():
+        raise ValueError("ledger path must not be the probe output directory")
+    llm_key, openalex_keys, openalex_mailto = _load_secrets(runtime.env_file)
+    frozen_inputs, raw_records = _frozen_inputs(lock)
+    business_by_id: dict[str, Mapping[str, object]] = {
+        query_id: cast(Mapping[str, object], raw_records[query_id]["business"])
+        for query_id in lock.query_ids
+    }
+    prompt_sha = lock.prompt_sha256
+    policy = load_pricing_policy(DEFAULT_PRICING_POLICY)
+    pricer = ActualCostPricer(policy)
+    ledger = SQLiteBudgetLedger(runtime.ledger_path, reservation_ttl_seconds=PROBE_LEDGER_TTL_SECONDS)
+    persistent = reserve_probe_operations(lock, ledger).values
+    capture_root = run_dir / "snapshots"
+    capture_root.mkdir(parents=True, exist_ok=True)
+    capture_store = DependencyCaptureStore(capture_root)
+    llm_http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=30.0))
+    openalex_http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=30.0))
+    captured: dict[str, dict[str, object]] = {}
+    try:
+        client = OpenAICompatibleLLMClient(
+            client=llm_http,
+            base_url="https://api.deepseek.com/v1",
+            model=lock.model_id,
+            api_key=llm_key,
+            prompt_version=lock.prompt_version,
+        )
+        for query_id in lock.query_ids:
+            raw = business_by_id[query_id]
+            analysis = raw.get("query_analysis")
+            if not isinstance(analysis, Mapping):
+                raise ValueError(f"frozen query analysis is missing for {query_id}")
+            spec = QuerySpec.model_validate(analysis["query_spec"])
+            plan = SearchPlan.model_validate(analysis["search_plan"])
+            execution = raw_records[query_id].get("execution")
+            if not isinstance(execution, Mapping):
+                execution = {}
+            retrieved = execution.get("retrieved_paper_ids", [])
+            candidate_count = len(retrieved) if isinstance(retrieved, list) else 0
+            context = build_query_evolution_context(spec, plan, candidate_count, [])
+            evolve_controller = _controller("evolve", _estimate(lock, "evolve"))
+            evolve_reservation = evolve_controller.reserve("query-evolution", _estimate(lock, "evolve"))
+            evolve_persistent = persistent[(query_id, "evolve")]
+            generator = QueryEvolutionGenerator(
+                analyzer=LiveCaptureLLMAnalyzer(
+                    client=client,
+                    capture_store=capture_store,
+                    pricer=pricer,
+                    controller=HardBudgetSettlementAdapter(evolve_controller),
+                    prompt_artifact_sha256=prompt_sha,
+                )
+            )
+            try:
+                generated = await generator.generate(context, evolve_reservation)
+                _settle_ledger(ledger, evolve_persistent, generated.usage)
+            except BaseException:
+                _fail_ledger(ledger, evolve_persistent)
+                raise
+            searches: list[ProviderResult[list[Paper]]] = []
+            status = generated.status
+            if generated.status == "generated" and generated.proposal is not None:
+                for index, subquery in enumerate(generated.proposal.subqueries, start=1):
+                    operation = f"search-{index}"
+                    search_controller = _controller(operation, _estimate(lock, operation))
+                    search_reservation = search_controller.reserve(operation, _estimate(lock, operation))
+                    search_persistent = persistent[(query_id, operation)]
+                    provider = LiveCaptureSearchProvider(
+                        dependency="openalex",
+                        client=openalex_http,
+                        capture_store=capture_store,
+                        pricer=pricer,
+                        controller=HardBudgetSettlementAdapter(search_controller),
+                        api_key=openalex_keys[0],
+                        additional_api_keys=openalex_keys[1:],
+                        mailto=openalex_mailto,
+                    )
+                    try:
+                        result = await provider.search(
+                            subquery.text,
+                            dict(plan.inherited_hard_filters),
+                            50,
+                            search_reservation,
+                        )
+                        _settle_ledger(ledger, search_persistent, result.usage)
+                    except BaseException:
+                        _fail_ledger(ledger, search_persistent)
+                        raise
+                    searches.append(result)
+                for index in range(len(searches) + 1, 3):
+                    _fail_ledger(ledger, persistent[(query_id, f"search-{index}")])
+            else:
+                _fail_ledger(ledger, persistent[(query_id, "search-1")])
+                _fail_ledger(ledger, persistent[(query_id, "search-2")])
+            captured[query_id] = {
+                "terminal": status,
+                "proposal": _comparable(generated.proposal),
+                "searches": [_comparable(result) for result in searches],
+                "additions": searches,
+            }
+    finally:
+        await llm_http.aclose()
+        await openalex_http.aclose()
+    manifest = capture_store.seal()
+    reader = DependencySnapshotReader(
+        capture_store.manifest_path,
+        snapshot_manifest_sha256=capture_store.manifest_sha256,
+        snapshot_set_id=manifest.snapshot_set_id,
+    )
+    replayed: dict[str, dict[str, object]] = {}
+    for query_id in lock.query_ids:
+        raw = business_by_id[query_id]
+        analysis = raw.get("query_analysis")
+        if not isinstance(analysis, Mapping):
+            raise ValueError(f"frozen query analysis is missing for {query_id}")
+        spec = QuerySpec.model_validate(analysis["query_spec"])
+        plan = SearchPlan.model_validate(analysis["search_plan"])
+        execution = raw_records[query_id].get("execution")
+        if not isinstance(execution, Mapping):
+            execution = {}
+        retrieved = execution.get("retrieved_paper_ids", [])
+        candidate_count = len(retrieved) if isinstance(retrieved, list) else 0
+        context = build_query_evolution_context(spec, plan, candidate_count, [])
+        controller = _controller("evolve", _estimate(lock, "evolve"))
+        reservation = controller.reserve("replay", _estimate(lock, "evolve"))
+        generator = QueryEvolutionGenerator(
+            analyzer=ReplayLLMAnalyzer(
+                reader=reader,
+                model_id=lock.model_id,
+                prompt_artifact_sha256=prompt_sha,
+                prompt_version=lock.prompt_version,
+            )
+        )
+        generated = await generator.generate(context, reservation)
+        replay_searches: list[ProviderResult[list[Paper]]] = []
+        if generated.status == "generated" and generated.proposal is not None:
+            replay_provider = ReplaySearchProvider(dependency="openalex", reader=reader)
+            for subquery in generated.proposal.subqueries:
+                replay_searches.append(await replay_provider.search(subquery.text, dict(plan.inherited_hard_filters), 50, reservation))
+        replayed[query_id] = {
+            "terminal": generated.status,
+            "proposal": _comparable(generated.proposal),
+            "searches": [_comparable(result) for result in replay_searches],
+            "additions": replay_searches,
+        }
+    capture_hash = _capture_replay_hash(lock, captured)
+    replay_hash = _capture_replay_hash(lock, replayed)
+    match = capture_hash == replay_hash
+    additions: dict[str, list[ProviderResult[list[Paper]]]] = {}
+    for query_id in lock.query_ids:
+        raw_additions = replayed[query_id].get("additions", [])
+        additions[query_id] = cast(list[ProviderResult[list[Paper]]], raw_additions)
+    baseline = reconstruct_frozen_baseline(frozen_inputs, None)
+    projection = merge_probe_results(baseline, additions)
+    gold = read_jsonl(DEFAULT_GOLD, EvaluationQuery)
+    id_map = IdentifierMap.from_path(DEFAULT_ID_MAP)
+    integrity = ProbeIntegrity(
+        capture_replay_match="matched" if match else "mismatched",
+        locked_query_count=baseline.expected_query_count,
+        terminal_count=len(replayed),
+        request_failures=sum(
+            1 for query_id in lock.query_ids if replayed[query_id]["terminal"] in {"dependency_failure", "integrity_failure"}
+        ),
+        balanced_production_estimate=Decimal("0.01"),
+        run_reason=None if match else "replay_mismatch",
+    )
+    evaluation = evaluate_probe(baseline=baseline, projection=projection, gold=gold, id_map=id_map, integrity=integrity)
+    (run_dir / "outcomes.jsonl").write_text(
+        "".join(_canonical_json({"query_id": query_id, **{key: value for key, value in captured[query_id].items() if key != "additions"}}).decode("utf-8") for query_id in lock.query_ids),
+        encoding="utf-8",
+    )
+    (run_dir / "result.json").write_bytes(
+        _canonical_json(
+            {
+                "schema_version": "query-evolution-probe-result-v1",
+                "capture_business_sha256": capture_hash,
+                "replay_business_sha256": replay_hash if match else None,
+                "capture_replay_match": "matched" if match else "mismatched",
+                "public_report": public_probe_report(evaluation).model_dump(mode="json"),
+                "snapshot_manifest_sha256": capture_store.manifest_sha256,
+                "snapshot_set_id": manifest.snapshot_set_id,
+                "ledger_checkpoint_sha256": ledger.project_checkpoint()[1],
+            }
+        )
+    )
+
+
 def capture_probe(lock: ProbeLock, runtime: ProbeRuntime, reservations: ProbeReservations | None = None) -> CapturedProbe:
     del reservations
     if not runtime.allow_live:
         raise LiveNotAuthorized("bounded live capture requires --allow-live")
-    raise NotImplementedError("live capture is intentionally not executed in the offline implementation phase")
+    raise NotImplementedError("capture_probe is only available through run_probe")
 
 
 def replay_probe(lock: ProbeLock, replay_trace: ReplayTrace, snapshot_reader: object) -> ReplayedProbe:
@@ -348,8 +763,25 @@ def run_probe(lock_path: Path, runtime: ProbeRuntime) -> None:
     lock = load_probe_lock(lock_path)
     if not runtime.allow_live:
         raise LiveNotAuthorized("run --lock requires --allow-live")
-    del lock
-    raise NotImplementedError("live capture is outside the authorized offline phase")
+    if lock.probe_code_sha256 != _probe_code_sha256():
+        raise ValueError("probe code hash mismatch")
+    if runtime.ledger_path.exists():
+        ledger = SQLiteBudgetLedger(runtime.ledger_path, reservation_ttl_seconds=PROBE_LEDGER_TTL_SECONDS)
+        if ledger.project_checkpoint()[1] != lock.ledger_checkpoint_sha256:
+            raise ValueError("ledger checkpoint mismatch")
+    run_dir = ROOT / lock.expected_run_directory
+    lock_bytes = lock_path.read_bytes()
+    if run_dir.exists():
+        if not _can_resume_partial_run(run_dir):
+            raise FileExistsError(f"probe output already exists: {run_dir}")
+        (run_dir / "probe.lock.json").write_bytes(lock_bytes)
+    else:
+        run_dir.mkdir(parents=True)
+        (run_dir / "probe.lock.json").write_bytes(lock_bytes)
+    try:
+        asyncio.run(_run_live_probe(lock, runtime, run_dir))
+    except BaseException:
+        raise
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -368,6 +800,8 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run")
     run.add_argument("--lock", type=Path, required=True)
     run.add_argument("--allow-live", action="store_true")
+    run.add_argument("--env-file", type=Path, default=ProbeRuntime.model_fields["env_file"].default)
+    run.add_argument("--ledger", type=Path, default=ProbeRuntime.model_fields["ledger_path"].default)
     return parser
 
 
@@ -388,7 +822,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_path=args.out,
             )
             return 0
-        run_probe(args.lock, ProbeRuntime(allow_live=args.allow_live))
+        run_probe(
+            args.lock,
+            ProbeRuntime(
+                allow_live=args.allow_live,
+                env_file=args.env_file,
+                ledger_path=args.ledger,
+            ),
+        )
         return 0
     except LiveNotAuthorized:
         return 2

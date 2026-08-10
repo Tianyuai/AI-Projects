@@ -592,6 +592,7 @@ def test_run_rejects_locked_prompt_hash_drift_before_live_probe(
             encoding="utf-8",
         )
         live_probe_started = False
+        ledger_path = tmp_path / "runtime-ledger.sqlite3"
 
         async def fail_live_probe(*_: object, **__: object) -> None:
             nonlocal live_probe_started
@@ -606,11 +607,12 @@ def test_run_rejects_locked_prompt_hash_drift_before_live_probe(
                 ProbeRuntime(
                     allow_live=True,
                     env_file=tmp_path / "unused.env",
-                    ledger_path=tmp_path / "ledger.sqlite3",
+                    ledger_path=ledger_path,
                 ),
             )
 
         assert live_probe_started is False
+        assert not ledger_path.exists()
 
 
 def test_canary_selects_minimum_median_and_maximum_canonical_payload() -> None:
@@ -1079,6 +1081,11 @@ def test_canary_run_marks_timeout_as_cancelled(
             "prompt_binding_failed",
         ),
         (
+            "prompt-version",
+            lambda payload: payload["prompt"].__setitem__("version", "query-evolve-v1"),  # type: ignore[index]
+            "prompt_binding_failed",
+        ),
+        (
             "limits",
             lambda payload: payload["limits"].__setitem__("llm_attempts", 8),  # type: ignore[index]
             "canary_preflight_failed",
@@ -1108,15 +1115,18 @@ def test_canary_run_rejects_lock_drift_before_dispatch(
     _install_openalex_guards(monkeypatch)
     monkeypatch.setattr(probe.httpx, "AsyncClient", fail_async_client)
 
+    ledger_path = tmp_path / "runtime-ledger.sqlite3"
+
     probe.run_canary(
         lock_path,
         ProbeRuntime(
             allow_live=True,
             env_file=env_file,
-            ledger_path=tmp_path / "ledger.sqlite3",
+            ledger_path=ledger_path,
         ),
     )
 
+    assert not ledger_path.exists()
     result = _read_result(run_dir)
     assert result["reason"] == expected_reason
     assert result["promoted"] is False

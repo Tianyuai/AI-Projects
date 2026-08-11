@@ -14,10 +14,13 @@ import scripts.probe_query_evolution as probe
 import scripts.rescore_identifier_semantics as rescore
 import pytest
 
+from paper_search.domain.models import ProviderResult, UsageActual
+from paper_search.evaluation.execution_adapter import EvaluationExecutionRecord
 from paper_search.evaluation.identifier_semantics import (
     assert_public_json_safe,
     assert_public_markdown_safe,
 )
+from paper_search.evaluation.query_evolution_probe import FrozenProbeInputs
 from paper_search.evaluation.semantic_rescore import SemanticRescoreReport
 
 
@@ -138,6 +141,212 @@ def _report() -> SemanticRescoreReport:
 
 def _sha256(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def _execution(
+    query_id: str,
+    *,
+    retrieved: list[str] | None = None,
+    post_filter: list[str] | None = None,
+) -> EvaluationExecutionRecord:
+    return EvaluationExecutionRecord(
+        query_id=query_id,
+        run_id="dev-20260809T061903Z-9bd861e90299",
+        outcome_kind="success",
+        business_result_sha256=HASH,
+        usage=UsageActual(),
+        diagnostics=[],
+        retrieved_paper_ids=retrieved or ["openalex:W1"],
+        post_filter_paper_ids=post_filter or ["openalex:W1"],
+        is_partial=False,
+        planner_status="primary",
+        planner_fallback=False,
+        stop_reason="complete",
+    )
+
+
+def test_verified_probe_material_loader_reuses_full_probe_verification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "runs" / "_diag_query_evolution_query-evolution-prompt-v2-full-20260810"
+    (run_dir / "snapshots").mkdir(parents=True)
+    for relative in (
+        "probe.lock.json",
+        "result.json",
+        "snapshots/snapshot-manifest.json",
+    ):
+        (run_dir / relative).write_bytes(relative.encode())
+    outcomes = (
+        b'{"query_id":"q-1","terminal":"generated","searches":'
+        b'[{"errors":[],"data":[{"canonical_id":"openalex:W1","title":"One"}]}]}\n'
+    )
+    (run_dir / "outcomes.jsonl").write_bytes(outcomes)
+    baseline_inputs = FrozenProbeInputs(
+        queries=[],
+        source_run_id="dev-20260809T061903Z-9bd861e90299",
+        source_hashes={"business_results_sha256": HASH},
+        expected_query_count=1,
+        expected_total_selected=1,
+    )
+    baseline_execution = _execution("q-1")
+    events: list[object] = []
+    lock = SimpleNamespace(
+        expected_run_directory="runs/_diag_query_evolution_query-evolution-prompt-v2-full-20260810",
+        source_hashes={
+            "business_results_sha256": HASH,
+            "executions_sha256": HASH,
+            "run_sha256": HASH,
+            "snapshot_manifest_sha256": HASH,
+        },
+        query_ids=("q-1",),
+    )
+    result = SimpleNamespace(
+        capture_business_sha256=HASH,
+        replay_business_sha256=HASH,
+        capture_replay_match="matched",
+        snapshot_manifest_sha256=HASH,
+        snapshot_set_id=HASH,
+        ledger_checkpoint_sha256=HASH,
+    )
+
+    class Reader:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            events.append(("reader", args, kwargs))
+
+        def read(self, request: object) -> bytes:
+            events.append(("snapshot-read", request))
+            return b"snapshot"
+
+    monkeypatch.setattr(rescore, "ROOT", tmp_path)
+    monkeypatch.setattr(probe, "load_probe_lock", lambda path: events.append("lock") or lock)
+    monkeypatch.setattr(
+        probe,
+        "verify_probe_source_bindings",
+        lambda value: events.append("source-bindings") or (tmp_path / "source"),
+    )
+    monkeypatch.setattr(rescore, "_load_probe_result", lambda path: events.append("result") or result)
+    monkeypatch.setattr(rescore, "DependencySnapshotReader", Reader)
+    monkeypatch.setattr(
+        rescore,
+        "DependencySnapshotManifestV2",
+        SimpleNamespace(
+            model_validate_json=lambda content: SimpleNamespace(
+                entries=(SimpleNamespace(request="first"), SimpleNamespace(request="second"))
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        probe,
+        "probe_outcome_hash",
+        lambda lock_value, payload: events.append(("outcome-hash", payload)) or HASH,
+    )
+    monkeypatch.setattr(
+        probe,
+        "frozen_probe_inputs",
+        lambda value: events.append("frozen-inputs") or (baseline_inputs, {}),
+    )
+    monkeypatch.setattr(
+        rescore,
+        "_record_maps",
+        lambda source, expected, label: events.append(("records", source, expected, label))
+        or ({}, {"q-1": baseline_execution}),
+    )
+
+    materials = rescore.load_verified_probe_materials(run_dir, ("q-1",))
+
+    assert isinstance(materials, rescore.VerifiedProbeMaterials)
+    assert materials.baseline_inputs is baseline_inputs
+    assert materials.baseline_executions == {"q-1": baseline_execution}
+    assert isinstance(materials.additions["q-1"][0], ProviderResult)
+    assert [paper.canonical_id for paper in materials.additions["q-1"][0].data] == [
+        "openalex:W1"
+    ]
+    assert materials.binding_hashes == {
+        "probe_lock_sha256": _sha256(b"probe.lock.json"),
+        "probe_result_sha256": _sha256(b"result.json"),
+        "probe_outcomes_sha256": _sha256(outcomes),
+        "probe_snapshot_manifest_sha256": _sha256(b"snapshots/snapshot-manifest.json"),
+        "source_business_results_sha256": HASH,
+        "source_executions_sha256": HASH,
+        "source_run_sha256": HASH,
+        "source_snapshot_manifest_sha256": HASH,
+    }
+    assert events == [
+        "lock",
+        "source-bindings",
+        "result",
+        ("reader", (run_dir / "snapshots/snapshot-manifest.json",), {"snapshot_manifest_sha256": HASH, "snapshot_set_id": HASH}),
+        ("snapshot-read", "first"),
+        ("snapshot-read", "second"),
+        ("outcome-hash", {"q-1": {"terminal": "generated", "searches": [{"errors": [], "data": [{"canonical_id": "openalex:W1", "title": "One"}]}]}}),
+        "frozen-inputs",
+        ("records", tmp_path / "source", ("q-1",), "probe baseline"),
+    ]
+
+
+def test_load_probe_source_is_thin_projection_over_verified_materials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    baseline_inputs = FrozenProbeInputs(
+        queries=[],
+        source_run_id="dev-20260809T061903Z-9bd861e90299",
+        source_hashes={},
+    )
+    baseline_execution = _execution(
+        "q-1",
+        retrieved=["openalex:W1", "openalex:W2", "openalex:W3"],
+        post_filter=["openalex:W1", "openalex:W2"],
+    )
+    materials = rescore.VerifiedProbeMaterials(
+        baseline_inputs=baseline_inputs,
+        baseline_executions={"q-1": baseline_execution},
+        additions={},
+        binding_hashes={"probe_lock_sha256": HASH},
+    )
+    projection = SimpleNamespace(
+        by_query={
+            "q-1": SimpleNamespace(
+                retrieved_ids=("openalex:W1", "openalex:W2", "openalex:W3"),
+                post_filter_ids=("openalex:W2", "openalex:W3"),
+                top50_ids=("openalex:W3",),
+            )
+        }
+    )
+    calls: list[object] = []
+    monkeypatch.setattr(
+        rescore,
+        "load_verified_probe_materials",
+        lambda run_dir, expected_query_ids: calls.append((run_dir, expected_query_ids))
+        or materials,
+    )
+    monkeypatch.setattr(
+        rescore,
+        "_probe_projection",
+        lambda **kwargs: calls.append(kwargs) or projection,
+    )
+
+    source = rescore.load_probe_source(tmp_path / "probe", ("q-1",))
+
+    assert source.label == "query_evolution_prompt_v2"
+    assert source.kind == "sealed_probe"
+    assert source.capture_replay_status == "matched"
+    assert source.binding_hashes == {"probe_lock_sha256": HASH}
+    assert source.retrieved_paper_ids == {
+        "q-1": ("openalex:W1", "openalex:W2", "openalex:W3")
+    }
+    assert source.post_filter_paper_ids == {
+        "q-1": ("openalex:W1", "openalex:W2", "openalex:W3")
+    }
+    assert source.selected_paper_ids == {"q-1": ("openalex:W3",)}
+    assert calls == [
+        (tmp_path / "probe", ("q-1",)),
+        {
+            "baseline_inputs": baseline_inputs,
+            "baseline_executions": {"q-1": baseline_execution},
+            "additions": {},
+            "expected_query_ids": ("q-1",),
+        },
+    ]
 
 
 def test_rescore_module_help_lists_only_fixed_commands() -> None:

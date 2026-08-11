@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeVar
 
@@ -16,7 +17,7 @@ from pydantic import ValidationError, model_validator
 
 import scripts.probe_query_evolution as probe
 from paper_search.control.pricing import parse_quality_gate_policy_bytes
-from paper_search.domain.models import DomainModel, Paper, Sha256
+from paper_search.domain.models import DomainModel, Paper, ProviderResult, Sha256
 from paper_search.evaluation.business_results import (
     BusinessResultRecord,
     business_result_sha256,
@@ -76,6 +77,14 @@ _PROBE_SOURCE_HASH_KEYS = frozenset(
     }
 )
 ModelT = TypeVar("ModelT", bound=DomainModel)
+
+
+@dataclass(frozen=True)
+class VerifiedProbeMaterials:
+    baseline_inputs: FrozenProbeInputs
+    baseline_executions: dict[str, EvaluationExecutionRecord]
+    additions: dict[str, tuple[ProviderResult[list[Paper]], ...]]
+    binding_hashes: dict[str, str]
 
 
 class _ProbeResult(DomainModel):
@@ -325,8 +334,8 @@ def _require_ordered_probe_subset(
 
 def _probe_additions(
     rows: Sequence[Mapping[str, object]],
-) -> dict[str, list[object]]:
-    additions: dict[str, list[object]] = {}
+) -> dict[str, tuple[ProviderResult[list[Paper]], ...]]:
+    additions: dict[str, tuple[ProviderResult[list[Paper]], ...]] = {}
     for row in rows:
         query_id = row["query_id"]
         if not isinstance(query_id, str):
@@ -337,7 +346,7 @@ def _probe_additions(
         searches = row.get("searches")
         if not isinstance(searches, list):
             raise ValueError("probe outcome searches are invalid")
-        converted: list[object] = []
+        converted: list[ProviderResult[list[Paper]]] = []
         for search in searches:
             if not isinstance(search, dict):
                 raise ValueError("probe outcome search is invalid")
@@ -354,7 +363,7 @@ def _probe_additions(
             except ValidationError as error:
                 raise ValueError("probe outcome contains an invalid paper") from error
             converted.append(offline_provider_result(papers))
-        additions[query_id] = converted
+        additions[query_id] = tuple(converted)
     return additions
 
 
@@ -402,6 +411,44 @@ def load_probe_source(
     expected_query_ids: tuple[str, ...],
 ) -> SourceProjection:
     """Verify and project the sealed Query Evolution capture/replay source."""
+    materials = load_verified_probe_materials(run_dir, expected_query_ids)
+    projection = _probe_projection(
+        baseline_inputs=materials.baseline_inputs,
+        baseline_executions=materials.baseline_executions,
+        additions=materials.additions,
+        expected_query_ids=expected_query_ids,
+    )
+    post_filter_paper_ids = {
+        query_id: _stable_union(
+            materials.baseline_executions[query_id].post_filter_paper_ids,
+            projection.by_query[query_id].post_filter_ids,
+        )
+        for query_id in expected_query_ids
+    }
+    return SourceProjection(
+        label="query_evolution_prompt_v2",
+        kind="sealed_probe",
+        verification_status="probe_verified",
+        capture_replay_status="matched",
+        binding_hashes=materials.binding_hashes,
+        query_ids=expected_query_ids,
+        retrieved_paper_ids={
+            query_id: tuple(projection.by_query[query_id].retrieved_ids)
+            for query_id in expected_query_ids
+        },
+        post_filter_paper_ids=post_filter_paper_ids,
+        selected_paper_ids={
+            query_id: tuple(projection.by_query[query_id].top50_ids)
+            for query_id in expected_query_ids
+        },
+    )
+
+
+def load_verified_probe_materials(
+    run_dir: Path,
+    expected_query_ids: tuple[str, ...],
+) -> VerifiedProbeMaterials:
+    """Verify and load reusable sealed Query Evolution probe materials."""
     lock_path = run_dir / "probe.lock.json"
     lock = probe.load_probe_lock(lock_path)
     expected_directory = (ROOT / lock.expected_run_directory).resolve()
@@ -460,24 +507,11 @@ def load_probe_source(
     _, baseline_executions = _record_maps(
         source_run, expected_query_ids, label="probe baseline"
     )
-    projection = _probe_projection(
+
+    return VerifiedProbeMaterials(
         baseline_inputs=baseline_inputs,
         baseline_executions=baseline_executions,
         additions=additions,
-        expected_query_ids=expected_query_ids,
-    )
-    post_filter_paper_ids = {
-        query_id: _stable_union(
-            baseline_executions[query_id].post_filter_paper_ids,
-            projection.by_query[query_id].post_filter_ids,
-        )
-        for query_id in expected_query_ids
-    }
-    return SourceProjection(
-        label="query_evolution_prompt_v2",
-        kind="sealed_probe",
-        verification_status="probe_verified",
-        capture_replay_status="matched",
         binding_hashes={
             "probe_lock_sha256": _sha256_file(lock_path),
             "probe_result_sha256": _sha256_file(result_path),
@@ -487,16 +521,6 @@ def load_probe_source(
                 f"source_{key}": value
                 for key, value in sorted(lock.source_hashes.items())
             },
-        },
-        query_ids=expected_query_ids,
-        retrieved_paper_ids={
-            query_id: tuple(projection.by_query[query_id].retrieved_ids)
-            for query_id in expected_query_ids
-        },
-        post_filter_paper_ids=post_filter_paper_ids,
-        selected_paper_ids={
-            query_id: tuple(projection.by_query[query_id].top50_ids)
-            for query_id in expected_query_ids
         },
     )
 

@@ -16,6 +16,11 @@ evidence:
   prompt_model_visibility: {available: false}
   gold_denominator: {available: true, path: runs/_diag_title_candidates_v2_20260805T013706Z.json}
 generation_recipe_reconstructability: not_reconstructable
+generation_comparison: insufficient_historical_evidence
+generation_comparison_missing_fields:
+  - title action payloads and provider responses
+  - prompt, model, temperature, and visibility
+  - retrieval budget/backend and candidate-pool policy
 candidate_pool_policy_version: canonical-id-first-v1
 status: aggregate_only
 missing_or_misaligned:

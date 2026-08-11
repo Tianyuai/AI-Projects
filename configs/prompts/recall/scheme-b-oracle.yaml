@@ -1,0 +1,8 @@
+name: recall_scheme_b_oracle
+version: recall-scheme-b-oracle-v1
+model: deepseek-v4-flash
+temperature: 0
+instructions:
+  - Use the supplied Gold bibliographic prose only to propose complementary retrieval actions.
+  - Preserve query constraints and use only the allowed action types.
+  - Do not emit identifiers, URLs, prior hits, evaluation outcomes, or prose outside the JSON action batch.

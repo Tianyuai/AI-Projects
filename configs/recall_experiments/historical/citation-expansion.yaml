@@ -14,6 +14,11 @@ evidence:
   prompt_model_visibility: {available: false}
   gold_denominator: {available: true, path: runs/_diag_citation_expansion_probe_20260804T150231Z.json}
 generation_recipe_reconstructability: not_reconstructable
+generation_comparison: insufficient_historical_evidence
+generation_comparison_missing_fields:
+  - replayable seed actions and provider responses
+  - prompt/model generation method and visibility
+  - retrieval budget and candidate-pool policy
 candidate_pool_policy_version: canonical-id-first-v1
 status: insufficient
 missing_or_misaligned:

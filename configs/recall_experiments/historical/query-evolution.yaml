@@ -20,6 +20,12 @@ evidence:
   prompt_model_visibility: {available: true, path: runs/_diag_query_evolution_query-evolution-prompt-v2-full-20260810/probe.lock.json}
   gold_denominator: {available: true, path: runs/_diag_query_evolution_query-evolution-prompt-v2-full-20260810/probe.lock.json}
 generation_recipe_reconstructability: partially_reconstructable
+generation_comparison: insufficient_historical_evidence
+generation_comparison_missing_fields:
+  - original query IDs
+  - complete prompt, model, temperature, and visibility binding
+  - action limits and retrieval budget binding
+  - Gold denominator and candidate-pool comparison binding
 candidate_pool_policy_version: canonical-id-first-v1
 status: exact
 missing_or_misaligned:

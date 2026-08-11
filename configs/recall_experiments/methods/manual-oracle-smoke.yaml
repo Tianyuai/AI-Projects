@@ -1,0 +1,15 @@
+method_id: manual-oracle-smoke
+generator:
+  type: manual_actions
+  actions: runs/recall_inputs/manual-oracle-smoke/actions.json
+  gold_visibility: oracle
+retrieval:
+  allowed_actions: [text_search, title_search, citation_expand]
+  backend: live_provider
+  max_results_per_action: 50
+  max_total_actions: 3
+candidate_pool:
+  policy_version: production-dedup-v1
+evaluation:
+  repeat_count: 1
+  max_repeat_attempts: 1

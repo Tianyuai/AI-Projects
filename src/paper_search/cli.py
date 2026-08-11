@@ -108,6 +108,37 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--config", type=Path)
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8000)
+    recall = commands.add_parser("recall", help="run isolated candidate-recall workflows")
+    recall_commands = recall.add_subparsers(dest="recall_command", required=True)
+    prepare = recall_commands.add_parser(
+        "prepare-context", help="verify frozen inputs and write safe generation contexts"
+    )
+    prepare.add_argument("--recipe", type=Path, required=True)
+    prepare.add_argument("--sample", type=Path, required=True)
+    prepare.add_argument("--out", type=Path, required=True)
+    validate = recall_commands.add_parser(
+        "validate-actions", help="validate pasted action batches without retrieval"
+    )
+    validate.add_argument("--recipe", type=Path, required=True)
+    validate.add_argument("--contexts", type=Path, required=True)
+    validate.add_argument("--actions", type=Path, required=True)
+    validate.add_argument("--out", type=Path, required=True)
+    run_recall = recall_commands.add_parser("run", help="run one candidate-recall recipe")
+    run_recall.add_argument("--recipe", type=Path, required=True)
+    run_recall.add_argument("--sample", type=Path, required=True)
+    run_recall.add_argument("--actions", type=Path)
+    run_recall.add_argument("--snapshot-manifest", type=Path)
+    run_recall.add_argument("--allow-live", action="store_true")
+    run_recall.add_argument("--out", type=Path, required=True)
+    compare_recall = recall_commands.add_parser("compare", help="compare a recall run")
+    compare_recall.add_argument("run_directory", type=Path)
+    inventory = recall_commands.add_parser(
+        "inventory-history", help="verify frozen historical recall evidence"
+    )
+    inventory.add_argument(
+        "--config-root", type=Path, default=_PROJECT_CONFIG_ROOT / "recall_experiments" / "historical"
+    )
+    inventory.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -275,6 +306,8 @@ def _run_serve(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "recall":
+        return _run_recall_command(args)
     if args.command == "verify-run":
         return verify_run_command(args.run_directory)
     if args.command == "compare-replay":
@@ -338,6 +371,73 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return exit_code
+
+
+def _run_recall_command(args: argparse.Namespace) -> int:
+    """Dispatch recall composition without opening runtime state for offline paths."""
+    from paper_search.recall_experiments.composition import (
+        RecallTerminalError,
+        prepare_recall_run,
+        run_recall_experiment,
+        validate_pasted_actions,
+        write_prepared_contexts,
+    )
+
+    output = Path(getattr(args, "out", Path(".")))
+    try:
+        if args.recall_command == "prepare-context":
+            prepared = prepare_recall_run(args.recipe, args.sample, workspace_root=Path.cwd())
+            path = write_prepared_contexts(prepared, output)
+        elif args.recall_command == "validate-actions":
+            path = validate_pasted_actions(
+                recipe_path=args.recipe,
+                contexts_path=args.contexts,
+                actions_path=args.actions,
+                output_path=output,
+            )
+        elif args.recall_command == "run":
+            path = asyncio.run(
+                run_recall_experiment(
+                    recipe_path=args.recipe,
+                    sample_path=args.sample,
+                    output_path=output,
+                    workspace_root=Path.cwd(),
+                    actions_path=args.actions,
+                    allow_live=bool(args.allow_live),
+                    snapshot_manifest_path=args.snapshot_manifest,
+                )
+            )
+        elif args.recall_command == "inventory-history":
+            from paper_search.recall_experiments.inventory import build_inventory
+
+            report = build_inventory(args.config_root, workspace_root=Path.cwd())
+            output.mkdir(parents=True, exist_ok=False)
+            (output / "source-inventory.json").write_text(
+                json.dumps(report, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            path = output
+        else:
+            raise RecallTerminalError("config_mismatch")
+    except RecallTerminalError as error:
+        print(
+            json.dumps(
+                {"error_code": error.code, "path": str(output), "status": "failed"},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    except (OSError, RuntimeError, TypeError, ValueError):
+        print(
+            json.dumps(
+                {"error_code": "config_mismatch", "path": str(output), "status": "failed"},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
+    print(json.dumps({"path": str(path), "status": "complete"}, ensure_ascii=False, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":

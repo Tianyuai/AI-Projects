@@ -34,6 +34,20 @@ def _sha256(payload: bytes) -> str:
     return f"sha256:{hashlib.sha256(payload).hexdigest()}"
 
 
+def test_recall_offline_commands_are_available_without_runtime_options() -> None:
+    parser = build_parser()
+
+    prepared = parser.parse_args(
+        ["recall", "prepare-context", "--recipe", "recipe.yaml", "--sample", "sample.yaml", "--out", "out"]
+    )
+    validated = parser.parse_args(
+        ["recall", "validate-actions", "--recipe", "recipe.yaml", "--contexts", "contexts", "--actions", "actions.json", "--out", "out"]
+    )
+
+    assert prepared.recall_command == "prepare-context"
+    assert validated.recall_command == "validate-actions"
+
+
 def _candidate_lock_bytes(*, runtime_allow_live: bool = True) -> bytes:
     raw = yaml.safe_load(Path("tests/fixtures/application/candidate.lock.yaml").read_bytes())
     raw["runtime_allow_live"] = runtime_allow_live

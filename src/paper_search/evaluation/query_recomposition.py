@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -26,6 +26,7 @@ from paper_search.evaluation.dataset import (
 )
 from paper_search.evaluation.metrics import evaluate
 from paper_search.evaluation.ranking_metrics import evaluate_ranking
+from paper_search.processing.filter import apply_hard_filters
 from paper_search.ranking.fusion import fuse_provider_results
 
 
@@ -155,9 +156,10 @@ def compose_append(slots: Sequence[Sequence[Paper]]) -> tuple[Paper, ...]:
     seen: set[str] = set()
     for slot in slots:
         for paper in slot:
-            if paper.canonical_id in seen:
+            paper_id = normalize_paper_id(paper.canonical_id)
+            if paper_id in seen:
                 continue
-            seen.add(paper.canonical_id)
+            seen.add(paper_id)
             selected.append(paper)
     return tuple(selected)
 
@@ -172,9 +174,10 @@ def compose_round_robin(slots: Sequence[Sequence[Paper]]) -> tuple[Paper, ...]:
             if rank >= len(slot):
                 continue
             paper = slot[rank]
-            if paper.canonical_id in seen:
+            paper_id = normalize_paper_id(paper.canonical_id)
+            if paper_id in seen:
                 continue
-            seen.add(paper.canonical_id)
+            seen.add(paper_id)
             selected.append(paper)
     return tuple(selected)
 
@@ -206,26 +209,58 @@ def compose_rrf(slots: Sequence[Sequence[Paper]]) -> tuple[Paper, ...]:
 def project_all(
     inputs: Sequence[RecompositionInput],
 ) -> dict[RecompositionMethod, dict[str, RecompositionProjection]]:
-    """Project the three fixed recompositions without changing sealed streams."""
+    """Project the three fixed recompositions over verified sealed streams."""
     projections: dict[RecompositionMethod, dict[str, RecompositionProjection]] = {
         method: {} for method in _FIXED_METHODS
     }
+    seen_query_ids: set[str] = set()
     for record in inputs:
+        if record.query_id in seen_query_ids:
+            raise ValueError(f"duplicate query_id: {record.query_id}")
+        seen_query_ids.add(record.query_id)
+
         slots = (*record.baseline_slots, *record.addition_slots)
+        addition_papers = tuple(
+            paper for slot in record.addition_slots for paper in slot
+        )
+        retrieved_ids = _stable_normalized_union(
+            record.retrieved_paper_ids,
+            (paper.canonical_id for paper in addition_papers),
+        )
+        accepted_additions = apply_hard_filters(
+            addition_papers, record.query_spec
+        ).accepted
+        post_filter_ids = _stable_normalized_union(
+            record.post_filter_paper_ids,
+            (item.paper.canonical_id for item in accepted_additions),
+        )
         selected_by_method: dict[RecompositionMethod, tuple[Paper, ...]] = {
             "append_v2": compose_append(slots),
             "round_robin_slots": compose_round_robin(slots),
             "rrf_slots_k60": compose_rrf(slots),
         }
-        accepted_ids = set(record.post_filter_paper_ids)
+        accepted_ids = set(post_filter_ids)
         for method in _FIXED_METHODS:
             projections[method][record.query_id] = RecompositionProjection(
                 method=method,
-                retrieved_ids=record.retrieved_paper_ids,
-                post_filter_ids=record.post_filter_paper_ids,
+                retrieved_ids=retrieved_ids,
+                post_filter_ids=post_filter_ids,
                 selected_ids=_accepted_top50_ids(selected_by_method[method], accepted_ids),
             )
     return projections
+
+
+def _stable_normalized_union(*groups: Iterable[str]) -> tuple[str, ...]:
+    values: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for value in group:
+            normalized = normalize_paper_id(value)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            values.append(normalized)
+    return tuple(values)
 
 
 def build_report(

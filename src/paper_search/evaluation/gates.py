@@ -140,7 +140,7 @@ def _split_from_frozen_queries(
     raise ValueError("frozen queries must declare one consistent dev or validation split")
 
 
-def _compare(rule: QualityGateRule, value: Decimal) -> bool:
+def compare_quality_gate_rule(rule: QualityGateRule, value: Decimal) -> bool:
     threshold = Decimal(rule.threshold)
     if rule.operator == "eq":
         return value == threshold
@@ -212,7 +212,7 @@ def evaluate_gates(
             ):
                 passed = None if rule.classification == "reporting_only" else False
             else:
-                passed = _compare(rule, measure.value)
+                passed = compare_quality_gate_rule(rule, measure.value)
         checks.append(
             GateCheck(
                 rule_id=rule.rule_id,

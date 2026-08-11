@@ -10,11 +10,32 @@ from paper_search.control.pricing import load_quality_gate_policy
 from paper_search.domain.models import UsageActual, UsageEstimate
 from paper_search.evaluation.dataset import EvaluationQuery, PredictionRecord
 from paper_search.evaluation.execution_adapter import EvaluationFailureRecord
-from paper_search.evaluation.gates import MeasureValue, evaluate_gates
+from paper_search.evaluation.gates import (
+    MeasureValue,
+    compare_quality_gate_rule,
+    evaluate_gates,
+)
 from paper_search.evaluation.metrics import evaluate
 
 
 POLICY = load_quality_gate_policy(Path("configs/quality_gates_v1.yaml"))
+
+
+def test_public_gate_comparator_preserves_required_boundaries() -> None:
+    rules = {rule.rule_id: rule for rule in POLICY.rules}
+
+    assert compare_quality_gate_rule(
+        rules["hard-filter-recall-loss"], Decimal("0.02")
+    )
+    assert not compare_quality_gate_rule(
+        rules["hard-filter-recall-loss"], Decimal("0.0201")
+    )
+    assert compare_quality_gate_rule(
+        rules["macro-recall-positive"], Decimal("0.0001")
+    )
+    assert not compare_quality_gate_rule(
+        rules["macro-recall-positive"], Decimal("0")
+    )
 
 
 def _measure(value: str, denominator: str = "100") -> MeasureValue:

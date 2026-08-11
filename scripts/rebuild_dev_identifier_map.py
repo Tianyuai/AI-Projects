@@ -19,6 +19,7 @@ from paper_search.evaluation.identifier_semantics import (
     RelationAudit,
     _read_dev_arxiv_ids,
     _read_identity_evidence,
+    _read_referenced_snapshot_bytes,
     _snapshot_observations,
     arxiv_anchor,
     assert_public_json_safe,
@@ -111,11 +112,38 @@ def _atomic_write(path: Path, content: bytes) -> None:
             temporary.write(content)
             temporary.flush()
             os.fsync(temporary.fileno())
-        temporary_path.replace(path)
+        os.link(temporary_path, path)
+        temporary_path.unlink()
         temporary_path = None
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+
+
+def _acquire_publication_lock(
+    *, out_map: Path, out_private_audit: Path, out_public_audit: Path
+) -> Path:
+    resolved_map = out_map.resolve()
+    resolved_private = out_private_audit.resolve()
+    resolved_public = out_public_audit.resolve()
+    lock_path = Path(f"{resolved_public}.lock")
+    if len({resolved_map, resolved_private, resolved_public, lock_path}) != 4:
+        raise ValueError("publication targets must be distinct")
+    if any(path.exists() for path in (resolved_map, resolved_private, resolved_public)):
+        raise ValueError("publication target exists")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with lock_path.open("xb") as handle:
+            handle.write(b"identifier-map-publication-lock-v2\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        raise ValueError("publication lock exists") from None
+    return lock_path
+
+
+def _release_publication_lock(lock_path: Path) -> None:
+    lock_path.unlink(missing_ok=True)
 
 
 def _aggregate_audit(
@@ -244,8 +272,13 @@ def _resolve_alias_conflicts(relations: list[RelationAudit]) -> list[RelationAud
     ]
 
 
-def rebuild_dev_map(
-    *, gold_bytes: bytes, evidence_bytes: bytes, snapshot_root: Path
+def _rebuild_dev_map(
+    *,
+    gold_bytes: bytes,
+    evidence_bytes: bytes,
+    snapshot_root: Path,
+    manifest_content: bytes | None = None,
+    response_bytes: dict[str, bytes] | None = None,
 ) -> RebuiltDevMap:
     """Rebuild observations from sealed snapshots, then build the dev map."""
     try:
@@ -256,6 +289,8 @@ def rebuild_dev_map(
     observations, manifest_hash = _snapshot_observations(
         evidence=evidence,
         snapshot_root=snapshot_root,
+        manifest_content=manifest_content,
+        response_bytes=response_bytes,
     )
     raw_refs = evidence["evidence_refs"]
     if not isinstance(raw_refs, list):
@@ -344,6 +379,17 @@ def rebuild_dev_map(
     )
 
 
+def rebuild_dev_map(
+    *, gold_bytes: bytes, evidence_bytes: bytes, snapshot_root: Path
+) -> RebuiltDevMap:
+    """Rebuild observations from sealed snapshots, then build the dev map."""
+    return _rebuild_dev_map(
+        gold_bytes=gold_bytes,
+        evidence_bytes=evidence_bytes,
+        snapshot_root=snapshot_root,
+    )
+
+
 def publish_semantic_audit(
     audit: IdentifierMapSemanticAudit, *, output_path: Path
 ) -> None:
@@ -386,14 +432,29 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    lock_path = _acquire_publication_lock(
+        out_map=args.out_map,
+        out_private_audit=args.out_private_audit,
+        out_public_audit=args.out_public_audit,
+    )
     try:
-        result = rebuild_dev_map(
-            gold_bytes=args.gold.read_bytes(),
-            evidence_bytes=args.evidence.read_bytes(),
+        gold_bytes = args.gold.read_bytes()
+        evidence_bytes = args.evidence.read_bytes()
+        evidence = _read_identity_evidence(evidence_bytes)
+        manifest_content = (args.snapshot_root / "snapshot-manifest.json").read_bytes()
+        response_bytes = _read_referenced_snapshot_bytes(
+            evidence=evidence,
             snapshot_root=args.snapshot_root,
+            manifest_content=manifest_content,
+        )
+        result = _rebuild_dev_map(
+            gold_bytes=gold_bytes,
+            evidence_bytes=evidence_bytes,
+            snapshot_root=args.snapshot_root,
+            manifest_content=manifest_content,
+            response_bytes=response_bytes,
         )
     except SemanticAuditFailure as error:
-        publish_semantic_audit(error.public_audit, output_path=args.out_public_audit)
         _atomic_write(
             args.out_private_audit,
             _canonical_json(
@@ -404,13 +465,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ).model_dump(mode="json")
             ),
         )
+        publish_semantic_audit(error.public_audit, output_path=args.out_public_audit)
+        _release_publication_lock(lock_path)
         return 1
+    except (OSError, ValueError):
+        _release_publication_lock(lock_path)
+        raise
     _write_private_outputs(
         result,
         out_map=args.out_map,
         out_private_audit=args.out_private_audit,
     )
     publish_semantic_audit(result.audit, output_path=args.out_public_audit)
+    _release_publication_lock(lock_path)
     return 0
 
 

@@ -734,19 +734,22 @@ def test_privacy_scan_rejects_private_semantic_scholar_item_indexes(field: str) 
         assert_public_json_safe(json.dumps({field: 0}).encode("utf-8"))
 
 
-def test_audit_rejects_tampered_raw_snapshot(tmp_path: Path) -> None:
+def test_audit_ignores_tampered_unreferenced_snapshot(tmp_path: Path) -> None:
     map_bytes, gold_bytes, evidence_bytes, snapshot_root = _audit_fixture(tmp_path / "source")
     root = tmp_path / "tampered"
     shutil.copytree(snapshot_root, root)
-    next((root / "responses").rglob("*.bin")).write_bytes(b"tampered")
+    manifest = json.loads((root / "snapshot-manifest.json").read_bytes())
+    entry = manifest["entries"][0]
+    (root / entry["response_path"]).write_bytes(b"tampered")
 
-    with pytest.raises(ValueError, match="identity snapshot is invalid"):
-        audit_identifier_map_semantics(
-            map_bytes=map_bytes,
-            gold_bytes=gold_bytes,
-            evidence_bytes=evidence_bytes,
-            snapshot_root=root,
-        )
+    bundle = audit_identifier_map_semantics(
+        map_bytes=map_bytes,
+        gold_bytes=gold_bytes,
+        evidence_bytes=evidence_bytes,
+        snapshot_root=root,
+    )
+
+    assert bundle.report.status == "passed"
 
 
 def test_audit_rejects_dangling_private_snapshot_reference(tmp_path: Path) -> None:

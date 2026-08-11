@@ -23,7 +23,7 @@ from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap, norm
 from paper_search.storage.dependency_snapshot import (
     DependencyRequestIdentity,
     DependencySnapshotManifestV2,
-    DependencySnapshotReader,
+    SnapshotEntryV2,
 )
 
 
@@ -128,6 +128,21 @@ class RelationAudit(DomainModel):
                     raise ValueError("verified anchor proof is invalid")
             elif self.proof_kind is not None or self.reason_code != "arxiv_datacite_mismatch":
                 raise ValueError("failed anchor proof is invalid")
+        elif self.state == "verified":
+            if self.proof_kind is None or self.reason_code != self.proof_kind:
+                raise ValueError("verified provider proof is invalid")
+        elif self.state == "semantic_mismatch":
+            if self.proof_kind is not None or self.reason_code not in {
+                "arxiv_datacite_mismatch",
+                "openalex_location_mismatch",
+            }:
+                raise ValueError("provider mismatch proof is invalid")
+        elif self.proof_kind is not None or self.reason_code not in {
+            "insufficient_identity_evidence",
+            "observation_binding_mismatch",
+            "alias_target_conflict",
+        }:
+            raise ValueError("unresolved provider proof is invalid")
         return self
 
 
@@ -201,11 +216,34 @@ class PrivateRelationAuditV2(DomainModel):
     scope: Literal["dev"]
     relations: tuple[RelationAudit, ...]
 
+    @model_validator(mode="after")
+    def validate_relation_order_and_uniqueness(self) -> PrivateRelationAuditV2:
+        def order(row: RelationAudit) -> tuple[int, str, str]:
+            return (
+                0 if row.relation_kind == "required_anchor" else 1,
+                row.arxiv_id,
+                row.alias,
+            )
+        keys = [
+            (row.relation_kind, row.arxiv_id, row.alias) for row in self.relations
+        ]
+        if len(set(keys)) != len(keys) or tuple(self.relations) != tuple(
+            sorted(self.relations, key=order)
+        ):
+            raise ValueError("private relation audit rows are not canonical")
+        return self
+
 
 @dataclass(frozen=True)
 class SemanticAuditBundle:
     report: IdentifierMapSemanticAuditV1
     private_relations: tuple[RelationAudit, ...]
+
+
+@dataclass(frozen=True)
+class VerifiedIdentifierGeneration:
+    audit: IdentifierMapSemanticAudit
+    identifier_map: IdentifierMap
 
 
 def arxiv_anchor(arxiv_id: str) -> str:
@@ -302,25 +340,153 @@ def _read_dev_arxiv_ids(content: bytes) -> tuple[str, ...]:
     return tuple(sorted(arxiv_ids))
 
 
-def _snapshot_observations(
-    *, evidence: dict[str, object], snapshot_root: Path
-) -> tuple[dict[tuple[str, str], IdentityObservation], str]:
-    manifest_path = snapshot_root / "snapshot-manifest.json"
+def _snapshot_canonical_json_bytes(value: object) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _referenced_snapshot_entry_ids(evidence: dict[str, object]) -> tuple[str, ...]:
+    raw_refs = evidence.get("evidence_refs")
+    if not isinstance(raw_refs, list):
+        raise ValueError("identity evidence is invalid")
+    entry_ids: set[str] = set()
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, dict):
+            raise ValueError("identity evidence is invalid")
+        values = (
+            raw_ref.get("semantic_scholar_arxiv_entry_id"),
+            raw_ref.get("semantic_scholar_doi_entry_id"),
+        )
+        openalex_entry_ids = raw_ref.get("openalex_entry_ids", [])
+        if (
+            any(value is not None and not isinstance(value, str) for value in values)
+            or not isinstance(openalex_entry_ids, list)
+            or not all(isinstance(entry_id, str) for entry_id in openalex_entry_ids)
+        ):
+            raise ValueError("identity snapshot is invalid")
+        entry_ids.update(value for value in values if value is not None)
+        entry_ids.update(openalex_entry_ids)
+    return tuple(sorted(entry_ids))
+
+
+def _snapshot_entries_from_manifest_bytes(
+    *, evidence: dict[str, object], manifest_content: bytes
+) -> dict[str, SnapshotEntryV2]:
     expected_manifest_hash = evidence["snapshot_manifest_sha256"]
     if not isinstance(expected_manifest_hash, str):
         raise ValueError("identity snapshot is invalid")
     try:
-        manifest_content = manifest_path.read_bytes()
         manifest = DependencySnapshotManifestV2.model_validate_json(manifest_content)
-        reader = DependencySnapshotReader(
-            manifest_path,
-            snapshot_manifest_sha256=expected_manifest_hash,
+        if _sha256(manifest_content) != expected_manifest_hash:
+            raise ValueError
+        entries = manifest.entries
+        if (
+            len({entry.cache_key for entry in entries}) != len(entries)
+            or len({entry.entry_id for entry in entries}) != len(entries)
+            or entries
+            != sorted(
+                entries,
+                key=lambda entry: (
+                    entry.request.dependency,
+                    entry.cache_key,
+                    entry.entry_id,
+                ),
+            )
+        ):
+            raise ValueError
+        if manifest.snapshot_set_id != _sha256(
+            _snapshot_canonical_json_bytes(
+                [entry.model_dump(mode="json", exclude_none=True) for entry in entries]
+            )
+        ):
+            raise ValueError
+        for entry in entries:
+            expected_cache_key = _sha256(
+                _snapshot_canonical_json_bytes(entry.request.model_dump(mode="json"))
+            )
+            expected_path = (
+                f"responses/{entry.request.dependency}/"
+                f"{entry.cache_key.removeprefix('sha256:')}.bin"
+            )
+            if entry.cache_key != expected_cache_key or entry.response_path != expected_path:
+                raise ValueError
+        return {entry.entry_id: entry for entry in entries}
+    except (ValidationError, ValueError):
+        raise ValueError("identity snapshot is invalid") from None
+
+
+def _read_referenced_snapshot_bytes(
+    *,
+    evidence: dict[str, object],
+    snapshot_root: Path,
+    manifest_content: bytes,
+) -> dict[str, bytes]:
+    entries = _snapshot_entries_from_manifest_bytes(
+        evidence=evidence, manifest_content=manifest_content
+    )
+    entry_ids = _referenced_snapshot_entry_ids(evidence)
+    if not set(entry_ids).issubset(entries):
+        raise ValueError("identity snapshot is invalid")
+    response_root = snapshot_root.resolve()
+    published_root = response_root / "snapshots"
+    if published_root.is_dir():
+        response_root = published_root.resolve()
+    response_bytes: dict[str, bytes] = {}
+    try:
+        for entry_id in entry_ids:
+            entry = entries[entry_id]
+            path = response_root / entry.response_path
+            resolved = path.resolve()
+            if response_root not in resolved.parents:
+                raise ValueError
+            cursor = response_root
+            for part in Path(entry.response_path).parts:
+                cursor /= part
+                if cursor.is_symlink():
+                    raise ValueError
+            content = path.read_bytes()
+            if _sha256(content) != entry.response_sha256:
+                raise ValueError
+            response_bytes[entry_id] = content
+    except (OSError, ValueError):
+        raise ValueError("identity snapshot is invalid") from None
+    return response_bytes
+
+
+def _snapshot_observations(
+    *,
+    evidence: dict[str, object],
+    snapshot_root: Path,
+    manifest_content: bytes | None = None,
+    response_bytes: dict[str, bytes] | None = None,
+) -> tuple[dict[tuple[str, str], IdentityObservation], str]:
+    try:
+        if manifest_content is None:
+            manifest_content = (snapshot_root / "snapshot-manifest.json").read_bytes()
+        entry_by_id = _snapshot_entries_from_manifest_bytes(
+            evidence=evidence, manifest_content=manifest_content
         )
-        entry_bytes = {}
-        entry_requests = {}
-        for entry in manifest.entries:
-            entry_bytes[entry.entry_id] = reader.read(entry.request).response_bytes
-            entry_requests[entry.entry_id] = entry.request
+        referenced_entry_ids = _referenced_snapshot_entry_ids(evidence)
+        if response_bytes is None:
+            entry_bytes = _read_referenced_snapshot_bytes(
+                evidence=evidence,
+                snapshot_root=snapshot_root,
+                manifest_content=manifest_content,
+            )
+        else:
+            entry_bytes = response_bytes
+        if set(entry_bytes) != set(referenced_entry_ids):
+            raise ValueError
+        if any(
+            _sha256(entry_bytes[entry_id]) != entry_by_id[entry_id].response_sha256
+            for entry_id in referenced_entry_ids
+        ):
+            raise ValueError
+        entry_requests = {
+            entry_id: entry_by_id[entry_id].request for entry_id in referenced_entry_ids
+        }
+        manifest_entries = tuple(entry_by_id.values())
     except (OSError, ValidationError, ValueError, KeyError):
         raise ValueError("identity snapshot is invalid") from None
 
@@ -363,7 +529,7 @@ def _snapshot_observations(
             or not all(isinstance(entry_id, str) for entry_id in openalex_entry_ids)
         ):
             raise ValueError("identity snapshot is invalid")
-        referenced_entry_ids = {
+        relation_entry_ids = {
             entry_id
             for entry_id in (
                 s2_arxiv_entry_id,
@@ -372,7 +538,7 @@ def _snapshot_observations(
             )
             if entry_id is not None
         }
-        if not referenced_entry_ids.issubset(entry_bytes):
+        if not relation_entry_ids.issubset(entry_bytes):
             raise ValueError("identity snapshot is invalid")
         if (
             s2_arxiv_entry_id is not None
@@ -440,7 +606,7 @@ def _snapshot_observations(
                 openalex_arxiv_ids=openalex_ids,
                 snapshot_sha256s=[
                     entry.response_sha256
-                    for entry in manifest.entries
+                    for entry in manifest_entries
                     if entry.entry_id
                     in {
                         s2_arxiv_entry_id,
@@ -813,3 +979,233 @@ def assert_public_markdown_safe(content: str) -> None:
         or _QUERY_SENTINEL.search(content)
     ):
         raise ValueError("public content contains a private value")
+
+
+def _canonical_json_bytes(payload: object) -> bytes:
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def _parse_json_without_duplicate_keys(content: bytes, *, label: str) -> object:
+    def object_pairs_hook(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"{label} contains duplicate JSON keys")
+            result[key] = value
+        return result
+
+    try:
+        return json.loads(content, object_pairs_hook=object_pairs_hook)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ValueError(f"{label} is invalid") from None
+
+
+def _hash_bytes(content: bytes) -> str:
+    return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+def _private_relation_order(row: RelationAudit) -> tuple[int, str, str]:
+    return (
+        0 if row.relation_kind == "required_anchor" else 1,
+        row.arxiv_id,
+        row.alias,
+    )
+
+
+def load_verified_identifier_generation(
+    *,
+    audit_path: Path,
+    gold_path: Path,
+    evidence_path: Path,
+    snapshot_manifest_path: Path,
+    private_audit_path: Path,
+    map_path: Path,
+) -> VerifiedIdentifierGeneration:
+    """Load one passed v2 generation and recheck its cross-artifact contract."""
+    try:
+        audit_bytes = audit_path.read_bytes()
+    except OSError:
+        raise ValueError("public audit is invalid") from None
+    audit_payload = _parse_json_without_duplicate_keys(
+        audit_bytes, label="public audit"
+    )
+    if _canonical_json_bytes(audit_payload) != audit_bytes:
+        raise ValueError("public audit is not canonical")
+    assert_public_json_safe(audit_bytes)
+    try:
+        audit = IdentifierMapSemanticAudit.model_validate(audit_payload)
+    except ValidationError:
+        raise ValueError("public audit is invalid") from None
+    if audit.status != "passed":
+        raise ValueError("identifier semantic audit is not passed")
+
+    try:
+        gold_bytes = gold_path.read_bytes()
+        evidence_bytes = evidence_path.read_bytes()
+        manifest_bytes = snapshot_manifest_path.read_bytes()
+        private_bytes = private_audit_path.read_bytes()
+        map_bytes = map_path.read_bytes()
+    except OSError:
+        raise ValueError("identifier generation input is invalid") from None
+
+    expected_inputs = {
+        "dev_gold": _hash_bytes(gold_bytes),
+        "identity_evidence": _hash_bytes(evidence_bytes),
+        "snapshot_manifest": _hash_bytes(manifest_bytes),
+    }
+    if audit.input_hashes.model_dump() != expected_inputs:
+        raise ValueError("identifier generation input hash mismatch")
+    if _hash_bytes(private_bytes) != audit.artifact_hashes.private_relation_audit:
+        raise ValueError("private relation audit hash mismatch")
+    if _hash_bytes(map_bytes) != audit.artifact_hashes.candidate_map:
+        raise ValueError("candidate map hash mismatch")
+
+    private_payload = _parse_json_without_duplicate_keys(
+        private_bytes, label="private relation audit"
+    )
+    if _canonical_json_bytes(private_payload) != private_bytes:
+        raise ValueError("private relation audit is not canonical")
+    try:
+        private_audit = PrivateRelationAuditV2.model_validate(private_payload)
+    except ValidationError:
+        raise ValueError("private relation audit is invalid") from None
+    if tuple(private_audit.relations) != tuple(
+        sorted(private_audit.relations, key=_private_relation_order)
+    ):
+        raise ValueError("private relation audit order is invalid")
+
+    map_payload = _parse_json_without_duplicate_keys(map_bytes, label="candidate map")
+    if not isinstance(map_payload, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in map_payload.items()
+    ):
+        raise ValueError("candidate map is invalid")
+    if _canonical_json_bytes(map_payload) != map_bytes:
+        raise ValueError("candidate map is not canonical")
+    try:
+        for key, value in map_payload.items():
+            if normalize_paper_id(key) != key or normalize_paper_id(value) != value:
+                raise ValueError
+        identifier_map = IdentifierMap.from_bytes(map_bytes)
+    except ValueError:
+        raise ValueError("candidate map is invalid") from None
+
+    try:
+        gold_ids = set(_read_dev_arxiv_ids(gold_bytes))
+        evidence = _read_identity_evidence(evidence_bytes)
+        manifest = DependencySnapshotManifestV2.model_validate_json(manifest_bytes)
+    except (ValidationError, ValueError):
+        raise ValueError("identifier generation input is invalid") from None
+    if _hash_bytes(manifest_bytes) != evidence["snapshot_manifest_sha256"]:
+        raise ValueError("identifier generation input hash mismatch")
+
+    raw_refs = evidence["evidence_refs"]
+    if not isinstance(raw_refs, list):
+        raise ValueError("identifier generation input is invalid")
+    candidate_keys: list[tuple[str, str]] = []
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, dict):
+            raise ValueError("identifier generation input is invalid")
+        arxiv_id = raw_ref.get("arxiv_id")
+        alias = raw_ref.get("alias")
+        if not isinstance(arxiv_id, str) or not isinstance(alias, str):
+            raise ValueError("identifier generation input is invalid")
+        try:
+            candidate_keys.append(
+                (
+                    normalize_paper_id(arxiv_id, kind="arxiv"),
+                    normalize_paper_id(alias),
+                )
+            )
+        except ValueError:
+            raise ValueError("identifier generation input is invalid") from None
+    if len(set(candidate_keys)) != len(candidate_keys) or candidate_keys != sorted(candidate_keys):
+        raise ValueError("identifier generation input is invalid")
+
+    relations = private_audit.relations
+    anchors = tuple(row for row in relations if row.relation_kind == "required_anchor")
+    providers = tuple(row for row in relations if row.relation_kind == "provider_candidate")
+    if {row.arxiv_id for row in anchors} != gold_ids or len(anchors) != len(gold_ids):
+        raise ValueError("private relation audit does not cover anchors")
+    if {(row.arxiv_id, row.alias) for row in providers} != set(candidate_keys):
+        raise ValueError("private relation audit does not cover evidence refs")
+    if any(row.arxiv_id not in gold_ids for row in providers):
+        raise ValueError("private relation audit contains an outside-gold relation")
+
+    state_counts = Counter(row.state for row in relations)
+    proof_counts = Counter(row.proof_kind for row in relations if row.proof_kind is not None)
+    reason_counts = Counter(row.reason_code for row in relations)
+    expected_state_counts = {
+        "verified": state_counts.get("verified", 0),
+        "semantic_mismatch": state_counts.get("semantic_mismatch", 0),
+        "unresolved": state_counts.get("unresolved", 0),
+    }
+    expected_proof_counts = {
+        "arxiv_datacite_exact": proof_counts.get("arxiv_datacite_exact", 0),
+        "semantic_scholar_exact": proof_counts.get("semantic_scholar_exact", 0),
+        "openalex_location_exact": proof_counts.get("openalex_location_exact", 0),
+    }
+    reason_names: tuple[ReasonCode, ...] = (
+        "arxiv_datacite_exact",
+        "arxiv_datacite_mismatch",
+        "semantic_scholar_exact",
+        "openalex_location_exact",
+        "openalex_location_mismatch",
+        "insufficient_identity_evidence",
+        "observation_binding_mismatch",
+        "provider_identity_missing",
+        "alias_target_conflict",
+    )
+    expected_reason_counts = {
+        reason: reason_counts.get(reason, 0) for reason in reason_names
+    }
+    verified_anchors = {
+        row.arxiv_id
+        for row in anchors
+        if row.state == "verified" and row.proof_kind == "arxiv_datacite_exact"
+    }
+    expected_audit_counts = {
+        "gold_group_count": len(gold_ids),
+        "required_anchor_count": len(anchors),
+        "verified_anchor_count": len(verified_anchors),
+        "provider_candidate_count": len(providers),
+        "provider_identity_group_count": len({row.arxiv_id for row in providers}),
+        "provider_identity_missing_group_count": len(
+            gold_ids - {row.arxiv_id for row in providers}
+        ),
+        "relation_count": len(relations),
+    }
+    if any(
+        getattr(audit, field_name) != value
+        for field_name, value in expected_audit_counts.items()
+    ) or audit.state_counts.model_dump() != expected_state_counts:
+        raise ValueError("public audit counts do not match private relations")
+    if audit.proof_counts.model_dump() != expected_proof_counts:
+        raise ValueError("public audit proof counts do not match private relations")
+    if audit.reason_counts.model_dump() != expected_reason_counts:
+        raise ValueError("public audit reason counts do not match private relations")
+    if any(row.state != "verified" for row in relations):
+        raise ValueError("passed audit contains an unverified relation")
+
+    expected_map = {
+        row.arxiv_id: row.terminal for row in anchors if row.state == "verified"
+    }
+    expected_map.update(
+        {
+            row.alias: row.terminal
+            for row in providers
+            if row.state == "verified" and row.alias != row.terminal
+        }
+    )
+    if map_payload != dict(sorted(expected_map.items())):
+        raise ValueError("candidate map does not match private relations")
+    _ = manifest
+    return VerifiedIdentifierGeneration(audit=audit, identifier_map=identifier_map)

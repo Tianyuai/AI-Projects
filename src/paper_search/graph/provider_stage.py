@@ -45,9 +45,15 @@ class CitationExpansionUnavailableError(OptionalStageUnavailableError):
         message: str,
         *,
         diagnostic: DependencyDiagnostic | None = None,
+        diagnostics: list[DependencyDiagnostic] | None = None,
     ) -> None:
         super().__init__(message)
         self.diagnostic = diagnostic
+        self.diagnostics = (
+            list(diagnostics)
+            if diagnostics is not None
+            else ([] if diagnostic is None else [diagnostic])
+        )
 
 
 class ProviderCitationExpansionResult(CitationExpansionResult):
@@ -224,11 +230,18 @@ class ProviderCitationExpansionStage:
                 value=seed.semantic_scholar_id,
             )
             for direction in ("references", "citations"):
-                result = await self._call(
-                    direction=direction,
-                    paper_id=paper_id,
-                    controller=controller,
-                )
+                try:
+                    result = await self._call(
+                        direction=direction,
+                        paper_id=paper_id,
+                        controller=controller,
+                    )
+                except CitationExpansionUnavailableError as error:
+                    raise CitationExpansionUnavailableError(
+                        str(error),
+                        diagnostic=error.diagnostic,
+                        diagnostics=[*diagnostics, *error.diagnostics],
+                    ) from error
                 expansions.append(result.data)
                 refs.extend(_snapshot_refs(result))
                 diagnostics.append(_diagnostic(result))

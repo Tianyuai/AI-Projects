@@ -118,8 +118,8 @@ def _citation_failure(
     direction: CitationDirection,
     error: CitationExpansionUnavailableError,
 ) -> BackendCitationResult:
-    diagnostic = error.diagnostic
-    if diagnostic is None:
+    diagnostics = list(error.diagnostics)
+    if not diagnostics:
         return BackendCitationResult(
             direction=direction,
             errors=[
@@ -131,17 +131,22 @@ def _citation_failure(
             ],
             infrastructure_failure=True,
         )
-    snapshot_refs = [ref.model_dump(mode="json") for ref in diagnostic.snapshot_refs]
+    snapshot_refs = [
+        ref.model_dump(mode="json")
+        for diagnostic in diagnostics
+        for ref in diagnostic.snapshot_refs
+    ]
+    errors = [item for diagnostic in diagnostics for item in diagnostic.errors]
     return BackendCitationResult(
         direction=direction,
-        usage=diagnostic.usage,
+        usage=_aggregate_usage([diagnostic.usage for diagnostic in diagnostics]),
         provenance={
             "provider": "semantic_scholar",
             "stage": "provider_citation_expand",
             "snapshot_refs": json.dumps(snapshot_refs, separators=(",", ":")),
         },
-        errors=list(diagnostic.errors),
-        infrastructure_failure=_infrastructure_failure(diagnostic.errors),
+        errors=errors,
+        infrastructure_failure=_infrastructure_failure(errors),
     )
 class _BudgetedProviderCall:
     def __init__(

@@ -151,6 +151,28 @@ class _BothDirectionCitationProvider:
         return self.result
 
 
+class _SequencedCitationProvider:
+    def __init__(
+        self,
+        reference_result: ProviderResult[CitationExpansion],
+        citation_result: ProviderResult[CitationExpansion],
+    ) -> None:
+        self.reference_result = reference_result
+        self.citation_result = citation_result
+        self.reservations = []
+
+    async def references(
+        self, paper_id: object, limit: int, reservation: object
+    ) -> ProviderResult[CitationExpansion]:
+        self.reservations.append(reservation)
+        return self.reference_result
+
+    async def citations(
+        self, paper_id: object, limit: int, reservation: object
+    ) -> ProviderResult[CitationExpansion]:
+        self.reservations.append(reservation)
+        return self.citation_result
+
 class _CancellingSearchProvider:
     def __init__(self) -> None:
         self.reservation: object | None = None
@@ -410,6 +432,56 @@ def test_both_direction_citation_preserves_provider_error_and_terminal_receipt()
     assert observed.infrastructure_failure is True
     assert len(provider.reservations) == 1
     assert controller.terminal_outcome(provider.reservations[0]) == ("settled", result.usage)
+
+
+def test_both_direction_citation_error_in_second_direction_keeps_prior_usage() -> None:
+    controller = HardBudgetController(_budget())
+    reference_result = ProviderResult(
+        data=CitationExpansion(papers=[], raw_edges=[]),
+        usage=UsageActual(search_api_calls=1, elapsed_ms=7, cost_cny=Decimal("0.01")),
+        provenance={
+            "provider": "semantic_scholar",
+            "endpoint": "/paper/S2:seed/references",
+            "model_id": "semantic-graph-v1",
+            "requested_at": datetime.now(UTC).isoformat(),
+            "response_hash": "sha256:reference",
+        },
+        cache_hit=True,
+        latency_ms=7,
+        errors=[],
+    )
+    citation_error = ErrorDetail(
+        code="network_error",
+        message="offline citation provider failed",
+        retryable=True,
+        provider="semantic_scholar",
+    )
+    citation_result = reference_result.model_copy(
+        update={
+            "provenance": {**reference_result.provenance, "response_hash": "sha256:citation"},
+            "errors": [citation_error],
+        }
+    )
+    provider = _SequencedCitationProvider(reference_result, citation_result)
+    backend = BudgetedCitationBackend(
+        provider=provider,
+        controller=controller,
+        call_estimate=UsageEstimate(
+            search_api_calls=1, elapsed_ms=10, cost_cny=Decimal("0.02")
+        ),
+    )
+    seed = _paper().model_copy(update={"semantic_scholar_id": "S2:seed"})
+
+    observed = asyncio.run(backend.expand("citation-44", seed, "both", 2))
+
+    assert observed.usage == UsageActual(
+        search_api_calls=2, elapsed_ms=14, cost_cny=Decimal("0.02")
+    )
+    assert [error.code for error in observed.errors] == ["network_error"]
+    assert [controller.terminal_outcome(reservation)[0] for reservation in provider.reservations] == [
+        "settled",
+        "settled",
+    ]
 
 
 @pytest.mark.parametrize(

@@ -10,9 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
-from pydantic import Field, ValidationError
+from pydantic import Field, ValidationError, model_validator
 
-from paper_search.domain.models import DomainModel, NonEmptyStr, NonNegativeInt, Sha256
+from paper_search.domain.models import (
+    DomainModel,
+    NonEmptyStr,
+    NonNegativeInt,
+    Sha256,
+    StrictNonNegativeInt,
+)
 from paper_search.evaluation.dataset import EvaluationQuery, IdentifierMap, normalize_paper_id
 from paper_search.storage.dependency_snapshot import (
     DependencyRequestIdentity,
@@ -22,10 +28,22 @@ from paper_search.storage.dependency_snapshot import (
 
 
 SemanticState = Literal["verified", "semantic_mismatch", "unresolved"]
+RelationKind = Literal["required_anchor", "provider_candidate"]
 ProofKind = Literal[
     "arxiv_datacite_exact",
     "semantic_scholar_exact",
     "openalex_location_exact",
+]
+ReasonCode = Literal[
+    "arxiv_datacite_exact",
+    "arxiv_datacite_mismatch",
+    "semantic_scholar_exact",
+    "openalex_location_exact",
+    "openalex_location_mismatch",
+    "insufficient_identity_evidence",
+    "observation_binding_mismatch",
+    "provider_identity_missing",
+    "alias_target_conflict",
 ]
 _S2_ARXIV_ADAPTER = "semantic-scholar-identity-arxiv-v1"
 _S2_DOI_ADAPTER = "semantic-scholar-identity-doi-v1"
@@ -76,15 +94,79 @@ class IdentityObservation(DomainModel):
 
 
 class RelationAudit(DomainModel):
+    relation_kind: RelationKind = "provider_candidate"
     arxiv_id: NonEmptyStr
     alias: NonEmptyStr
     terminal: NonEmptyStr
     state: SemanticState
     proof_kind: ProofKind | None
-    reason_code: NonEmptyStr
+    reason_code: ReasonCode
+
+    @model_validator(mode="after")
+    def validate_relation_contract(self) -> RelationAudit:
+        try:
+            normalized_arxiv = normalize_paper_id(self.arxiv_id, kind="arxiv")
+            normalized_alias = normalize_paper_id(self.alias)
+            normalized_terminal = normalize_paper_id(self.terminal, kind="doi")
+        except ValueError:
+            raise ValueError("identifier relation is not canonical") from None
+        if (
+            self.arxiv_id != normalized_arxiv
+            or self.alias != normalized_alias
+            or self.terminal != normalized_terminal
+            or self.terminal != arxiv_anchor(normalized_arxiv)
+        ):
+            raise ValueError("identifier relation is not canonical")
+        if self.relation_kind == "required_anchor":
+            if self.alias != self.terminal:
+                raise ValueError("required anchor alias must equal terminal")
+            if self.state == "verified":
+                if (
+                    self.proof_kind != "arxiv_datacite_exact"
+                    or self.reason_code != "arxiv_datacite_exact"
+                ):
+                    raise ValueError("verified anchor proof is invalid")
+            elif self.proof_kind is not None or self.reason_code != "arxiv_datacite_mismatch":
+                raise ValueError("failed anchor proof is invalid")
+        return self
 
 
-class IdentifierMapSemanticAudit(DomainModel):
+class AuditInputHashes(DomainModel):
+    dev_gold: Sha256
+    identity_evidence: Sha256
+    snapshot_manifest: Sha256
+
+
+class AuditArtifactHashes(DomainModel):
+    candidate_map: Sha256
+    private_relation_audit: Sha256
+
+
+class AuditStateCounts(DomainModel):
+    verified: StrictNonNegativeInt
+    semantic_mismatch: StrictNonNegativeInt
+    unresolved: StrictNonNegativeInt
+
+
+class AuditProofCounts(DomainModel):
+    arxiv_datacite_exact: StrictNonNegativeInt
+    semantic_scholar_exact: StrictNonNegativeInt
+    openalex_location_exact: StrictNonNegativeInt
+
+
+class AuditReasonCounts(DomainModel):
+    arxiv_datacite_exact: StrictNonNegativeInt
+    arxiv_datacite_mismatch: StrictNonNegativeInt
+    semantic_scholar_exact: StrictNonNegativeInt
+    openalex_location_exact: StrictNonNegativeInt
+    openalex_location_mismatch: StrictNonNegativeInt
+    insufficient_identity_evidence: StrictNonNegativeInt
+    observation_binding_mismatch: StrictNonNegativeInt
+    provider_identity_missing: StrictNonNegativeInt
+    alias_target_conflict: StrictNonNegativeInt
+
+
+class IdentifierMapSemanticAuditV1(DomainModel):
     schema_version: Literal["identifier-map-semantic-audit-v1"]
     scope: Literal["dev"]
     status: Literal["passed", "failed"]
@@ -96,9 +178,33 @@ class IdentifierMapSemanticAudit(DomainModel):
     reason_counts: dict[NonEmptyStr, NonNegativeInt]
 
 
+class IdentifierMapSemanticAudit(DomainModel):
+    schema_version: Literal["identifier-map-semantic-audit-v2"]
+    scope: Literal["dev"]
+    status: Literal["passed", "failed"]
+    input_hashes: AuditInputHashes
+    artifact_hashes: AuditArtifactHashes
+    gold_group_count: StrictNonNegativeInt
+    required_anchor_count: StrictNonNegativeInt
+    verified_anchor_count: StrictNonNegativeInt
+    provider_candidate_count: StrictNonNegativeInt
+    provider_identity_group_count: StrictNonNegativeInt
+    provider_identity_missing_group_count: StrictNonNegativeInt
+    relation_count: StrictNonNegativeInt
+    state_counts: AuditStateCounts
+    proof_counts: AuditProofCounts
+    reason_counts: AuditReasonCounts
+
+
+class PrivateRelationAuditV2(DomainModel):
+    schema_version: Literal["identifier-map-private-relation-audit-v2"]
+    scope: Literal["dev"]
+    relations: tuple[RelationAudit, ...]
+
+
 @dataclass(frozen=True)
 class SemanticAuditBundle:
-    report: IdentifierMapSemanticAudit
+    report: IdentifierMapSemanticAuditV1
     private_relations: tuple[RelationAudit, ...]
 
 
@@ -135,6 +241,7 @@ def _external_ids_conflict(left: dict[str, str], right: dict[str, str]) -> bool:
 
 def _relation(
     *,
+    relation_kind: RelationKind,
     arxiv_id: str,
     alias: str,
     state: SemanticState,
@@ -142,6 +249,7 @@ def _relation(
     reason_code: str,
 ) -> RelationAudit:
     return RelationAudit(
+        relation_kind=relation_kind,
         arxiv_id=arxiv_id,
         alias=alias,
         terminal=arxiv_anchor(arxiv_id),
@@ -488,7 +596,11 @@ def _decode_openalex_arxiv_ids(
 
 
 def classify_relation(
-    *, alias: str, arxiv_id: str, observation: IdentityObservation | None
+    *,
+    alias: str,
+    arxiv_id: str,
+    observation: IdentityObservation | None,
+    relation_kind: RelationKind = "provider_candidate",
 ) -> RelationAudit:
     """Apply only exact DataCite, two-sided S2, and OpenAlex proof rules."""
     try:
@@ -501,6 +613,7 @@ def classify_relation(
     if normalized_alias.startswith("doi:10.48550/arxiv."):
         if normalized_alias == anchor:
             return _relation(
+                relation_kind=relation_kind,
                 arxiv_id=normalized_arxiv_id,
                 alias=normalized_alias,
                 state="verified",
@@ -508,6 +621,7 @@ def classify_relation(
                 reason_code="arxiv_datacite_exact",
             )
         return _relation(
+            relation_kind=relation_kind,
             arxiv_id=normalized_arxiv_id,
             alias=normalized_alias,
             state="semantic_mismatch",
@@ -527,6 +641,7 @@ def classify_relation(
             or observation_alias != normalized_alias
         ):
             return _relation(
+                relation_kind=relation_kind,
                 arxiv_id=normalized_arxiv_id,
                 alias=normalized_alias,
                 state="unresolved",
@@ -551,6 +666,7 @@ def classify_relation(
         )
         if s2_exact:
             return _relation(
+                relation_kind=relation_kind,
                 arxiv_id=normalized_arxiv_id,
                 alias=normalized_alias,
                 state="verified",
@@ -567,6 +683,7 @@ def classify_relation(
             openalex_arxiv_ids = set()
         if normalized_arxiv_id in openalex_arxiv_ids:
             return _relation(
+                relation_kind=relation_kind,
                 arxiv_id=normalized_arxiv_id,
                 alias=normalized_alias,
                 state="verified",
@@ -575,6 +692,7 @@ def classify_relation(
             )
         if observation.openalex_complete and openalex_arxiv_ids:
             return _relation(
+                relation_kind=relation_kind,
                 arxiv_id=normalized_arxiv_id,
                 alias=normalized_alias,
                 state="semantic_mismatch",
@@ -583,6 +701,7 @@ def classify_relation(
             )
 
     return _relation(
+        relation_kind=relation_kind,
         arxiv_id=normalized_arxiv_id,
         alias=normalized_alias,
         state="unresolved",
@@ -634,7 +753,7 @@ def audit_identifier_map_semantics(
         if relation.proof_kind is not None
     )
     reason_counts = Counter(relation.reason_code for relation in ordered_relations)
-    report = IdentifierMapSemanticAudit(
+    report = IdentifierMapSemanticAuditV1(
         schema_version="identifier-map-semantic-audit-v1",
         scope="dev",
         status="passed"

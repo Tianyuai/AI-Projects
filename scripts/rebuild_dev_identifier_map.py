@@ -14,6 +14,8 @@ from typing import Sequence
 
 from paper_search.evaluation.identifier_semantics import (
     IdentifierMapSemanticAudit,
+    PrivateRelationAuditV2,
+    ReasonCode,
     RelationAudit,
     _read_dev_arxiv_ids,
     _read_identity_evidence,
@@ -22,6 +24,7 @@ from paper_search.evaluation.identifier_semantics import (
     assert_public_json_safe,
     classify_relation,
 )
+from paper_search.evaluation.dataset import normalize_paper_id
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,38 @@ class SemanticAuditFailure(ValueError):
 
 def _sha256(content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+_FIXED_INPUT_HASHES = {
+    "dev_gold": "sha256:24009cf03ad069131793b9a190024e239082277bd0e48149a1efbbbb7978e215",
+    "identity_evidence": "sha256:e4567d4b7641871ed538c18f5625cd7037e3014065e7311d3a76e81d4e4c61d4",
+    "snapshot_manifest": "sha256:a0c0cd67543582e02365a2adfb3464a6f33fa96be5304d4ccac8dd031867943b",
+}
+
+
+def _assert_fixed_baseline_invariant(
+    *,
+    input_hashes: dict[str, str],
+    gold_group_count: int,
+    required_anchor_count: int,
+    provider_identity_group_count: int,
+    provider_identity_missing_group_count: int,
+    provider_candidate_count: int,
+    relation_count: int,
+) -> None:
+    if input_hashes != _FIXED_INPUT_HASHES:
+        return
+    expected = (141, 141, 90, 51, 90, 231)
+    actual = (
+        gold_group_count,
+        required_anchor_count,
+        provider_identity_group_count,
+        provider_identity_missing_group_count,
+        provider_candidate_count,
+        relation_count,
+    )
+    if actual != expected:
+        raise ValueError("identifier semantic decoder regression")
 
 
 def _canonical_json(payload: object) -> bytes:
@@ -97,30 +132,98 @@ def _aggregate_audit(
         relation.proof_kind for relation in relations if relation.proof_kind is not None
     )
     reason_counts = Counter(relation.reason_code for relation in relations)
+    private_audit = PrivateRelationAuditV2(
+        schema_version="identifier-map-private-relation-audit-v2",
+        scope="dev",
+        relations=relations,
+    )
+    anchor_relations = tuple(
+        relation for relation in relations if relation.relation_kind == "required_anchor"
+    )
+    provider_relations = tuple(
+        relation for relation in relations if relation.relation_kind == "provider_candidate"
+    )
+    verified_anchor_count = len(
+        {
+            relation.arxiv_id
+            for relation in anchor_relations
+            if relation.state == "verified"
+            and relation.proof_kind == "arxiv_datacite_exact"
+        }
+    )
+    all_state_counts = {
+        "verified": state_counts.get("verified", 0),
+        "semantic_mismatch": state_counts.get("semantic_mismatch", 0),
+        "unresolved": state_counts.get("unresolved", 0),
+    }
+    all_proof_counts = {
+        "arxiv_datacite_exact": proof_counts.get("arxiv_datacite_exact", 0),
+        "semantic_scholar_exact": proof_counts.get("semantic_scholar_exact", 0),
+        "openalex_location_exact": proof_counts.get("openalex_location_exact", 0),
+    }
+    reason_names: tuple[ReasonCode, ...] = (
+            "arxiv_datacite_exact",
+            "arxiv_datacite_mismatch",
+            "semantic_scholar_exact",
+            "openalex_location_exact",
+            "openalex_location_mismatch",
+            "insufficient_identity_evidence",
+            "observation_binding_mismatch",
+            "provider_identity_missing",
+            "alias_target_conflict",
+    )
+    all_reason_counts = {
+        reason: reason_counts.get(reason, 0) for reason in reason_names
+    }
+    input_hashes = {
+        "dev_gold": _sha256(gold_bytes),
+        "identity_evidence": _sha256(evidence_bytes),
+        "snapshot_manifest": manifest_hash,
+    }
+    _assert_fixed_baseline_invariant(
+        input_hashes=input_hashes,
+        gold_group_count=gold_group_count,
+        required_anchor_count=len(anchor_relations),
+        provider_identity_group_count=len({row.arxiv_id for row in provider_relations}),
+        provider_identity_missing_group_count=gold_group_count
+        - len({row.arxiv_id for row in provider_relations}),
+        provider_candidate_count=len(provider_relations),
+        relation_count=len(relations),
+    )
     return IdentifierMapSemanticAudit(
-        schema_version="identifier-map-semantic-audit-v1",
+        schema_version="identifier-map-semantic-audit-v2",
         scope="dev",
         status=(
-            "passed" if relations and all(row.state == "verified" for row in relations) else "failed"
+            "passed"
+            if len(anchor_relations) == gold_group_count
+            and verified_anchor_count == gold_group_count
+            and relations
+            and all(row.state == "verified" for row in relations)
+            else "failed"
         ),
-        input_hashes={
-            "map": _sha256(map_bytes),
-            "dev_gold": _sha256(gold_bytes),
-            "identity_evidence": _sha256(evidence_bytes),
-            "snapshot_manifest": manifest_hash,
+        input_hashes=input_hashes,
+        artifact_hashes={
+            "candidate_map": _sha256(map_bytes),
+            "private_relation_audit": _sha256(_canonical_json(private_audit.model_dump(mode="json"))),
         },
         gold_group_count=gold_group_count,
+        required_anchor_count=len(anchor_relations),
+        verified_anchor_count=verified_anchor_count,
+        provider_candidate_count=len(provider_relations),
+        provider_identity_group_count=len({row.arxiv_id for row in provider_relations}),
+        provider_identity_missing_group_count=gold_group_count
+        - len({row.arxiv_id for row in provider_relations}),
         relation_count=len(relations),
-        state_counts=dict(sorted(state_counts.items())),
-        proof_counts=dict(sorted(proof_counts.items())),
-        reason_counts=dict(sorted(reason_counts.items())),
+        state_counts=all_state_counts,
+        proof_counts=all_proof_counts,
+        reason_counts=all_reason_counts,
     )
 
 
 def _resolve_alias_conflicts(relations: list[RelationAudit]) -> list[RelationAudit]:
     targets_by_alias: dict[str, set[str]] = defaultdict(set)
     for relation in relations:
-        if relation.state == "verified":
+        if relation.relation_kind == "provider_candidate":
             targets_by_alias[relation.alias].add(relation.terminal)
     conflicts = {
         alias for alias, terminals in targets_by_alias.items() if len(terminals) > 1
@@ -135,7 +238,7 @@ def _resolve_alias_conflicts(relations: list[RelationAudit]) -> list[RelationAud
                 "reason_code": "alias_target_conflict",
             }
         )
-        if relation.alias in conflicts
+        if relation.relation_kind == "provider_candidate" and relation.alias in conflicts
         else relation
         for relation in relations
     ]
@@ -155,24 +258,46 @@ def rebuild_dev_map(
         snapshot_root=snapshot_root,
     )
     raw_refs = evidence["evidence_refs"]
-    if not isinstance(raw_refs, list) or len(raw_refs) != len(observations):
+    if not isinstance(raw_refs, list):
         raise ValueError("identifier semantic audit inputs are invalid")
     gold_set = set(gold_arxiv_ids)
-    if any(arxiv_id not in gold_set for arxiv_id, _alias in observations):
+    candidate_keys: list[tuple[str, str]] = []
+    try:
+        for raw_ref in raw_refs:
+            if not isinstance(raw_ref, dict):
+                raise ValueError
+            raw_arxiv_id = raw_ref.get("arxiv_id")
+            raw_alias = raw_ref.get("alias")
+            if not isinstance(raw_arxiv_id, str) or not isinstance(raw_alias, str):
+                raise ValueError
+            candidate_keys.append(
+                (
+                    normalize_paper_id(raw_arxiv_id, kind="arxiv"),
+                    normalize_paper_id(raw_alias),
+                )
+            )
+    except ValueError:
+        raise ValueError("identifier semantic audit inputs are invalid") from None
+    if (
+        len(set(candidate_keys)) != len(candidate_keys)
+        or candidate_keys != sorted(candidate_keys)
+        or len(candidate_keys) != len(observations)
+        or set(candidate_keys) != set(observations)
+        or any(arxiv_id not in gold_set for arxiv_id, _alias in candidate_keys)
+    ):
         raise ValueError("identifier semantic audit inputs are invalid")
 
     relations: list[RelationAudit] = []
-    observed_groups: set[str] = set()
     for arxiv_id in gold_arxiv_ids:
         relations.append(
             classify_relation(
                 alias=arxiv_anchor(arxiv_id),
                 arxiv_id=arxiv_id,
                 observation=None,
+                relation_kind="required_anchor",
             )
         )
     for (arxiv_id, alias), observation in sorted(observations.items()):
-        observed_groups.add(arxiv_id)
         relations.append(
             classify_relation(
                 alias=alias,
@@ -180,21 +305,16 @@ def rebuild_dev_map(
                 observation=observation,
             )
         )
-    for arxiv_id in sorted(gold_set.difference(observed_groups)):
-        relations.append(
-            RelationAudit(
-                arxiv_id=arxiv_id,
-                alias=arxiv_id,
-                terminal=arxiv_anchor(arxiv_id),
-                state="unresolved",
-                proof_kind=None,
-                reason_code="provider_identity_missing",
-            )
-        )
-
     relations = _resolve_alias_conflicts(relations)
     ordered_relations = tuple(
-        sorted(relations, key=lambda row: (row.arxiv_id, row.alias, row.reason_code))
+        sorted(
+            relations,
+            key=lambda row: (
+                0 if row.relation_kind == "required_anchor" else 1,
+                row.arxiv_id,
+                row.alias,
+            ),
+        )
     )
     map_payload = {arxiv_id: arxiv_anchor(arxiv_id) for arxiv_id in gold_arxiv_ids}
     map_payload.update(
@@ -202,7 +322,8 @@ def rebuild_dev_map(
             relation.alias: relation.terminal
             for relation in ordered_relations
             if relation.state == "verified"
-            and relation.proof_kind != "arxiv_datacite_exact"
+            and relation.relation_kind == "provider_candidate"
+            and relation.alias != relation.terminal
         }
     )
     map_bytes = _canonical_json(map_payload)
@@ -243,7 +364,11 @@ def _write_private_outputs(
     _atomic_write(
         out_private_audit,
         _canonical_json(
-            [relation.model_dump(mode="json") for relation in result.private_relations]
+            PrivateRelationAuditV2(
+                schema_version="identifier-map-private-relation-audit-v2",
+                scope="dev",
+                relations=result.private_relations,
+            ).model_dump(mode="json")
         ),
     )
 
@@ -272,7 +397,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         _atomic_write(
             args.out_private_audit,
             _canonical_json(
-                [relation.model_dump(mode="json") for relation in error.private_relations]
+                PrivateRelationAuditV2(
+                    schema_version="identifier-map-private-relation-audit-v2",
+                    scope="dev",
+                    relations=error.private_relations,
+                ).model_dump(mode="json")
             ),
         )
         return 1

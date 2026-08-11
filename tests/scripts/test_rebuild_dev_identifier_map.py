@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
@@ -13,6 +14,9 @@ from paper_search.storage.dependency_snapshot import (
 )
 from scripts.rebuild_dev_identifier_map import (
     SemanticAuditFailure,
+    PrivateRelationAuditV2,
+    RelationAudit,
+    _assert_fixed_baseline_invariant,
     _parser,
     publish_semantic_audit,
     rebuild_dev_map,
@@ -146,26 +150,113 @@ def test_unresolved_group_stops_without_a_passed_map(tmp_path: Path) -> None:
         )
 
     assert caught.value.public_audit.status == "failed"
-    assert caught.value.public_audit.state_counts["unresolved"] == 1
+    assert caught.value.public_audit.state_counts.unresolved == 1
 
 
-def test_missing_provider_relation_stops_the_gold_group(tmp_path: Path) -> None:
+def test_missing_provider_relation_does_not_stop_the_gold_group(tmp_path: Path) -> None:
     evidence_bytes, snapshot_root = _sealed_evidence(tmp_path)
     evidence = json.loads(evidence_bytes)
     evidence["evidence_refs"] = []
 
-    with pytest.raises(SemanticAuditFailure) as caught:
-        rebuild_dev_map(
-            gold_bytes=GOLD_BYTES,
-            evidence_bytes=json.dumps(evidence, sort_keys=True).encode("utf-8"),
-            snapshot_root=snapshot_root,
+    result = rebuild_dev_map(
+        gold_bytes=GOLD_BYTES,
+        evidence_bytes=json.dumps(evidence, sort_keys=True).encode("utf-8"),
+        snapshot_root=snapshot_root,
+    )
+
+    assert result.audit.status == "passed"
+    assert result.audit.provider_identity_missing_group_count == 1
+    assert result.audit.reason_counts.provider_identity_missing == 0
+
+
+def test_anchor_only_group_passes_without_provider_placeholder(tmp_path: Path) -> None:
+    evidence_bytes, snapshot_root = _sealed_evidence(tmp_path)
+    evidence = json.loads(evidence_bytes)
+    evidence["evidence_refs"] = []
+
+    result = rebuild_dev_map(
+        gold_bytes=GOLD_BYTES,
+        evidence_bytes=json.dumps(evidence, sort_keys=True).encode("utf-8"),
+        snapshot_root=snapshot_root,
+    )
+
+    assert result.audit.status == "passed"
+    assert result.audit.provider_candidate_count == 0
+    assert result.audit.provider_identity_missing_group_count == 1
+    assert len(result.private_relations) == 1
+
+
+def test_v2_private_relation_requires_canonical_anchor_and_terminal() -> None:
+    with pytest.raises(ValidationError):
+        PrivateRelationAuditV2.model_validate(
+            {
+                "schema_version": "identifier-map-private-relation-audit-v2",
+                "scope": "dev",
+                "relations": [
+                    {
+                        "relation_kind": "required_anchor",
+                        "arxiv_id": "arxiv:2501.00001",
+                        "alias": "arxiv:2501.00001",
+                        "terminal": "doi:10.1000/not-the-anchor",
+                        "state": "verified",
+                        "proof_kind": "arxiv_datacite_exact",
+                        "reason_code": "arxiv_datacite_exact",
+                    }
+                ],
+            }
         )
 
-    assert caught.value.public_audit.status == "failed"
-    assert caught.value.public_audit.reason_counts == {
-        "arxiv_datacite_exact": 1,
-        "provider_identity_missing": 1,
-    }
+
+def test_anchor_and_same_alias_provider_candidate_remain_distinct() -> None:
+    anchor = "doi:10.48550/arxiv.2501.00001"
+    audit = PrivateRelationAuditV2.model_validate(
+        {
+            "schema_version": "identifier-map-private-relation-audit-v2",
+            "scope": "dev",
+            "relations": [
+                RelationAudit(
+                    relation_kind="required_anchor",
+                    arxiv_id="arxiv:2501.00001",
+                    alias=anchor,
+                    terminal=anchor,
+                    state="verified",
+                    proof_kind="arxiv_datacite_exact",
+                    reason_code="arxiv_datacite_exact",
+                ),
+                RelationAudit(
+                    relation_kind="provider_candidate",
+                    arxiv_id="arxiv:2501.00001",
+                    alias=anchor,
+                    terminal=anchor,
+                    state="verified",
+                    proof_kind="arxiv_datacite_exact",
+                    reason_code="arxiv_datacite_exact",
+                ),
+            ],
+        }
+    )
+
+    assert [row.relation_kind for row in audit.relations] == [
+        "required_anchor",
+        "provider_candidate",
+    ]
+
+
+def test_fixed_baseline_count_drift_is_decoder_regression() -> None:
+    with pytest.raises(ValueError, match="identifier semantic decoder regression"):
+        _assert_fixed_baseline_invariant(
+            input_hashes={
+                "dev_gold": "sha256:24009cf03ad069131793b9a190024e239082277bd0e48149a1efbbbb7978e215",
+                "identity_evidence": "sha256:e4567d4b7641871ed538c18f5625cd7037e3014065e7311d3a76e81d4e4c61d4",
+                "snapshot_manifest": "sha256:a0c0cd67543582e02365a2adfb3464a6f33fa96be5304d4ccac8dd031867943b",
+            },
+            gold_group_count=141,
+            required_anchor_count=141,
+            provider_identity_group_count=90,
+            provider_identity_missing_group_count=51,
+            provider_candidate_count=89,
+            relation_count=230,
+        )
 
 
 def test_duplicate_evidence_relation_is_rejected(tmp_path: Path) -> None:

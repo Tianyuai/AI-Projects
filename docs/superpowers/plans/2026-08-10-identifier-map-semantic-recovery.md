@@ -617,6 +617,8 @@ report a restored F1.
 
 ### Task 4: Sealed-run offline rescoring and trustworthy funnel
 
+> **Superseded before implementation (2026-08-11).** This Task 4 text is retained only as historical context. Its v1 map/audit inputs, report schema, dates, and callable interface must not be implemented. The replacement direction is approved and is written in `docs/superpowers/specs/2026-08-11-verified-identifier-rescore-design.md`; that formal text still requires stakeholder review. A companion lean implementation plan will be written only after that review.
+
 **Files:**
 - Create: `scripts/rescore_identifier_semantics.py`
 - Create: `tests/scripts/test_rescore_identifier_semantics.py`

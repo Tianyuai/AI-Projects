@@ -13,6 +13,7 @@ from paper_search.recall_experiments.inputs.gold_catalog import (
     OracleCatalogStatus,
     SealedGoldDocumentCatalog,
     SealedGoldDocumentRecord,
+    SealedGoldCatalogManifest,
     SourceManifestEntry,
 )
 
@@ -27,5 +28,6 @@ __all__ = [
     "OracleCatalogStatus",
     "SealedGoldDocumentCatalog",
     "SealedGoldDocumentRecord",
+    "SealedGoldCatalogManifest",
     "SourceManifestEntry",
 ]

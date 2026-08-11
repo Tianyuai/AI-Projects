@@ -83,6 +83,10 @@ def _sample_binding(*, query_ids: list[str] | None = None) -> dict[str, object]:
             "path": "catalogs/gold.jsonl",
             "sha256": _sha256(b"catalog bytes"),
         },
+        "gold_document_catalog_manifest": {
+            "path": "catalogs/gold.manifest.json",
+            "sha256": _sha256(b"catalog manifest bytes"),
+        },
         "gold_ids": ["gold-a"],
         "seed_canonical_ids": ["seed-a"],
         "legacy_candidate_pool_policy": "canonical-id-first-v1",

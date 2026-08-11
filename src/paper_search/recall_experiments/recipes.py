@@ -170,6 +170,7 @@ class SampleBinding(DomainModel):
     sample_id: NonEmptyStr
     query_ids: list[NonEmptyStr] = Field(min_length=1)
     gold_document_catalog: ArtifactBinding | None = None
+    gold_document_catalog_manifest: ArtifactBinding | None = None
     gold_ids: list[NonEmptyStr] = Field(default_factory=list)
     seed_canonical_ids: list[NonEmptyStr] = Field(default_factory=list)
     legacy_candidate_pool_policy: Literal["canonical-id-first-v1"] | None = None
@@ -250,8 +251,10 @@ def validate_recipe_sample_preflight(
     The frozen-input/evaluator layers later repeat these checks after resolving
     the actual identifiers.
     """
-    if recipe.generator.gold_visibility == "oracle" and sample.gold_document_catalog is None:
-        raise ValueError("oracle generation requires a Gold-document catalog binding")
+    if recipe.generator.gold_visibility == "oracle" and (
+        sample.gold_document_catalog is None or sample.gold_document_catalog_manifest is None
+    ):
+        raise ValueError("oracle generation requires Gold-document catalog and manifest bindings")
     if (
         recipe.candidate_pool.policy_version == "canonical-id-first-v1"
         and sample.legacy_candidate_pool_policy != "canonical-id-first-v1"

@@ -11,7 +11,7 @@ from typing import Literal
 from pydantic import Field, ValidationError
 
 from paper_search.domain.models import DomainModel, NonEmptyStr, Paper, SafeRelativePath, Sha256
-from paper_search.evaluation.dataset import EvaluationQuery, normalize_paper_id, read_jsonl
+from paper_search.evaluation.dataset import EvaluationQuery, normalize_paper_id
 from paper_search.recall_experiments.contracts import (
     GoldDocument,
     assert_no_forbidden_identifier_keys_or_patterns,
@@ -27,6 +27,17 @@ class SourceManifestEntry(DomainModel):
 
     path: SafeRelativePath
     sha256: Sha256
+
+
+class SealedGoldCatalogManifest(DomainModel):
+    """Persisted provenance that authorizes one sealed catalog artifact."""
+
+    schema_version: Literal["sealed-gold-document-catalog-manifest-v1"] = (
+        "sealed-gold-document-catalog-manifest-v1"
+    )
+    catalog: ArtifactBinding
+    bound_paper_sources: list[ArtifactBinding]
+    sealed_catalog_sha256: Sha256
 
 
 class SealedGoldDocumentRecord(DomainModel):
@@ -92,6 +103,20 @@ class GoldDocumentCatalogBuilder:
         records = _records_for_associations(gold_associations, papers)
         return _seal(records, manifest, _catalog_status(records, gold_associations))
 
+    def manifest_bytes(
+        self, catalog_binding: ArtifactBinding, catalog: SealedGoldDocumentCatalog
+    ) -> bytes:
+        """Return deterministic bytes for the persisted catalog provenance artifact."""
+        manifest = SealedGoldCatalogManifest(
+            catalog=catalog_binding,
+            bound_paper_sources=[
+                ArtifactBinding(path=entry.path, sha256=entry.sha256)
+                for entry in catalog.source_manifest
+            ],
+            sealed_catalog_sha256=catalog.catalog_sha256,
+        )
+        return _canonical_bytes(manifest.model_dump(mode="json")) + b"\n"
+
     def _load_paper_sources(
         self, bound_paper_sources: Sequence[ArtifactBinding]
     ) -> tuple[list[SourceManifestEntry], dict[str, Paper]]:
@@ -125,6 +150,8 @@ class GoldDocumentCatalogSource:
         self,
         binding: ArtifactBinding,
         *,
+        manifest_binding: ArtifactBinding | None = None,
+        bound_paper_sources: Sequence[ArtifactBinding] = (),
         gold_associations: Sequence[EvaluationQuery] | None = None,
     ) -> SealedGoldDocumentCatalog:
         path = _resolve_within(self._workspace_root, binding.path, "Gold-document catalog")
@@ -132,11 +159,24 @@ class GoldDocumentCatalogSource:
         if _sha256(content) != binding.sha256:
             raise ValueError("Gold-document catalog hash mismatch")
         records = _read_catalog_records(path, content)
-        manifest = [SourceManifestEntry(path=binding.path, sha256=binding.sha256)]
-        status: OracleCatalogStatus = "invalid"
-        if gold_associations is not None:
-            status = _catalog_status(records, gold_associations)
-        return _seal(records, manifest, status)
+        if manifest_binding is None or gold_associations is None:
+            return _seal(records, [], "invalid")
+        persisted = _read_persisted_manifest(self._workspace_root, manifest_binding)
+        expected_sources = list(bound_paper_sources)
+        if persisted is None or persisted.catalog != binding or persisted.bound_paper_sources != expected_sources:
+            return _seal(records, [], "invalid")
+        try:
+            expected = GoldDocumentCatalogBuilder(self._workspace_root).build(
+                gold_associations, expected_sources
+            )
+        except (TypeError, ValueError):
+            return _seal(records, [], "invalid")
+        if (
+            records != expected.records
+            or persisted.sealed_catalog_sha256 != expected.catalog_sha256
+        ):
+            return _seal(records, expected.source_manifest, "invalid")
+        return expected
 
 
 def _read_catalog_records(path: Path, content: bytes) -> list[SealedGoldDocumentRecord]:
@@ -156,12 +196,12 @@ def _read_catalog_records(path: Path, content: bytes) -> list[SealedGoldDocument
 
 def _read_normalized_papers(path: Path, content: bytes) -> list[Paper]:
     """Accept direct Paper JSONL or the frozen Query Evolution outcome envelope."""
+    rows = _read_json_objects_from_bytes(path, content)
     try:
-        return read_jsonl(path, Paper)
-    except ValueError as direct_error:
+        return [Paper.model_validate(row) for row in rows]
+    except ValidationError as direct_error:
         papers: list[Paper] = []
         try:
-            rows = [json.loads(line) for line in content.splitlines()]
             for row in rows:
                 if not isinstance(row, Mapping):
                     raise ValueError("outcome row must be a JSON object")
@@ -175,9 +215,37 @@ def _read_normalized_papers(path: Path, content: bytes) -> list[Paper]:
                     if not isinstance(data, list):
                         raise ValueError("outcome search lacks Paper data")
                     papers.extend(Paper.model_validate(record) for record in data)
-        except (json.JSONDecodeError, ValidationError, ValueError) as outcome_error:
+        except (ValidationError, ValueError) as outcome_error:
             raise direct_error from outcome_error
         return papers
+
+
+def _read_persisted_manifest(
+    root: Path, binding: ArtifactBinding
+) -> SealedGoldCatalogManifest | None:
+    path = _resolve_within(root, binding.path, "Gold-document catalog manifest")
+    content = path.read_bytes()
+    if _sha256(content) != binding.sha256:
+        raise ValueError("Gold-document catalog manifest hash mismatch")
+    try:
+        return SealedGoldCatalogManifest.model_validate(json.loads(content))
+    except (json.JSONDecodeError, ValidationError):
+        return None
+
+
+def _read_json_objects_from_bytes(path: Path, content: bytes) -> list[Mapping[str, object]]:
+    rows: list[Mapping[str, object]] = []
+    try:
+        for line_number, raw_line in enumerate(content.splitlines(), start=1):
+            if not raw_line.strip():
+                raise ValueError(f"{path}:{line_number}: blank line is not allowed")
+            decoded = json.loads(raw_line)
+            if not isinstance(decoded, Mapping):
+                raise ValueError(f"{path}:{line_number}: expected a JSON object")
+            rows.append(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"invalid normalized Paper source: {path}") from error
+    return rows
 
 
 def _records_for_associations(

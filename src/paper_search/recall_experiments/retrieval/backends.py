@@ -344,6 +344,7 @@ class BudgetedCitationBackend(_BudgetedProviderCall):
                 call_estimate=self._call_estimate,
                 per_direction_limit=limit,
                 max_expanded=limit,
+                action_id=action_id,
             )
             try:
                 expanded = await stage.expand([seed], controller=self._controller)

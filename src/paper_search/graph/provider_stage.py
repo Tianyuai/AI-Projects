@@ -126,6 +126,7 @@ class ProviderCitationExpansionStage:
         call_estimate: UsageEstimate,
         per_direction_limit: int = 2,
         max_expanded: int = 2,
+        action_id: str | None = None,
     ) -> None:
         if (
             type(per_direction_limit) is not int
@@ -136,10 +137,13 @@ class ProviderCitationExpansionStage:
             raise ValueError("max_expanded must be a positive integer")
         if call_estimate.search_api_calls < 1:
             raise ValueError("citation calls require a search API estimate")
+        if action_id is not None and not action_id.strip():
+            raise ValueError("citation action ID must not be empty")
         self._provider = provider
         self._call_estimate = call_estimate
         self._per_direction_limit = per_direction_limit
         self._max_expanded = max_expanded
+        self._action_id = action_id or "semantic_scholar"
 
     async def _call(
         self,
@@ -149,7 +153,7 @@ class ProviderCitationExpansionStage:
         controller: HardBudgetController,
     ) -> ProviderResult[CitationExpansion]:
         reservation = controller.reserve(
-            f"semantic_scholar.{direction}:{paper_id.value}",
+            f"{self._action_id}.{direction}:{paper_id.value}",
             self._call_estimate,
         )
         result: ProviderResult[CitationExpansion] | None = None

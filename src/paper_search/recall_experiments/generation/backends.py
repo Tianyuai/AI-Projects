@@ -28,19 +28,6 @@ from paper_search.domain.models import (
 
 
 LLMCallKind = Literal["initial", "repair"]
-_INFRASTRUCTURE_ERROR_CODES = frozenset(
-    {
-        "authentication_error",
-        "accounting_failure",
-        "budget_exhausted",
-        "network_error",
-        "provider_error",
-        "rate_limited",
-        "server_error",
-        "snapshot_unavailable",
-        "timeout",
-    }
-)
 
 
 class LLMGenerationRequest(DomainModel):
@@ -81,16 +68,17 @@ class _Analyzer(Protocol):
 
 def _as_result(result: ProviderResult[dict[str, Any]]) -> LLMBackendResult:
     code = result.errors[0].code if result.errors else None
-    infrastructure_failure = any(
-        error.code in _INFRASTRUCTURE_ERROR_CODES for error in result.errors
+    repairable = bool(result.errors) and all(
+        error.code == "invalid_json" for error in result.errors
     )
+    infrastructure_failure = bool(result.errors) and not repairable
     return LLMBackendResult(
         data=dict(result.data),
         usage=result.usage,
         provenance=dict(result.provenance),
         errors=list(result.errors),
         infrastructure_failure=infrastructure_failure,
-        repairable=code == "invalid_json" and not infrastructure_failure,
+        repairable=code == "invalid_json" and repairable,
     )
 
 

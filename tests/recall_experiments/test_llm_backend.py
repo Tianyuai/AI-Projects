@@ -171,6 +171,28 @@ def test_any_infrastructure_error_prevents_semantic_repair() -> None:
     assert observed.repairable is False
 
 
+@pytest.mark.parametrize("code", ["invalid_request", "unknown_provider_failure"])
+def test_all_non_json_analyzer_errors_are_infrastructure_failures(code: str) -> None:
+    error = ErrorDetail(
+        code=code,
+        message="provider rejected the request",
+        retryable=False,
+        provider="llm",
+    )
+    backend = BudgetedLLMBackend(
+        analyzer=_FakeAnalyzer([_result(errors=[error])]),
+        controller=HardBudgetController(_budget()),
+        initial_estimate=_estimate(),
+        repair_estimate=_estimate(),
+    )
+    request = LLMGenerationRequest(prompt_name="recall_actions", payload={"query": "offline"})
+
+    observed = asyncio.run(backend.generate(request, "initial"))
+
+    assert observed.infrastructure_failure is True
+    assert observed.repairable is False
+
+
 def test_cancelled_generation_releases_its_undispatched_reservation() -> None:
     controller = HardBudgetController(_budget())
     analyzer = _CancellingAnalyzer()

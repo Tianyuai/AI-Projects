@@ -104,8 +104,42 @@ def test_recipe_defaults_to_production_dedup_and_has_hashable_canonical_serializ
     recipe = RecallMethodRecipe.model_validate(_manual_recipe())
 
     assert recipe.candidate_pool.policy_version == "production-dedup-v1"
-    assert recipe.canonical_bytes() == recipe.canonical_bytes()
-    assert hash(recipe) == hash(recipe)
+
+
+def test_equivalent_recipe_files_have_equal_canonical_identity(tmp_path: Path) -> None:
+    first_path = _write(
+        tmp_path / "first.yaml",
+        """method_id: manual-example
+generator:
+  type: manual_actions
+  actions: runs/actions.json
+  gold_visibility: oracle
+retrieval:
+  allowed_actions: [text_search, title_search]
+  backend: live_provider
+  max_results_per_action: 50
+  max_total_actions: 3
+candidate_pool: {}
+evaluation:
+  repeat_count: 1
+  max_repeat_attempts: 1
+""",
+    )
+    second_path = _write(tmp_path / "second.yaml", first_path.read_text(encoding="utf-8"))
+    different_path = _write(
+        tmp_path / "different.yaml",
+        first_path.read_text(encoding="utf-8").replace("manual-example", "manual-other"),
+    )
+
+    first = load_recall_recipe(first_path)
+    second = load_recall_recipe(second_path)
+    different = load_recall_recipe(different_path)
+
+    assert first.recipe.canonical_bytes() == second.recipe.canonical_bytes()
+    assert hash(first.recipe) == hash(second.recipe)
+    assert first.recipe_sha256 == second.recipe_sha256
+    assert first.recipe.canonical_bytes() != different.recipe.canonical_bytes()
+    assert first.recipe_sha256 != different.recipe_sha256
 
 
 def test_manual_and_fixed_generators_require_actions_artifacts() -> None:
@@ -126,6 +160,27 @@ def test_deepseek_recipe_requires_frozen_generation_settings() -> None:
     payload = _comparison_recipe()
     payload["generator"] = {**payload["generator"], "repair_attempts": 2}
     with pytest.raises(ValidationError, match="repair_attempts"):
+        RecallMethodRecipe.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", False),
+        ("temperature", "0"),
+        ("temperature", 0.0),
+        ("repair_attempts", True),
+        ("repair_attempts", "1"),
+        ("repair_attempts", 1.0),
+    ],
+)
+def test_deepseek_recipe_rejects_coercible_non_integer_lock_values(
+    field: str, value: object
+) -> None:
+    payload = _comparison_recipe()
+    payload["generator"] = {**payload["generator"], field: value}
+
+    with pytest.raises(ValidationError, match=field):
         RecallMethodRecipe.model_validate(payload)
 
 

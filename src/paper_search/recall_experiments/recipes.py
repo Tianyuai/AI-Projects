@@ -42,9 +42,9 @@ class DeepSeekPromptGeneratorRecipe(_GeneratorRecipeBase):
     type: Literal["deepseek_prompt"]
     prompt: SafeRelativePath
     model: NonEmptyStr
-    temperature: Literal[0]
+    temperature: Annotated[int, Field(strict=True, ge=0, le=0)]
     max_generated_actions: Annotated[int, Field(strict=True, gt=0)]
-    repair_attempts: Literal[1]
+    repair_attempts: Annotated[int, Field(strict=True, ge=1, le=1)]
 
 
 GeneratorRecipe: TypeAlias = Annotated[

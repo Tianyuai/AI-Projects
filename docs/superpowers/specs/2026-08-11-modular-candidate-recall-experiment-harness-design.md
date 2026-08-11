@@ -49,6 +49,41 @@ flowchart LR
 
 组合根只负责根据配置装配接口，不包含方法判断。注册表只映射动作名到处理器；删除处理器、添加处理器或替换实现不影响生成器、候选池和评估器。
 
+### 3.1 包结构与依赖方向
+
+新增能力放入独立包，避免继续扩张现有单体探针脚本：
+
+```text
+src/paper_search/recall_experiments/
+  contracts.py
+  recipes.py
+  inputs/
+  generation/
+  retrieval/
+    registry.py
+    backends.py
+    text_search.py
+    title_search.py
+    citation_expand.py
+  candidate_pool.py
+  stages.py
+  evaluator.py
+  artifacts.py
+  runner.py
+```
+
+依赖方向固定为 `contracts <- 各独立实现 <- runner/组合根`：
+
+- `contracts.py` 不导入具体 Provider、LLM 或本地文件适配器。
+- 三个检索处理器不得互相导入。
+- 检索处理器只依赖 `SearchBackend` / `CitationBackend` 协议，不直接创建 live client、快照 reader 或本地索引。
+- `FrozenInputSource` 不导入生成器或检索处理器。
+- `CandidatePoolBuilder` 不导入评估器；评估器可以读取候选池快照。
+- `runner.py` 只编排接口，不包含动作类型分支、指标公式或方法专属常量。
+- 注册表由组合根显式构造，不使用导入副作用或进程级可变全局注册。
+
+测试目录镜像上述模块边界。任何新方法若需要修改 `runner.py` 中的方法分支，即视为模块化验收失败。
+
 ## 4. 模块边界
 
 ### 4.1 `RecallMethodRecipe`
@@ -67,10 +102,12 @@ generator:
   repair_attempts: 1
 retrieval:
   allowed_actions: [text_search]
+  backend: snapshot_replay
   max_results_per_action: 50
   max_total_actions: 3
 evaluation:
   repeat_count: 3
+  max_repeat_attempts: 5
   compare_with: historical-query-evolution-v2
   gold_count_tolerance: 1
   macro_recall_tolerance: 0.02
@@ -89,7 +126,7 @@ load_queries(sample_binding) -> FrozenRecallDataset
 load_historical_baseline(binding) -> HistoricalRecallBaseline | None
 ```
 
-首版实现本地正式运行适配器，读取既有 Gold、identifier map、business/execution 记录和依赖快照。后续若认为本地冻结方式不合理，只需新增或替换该适配器。核心模块只依赖规范化后的 `FrozenRecallDataset`。
+首版实现本地正式运行适配器，读取既有 Gold、identifier map、business/execution 记录和依赖快照。后续若认为本地冻结方式不合理，只需新增或替换该适配器。核心模块只依赖规范化后的 `FrozenRecallDataset`。identifier map 作为评测侧数据保存在 dataset/evaluation context 中，不注入候选池构建器。
 
 适配器负责校验：查询 ID 唯一、Gold 关联无重复、输入哈希匹配、Oracle/Blind 分区不重叠、历史比较分母一致。
 
@@ -146,7 +183,9 @@ TitleSearchPayload(title_text)
 CitationExpandPayload(seed_canonical_id, direction, limit)
 ```
 
-`direction` 只能是 `references` 或 `citations`；`seed_canonical_id` 必须存在于 `RecallGenerationContext.seed_candidates`。新增动作类型时必须增加自己的载荷模型和处理器，不扩张已有载荷。
+`direction` 只能是 `references`、`citations` 或 `both`；`seed_canonical_id` 必须存在于 `RecallGenerationContext.seed_candidates`。新增动作类型时必须增加自己的载荷模型和处理器，不扩张已有载荷。
+
+第一阶段的引文动作只能使用实验开始前已经冻结在 `seed_candidates` 中的候选。动态执行“先搜索、再选择新种子、再扩展”属于后续多轮协调器，不得隐式塞入首版 Runner。
 
 动作必须在执行前完成规范化、长度校验、允许类型校验和同轮去重。生成记录在检索前写入不可变产物；同一次 repeat 不得根据结果修改已经冻结的动作。
 
@@ -162,11 +201,13 @@ resolve(action_type) -> RetrievalActionHandler
 
 三个首版处理器分别位于独立模块：
 
-- `TextSearchHandler`：复用 `OpenAlexProvider.search`，执行普通文本查询。
-- `TitleSearchHandler`：复用现有标题候选检索/规范化逻辑，执行标题型查询。
-- `CitationExpandHandler`：复用现有 citation expansion/provider stage，按明确种子展开 references/citations。
+- `TextSearchHandler`：通过注入的 `SearchBackend.search` 执行普通文本查询；首版 backend 适配现有 `OpenAlexProvider.search` 和冻结快照回放。
+- `TitleSearchHandler`：通过同一可替换 backend，把完整标题作为搜索输入并复用现有标题候选规范化逻辑；除非 backend 明确提供并验证 exact-title 契约，否则不得宣称精确标题匹配。
+- `CitationExpandHandler`：通过注入的 `CitationBackend` 复用现有 citation provider、预算、快照和图规范化能力。`both` 可委托现有 provider stage；单方向通过同一 `SearchProvider.references/citations` 契约执行。
 
 处理器只返回统一 `RetrievalActionResult`，不得直接计算召回、过滤或修改其他处理器状态。每个处理器可独立删除、替换或增加。
+
+搜索后端与冻结输入来源是两个独立扩展点：`FrozenInputSource` 决定实验读取哪些查询、Gold 和历史绑定；`SearchBackend` 决定动作如何获得论文。首版提供 `snapshot_replay` 和受显式授权的 `live_provider`，以后可新增 `local_index` 或替换快照检索方式。只要满足相同协议，不修改生成器、动作处理器、候选池或评估器。
 
 ### 4.6 `CandidatePoolBuilder`
 
@@ -174,11 +215,11 @@ resolve(action_type) -> RetrievalActionHandler
 
 - 收集所有动作结果；
 - 复用现有论文规范化与 `deduplicate_papers`；
-- 通过 identifier map 形成规范 ID；
+- 使用 Provider 返回并经现有 normalize/deduplicate 逻辑形成的 `Paper.canonical_id`；
 - 保留每篇论文命中的 action、搜索词、Provider 和原始 rank；
 - 输出未过滤、未重排、未截断的完整候选池。
 
-候选池构建器不得读取 Gold，确保召回评估与候选生成解耦。
+候选池构建器不得读取 Gold 或评测 identifier map，确保召回评估与候选生成解耦。只有 `CandidateRecallEvaluator` 可以使用 identifier map 将候选 ID 和 Gold ID 投影到相同评测语义。
 
 ### 4.7 可选 `CandidateStage` 管线
 
@@ -206,7 +247,7 @@ apply(pool, context) -> StageResult
 
 ## 5. Oracle、Blind 与重复运行
 
-- Oracle 和 Blind 使用互不重叠的冻结查询 ID。
+- 同一新方法若同时声明 Oracle 和 Blind 阶段，两阶段必须使用互不重叠的冻结查询 ID。仅执行历史兼容性复现时保持历史原有的 Gold 可见性，不强行创建 Oracle 分区。
 - Oracle 只用于确认方法在看到相关论文内容时是否能生成有效搜索表达。
 - Blind 用于后续确认规则是否能迁移，不作为第一阶段实验台正确性的前置条件。
 - DeepSeek 重新生成默认执行三次；每次拥有独立 generation artifact 和候选池结果。
@@ -223,14 +264,14 @@ apply(pool, context) -> StageResult
 
 ### 6.2 重新生成一致性
 
-使用相同冻结查询、Prompt 方法、模型和搜索预算重新生成三次。方案 B 被认定可行时必须同时满足：
+使用与对应历史实验完全相同的查询 ID 集合、Gold 关联分母、Prompt 方法、Gold 可见性、模型和搜索预算，获得三次有效重新生成结果。不同查询集合之间不直接比较 macro recall。方案 B 被认定可行时必须同时满足：
 
 - Gold association 命中数相对历史值误差不超过 `±1`；
 - macro candidate recall 绝对误差不超过 `0.02`；
 - 历史已命中 Gold 保留率不低于 `0.90`；
 - 三次中至少两次满足以上条件。
 
-若 Provider、快照、认证、限流或账本发生基础设施失败，该 repeat 标记为 `infrastructure_failure`，不得计入通过或失败。若不足三次有效 repeat，报告结论为 `insufficient_valid_repeats`。
+若 Provider、快照、认证、限流或账本发生基础设施失败，该尝试标记为 `infrastructure_failure`，不得计入通过或失败。最多允许 `max_repeat_attempts=5` 次调度以取得 `repeat_count=3` 次有效结果；达到上限仍不足三次有效结果时，报告结论为 `insufficient_valid_repeats`，不得继续自动重试。
 
 该结论只表示新实验台与旧候选召回流程在允许误差内一致，不评价历史方法本身是否优秀。
 
@@ -279,7 +320,7 @@ recall-report.json
 - `paper_search.graph.provider_stage` 与 citation expansion
 - `paper_search.processing.normalize`
 - `paper_search.processing.deduplicate.deduplicate_papers`
-- `paper_search.evaluation.identifier_semantics.IdentifierMap`
+- `paper_search.evaluation.dataset.IdentifierMap`
 - `paper_search.llm` 的 live/replay 适配器和快照能力
 - `paper_search.control` 的预算和账本能力
 
@@ -294,6 +335,7 @@ recall-report.json
 - 三种 QueryGenerator；
 - 动作校验、去重和一次修复；
 - 注册、移除、替换 RetrievalActionHandler；
+- snapshot/live/未来 local backend 的协议契约与替换测试；
 - text/title/citation 三个处理器；
 - CandidatePoolBuilder 的规范化、去重和来源保留；
 - 空 CandidateStage 管线和后续 stage 顺序契约；

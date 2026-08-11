@@ -12,7 +12,7 @@ from paper_search.recall_experiments.validation import validate_action_batch
 
 
 class FixedActionGenerator:
-    """Validate and freeze one canonical action payload for every expected query."""
+    """Validate and freeze one immutable action payload for every expected query."""
 
     def __init__(
         self,
@@ -54,15 +54,20 @@ class FixedActionGenerator:
 def _freeze_action_bytes(raw: bytes | str | Mapping[str, object]) -> bytes:
     try:
         if isinstance(raw, bytes):
-            decoded = json.loads(raw.decode("utf-8"))
+            frozen = raw
+            decoded = json.loads(frozen.decode("utf-8"))
         elif isinstance(raw, str):
+            frozen = raw.encode("utf-8")
             decoded = json.loads(raw)
         else:
-            decoded = json.loads(json.dumps(raw, ensure_ascii=False))
+            frozen = json.dumps(
+                raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+            ).encode("utf-8")
+            decoded = json.loads(frozen)
         RecallActionBatch.model_validate(decoded)
-    except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+    except (TypeError, UnicodeDecodeError, UnicodeEncodeError, json.JSONDecodeError, ValueError) as error:
         raise ValueError("fixed actions must contain a valid UTF-8 JSON action batch") from error
-    return json.dumps(decoded, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return frozen
 
 
 __all__ = ["FixedActionGenerator"]

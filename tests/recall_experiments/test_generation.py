@@ -48,6 +48,34 @@ def test_fixed_generation_preserves_the_bound_action_bytes_and_validates_before_
     assert result.action_batch.actions[0].action_id == "search-1"
 
 
+@pytest.mark.parametrize("as_bytes", [True, False])
+def test_fixed_generation_preserves_formatted_and_reordered_byte_or_string_sources(
+    as_bytes: bool,
+) -> None:
+    source_text = """{
+  "actions": [
+    {
+      "strategy": "fixed",
+      "payload": {"query_text": "graph retrieval"},
+      "action_type": "text_search",
+      "action_id": "search-1"
+    }
+  ]
+}"""
+    source = source_text.encode("utf-8") if as_bytes else source_text
+    generator = FixedActionGenerator(
+        {"query-1": source},
+        expected_query_ids=["query-1"],
+        allowed_actions={"text_search"},
+        max_actions=1,
+    )
+
+    result = asyncio.run(generator.generate(_context("query-1")))
+
+    assert result.artifact_bytes == source_text.encode("utf-8")
+    assert result.action_batch.actions[0].action_id == "search-1"
+
+
 def test_fixed_generation_rejects_unknown_or_missing_query_ids() -> None:
     with pytest.raises(ValueError, match="coverage"):
         FixedActionGenerator(

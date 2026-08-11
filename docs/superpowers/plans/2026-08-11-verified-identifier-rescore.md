@@ -125,6 +125,7 @@ Expected: selected tests pass and only Task 1 files are committed.
 - Modify: `scripts/probe_query_evolution.py`
 - Modify: `tests/evaluation/test_query_evolution_probe.py`
 - Modify: `tests/integration/test_query_evolution_probe.py`
+- Create: `scripts/__init__.py`
 - Create: `scripts/rescore_identifier_semantics.py`
 - Create: `tests/scripts/test_rescore_identifier_semantics.py`
 
@@ -166,7 +167,7 @@ Add thin public wrappers around the existing helpers and leave existing private 
 | `scripts/probe_query_evolution.py` | `_frozen_inputs` | `frozen_probe_inputs` |
 | `scripts/probe_query_evolution.py` | `_capture_replay_hash` | `probe_outcome_hash` |
 
-Add `offline_provider_result` to the evaluation module's `__all__`. Import script wrappers through `scripts.probe_query_evolution` and invoke the new CLI as a module; do not alter live capture, retry, budget, or existing Gate behavior.
+Add `offline_provider_result` to the evaluation module's `__all__`. Create `scripts/__init__.py`, import script wrappers through `scripts.probe_query_evolution`, and invoke the new CLI as a module so mypy has one module identity; do not alter live capture, retry, budget, or existing Gate behavior.
 
 - [ ] **Step 3: Implement the three strict adapters**
 
@@ -219,7 +220,7 @@ def load_fixed_sources(
 
 ```powershell
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest tests/evaluation/test_query_evolution_probe.py tests/integration/test_query_evolution_probe.py tests/scripts/test_rescore_identifier_semantics.py -q
-git add src/paper_search/evaluation/query_evolution_probe.py scripts/probe_query_evolution.py tests/evaluation/test_query_evolution_probe.py tests/integration/test_query_evolution_probe.py scripts/rescore_identifier_semantics.py tests/scripts/test_rescore_identifier_semantics.py
+git add src/paper_search/evaluation/query_evolution_probe.py scripts/__init__.py scripts/probe_query_evolution.py tests/evaluation/test_query_evolution_probe.py tests/integration/test_query_evolution_probe.py scripts/rescore_identifier_semantics.py tests/scripts/test_rescore_identifier_semantics.py
 git commit -m "feat: load sealed identifier rescore sources"
 ```
 

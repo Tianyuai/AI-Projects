@@ -168,7 +168,7 @@ Do not respond to a stop by rebuilding a candidate lock, refreshing readiness, r
 - `src/paper_search/evaluation/identifier_semantics.py` continues to own the verified-generation loader and identifier relation contract.
 - A new focused evaluation module owns the common rescore model, source-neutral association classification, identifier resolution, metric assembly, conservation checks, and decision rule.
 - `src/paper_search/evaluation/gates.py` exposes its existing rule comparator through a public helper; its comparison behavior and formal Gate contract do not change.
-- A thin `scripts` module owns fixed local path selection, source-adapter orchestration, privacy validation, and no-replace publication. It is invoked with `python -m scripts.rescore_identifier_semantics` so the sealed-probe wrappers can be imported consistently by both tests and the CLI.
+- A thin `scripts` package (explicitly marked by `scripts/__init__.py`) owns fixed local path selection, source-adapter orchestration, privacy validation, and no-replace publication. It is invoked with `python -m scripts.rescore_identifier_semantics` so the sealed-probe wrappers have one module identity for tests, the CLI, and mypy.
 - Existing formal-run validation, metric, ranking, query-evolution projection, and privacy helpers are reused rather than copied.
 - `scripts/analyze_gold_bottlenecks.py` remains a historical availability diagnostic. Task 4 does not refactor it or use its old independently loaded identifier map.
 

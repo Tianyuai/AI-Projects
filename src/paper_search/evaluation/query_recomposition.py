@@ -127,6 +127,46 @@ class SealedQueryRecompositionRow(DomainModel):
         return self
 
 
+def _row_has_usable_signal(
+    row: SealedQueryRecompositionRow,
+    append: SealedQueryRecompositionRow,
+) -> bool:
+    return all(
+        (
+            row.selected_top50 > _USABLE_SELECTED_THRESHOLD,
+            row.retains_append_selected_gold,
+            row.macro_f1 >= append.macro_f1,
+            row.macro_recall >= append.macro_recall,
+            row.mrr >= append.mrr,
+            row.ndcg >= append.ndcg,
+            row.filtered_out == 0,
+            row.retrieved_streams_unchanged,
+            row.post_filter_streams_unchanged,
+        )
+    )
+
+
+def _is_canonical_integrity_row(row: SealedQueryRecompositionRow) -> bool:
+    return all(
+        (
+            row.true_positive_count == 0,
+            row.not_retrieved == row.total_gold_associations,
+            row.filtered_out == 0,
+            row.ranked_outside_top50 == 0,
+            row.selected_top50 == 0,
+            row.macro_f1 == 0.0,
+            row.macro_recall == 0.0,
+            row.micro_recall == 0.0,
+            row.mrr == 0.0,
+            row.ndcg == 0.0,
+            not row.retains_append_selected_gold,
+            not row.retrieved_streams_unchanged,
+            not row.post_filter_streams_unchanged,
+            not row.usable_signal,
+        )
+    )
+
+
 class SealedQueryRecompositionReport(DomainModel):
     schema_version: Literal["sealed-query-recomposition-offline-v1"] = (
         "sealed-query-recomposition-offline-v1"
@@ -147,6 +187,20 @@ class SealedQueryRecompositionReport(DomainModel):
             raise ValueError("recomposition rows must use the same gold denominator")
         if self.reason_codes != (_REASON_CODE_BY_CONCLUSION[self.conclusion],):
             raise ValueError("reason code must match conclusion")
+        if self.conclusion == "integrity_failure":
+            if not all(_is_canonical_integrity_row(row) for row in self.rows):
+                raise ValueError(
+                    "integrity_failure rows must use canonical aggregate failure shape"
+                )
+            return self
+        append = self.rows[0]
+        if any(
+            row.usable_signal != _row_has_usable_signal(row, append)
+            for row in self.rows
+        ):
+            raise ValueError("usable_signal must match preregistered rule")
+        if self.conclusion != _conclusion(self.rows, self.legacy_title_selected):
+            raise ValueError("conclusion must match usable rows and legacy benchmark")
         return self
 
 
@@ -324,7 +378,6 @@ def build_report(
             (
                 score.macro_f1 >= append_score.macro_f1,
                 score.macro_recall >= append_score.macro_recall,
-                score.micro_recall >= append_score.micro_recall,
                 score.mrr >= append_score.mrr,
                 score.ndcg >= append_score.ndcg,
             )

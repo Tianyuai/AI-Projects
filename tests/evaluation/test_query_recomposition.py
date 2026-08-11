@@ -394,6 +394,81 @@ def test_report_rejects_reason_code_that_does_not_match_conclusion(
         SealedQueryRecompositionReport.model_validate(payload)
 
 
+def _legacy_met_report_payload() -> dict[str, object]:
+    report = build_report(
+        gold=_gold(),
+        identifier_map=IdentifierMap.from_bytes(b"{}"),
+        projections=_projections_for_selected_counts(
+            {
+                "append_v2": 19,
+                "round_robin_slots": 29,
+                "rrf_slots_k60": 30,
+            }
+        ),
+        input_hashes={"gold": "sha256:" + "1" * 64},
+        current_formal_selected=17,
+        legacy_title_selected=30,
+    )
+    return report.model_dump(mode="json")
+
+
+def test_report_rejects_tampered_usable_signal() -> None:
+    payload = _legacy_met_report_payload()
+    rows = payload["rows"]
+    assert isinstance(rows, list)
+    rows[2]["usable_signal"] = False
+
+    with pytest.raises(ValueError, match="usable_signal must match preregistered rule"):
+        SealedQueryRecompositionReport.model_validate(payload)
+
+
+def test_report_rejects_tampered_semantic_conclusion() -> None:
+    payload = _legacy_met_report_payload()
+    payload["conclusion"] = "signal_insufficient"
+    payload["reason_codes"] = ["usable_signal_below_legacy_benchmark"]
+
+    with pytest.raises(ValueError, match="conclusion must match usable rows"):
+        SealedQueryRecompositionReport.model_validate(payload)
+
+
+def test_report_rejects_noncanonical_integrity_failure_shape() -> None:
+    projections = _projections_for_selected_counts(
+        {
+            "append_v2": 19,
+            "round_robin_slots": 29,
+            "rrf_slots_k60": 30,
+        }
+    )
+    projections["rrf_slots_k60"] = {}
+    report = build_report(
+        gold=_gold(),
+        identifier_map=IdentifierMap.from_bytes(b"{}"),
+        projections=projections,
+        input_hashes={"gold": "sha256:" + "1" * 64},
+        current_formal_selected=17,
+        legacy_title_selected=30,
+    )
+    payload = report.model_dump(mode="json")
+    rows = payload["rows"]
+    assert isinstance(rows, list)
+    rows[0]["selected_top50"] = 1
+    rows[0]["not_retrieved"] = 142
+
+    with pytest.raises(ValueError, match="canonical aggregate failure shape"):
+        SealedQueryRecompositionReport.model_validate(payload)
+
+
+def test_report_usable_signal_gate_does_not_include_micro_recall() -> None:
+    payload = _legacy_met_report_payload()
+    rows = payload["rows"]
+    assert isinstance(rows, list)
+    rows[2]["micro_recall"] = 0.0
+
+    parsed = SealedQueryRecompositionReport.model_validate(payload)
+
+    assert parsed.rows[2].usable_signal is True
+
+
 def test_build_report_counts_all_pipeline_stages_by_precedence() -> None:
     projections: dict[RecompositionMethod, dict[str, RecompositionProjection]] = {}
     for method in ("append_v2", "round_robin_slots", "rrf_slots_k60"):

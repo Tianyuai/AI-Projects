@@ -1,7 +1,7 @@
 # Identifier Relation-Correctness Gate Design
 
 **Date:** 2026-08-11
-**Status:** Proposed amendment
+**Status:** Approved
 **Scope:** Development identifier-map semantic promotion only
 
 ## Decision
@@ -55,6 +55,34 @@ A gold group with no evidence ref has no provider relation to classify. The buil
 
 The public aggregate audit advances to `identifier-map-semantic-audit-v2`. `input_hashes` contains only source inputs; `artifact_hashes` contains hashes of derived canonical bytes.
 
+The exact public schema is closed at every object level (`additionalProperties=false`):
+
+| Field | Exact type/value |
+|---|---|
+| `schema_version` | literal `identifier-map-semantic-audit-v2` |
+| `scope` | literal `dev` |
+| `status` | `passed` or `failed` |
+| `input_hashes` | object with exactly `dev_gold`, `identity_evidence`, `snapshot_manifest` |
+| `artifact_hashes` | object with exactly `candidate_map`, `private_relation_audit` |
+| `gold_group_count` | non-negative integer |
+| `required_anchor_count` | non-negative integer |
+| `verified_anchor_count` | non-negative integer |
+| `provider_candidate_count` | non-negative integer |
+| `provider_identity_group_count` | non-negative integer |
+| `provider_identity_missing_group_count` | non-negative integer |
+| `relation_count` | non-negative integer |
+| `state_counts` | object with exactly `verified`, `semantic_mismatch`, `unresolved` |
+| `proof_counts` | object with exactly `arxiv_datacite_exact`, `semantic_scholar_exact`, `openalex_location_exact` |
+| `reason_counts` | object with exactly `arxiv_datacite_exact`, `arxiv_datacite_mismatch`, `semantic_scholar_exact`, `openalex_location_exact`, `openalex_location_mismatch`, `insufficient_identity_evidence`, `observation_binding_mismatch`, `provider_identity_missing`, `alias_target_conflict` |
+
+Every hash is a lowercase `sha256:` prefix followed by exactly 64 lowercase hexadecimal characters. Every count value is a non-negative integer; booleans are not integers for schema purposes. The closed relation enums are: state = `verified | semantic_mismatch | unresolved`; proof kind = `arxiv_datacite_exact | semantic_scholar_exact | openalex_location_exact | null`; reason code = exactly the nine `reason_counts` keys above. `provider_identity_missing` remains a supported zero-valued diagnostic reason for compatibility, but this builder never creates such a relation.
+
+The exact private artifact is a closed object with `schema_version=identifier-map-private-relation-audit-v2`, `scope=dev`, and `relations`. Each relation is a closed object containing exactly `relation_kind`, `arxiv_id`, `alias`, `terminal`, `state`, `proof_kind`, and `reason_code`. `relation_kind` is `required_anchor` or `provider_candidate`; `state`, `proof_kind`, and `reason_code` use the public schema enums, with `proof_kind` alone permitting `null`. `arxiv_id`, `alias`, and `terminal` are non-empty canonical identifiers: `arxiv_id` is normalized with `kind=arxiv`, `alias` with automatic kind detection, and `terminal` with `kind=doi`. Every row requires `terminal == arxiv_anchor(arxiv_id)`. Every `required_anchor` row additionally requires `alias == terminal`; its verified form requires `proof_kind=arxiv_datacite_exact` and `reason_code=arxiv_datacite_exact`, while its nonverified form requires `proof_kind=null` and `reason_code=arxiv_datacite_mismatch`. Rows are unique and sorted by `(relation_kind, arxiv_id, alias)` using the explicit kind order `required_anchor`, then `provider_candidate`. The relation kind prevents a sealed provider candidate whose alias equals its deterministic DataCite anchor from being confused with the required anchor row.
+
+The candidate map remains a bare JSON object whose keys and values are normalized identifier strings. It equals exactly the union of `(required_anchor.arxiv_id -> terminal)` and `(verified provider_candidate.alias -> terminal)` pairs, omitting the redundant provider self-edge when `alias == terminal`. Duplicate raw or normalized keys, non-string values, chains, cycles, extra envelope fields, and noncanonical ordering are invalid for this generation; every value is the terminal deterministic DataCite anchor.
+
+All three artifacts use UTF-8 without BOM and canonical JSON with recursively sorted object keys, `ensure_ascii=false`, separators `(',', ':')`, and exactly one trailing LF. Hashes cover those exact bytes.
+
 Let `G` be the set of normalized unique gold arXiv IDs, `A` the anchor audit rows, `C` the provider candidate rows, and `P={c.arxiv_id | c in C}`. Audit v2 contains and enforces:
 
 - `gold_group_count = |G|`;
@@ -96,8 +124,8 @@ Provider coverage counts are computed before status but are not status predicate
 
 The builder consumes only dev gold, sealed identity evidence, and its bound snapshot manifest.
 
-1. Resolve the formal-map, private-audit, public-audit, and public-audit sibling lock targets to normalized absolute paths. Require all four paths to be pairwise distinct; require the three formal targets to be absent. Acquire the publication lock with exclusive create before reading inputs. A concurrent or stale lock refuses the run.
-2. Verify the manifest and every referenced response.
+1. Resolve the formal-map, private-audit, public-audit, and `<public-audit>.lock` sibling targets to normalized absolute paths. Require all four paths to be pairwise distinct; require the three formal targets to be absent. Acquire the publication lock with exclusive create before reading inputs. A concurrent or stale lock refuses the run.
+2. After locking, read dev gold, identity evidence, snapshot manifest, and each referenced response exactly once into immutable byte buffers. Hashing, schema validation, manifest verification, response verification, and decoding must all use those same buffers. A preflight hash outside the builder is informational only and never authorizes publication.
 3. Build and verify one anchor relation per gold group.
 4. Consume every evidence ref exactly once, reconstruct its bound provider observation, and classify it before filtering.
 5. Resolve cross-group conflicts while retaining every contributing audit row.
@@ -108,9 +136,9 @@ The builder consumes only dev gold, sealed identity evidence, and its bound snap
    - **Semantic gate failure:** trusted inputs reconstruct successfully but at least one relation is not verified. Schema-validate the private audit. Before any public write, reject duplicate keys in the public audit, enforce the exact v2 schema, require canonical reserialization to equal its bytes, and run recursive privacy validation. Exclusively write the private audit, re-read and verify its canonical bytes and bound hash, then exclusively write the validated public failed audit as the final commit marker; do not write a formal map. Release the publication lock only after the marker is durable.
    - **Successful publication:** apply the same private schema validation and public duplicate-key, exact-v2, canonical-byte, and privacy gates. Exclusively write the private audit and formal map, re-read and verify both canonical byte streams and their bound hashes, then exclusively write the validated public passed audit last as the final commit marker. Release the publication lock only after the marker is durable.
 
-Every formal write uses atomic no-replace publication; an existence check alone is not sufficient. Consumers recognize a generation only through the public audit at the requested output path. Before reading `status` or any hash, the loader rejects duplicate JSON keys, enforces the exact audit-v2 schema, canonically reserializes the parsed audit, requires byte-for-byte equality with the original public-audit bytes, and reruns recursive privacy validation. It then requires `status=passed`, verifies every bound input hash, verifies private-audit bytes against `artifact_hashes.private_relation_audit`, and verifies raw map bytes against `artifact_hashes.candidate_map` before parsing map entries.
+Every formal write uses atomic no-replace publication; an existence check alone is not sufficient. Consumers recognize a generation only through the public audit at the requested output path. Before reading `status` or any hash, the loader rejects duplicate JSON keys, enforces the exact audit-v2 schema, canonically reserializes the parsed audit, requires byte-for-byte equality with the original public-audit bytes, and reruns recursive privacy validation. It then requires `status=passed`, verifies every bound input hash, verifies private-audit bytes against `artifact_hashes.private_relation_audit`, and verifies raw map bytes against `artifact_hashes.candidate_map` before parsing either private rows or map entries.
 
-After raw-byte verification, the loader strictly parses the map with duplicate-key detection and exact schema enforcement, reserializes it with the canonical JSON encoder, and requires byte-for-byte equality with the original map bytes. Hashing a noncanonical representation and updating the audit hash does not make that representation valid.
+After raw-byte verification, the loader strictly parses the private audit and map with duplicate-key detection and exact schema enforcement, reserializes each with the canonical JSON encoder, and requires byte-for-byte equality with the original bytes. It reconstructs `G`, `A`, `C`, and `P`, rechecks every public count/state/proof/reason equation against private rows and sealed evidence refs, and requires the parsed map to equal the exact map reconstructed from verified private rows. Synchronously changing public, private, and map bytes and their hashes therefore cannot validate an unsupported relation set. Hashing a noncanonical representation and updating the audit hash does not make that representation valid. Recursive privacy validation applies only to the public audit; the private audit is intentionally validated by its closed schema, canonical bytes, hashes, and relation consistency.
 
 Because targets are distinct and absent, the publication lock is exclusive, every artifact write is no-replace, and the public audit is written last, a partial run cannot expose an old or uncommitted map as current. If interruption leaves a publication lock, private audit, or map without a public marker, automation must not delete or reuse it. Human intervention verifies that no public marker exists, archives the residual generation and lock, and chooses fresh empty output targets before another run.
 
@@ -124,7 +152,7 @@ The builder must not accept predictions, query text, historical runs, validation
 - The stakeholder requirement for second-provider proof is a code-external policy stop, not a runtime switch. If stakeholders require proof for all 141 groups, implementation stops and asks humans to choose a new provider or a separately designed annotation workflow.
 - Manual review cannot directly edit the map or inject an alias. It may identify a code/data defect for a new reviewed implementation cycle, or authorize a separately designed and sealed evidence workflow.
 - If the three sealed baseline hashes match but reconstruction violates 141/90/51/90/231, stop as a decoder regression. New evidence hashes do not use this fixed invariant.
-- Task 4 starts only after the public audit passes duplicate-key rejection, exact v2 schema validation, canonical byte equality, and recursive privacy validation and declares `status=passed`. Its loader then verifies all three source-input hashes, the private-audit hash, and the raw map hash before parsing map entries; it finally enforces strict canonical map serialization.
+- Task 4 starts only after the public audit passes duplicate-key rejection, exact v2 schema validation, canonical byte equality, and recursive privacy validation and declares `status=passed`. Its loader then verifies all three source-input hashes, the private-audit hash, and the raw map hash before parsing private rows or map entries; it finally rechecks all equations and exact map reconstruction.
 - If Task 4 fails retrieval, ranking, integrity, or budget guards, stop this improvement direction. Do not return to repeated identity capture without new evidence or a human policy decision.
 
 ## Testing Strategy
@@ -135,7 +163,7 @@ TDD coverage must prove:
 - every evidence ref is classified before filtering, and incomplete or mismatched candidates fail the gate;
 - duplicate, malformed, outside-gold, unconsumed, or undecodable evidence refs cause input-integrity rejection with no formal outputs;
 - every alias-conflict contributor remains in the private audit and counts remain conserved;
-- all set/count equations are exact, zero-valued enum keys are present, and state/reason totals equal `relation_count`;
+- all set/count equations are exact, booleans are rejected as counts, zero-valued enum keys are present, and state/reason totals equal `relation_count`;
 - the current sealed evidence reconstructs 141 anchors, 90 provider-covered groups, 51 provider-missing groups, 90 provider candidates, and 231 total relations without network access;
 - input-integrity and decoder-regression failures write no formal outputs;
 - semantic failures write a schema-valid private audit and privacy-valid public audit, include all failed candidates privately, bind both candidate map and private audit, and write no formal map;
@@ -143,16 +171,19 @@ TDD coverage must prove:
 - successful rebuilds bind both private audit and map, re-read both, and write the public passed audit as the final commit marker;
 - normalized formal-output and publication-lock targets must all be pairwise distinct; existing targets, path aliases, concurrent publication locks, and atomic no-replace races are rejected;
 - interruption before public-audit publication leaves no recognized generation and requires human archival to fresh targets rather than automatic cleanup;
-- map and audit serialization are deterministic and privacy-safe;
+- replacing any input between an attempted hash check and decode cannot change the byte buffers actually used by the builder; gold, evidence, manifest, and each distinct referenced response are opened once after publication-lock acquisition, while unreferenced responses are never opened;
+- map and private-audit serialization are deterministic and canonical, while the public audit is additionally privacy-safe;
 - the CLI and environment expose no predictions, query text, historical-run, validation, `.env`, network, manual-alias, override, or sidecar-bypass input;
 - before reading any field, the Task 4 loader rejects public-audit duplicate keys, extra or missing schema fields, noncanonical public-audit bytes, and public-audit privacy violations;
 - the loader rejects a non-v2 or non-passed audit; missing, malformed, or mismatched dev-gold, identity-evidence, snapshot-manifest, private-audit, or candidate-map hashes; and any raw map-byte change before parsing entries;
-- after hash verification, the loader rejects duplicate JSON keys, extra structure, and hash-synchronized noncanonical JSON, and accepts the exact canonical bytes.
+- after hash verification, the loader rejects duplicate JSON keys, extra structure, and hash-synchronized noncanonical JSON; it rejects any public/private/map combination whose rows, counts, evidence universe, or reconstructed map disagree even when all three hashes were changed together.
 
 After focused tests, run the identifier semantics, capture, rebuild, ledger, and snapshot suites, followed by Ruff and mypy on affected source and scripts.
 
 ## Implementation Boundary
 
-The implementation modifies only the offline rebuild/audit contract, the Task 4 map/audit loader, and their tests. The capture collector, sealed snapshots, private evidence, shared snapshot contract, ledger, semantic classifier, and OpenAlex behavior remain unchanged.
+This amendment implements only the offline rebuild/audit contract, the strict verified-generation loader required by Task 4, and their tests. It may publish one aggregate public audit after the Gate passes. It does not implement or execute the deferred rescore, which remains a separate downstream task and must consume this loader rather than recreating its checks.
+
+The capture collector, sealed snapshots, private evidence, shared snapshot contract, ledger, semantic classifier, historical runs, rescore report model, and OpenAlex behavior remain unchanged.
 
 The amendment relies on `src/paper_search/evaluation/identifier_semantics.py` (`classify_relation`, `arxiv_anchor`, semantic states, and privacy scanner), `src/paper_search/storage/dependency_snapshot.py` (manifest and response verification), and `scripts/rebuild_dev_identifier_map.py` (canonical JSON hashing and atomic output publication).

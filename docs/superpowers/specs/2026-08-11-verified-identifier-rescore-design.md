@@ -58,11 +58,11 @@ The source set and labels are fixed:
 | `legacy_title_2026_08_05` | legacy hash-bound run | `business-results.jsonl` and `executions.jsonl` match `docs/evidence/title-retention-offline-2026-08-09.json`; the row remains explicitly non-formal |
 | `query_evolution_prompt_v2` | sealed probe | the probe lock self-hash, all locked source hashes, snapshot binding, result binding, and `capture_replay_match=matched` pass for `runs/_diag_query_evolution_query-evolution-prompt-v2-full-20260810` |
 
-Source adapters may expose only a common in-memory projection: ordered query IDs, retrieved IDs, post-filter IDs, selected Top-50 IDs, predictions, immutable binding hashes, and a source-status enum. Query sets must equal the v2 gold query set exactly; duplicate or unknown query IDs fail the source.
+Source adapters expose one common in-memory projection containing ordered query IDs; raw, normalized-but-unresolved retrieved, post-filter, and selected Top-50 IDs; immutable safe binding hashes; and a closed source-status enum. Predictions are derived only from the stored selected Top-50 sequence and are not stored separately. Adapters receive the expected v2 gold query-ID sequence and reject duplicate, unknown, missing, or out-of-order query IDs. The source-neutral scorer owns identifier resolution, resolved subset checks, and cross-source denominator equality.
 
 For formal and legacy runs, `business-results.jsonl.selected_paper_ids`, `executions.jsonl.post_filter_paper_ids`, and `executions.jsonl.retrieved_paper_ids` are the three stage sets. The invariant `selected <= post_filter <= retrieved` must hold after identifier resolution.
 
-For the probe, the frozen baseline is reconstructed from its locked source and additions are reconstructed from sealed outcomes/snapshots through the existing query-evolution projection helpers. Baseline post-filter membership comes from the hash-bound source execution; accepted additions come from the same hard-filter projection used to produce the probe Top-50. The merged projection must satisfy the same subset invariant. The rescore must not infer missing papers from titles or issue replacement searches.
+For the probe, the frozen baseline is reconstructed from its locked source and additions are reconstructed from sealed outcomes/snapshots through the existing query-evolution projection helpers. `QueryProjection` exposes the ordered `post_filter_ids` produced by that same hard-filter pass; the probe post-filter set is the stable union of hash-bound baseline execution post-filter IDs and these projected IDs. This preserves accepted additions that did not reach Top-50 without re-running or inferring a filter result. The scorer then resolves the merged projection and enforces the same subset invariant. The rescore must not infer missing papers from titles or issue replacement searches.
 
 ## Canonical Association Denominator
 
@@ -135,7 +135,7 @@ The designated source is `formal_baseline_2026_08_10`. Its three loss buckets ar
 - A unique largest loss bucket becomes `primary_loss_stage`; otherwise it is `null`.
 - `reason_codes` is a sorted list using the fixed order `largest_loss_tie`, then `source_sensitivity`. A designated-source tie produces exactly `['largest_loss_tie']`; no cross-source sensitivity check is made in that case.
 - If the designated source has a unique primary stage, each other source independently derives a stage by the same unique-maximum rule. Any unique different stage adds `source_sensitivity`; tied comparison rows are ignored. A unique, consistent result has an empty reason list.
-- `next_direction` is `retrieval_query`, `retention_filter`, or `ranking_selector` only when the designated stage is unique and `source_sensitivity` is absent. Otherwise it is `null` and method selection requires human review.
+- `next_direction` is `retrieval_query`, `retention_filter`, or `ranking_selector` only when the designated stage is unique and `source_sensitivity` is absent. Otherwise it is `null`: Task 4 stops and cannot select a method automatically. A human may authorize a separately reviewed follow-up diagnostic or single-variable experiment, but that authorization is not implied by this report.
 - `selected_top50` is never a loss-stage recommendation.
 
 The resulting next direction is limited to one of:
@@ -166,9 +166,9 @@ Do not respond to a stop by rebuilding a candidate lock, refreshing readiness, r
 ## Module Boundaries
 
 - `src/paper_search/evaluation/identifier_semantics.py` continues to own the verified-generation loader and identifier relation contract.
-- A new focused evaluation module owns the common rescore model, source-neutral association classification, metric assembly, conservation checks, and decision rule.
+- A new focused evaluation module owns the common rescore model, source-neutral association classification, identifier resolution, metric assembly, conservation checks, and decision rule.
 - `src/paper_search/evaluation/gates.py` exposes its existing rule comparator through a public helper; its comparison behavior and formal Gate contract do not change.
-- A thin script owns fixed local path selection, source-adapter orchestration, privacy validation, and no-replace publication.
+- A thin `scripts` module owns fixed local path selection, source-adapter orchestration, privacy validation, and no-replace publication. It is invoked with `python -m scripts.rescore_identifier_semantics` so the sealed-probe wrappers can be imported consistently by both tests and the CLI.
 - Existing formal-run validation, metric, ranking, query-evolution projection, and privacy helpers are reused rather than copied.
 - `scripts/analyze_gold_bottlenecks.py` remains a historical availability diagnostic. Task 4 does not refactor it or use its old independently loaded identifier map.
 
@@ -180,6 +180,6 @@ Implementation follows TDD with only the tests needed to prove the contract:
 2. **Funnel correctness:** alias collapse, within-query deduplication, stage precedence, subset rejection, one-stage conservation, and equal denominators across all sources.
 3. **Metric and Gate identity:** predictions use the exact selected sequence; reported measures equal `evaluate()` and `evaluate_ranking()`; the three formal metric-quality checks use the existing policy comparator without a ledger; the designated formal source has exactly 12 pre-alias direct same-arXiv hits while v2 may yield more total true positives.
 4. **Decision behavior:** unique retrieval, retention, and ranking maxima; tie; source sensitivity; no recommendation from `selected_top50`.
-5. **Publication safety:** closed aggregate schema, deterministic JSON/Markdown agreement, privacy rejection, existing-target rejection, JSON-preserving Markdown recovery, and no network, ledger, lock, readiness, or capture path.
+5. **Publication safety:** closed aggregate schema, deterministic JSON/Markdown agreement, privacy rejection through `assert_public_json_safe()` and `assert_public_markdown_safe()`, existing-target rejection, JSON-preserving Markdown recovery, and an orchestration test that blocks network, `.env`, and ledger entry points.
 
 After focused tests, run the affected evaluation/script tests, offline project suite, Ruff, mypy, and `git diff --check`. Execute the real four-source rescore once only after all checks pass. A successful rescore ends Task 4; choosing or implementing a reference method is a separate reviewed task.

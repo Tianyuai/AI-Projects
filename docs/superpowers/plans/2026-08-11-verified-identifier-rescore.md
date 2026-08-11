@@ -6,7 +6,7 @@
 
 **Architecture:** Put source-neutral scoring, conservation, metric-quality checks, and the decision rule in one new evaluation module. Keep sealed-source loading and no-replace publication in one fixed-path script, reusing existing formal validation, probe projection, policy, metric, ranking, and privacy contracts.
 
-**Tech Stack:** Python 3.12, Pydantic v2, pytest, Ruff, mypy, canonical JSON, existing Paper Search evaluation contracts.
+**Tech Stack:** Python 3.11, Pydantic v2, pytest, Ruff, mypy, canonical JSON, existing Paper Search evaluation contracts.
 
 ## Global Constraints
 
@@ -32,7 +32,7 @@
 
 **Interfaces:**
 - `compare_quality_gate_rule(rule: QualityGateRule, value: Decimal) -> bool`
-- `score_source(gold, identifier_map, source, *, policy) -> SemanticRescoreRun`
+- `score_source(gold: Sequence[EvaluationQuery], identifier_map: IdentifierMap, source: SourceProjection, *, policy: QualityGatePolicy) -> SemanticRescoreRun`
 - `decide_bottleneck(runs: Sequence[SemanticRescoreRun]) -> RescoreDecision`
 - `build_rescore_report(*, gold, identifier_map, sources, policy, generation_hashes, quality_policy_sha256) -> SemanticRescoreReport`
 
@@ -90,7 +90,7 @@ Rename the existing private `_compare()` to `compare_quality_gate_rule()` and up
 
 In `semantic_rescore.py`, define these closed `DomainModel` types exactly:
 
-- `SourceProjection`: fixed label/kind/status, capture-replay status, safe binding hashes, ordered query IDs, and retrieved/post-filter/selected sequences by query.
+- `SourceProjection`: fixed label/kind/status, capture-replay status, safe binding hashes, ordered query IDs, and raw normalized-but-unresolved retrieved/post-filter/selected sequences by query. Predictions are derived from selected IDs; resolved sets exist only while scoring.
 - `PipelineStageCounts`: total plus `not_retrieved`, `filtered_out`, `ranked_outside_top50`, `selected_top50`.
 - `MetricQualityCheck`: rule identity, exact measure numerator/denominator/value, operator, threshold, and pass status.
 - `SemanticRescoreRun`: source metadata, TP, macro F1/recall, micro recall, macro MRR/NDCG, direct-hit count, funnel, and quality checks.
@@ -101,8 +101,8 @@ In `semantic_rescore.py`, define these closed `DomainModel` types exactly:
 Implementation rules:
 
 1. Build predictions from the exact selected sequence and call existing `evaluate()` and `evaluate_ranking()`.
-2. Build the direct set from raw normalized arXiv gold IDs and test exact DataCite-anchor membership before alias resolution.
-3. Assign stages with precedence selected, post-filter, retrieved, absent.
+2. Build the direct set from raw normalized arXiv gold IDs and test exact DataCite-anchor membership in raw selected IDs before alias resolution.
+3. Resolve every stage sequence with the passed map, reject resolved subset violations, then assign stages with precedence selected, post-filter, retrieved, absent.
 4. For formal rows, select exactly one applicable policy rule for each required measure and call `compare_quality_gate_rule()`; legacy/probe rows have no metric-quality checks.
 5. A designated tie yields `primary_loss_stage=null`, `next_direction=null`, `['largest_loss_tie']`. A unique designated stage contradicted by another unique stage yields `next_direction=null`, `['source_sensitivity']`. Otherwise return the mapped single direction and no reason code.
 
@@ -129,10 +129,10 @@ Expected: selected tests pass and only Task 1 files are committed.
 - Create: `tests/scripts/test_rescore_identifier_semantics.py`
 
 **Interfaces:**
-- `load_formal_source(label: SourceLabel, run_dir: Path) -> SourceProjection`
-- `load_legacy_source(run_dir: Path, evidence_path: Path) -> SourceProjection`
-- `load_probe_source(run_dir: Path) -> SourceProjection`
-- `load_fixed_sources(root: Path = ROOT) -> tuple[SourceProjection, ...]`
+- `load_formal_source(label: SourceLabel, run_dir: Path, expected_query_ids: tuple[str, ...]) -> SourceProjection`
+- `load_legacy_source(run_dir: Path, evidence_path: Path, expected_query_ids: tuple[str, ...]) -> SourceProjection`
+- `load_probe_source(run_dir: Path, expected_query_ids: tuple[str, ...]) -> SourceProjection`
+- `load_fixed_sources(expected_query_ids: tuple[str, ...], root: Path = ROOT) -> tuple[SourceProjection, ...]`
 
 - [ ] **Step 1: Write RED source-binding tests**
 
@@ -145,6 +145,8 @@ Tests must prove:
 - error-bearing probe search outcomes, unknown/duplicate queries, and subset violations are rejected;
 - the orchestrator returns exactly the four fixed labels in order.
 
+The adapter tests validate raw source structure and query coverage. Resolved subset and denominator checks remain Task 1 scorer tests, using the passed v2 map.
+
 Run:
 
 ```powershell
@@ -155,7 +157,7 @@ Expected: RED because the public helper names and rescore script are absent.
 
 - [ ] **Step 2: Expose only the existing probe helpers needed offline**
 
-Make these mechanical renames and update their existing call sites:
+Add thin public wrappers around the existing helpers and leave existing private call sites unchanged:
 
 | File | Existing | Public name |
 |---|---|---|
@@ -164,7 +166,7 @@ Make these mechanical renames and update their existing call sites:
 | `scripts/probe_query_evolution.py` | `_frozen_inputs` | `frozen_probe_inputs` |
 | `scripts/probe_query_evolution.py` | `_capture_replay_hash` | `probe_outcome_hash` |
 
-Add `offline_provider_result` to the evaluation module's `__all__`. Do not alter live capture, retry, budget, or existing Gate behavior.
+Add `offline_provider_result` to the evaluation module's `__all__`. Import script wrappers through `scripts.probe_query_evolution` and invoke the new CLI as a module; do not alter live capture, retry, budget, or existing Gate behavior.
 
 - [ ] **Step 3: Implement the three strict adapters**
 
@@ -179,30 +181,36 @@ The probe adapter:
 3. Instantiates `DependencySnapshotReader` with the result's manifest hash and set ID, then reads every manifest entry to verify every response hash.
 4. Recomputes `probe_outcome_hash()` from exact ordered outcomes.
 5. Converts error-free sealed search data to `Paper` and `offline_provider_result()`, then uses `reconstruct_frozen_baseline()` and `merge_probe_results()`.
-6. Uses merged retrieved/Top-50 IDs and the union of bound baseline post-filter IDs with accepted additions.
+6. Uses merged retrieved/Top-50 IDs and `QueryProjection.post_filter_ids`, which is produced by the same hard-filter pass. Build post-filter IDs as a stable union of bound baseline execution post-filter IDs and the projection's ordered `post_filter_ids`.
 
 The probe row binds the copied lock, result, outcomes, probe snapshot manifest, and all lock-declared source hashes. Every adapter requires the exact gold query set and records only aggregate-safe hash keys in `SourceProjection.binding_hashes`.
 
 Add the fixed orchestrator:
 
 ```python
-def load_fixed_sources(root: Path = ROOT) -> tuple[SourceProjection, ...]:
+def load_fixed_sources(
+    expected_query_ids: tuple[str, ...], root: Path = ROOT
+) -> tuple[SourceProjection, ...]:
     return (
         load_formal_source(
             "formal_baseline_2026_08_10",
             root / "runs/dev-20260810T104256Z-d9e89476d484",
+            expected_query_ids,
         ),
         load_formal_source(
             "formal_baseline_2026_08_09",
             root / "runs/dev-20260809T061903Z-9bd861e90299",
+            expected_query_ids,
         ),
         load_legacy_source(
             root / "runs/dev-20260805T035209Z-7af4b103f6cc",
             root / "docs/evidence/title-retention-offline-2026-08-09.json",
+            expected_query_ids,
         ),
         load_probe_source(
             root
-            / "runs/_diag_query_evolution_query-evolution-prompt-v2-full-20260810"
+            / "runs/_diag_query_evolution_query-evolution-prompt-v2-full-20260810",
+            expected_query_ids,
         ),
     )
 ```
@@ -231,11 +239,11 @@ Expected: selected tests pass without network or ledger access.
 - `render_markdown(report: SemanticRescoreReport) -> str`
 - `publish_report(report, *, json_path, markdown_path) -> None`
 - `render_markdown_from_json(json_path, markdown_path) -> None`
-- CLI commands: `run`, `render-markdown`; no additional arguments.
+- CLI commands: `run`, `render-markdown`; no additional arguments; invoke as `python -m scripts.rescore_identifier_semantics`.
 
 - [ ] **Step 1: Write RED orchestration and publication tests**
 
-Tests must prove strict generation failure stops before source loading; the parser exposes no path/network/env/ledger flags; the report is canonical and privacy-safe; existing targets are never overwritten; JSON is written as formal evidence; and `render-markdown` validates canonical existing JSON and creates only a missing Markdown companion.
+Tests must prove strict generation failure stops before source loading; the parser exposes no path/network/env/ledger flags; network, `.env`, and ledger entry points raise if called during `build_fixed_report()`; the report is canonical and privacy-safe through `assert_public_json_safe()` and `assert_public_markdown_safe()`; existing targets are never overwritten; JSON is written as formal evidence; and `render-markdown` validates canonical existing JSON and creates only a missing Markdown companion.
 
 ```python
 def test_generation_failure_stops_before_sources(
@@ -275,7 +283,7 @@ OUT_JSON = ROOT / "docs/evidence/identifier-map-semantic-rescore-2026-08-11.json
 OUT_MARKDOWN = ROOT / "docs/identifier-map-semantic-rescore-2026-08-11.md"
 ```
 
-`build_fixed_report()` must call the strict generation loader before `load_fixed_sources()`, parse the raw quality-policy bytes with the existing policy parser, bind the raw hashes for all six generation artifacts and the policy, call `build_rescore_report()`, and require designated direct hits equal 12 before returning.
+`build_fixed_report()` must call the strict generation loader before `load_fixed_sources()`, derive `expected_query_ids` from the same loaded gold rows, parse the raw quality-policy bytes with the existing policy parser, bind the raw hashes for all six generation artifacts and the policy, call `build_rescore_report()`, and require designated direct hits equal 12 before returning.
 
 - [ ] **Step 3: Implement deterministic privacy-safe publication**
 
@@ -283,9 +291,9 @@ OUT_MARKDOWN = ROOT / "docs/identifier-map-semantic-rescore-2026-08-11.md"
 - Markdown: deterministic rendering from the validated report model only; summarize source status, metrics, funnel, and decision.
 - Run both existing public privacy scanners before writing.
 - Use the existing no-replace hard-link pattern: fsync a sibling temporary file, hard-link it to the absent target, then remove the temporary file.
-- `run` refuses either existing target, writes formal JSON, then derived Markdown.
+  - `run` refuses either existing target, writes formal JSON, then derived Markdown.
 - `render-markdown` requires canonical privacy-valid formal JSON and an absent Markdown target; it never reruns sources or overwrites either file.
-- Catch only expected `OSError`/`ValueError`, print the safe fixed error, and return exit code 3; success returns 0.
+  - Catch only expected `OSError`/`ValueError`, print the safe fixed error, and return exit code 3; success returns 0.
 
 - [ ] **Step 4: Run GREEN and commit**
 
@@ -313,10 +321,10 @@ Expected: all selected tests pass; no formal report has been executed yet.
 
 ```powershell
 & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest tests/evaluation/test_gates.py tests/evaluation/test_semantic_rescore.py tests/evaluation/test_query_evolution_probe.py tests/integration/test_query_evolution_probe.py tests/scripts/test_rescore_identifier_semantics.py -q
-& 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest -m "not online" -q
+  & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest -m "not online" -q
 & 'D:\AI Projects\Projects\.venv\Scripts\ruff.exe' check src scripts tests
 & 'D:\AI Projects\Projects\.venv\Scripts\mypy.exe' src scripts
-git diff --check
+  git diff --check -- src/paper_search/evaluation/gates.py src/paper_search/evaluation/semantic_rescore.py src/paper_search/evaluation/query_evolution_probe.py scripts/probe_query_evolution.py scripts/rescore_identifier_semantics.py tests/evaluation/test_gates.py tests/evaluation/test_semantic_rescore.py tests/evaluation/test_query_evolution_probe.py tests/integration/test_query_evolution_probe.py tests/scripts/test_rescore_identifier_semantics.py
 ```
 
 Expected: every command exits 0. Stop before execution on the first failure.
@@ -326,10 +334,10 @@ Expected: every command exits 0. Stop before execution on the first failure.
 Require both output targets to be absent, then run:
 
 ```powershell
-& 'D:\AI Projects\Projects\.venv\Scripts\python.exe' scripts/rescore_identifier_semantics.py run
+  & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m scripts.rescore_identifier_semantics run
 ```
 
-Expected: exit 0 without network, ledger, readiness, capture, replay, or historical-source mutation.
+Expected: exit 0 without network, ledger, readiness, capture, replay, or historical-source mutation. If it returns 3 and canonical JSON exists while Markdown is absent, run `& 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m scripts.rescore_identifier_semantics render-markdown`, then continue with Step 3. Every other nonzero result stops for investigation and does not permit a second rescore.
 
 - [ ] **Step 3: Validate result and decision boundary**
 
@@ -358,11 +366,11 @@ print(report["decision"])
 
 If `next_direction` is null, stop for human review. Do not select a reference method automatically.
 
-- [ ] **Step 4: Reverify and commit only aggregate evidence**
+- [ ] **Step 4: Validate published evidence and commit only aggregate evidence**
 
 ```powershell
-& 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest tests/evaluation/test_semantic_rescore.py tests/scripts/test_rescore_identifier_semantics.py -q
-git diff --check
+  & 'D:\AI Projects\Projects\.venv\Scripts\python.exe' -m pytest tests/scripts/test_rescore_identifier_semantics.py -q
+  git diff --check -- docs/evidence/identifier-map-semantic-rescore-2026-08-11.json docs/identifier-map-semantic-rescore-2026-08-11.md
 git add docs/evidence/identifier-map-semantic-rescore-2026-08-11.json docs/identifier-map-semantic-rescore-2026-08-11.md
 git commit -m "docs: record verified identifier rescore"
 ```
@@ -371,4 +379,4 @@ Do not stage `HANDOFF.md`, `docs/retrieval-roadmap.md`, `data/budget_ledger.sqli
 
 ## Stop Boundary
 
-This plan ends after the offline report. A later reviewed task may select one reference-paper method only when the diagnosis has a non-null, non-sensitive direction, and may run one single-variable offline comparison. Production changes or live capture require a separate design and authorization.
+This plan ends after the offline report. A non-null, non-sensitive direction permits the next reviewed task to select one matching reference-paper method and run one single-variable offline comparison. A null direction permits no automatic selection: human review may authorize a separately designed follow-up diagnostic or experiment. Production changes or live capture require a separate design and authorization.

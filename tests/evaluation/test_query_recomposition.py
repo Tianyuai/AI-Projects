@@ -458,6 +458,31 @@ def test_report_rejects_noncanonical_integrity_failure_shape() -> None:
         SealedQueryRecompositionReport.model_validate(payload)
 
 
+def test_report_rejects_canonical_integrity_rows_relabelled_non_integrity() -> None:
+    projections = _projections_for_selected_counts(
+        {
+            "append_v2": 19,
+            "round_robin_slots": 29,
+            "rrf_slots_k60": 30,
+        }
+    )
+    projections["rrf_slots_k60"] = {}
+    report = build_report(
+        gold=_gold(),
+        identifier_map=IdentifierMap.from_bytes(b"{}"),
+        projections=projections,
+        input_hashes={"gold": "sha256:" + "1" * 64},
+        current_formal_selected=17,
+        legacy_title_selected=30,
+    )
+    payload = report.model_dump(mode="json")
+    payload["conclusion"] = "no_usable_recomposition_signal"
+    payload["reason_codes"] = ["no_variant_passed_signal_gate"]
+
+    with pytest.raises(ValueError, match="require integrity_failure conclusion"):
+        SealedQueryRecompositionReport.model_validate(payload)
+
+
 def test_report_usable_signal_gate_does_not_include_micro_recall() -> None:
     payload = _legacy_met_report_payload()
     rows = payload["rows"]

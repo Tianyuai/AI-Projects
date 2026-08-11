@@ -193,6 +193,16 @@ class SealedQueryRecompositionReport(DomainModel):
                     "integrity_failure rows must use canonical aggregate failure shape"
                 )
             return self
+        if any(
+            not row.retrieved_streams_unchanged
+            or not row.post_filter_streams_unchanged
+            or _is_canonical_integrity_row(row)
+            for row in self.rows
+        ):
+            raise ValueError(
+                "failed stream invariants or canonical failure rows require "
+                "integrity_failure conclusion"
+            )
         append = self.rows[0]
         if any(
             row.usable_signal != _row_has_usable_signal(row, append)

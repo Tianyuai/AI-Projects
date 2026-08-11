@@ -718,6 +718,50 @@ def test_render_markdown_rejects_canonical_semantically_inconsistent_json(
     assert not markdown_path.exists()
 
 
+def test_render_markdown_rejects_canonical_integrity_rows_relabelled_non_integrity(
+    tmp_path: Path,
+) -> None:
+    json_path = tmp_path / "report.json"
+    markdown_path = tmp_path / "report.md"
+    payload = _recomposition_report().model_dump(mode="json")
+    payload["conclusion"] = "no_usable_recomposition_signal"
+    payload["reason_codes"] = ["no_variant_passed_signal_gate"]
+    for row in payload["rows"]:
+        row.update(
+            {
+                "true_positive_count": 0,
+                "not_retrieved": row["total_gold_associations"],
+                "filtered_out": 0,
+                "ranked_outside_top50": 0,
+                "selected_top50": 0,
+                "macro_f1": 0.0,
+                "macro_recall": 0.0,
+                "micro_recall": 0.0,
+                "mrr": 0.0,
+                "ndcg": 0.0,
+                "retains_append_selected_gold": False,
+                "retrieved_streams_unchanged": False,
+                "post_filter_streams_unchanged": False,
+                "usable_signal": False,
+            }
+        )
+    json_path.write_bytes(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+    with pytest.raises(ValueError, match="formal JSON is invalid"):
+        analyze.render_markdown_from_json(json_path, markdown_path)
+
+    assert not markdown_path.exists()
+
+
 def test_main_safe_exception_boundary(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:

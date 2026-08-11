@@ -14,9 +14,10 @@ from pathlib import Path
 from typing import Annotated, Literal, TypeAlias
 
 import yaml
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from paper_search.domain.models import DomainModel, NonEmptyStr, SafeRelativePath, Sha256
+from paper_search.recall_experiments.contracts import SeedCandidate
 from paper_search.recall_experiments.contracts import ActionType, GoldVisibility
 
 
@@ -139,6 +140,25 @@ class ArtifactBinding(DomainModel):
     sha256: Sha256
 
 
+class HistoricalBaselineBinding(DomainModel):
+    """Hash-bound records used only for an approved historical comparison."""
+
+    query_ids: list[NonEmptyStr] = Field(min_length=1)
+    gold_associations: ArtifactBinding
+    business_results: ArtifactBinding
+    executions: ArtifactBinding
+
+
+class FormalRunInputBinding(DomainModel):
+    """Replaceable, offline formal-run inputs for a query sample."""
+
+    gold_associations: ArtifactBinding
+    identifier_map: ArtifactBinding
+    bound_paper_sources: list[ArtifactBinding] = Field(default_factory=list)
+    seed_candidates: list[SeedCandidate] = Field(default_factory=list)
+    historical_baseline: HistoricalBaselineBinding | None = None
+
+
 class SampleBinding(DomainModel):
     """Recipe-independent declarative binding for a frozen query sample.
 
@@ -153,6 +173,14 @@ class SampleBinding(DomainModel):
     gold_ids: list[NonEmptyStr] = Field(default_factory=list)
     seed_canonical_ids: list[NonEmptyStr] = Field(default_factory=list)
     legacy_candidate_pool_policy: Literal["canonical-id-first-v1"] | None = None
+    frozen_inputs: FormalRunInputBinding | None = None
+
+    @field_validator("query_ids")
+    @classmethod
+    def validate_unique_query_ids(cls, values: list[str]) -> list[str]:
+        if len(values) != len(set(values)):
+            raise ValueError("query_ids must be unique")
+        return values
 
 
 class LoadedRecallRecipe(DomainModel):

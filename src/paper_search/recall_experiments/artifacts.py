@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+from hashlib import sha256
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
@@ -19,6 +20,10 @@ from paper_search.recall_experiments.generation.base import GenerationResult
 AttemptStatus = Literal["running", "succeeded", "failed"]
 _SENSITIVE_KEY = re.compile(r"authorization|api[_-]?key|token|secret|password", re.IGNORECASE)
 _AUTHORIZATION_VALUE = re.compile(r"(?:authorization\s*:\s*|bearer\s+)\S+", re.IGNORECASE)
+_SENSITIVE_VALUE = re.compile(
+    r"(?:x-api-key|api[_-]?key|token|secret|password)\s*[:=]\s*[^\s;,]+",
+    re.IGNORECASE,
+)
 
 
 class ArtifactAttemptMetadata(DomainModel):
@@ -79,7 +84,12 @@ class RecallArtifactWriter:
         if isinstance(generation, GenerationResult):
             if generation.query_id != query_id:
                 raise ValueError("generation result query ID does not match artifact query ID")
-            payload: Mapping[str, object] = generation.action_batch.model_dump(mode="json")
+            source = generation.artifact_bytes.decode("utf-8")
+            payload: Mapping[str, object] = {
+                **generation.action_batch.model_dump(mode="json"),
+                "immutable_action_batch_utf8": source,
+                "immutable_action_batch_sha256": "sha256:" + sha256(generation.artifact_bytes).hexdigest(),
+            }
         else:
             payload = generation
         return self._write_attempt_json(
@@ -130,8 +140,8 @@ class RecallArtifactWriter:
         attempt_status: AttemptStatus,
         valid_repeat_ordinal: int | None,
     ) -> Path:
-        if not attempt_id or not query_id:
-            raise ValueError("attempt and query IDs must not be empty")
+        _safe_component(attempt_id, "attempt ID")
+        _safe_component(query_id, "query ID")
         metadata = ArtifactAttemptMetadata(
             attempt_id=attempt_id,
             attempt_status=attempt_status,
@@ -189,9 +199,16 @@ def _sanitize(value: object) -> object:
         return [_sanitize(item) for item in value]
     if isinstance(value, tuple):
         return [_sanitize(item) for item in value]
-    if isinstance(value, str) and _AUTHORIZATION_VALUE.search(value):
+    if isinstance(value, str) and (
+        _AUTHORIZATION_VALUE.search(value) or _SENSITIVE_VALUE.search(value)
+    ):
         return "[REDACTED]"
     return value
+
+
+def _safe_component(value: str, label: str) -> None:
+    if not value or value in {".", ".."} or "/" in value or "\\" in value:
+        raise ValueError(f"{label} must be a single path component")
 
 
 __all__ = ["ArtifactAttemptMetadata", "AttemptStatus", "RecallArtifactWriter"]

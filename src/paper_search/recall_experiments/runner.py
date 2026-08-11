@@ -189,7 +189,7 @@ class RecallExperimentRunner:
                 attempt_id,
                 context.query_id,
                 generation,
-                attempt_status="running",
+                attempt_status="succeeded",
                 valid_repeat_ordinal=None,
             )
 
@@ -214,7 +214,7 @@ class RecallExperimentRunner:
                 attempt_id,
                 context.query_id,
                 {"results": [_payload(result) for result in action_results]},
-                attempt_status="failed" if infrastructure_failure else "running",
+                attempt_status="failed" if infrastructure_failure else "succeeded",
                 valid_repeat_ordinal=None,
                 errors=[_payload(error) for result in action_results for error in result.errors],
             )
@@ -230,7 +230,7 @@ class RecallExperimentRunner:
                 attempt_id,
                 context.query_id,
                 _payload(pool),
-                attempt_status="running",
+                attempt_status="succeeded",
                 valid_repeat_ordinal=valid_repeat_ordinal,
             )
             pools.append(pool)

@@ -5,6 +5,8 @@ import json
 import pytest
 
 from paper_search.recall_experiments.artifacts import RecallArtifactWriter
+from paper_search.recall_experiments.contracts import RecallActionBatch
+from paper_search.recall_experiments.generation.base import GenerationResult
 
 
 def test_writer_creates_an_immutable_canonical_run_layout(tmp_path) -> None:
@@ -64,3 +66,43 @@ def test_writer_creates_an_immutable_canonical_run_layout(tmp_path) -> None:
         )
     with pytest.raises(FileExistsError):
         writer.start_run("run-01", recipe_lock={}, sample_manifest={})
+
+
+def test_writer_preserves_fixed_source_bytes_and_rejects_unsafe_paths_and_secrets(tmp_path) -> None:
+    writer = RecallArtifactWriter(tmp_path)
+    writer.start_run("run-01", recipe_lock={}, sample_manifest={})
+    raw_batch = b'{\n  "actions": []\n}'
+    generation = GenerationResult(
+        query_id="query-1",
+        action_batch=RecallActionBatch(actions=[]),
+        artifact_bytes=raw_batch,
+    )
+
+    generation_path = writer.write_generation(
+        "attempt-01",
+        "query-1",
+        generation,
+        attempt_status="succeeded",
+        valid_repeat_ordinal=1,
+    )
+    payload = json.loads(generation_path.read_text(encoding="utf-8"))
+    assert payload["immutable_action_batch_utf8"].encode("utf-8") == raw_batch
+
+    with pytest.raises(ValueError, match="path component"):
+        writer.write_generation(
+            "../../attempt-01",
+            "query-2",
+            {"actions": []},
+            attempt_status="succeeded",
+            valid_repeat_ordinal=1,
+        )
+    retrieval = writer.write_retrieval(
+        "attempt-01",
+        "query-2",
+        {"results": []},
+        attempt_status="failed",
+        valid_repeat_ordinal=None,
+        errors=[{"message": "request failed: x-api-key: top-secret; token=abc123"}],
+    )
+    assert "top-secret" not in retrieval.read_text(encoding="utf-8")
+    assert "abc123" not in retrieval.read_text(encoding="utf-8")

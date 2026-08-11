@@ -192,3 +192,36 @@ def test_unknown_handler_fails_before_a_retrieval_artifact_is_written() -> None:
         asyncio.run(runner.run(_request()))
 
     assert writer.retrieval_writes == 0
+
+
+def test_runner_writes_completed_phase_statuses_instead_of_permanent_running_statuses() -> None:
+    events: list[str] = []
+
+    class RecordingWriter(_Writer):
+        def __init__(self, captured_events: list[str]) -> None:
+            super().__init__(captured_events)
+            self.statuses: list[str] = []
+
+        def write_generation(self, *args: object, **kwargs: object) -> None:
+            self.statuses.append(str(kwargs["attempt_status"]))
+
+        def write_retrieval(self, *args: object, **kwargs: object) -> None:
+            self.statuses.append(str(kwargs["attempt_status"]))
+
+        def write_candidate_pool(self, *args: object, **kwargs: object) -> None:
+            self.statuses.append(str(kwargs["attempt_status"]))
+
+    writer = RecordingWriter(events)
+    runner = RecallExperimentRunner(
+        input_source=_InputSource(events),
+        generator=_Generator(events),
+        registry=_Registry(events, _Handler()),
+        pool_builder=_PoolBuilder(events),
+        stages=_Stages(events),
+        evaluator=_Evaluator(events, _context()),
+        writer=writer,
+    )
+
+    asyncio.run(runner.run(_request()))
+
+    assert writer.statuses == ["succeeded", "succeeded", "succeeded"]

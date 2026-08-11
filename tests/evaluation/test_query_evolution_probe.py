@@ -16,6 +16,7 @@ from paper_search.evaluation.query_evolution_probe import (
     calculate_production_estimates,
     FrozenProbeInputs,
     FrozenQueryRecord,
+    offline_provider_result,
     ProbeIntegrity,
     evaluate_probe,
     merge_probe_results,
@@ -152,6 +153,52 @@ def test_merge_preserves_baseline_then_search_1_then_search_2_and_first_id() -> 
         "openalex:W4",
     )
     assert projection.by_query["q-1"].fusion_sources == ("openalex",)
+
+
+def test_offline_provider_result_is_public_and_preserves_order() -> None:
+    papers = [_paper("openalex:W2"), _paper("openalex:W1")]
+
+    result = offline_provider_result(papers)
+
+    assert result.data == papers
+    assert result.provenance["provider"] == "offline"
+    assert result.errors == []
+
+
+def test_projection_exposes_ordered_post_filter_ids_from_the_hard_filter_pass() -> None:
+    spec = QuerySpec(
+        original_query="q-1",
+        research_goal="find papers",
+        year_from=2020,
+    )
+    baseline = FrozenProbeInputs(
+        queries=[
+            FrozenQueryRecord(
+                query_id="q-1",
+                query_spec=spec,
+                baseline_results=[
+                    _result(
+                        [
+                            _paper("openalex:W1", year=2022),
+                            _paper("openalex:W2", year=2019),
+                            _paper("openalex:W3", year=2023),
+                        ]
+                    )
+                ],
+                retrieved_paper_ids=["openalex:W1", "openalex:W2", "openalex:W3"],
+                source_index=0,
+            )
+        ],
+        source_run_id="dev-run",
+        source_hashes={"business_results_sha256": "sha256:" + "2" * 64},
+    )
+
+    projection = merge_probe_results(reconstruct_frozen_baseline(baseline, None), {})
+
+    assert projection.by_query["q-1"].post_filter_ids == (
+        "openalex:W1",
+        "openalex:W3",
+    )
 
 
 def test_evaluation_computes_14_8_baseline_and_gate_boundaries() -> None:

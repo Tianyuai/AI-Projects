@@ -679,6 +679,13 @@ def _frozen_inputs(lock: ProbeLock) -> tuple[FrozenProbeInputs, dict[str, dict[s
     )
 
 
+def frozen_probe_inputs(
+    lock: ProbeLock,
+) -> tuple[FrozenProbeInputs, dict[str, dict[str, object]]]:
+    """Expose the existing frozen-input loader for sealed offline adapters."""
+    return _frozen_inputs(lock)
+
+
 def build_probe_context(
     query_id: str,
     raw_record: Mapping[str, object],
@@ -755,6 +762,11 @@ def _verify_probe_source_bindings(lock: ProbeLock) -> Path:
         if _sha256_file(path) != expected:
             raise ValueError(f"frozen {label} hash mismatch")
     return run_dir
+
+
+def verify_probe_source_bindings(lock: ProbeLock) -> Path:
+    """Expose the existing fixed source-binding verifier."""
+    return _verify_probe_source_bindings(lock)
 
 
 def _load_canary_raw_records(lock: ProbeLock) -> dict[str, dict[str, object]]:
@@ -1362,6 +1374,14 @@ def _capture_replay_hash(lock: ProbeLock, outcomes: Mapping[str, Mapping[str, ob
             }
         )
     )
+
+
+def probe_outcome_hash(
+    lock: ProbeLock,
+    outcomes: Mapping[str, Mapping[str, object]],
+) -> str:
+    """Expose the existing ordered capture/replay outcome hash."""
+    return _capture_replay_hash(lock, outcomes)
 
 
 def _probe_integrity(

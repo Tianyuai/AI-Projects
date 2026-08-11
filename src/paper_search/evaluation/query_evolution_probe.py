@@ -107,6 +107,7 @@ class FrozenProbeBaseline(DomainModel):
 class QueryProjection(DomainModel):
     candidate_papers: list[Paper]
     retrieved_ids: list[str]
+    post_filter_ids: tuple[str, ...]
     top50_ids: list[str]
     fusion_sources: tuple[str, ...]
     hard_filter_rejections: int = Field(strict=True, ge=0)
@@ -246,6 +247,11 @@ def _offline_provider_result(papers: Sequence[Paper]) -> ProviderResult[list[Pap
     )
 
 
+def offline_provider_result(papers: Sequence[Paper]) -> ProviderResult[list[Paper]]:
+    """Expose the existing deterministic offline result adapter."""
+    return _offline_provider_result(papers)
+
+
 def _project_query(
     spec: QuerySpec,
     baseline_results: Sequence[ProviderResult[list[Paper]]],
@@ -261,7 +267,8 @@ def _project_query(
                 seen.add(paper.canonical_id)
                 ordered.append(paper)
     filtered = apply_hard_filters(ordered, spec)
-    accepted = {item.paper.canonical_id for item in filtered.accepted}
+    post_filter_ids = tuple(item.paper.canonical_id for item in filtered.accepted)
+    accepted = set(post_filter_ids)
     fused = fuse_provider_results({"openalex": _offline_provider_result(ordered)}, method="rrf")
     retrieved: list[str] = []
     seen_retrieved: set[str] = set()
@@ -280,6 +287,7 @@ def _project_query(
     return QueryProjection(
         candidate_papers=ordered,
         retrieved_ids=retrieved,
+        post_filter_ids=post_filter_ids,
         top50_ids=[item.paper.canonical_id for item in fused if item.paper.canonical_id in accepted][:50],
         fusion_sources=("openalex",),
         hard_filter_rejections=len(filtered.rejected),
@@ -562,6 +570,7 @@ __all__ = [
     "count_gold_associations",
     "evaluate_probe",
     "merge_probe_results",
+    "offline_provider_result",
     "calculate_production_estimates",
     "project_openalex_stream",
     "public_probe_report",

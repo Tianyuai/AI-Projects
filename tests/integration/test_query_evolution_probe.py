@@ -3,15 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
-from pathlib import Path
 from decimal import Decimal
+from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from pydantic import ValidationError
 
 import scripts.probe_query_evolution as probe
+import scripts.rescore_identifier_semantics as rescore
 from scripts.probe_query_evolution import (
     DEFAULT_AVAILABILITY,
     DEFAULT_GOLD,
@@ -1423,3 +1425,316 @@ def test_canary_cli_returns_zero_only_for_promoted_canary(
         )
         == 0
     )
+
+
+SEALED_PROBE = (
+    Path(__file__).resolve().parents[2]
+    / "runs/_diag_query_evolution_query-evolution-prompt-v2-full-20260810"
+)
+
+
+def _expected_rescore_query_ids() -> tuple[str, ...]:
+    return tuple(
+        json.loads(line)["query_id"]
+        for line in DEFAULT_GOLD.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def _copy_probe_source(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    destination = (
+        tmp_path
+        / "runs/_diag_query_evolution_query-evolution-prompt-v2-full-20260810"
+    )
+    shutil.copytree(SEALED_PROBE, destination)
+    monkeypatch.setattr(rescore, "ROOT", tmp_path)
+    return destination
+
+
+def _rewrite_probe_json(path: Path, update) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    update(payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _rewrite_probe_outcomes(path: Path, update) -> None:
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    update(rows)
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def test_formal_source_validation_runs_before_artifact_reads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ValidationSentinel(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        rescore,
+        "validate_run_directory",
+        lambda path: (_ for _ in ()).throw(ValidationSentinel(path)),
+    )
+
+    with pytest.raises(ValidationSentinel):
+        rescore.load_formal_source(
+            "formal_baseline_2026_08_10",
+            tmp_path / "missing-run",
+            ("q-1",),
+        )
+
+
+@pytest.mark.parametrize("artifact", ["business-results.jsonl", "executions.jsonl"])
+def test_formal_source_requires_exact_business_and_execution_query_order(
+    artifact: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path(__file__).resolve().parents[2] / "runs/dev-20260810T104256Z-d9e89476d484"
+    run_dir = tmp_path / "formal"
+    run_dir.mkdir()
+    for name in (
+        "run.json",
+        "gates.json",
+        "predictions.jsonl",
+        "executions.jsonl",
+        "business-results.jsonl",
+    ):
+        shutil.copy2(source / name, run_dir / name)
+    lines = (run_dir / artifact).read_text(encoding="utf-8").splitlines(keepends=True)
+    lines[0], lines[1] = lines[1], lines[0]
+    (run_dir / artifact).write_text("".join(lines), encoding="utf-8")
+    monkeypatch.setattr(
+        rescore,
+        "validate_run_directory",
+        lambda path: SimpleNamespace(valid=True, issues=()),
+    )
+
+    with pytest.raises(ValueError, match="query order"):
+        rescore.load_formal_source(
+            "formal_baseline_2026_08_10",
+            run_dir,
+            _expected_rescore_query_ids(),
+        )
+
+
+def test_formal_source_rejects_business_execution_query_set_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = Path(__file__).resolve().parents[2] / "runs/dev-20260810T104256Z-d9e89476d484"
+    run_dir = tmp_path / "formal"
+    run_dir.mkdir()
+    for name in (
+        "run.json",
+        "gates.json",
+        "predictions.jsonl",
+        "executions.jsonl",
+        "business-results.jsonl",
+    ):
+        shutil.copy2(source / name, run_dir / name)
+    path = run_dir / "executions.jsonl"
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    rows[0]["query_id"] = rows[1]["query_id"]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    monkeypatch.setattr(
+        rescore,
+        "validate_run_directory",
+        lambda path: SimpleNamespace(valid=True, issues=()),
+    )
+
+    with pytest.raises(ValueError, match="query IDs"):
+        rescore.load_formal_source(
+            "formal_baseline_2026_08_10",
+            run_dir,
+            _expected_rescore_query_ids(),
+        )
+
+
+def test_legacy_source_rejects_hash_drift_before_parsing(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    source = root / "runs/dev-20260805T035209Z-7af4b103f6cc"
+    run_dir = tmp_path / source.name
+    run_dir.mkdir()
+    for name in ("business-results.jsonl", "executions.jsonl"):
+        shutil.copy2(source / name, run_dir / name)
+    evidence = tmp_path / "evidence.json"
+    shutil.copy2(
+        root / "docs/evidence/title-retention-offline-2026-08-09.json",
+        evidence,
+    )
+    with (run_dir / "business-results.jsonl").open("ab") as handle:
+        handle.write(b"\n")
+
+    with pytest.raises(ValueError, match="business results hash mismatch"):
+        rescore.load_legacy_source(
+            run_dir,
+            evidence,
+            _expected_rescore_query_ids(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        (lambda value: value.__setitem__("schema_version", "unknown"), "result"),
+        (
+            lambda value: value.__setitem__("capture_replay_match", "mismatched"),
+            "capture_replay_match",
+        ),
+        (
+            lambda value: value.__setitem__(
+                "replay_business_sha256", "sha256:" + "0" * 64
+            ),
+            "business hashes",
+        ),
+        (lambda value: value.__setitem__("unexpected", True), "result"),
+        (
+            lambda value: value.__setitem__(
+                "snapshot_set_id", "sha256:" + "0" * 64
+            ),
+            "snapshot set identity",
+        ),
+    ],
+)
+def test_probe_source_requires_closed_matched_result_contract(
+    update,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = _copy_probe_source(tmp_path, monkeypatch)
+    _rewrite_probe_json(run_dir / "result.json", update)
+
+    with pytest.raises(ValueError, match=message):
+        rescore.load_probe_source(run_dir, _expected_rescore_query_ids())
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        (lambda value: value.__setitem__("source_git_sha", "changed"), "self-hash"),
+        (
+            lambda value: value.__setitem__(
+                "expected_run_directory", "runs/unexpected-probe"
+            ),
+            "expected directory",
+        ),
+        (
+            lambda value: value["source_hashes"].__setitem__(
+                "business_results_sha256", "sha256:" + "0" * 64
+            ),
+            "business results hash mismatch",
+        ),
+    ],
+)
+def test_probe_source_requires_lock_identity_directory_and_source_hashes(
+    update,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = _copy_probe_source(tmp_path, monkeypatch)
+    lock_path = run_dir / "probe.lock.json"
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    update(payload)
+    if message != "self-hash":
+        payload["lock_sha256"] = probe._self_hash(payload)
+    lock_path.write_bytes(probe._canonical_json(payload))
+
+    with pytest.raises(ValueError, match=message):
+        rescore.load_probe_source(run_dir, _expected_rescore_query_ids())
+
+
+def test_probe_source_verifies_every_snapshot_response_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = _copy_probe_source(tmp_path, monkeypatch)
+    manifest = json.loads(
+        (run_dir / "snapshots/snapshot-manifest.json").read_text(encoding="utf-8")
+    )
+    response = run_dir / "snapshots" / manifest["entries"][0]["response_path"]
+    with response.open("ab") as handle:
+        handle.write(b"tampered")
+
+    with pytest.raises(ValueError, match="response hash mismatch"):
+        rescore.load_probe_source(run_dir, _expected_rescore_query_ids())
+
+
+@pytest.mark.parametrize(
+    ("update", "message"),
+    [
+        (lambda rows: rows.reverse(), "outcome order"),
+        (
+            lambda rows: rows[1].__setitem__("query_id", rows[0]["query_id"]),
+            "duplicate",
+        ),
+        (lambda rows: rows[0].__setitem__("query_id", "unknown-query"), "unknown"),
+        (
+            lambda rows: rows[0].__setitem__("query_id", 7),
+            "outcome query ID must be a string",
+        ),
+        (
+            lambda rows: next(row for row in rows if row["searches"])["searches"][0][
+                "errors"
+            ].append(
+                {"provider": "openalex", "code": "provider_error", "retryable": False}
+            ),
+            "search errors",
+        ),
+        (
+            lambda rows: rows[0]["proposal"].__setitem__("no_op_reason", "changed"),
+            "outcome hash mismatch",
+        ),
+    ],
+)
+def test_probe_source_requires_exact_error_free_ordered_outcomes(
+    update,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = _copy_probe_source(tmp_path, monkeypatch)
+    _rewrite_probe_outcomes(run_dir / "outcomes.jsonl", update)
+
+    with pytest.raises(ValueError, match=message):
+        rescore.load_probe_source(run_dir, _expected_rescore_query_ids())
+
+
+def test_probe_source_rejects_stage_subset_violations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = _copy_probe_source(tmp_path, monkeypatch)
+    real_merge = rescore.merge_probe_results
+
+    def invalid_merge(*args, **kwargs):
+        projection = real_merge(*args, **kwargs)
+        query_id = next(iter(projection.by_query))
+        row = projection.by_query[query_id]
+        invalid_row = row.model_copy(
+            update={"post_filter_ids": [*row.post_filter_ids, "openalex:UNKNOWN"]}
+        )
+        return projection.model_copy(
+            update={"by_query": {**projection.by_query, query_id: invalid_row}}
+        )
+
+    monkeypatch.setattr(rescore, "merge_probe_results", invalid_merge)
+
+    with pytest.raises(ValueError, match="subset"):
+        rescore.load_probe_source(run_dir, _expected_rescore_query_ids())
+
+
+def test_fixed_source_orchestrator_loads_exact_four_real_sealed_labels() -> None:
+    sources = rescore.load_fixed_sources(_expected_rescore_query_ids())
+
+    assert tuple(source.label for source in sources) == (
+        "formal_baseline_2026_08_10",
+        "formal_baseline_2026_08_09",
+        "legacy_title_2026_08_05",
+        "query_evolution_prompt_v2",
+    )
+    assert all(source.query_ids == _expected_rescore_query_ids() for source in sources)

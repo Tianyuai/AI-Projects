@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -477,6 +478,15 @@ def _write_valid_generation(tmp_path: Path) -> dict[str, Path]:
     }
 
 
+def _canonical_bytes(payload: object) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+        + b"\n"
+    )
+
+
 def test_loader_accepts_verified_generation_and_rebuilds_exact_map(
     tmp_path: Path,
 ) -> None:
@@ -529,6 +539,102 @@ def test_loader_rejects_tampered_map_before_parsing_entries(tmp_path: Path) -> N
             snapshot_manifest_path=paths["manifest"],
             private_audit_path=paths["private_audit"],
             map_path=paths["map"],
+        )
+
+
+def test_loader_rejects_verified_relation_not_supported_by_sealed_snapshot(
+    tmp_path: Path,
+) -> None:
+    evidence_bytes, snapshot_root = _sealed_evidence(
+        tmp_path / "source", doi_paper_id="S2-B"
+    )
+    gold_path = tmp_path / "gold.jsonl"
+    evidence_path = tmp_path / "identity-evidence.json"
+    map_path = tmp_path / "map.json"
+    private_audit_path = tmp_path / "private-audit.json"
+    public_audit_path = tmp_path / "public-audit.json"
+    gold_path.write_bytes(GOLD_BYTES)
+    evidence_path.write_bytes(evidence_bytes)
+    assert (
+        main(
+            [
+                "--gold",
+                str(gold_path),
+                "--evidence",
+                str(evidence_path),
+                "--snapshot-root",
+                str(snapshot_root),
+                "--out-map",
+                str(map_path),
+                "--out-private-audit",
+                str(private_audit_path),
+                "--out-public-audit",
+                str(public_audit_path),
+            ]
+        )
+        == 1
+    )
+    private_payload = json.loads(private_audit_path.read_bytes())
+    provider = private_payload["relations"][1]
+    provider.update(
+        {
+            "state": "verified",
+            "proof_kind": "semantic_scholar_exact",
+            "reason_code": "semantic_scholar_exact",
+        }
+    )
+    private_bytes = _canonical_bytes(private_payload)
+    private_audit_path.write_bytes(private_bytes)
+    map_bytes = _canonical_bytes(
+        {
+            "arxiv:2501.00001": "doi:10.48550/arxiv.2501.00001",
+            "doi:10.1000/a": "doi:10.48550/arxiv.2501.00001",
+        }
+    )
+    map_path.write_bytes(map_bytes)
+    public_payload = json.loads(public_audit_path.read_bytes())
+    public_payload.update(
+        {
+            "status": "passed",
+            "relation_count": 2,
+            "provider_candidate_count": 1,
+            "state_counts": {
+                "verified": 2,
+                "semantic_mismatch": 0,
+                "unresolved": 0,
+            },
+            "proof_counts": {
+                "arxiv_datacite_exact": 1,
+                "semantic_scholar_exact": 1,
+                "openalex_location_exact": 0,
+            },
+            "reason_counts": {
+                "arxiv_datacite_exact": 1,
+                "arxiv_datacite_mismatch": 0,
+                "semantic_scholar_exact": 1,
+                "openalex_location_exact": 0,
+                "openalex_location_mismatch": 0,
+                "insufficient_identity_evidence": 0,
+                "observation_binding_mismatch": 0,
+                "provider_identity_missing": 0,
+                "alias_target_conflict": 0,
+            },
+        }
+    )
+    public_payload["artifact_hashes"] = {
+        "candidate_map": f"sha256:{hashlib.sha256(map_bytes).hexdigest()}",
+        "private_relation_audit": f"sha256:{hashlib.sha256(private_bytes).hexdigest()}",
+    }
+    public_audit_path.write_bytes(_canonical_bytes(public_payload))
+
+    with pytest.raises(ValueError, match="sealed snapshot"):
+        load_verified_identifier_generation(
+            audit_path=public_audit_path,
+            gold_path=gold_path,
+            evidence_path=evidence_path,
+            snapshot_manifest_path=snapshot_root / "snapshot-manifest.json",
+            private_audit_path=private_audit_path,
+            map_path=map_path,
         )
 
 
@@ -669,3 +775,83 @@ def test_semantic_failure_writes_private_audit_before_public_marker(
         )
         == 1
     )
+
+
+def test_cli_rejects_private_artifact_changed_before_public_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _write_valid_generation(tmp_path / "source")
+    output_map = tmp_path / "out-map.json"
+    output_private = tmp_path / "out-private.json"
+    output_public = tmp_path / "out-public.json"
+    original_write = rebuild_script._atomic_write
+
+    def corrupt_private(path: Path, content: bytes) -> None:
+        original_write(path, content)
+        if path == output_private:
+            path.write_bytes(b"corrupted")
+
+    monkeypatch.setattr(rebuild_script, "_atomic_write", corrupt_private)
+
+    with pytest.raises(ValueError, match="publication artifact"):
+        main(
+            [
+                "--gold",
+                str(paths["gold"]),
+                "--evidence",
+                str(paths["evidence"]),
+                "--snapshot-root",
+                str(paths["manifest"].parent),
+                "--out-map",
+                str(output_map),
+                "--out-private-audit",
+                str(output_private),
+                "--out-public-audit",
+                str(output_public),
+            ]
+        )
+
+    assert not output_public.exists()
+
+
+def test_cli_rejects_failed_private_audit_changed_before_public_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    evidence_bytes, snapshot_root = _sealed_evidence(
+        tmp_path / "source", doi_paper_id="S2-B"
+    )
+    gold_path = tmp_path / "gold.jsonl"
+    evidence_path = tmp_path / "identity-evidence.json"
+    output_map = tmp_path / "out-map.json"
+    output_private = tmp_path / "out-private.json"
+    output_public = tmp_path / "out-public.json"
+    gold_path.write_bytes(GOLD_BYTES)
+    evidence_path.write_bytes(evidence_bytes)
+    original_write = rebuild_script._atomic_write
+
+    def corrupt_private(path: Path, content: bytes) -> None:
+        original_write(path, content)
+        if path == output_private:
+            path.write_bytes(b"corrupted")
+
+    monkeypatch.setattr(rebuild_script, "_atomic_write", corrupt_private)
+
+    with pytest.raises(ValueError, match="publication artifact"):
+        main(
+            [
+                "--gold",
+                str(gold_path),
+                "--evidence",
+                str(evidence_path),
+                "--snapshot-root",
+                str(snapshot_root),
+                "--out-map",
+                str(output_map),
+                "--out-private-audit",
+                str(output_private),
+                "--out-public-audit",
+                str(output_public),
+            ]
+        )
+
+    assert not output_public.exists()

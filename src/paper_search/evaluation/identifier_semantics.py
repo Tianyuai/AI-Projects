@@ -1020,6 +1020,52 @@ def _private_relation_order(row: RelationAudit) -> tuple[int, str, str]:
     )
 
 
+def _relations_from_sealed_snapshot(
+    *,
+    gold_arxiv_ids: tuple[str, ...],
+    observations: dict[tuple[str, str], IdentityObservation],
+) -> tuple[RelationAudit, ...]:
+    relations = [
+        classify_relation(
+            alias=arxiv_anchor(arxiv_id),
+            arxiv_id=arxiv_id,
+            observation=None,
+            relation_kind="required_anchor",
+        )
+        for arxiv_id in gold_arxiv_ids
+    ]
+    relations.extend(
+        classify_relation(alias=alias, arxiv_id=arxiv_id, observation=observation)
+        for (arxiv_id, alias), observation in sorted(observations.items())
+    )
+    targets_by_alias: dict[str, set[str]] = {}
+    for relation in relations:
+        if relation.relation_kind != "provider_candidate":
+            continue
+        targets_by_alias.setdefault(relation.alias, set()).add(relation.terminal)
+    conflicts = {
+        alias for alias, terminals in targets_by_alias.items() if len(terminals) > 1
+    }
+    return tuple(
+        sorted(
+            (
+                relation.model_copy(
+                    update={
+                        "state": "unresolved",
+                        "proof_kind": None,
+                        "reason_code": "alias_target_conflict",
+                    }
+                )
+                if relation.relation_kind == "provider_candidate"
+                and relation.alias in conflicts
+                else relation
+                for relation in relations
+            ),
+            key=_private_relation_order,
+        )
+    )
+
+
 def load_verified_identifier_generation(
     *,
     audit_path: Path,
@@ -1099,13 +1145,22 @@ def load_verified_identifier_generation(
         raise ValueError("candidate map is invalid") from None
 
     try:
-        gold_ids = set(_read_dev_arxiv_ids(gold_bytes))
+        gold_arxiv_ids = _read_dev_arxiv_ids(gold_bytes)
+        gold_ids = set(gold_arxiv_ids)
         evidence = _read_identity_evidence(evidence_bytes)
         manifest = DependencySnapshotManifestV2.model_validate_json(manifest_bytes)
     except (ValidationError, ValueError):
         raise ValueError("identifier generation input is invalid") from None
     if _hash_bytes(manifest_bytes) != evidence["snapshot_manifest_sha256"]:
         raise ValueError("identifier generation input hash mismatch")
+    try:
+        observations, _ = _snapshot_observations(
+            evidence=evidence,
+            snapshot_root=snapshot_manifest_path.parent,
+            manifest_content=manifest_bytes,
+        )
+    except ValueError:
+        raise ValueError("identifier generation sealed snapshot is invalid") from None
 
     raw_refs = evidence["evidence_refs"]
     if not isinstance(raw_refs, list):
@@ -1131,6 +1186,10 @@ def load_verified_identifier_generation(
         raise ValueError("identifier generation input is invalid")
 
     relations = private_audit.relations
+    if relations != _relations_from_sealed_snapshot(
+        gold_arxiv_ids=gold_arxiv_ids, observations=observations
+    ):
+        raise ValueError("private relation audit does not match sealed snapshot")
     anchors = tuple(row for row in relations if row.relation_kind == "required_anchor")
     providers = tuple(row for row in relations if row.relation_kind == "provider_candidate")
     if {row.arxiv_id for row in anchors} != gold_ids or len(anchors) != len(gold_ids):

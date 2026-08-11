@@ -406,16 +406,25 @@ def _write_private_outputs(
     out_map: Path,
     out_private_audit: Path,
 ) -> None:
-    _atomic_write(out_map, _canonical_json(result.map_payload))
-    _atomic_write(
-        out_private_audit,
-        _canonical_json(
-            PrivateRelationAuditV2(
-                schema_version="identifier-map-private-relation-audit-v2",
-                scope="dev",
-                relations=result.private_relations,
-            ).model_dump(mode="json")
-        ),
+    map_bytes, private_audit_bytes = _private_output_bytes(result)
+    _atomic_write(out_map, map_bytes)
+    _atomic_write(out_private_audit, private_audit_bytes)
+
+
+def _private_output_bytes(result: RebuiltDevMap) -> tuple[bytes, bytes]:
+    return (
+        _canonical_json(result.map_payload),
+        _private_audit_bytes(result.private_relations),
+    )
+
+
+def _private_audit_bytes(relations: tuple[RelationAudit, ...]) -> bytes:
+    return _canonical_json(
+        PrivateRelationAuditV2(
+            schema_version="identifier-map-private-relation-audit-v2",
+            scope="dev",
+            relations=relations,
+        ).model_dump(mode="json")
     )
 
 
@@ -455,16 +464,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             response_bytes=response_bytes,
         )
     except SemanticAuditFailure as error:
+        expected_private_audit_bytes = _private_audit_bytes(error.private_relations)
         _atomic_write(
             args.out_private_audit,
-            _canonical_json(
-                PrivateRelationAuditV2(
-                    schema_version="identifier-map-private-relation-audit-v2",
-                    scope="dev",
-                    relations=error.private_relations,
-                ).model_dump(mode="json")
-            ),
+            expected_private_audit_bytes,
         )
+        if (
+            args.out_private_audit.read_bytes() != expected_private_audit_bytes
+            or _sha256(expected_private_audit_bytes)
+            != error.public_audit.artifact_hashes.private_relation_audit
+        ):
+            raise ValueError("identifier publication artifact verification failed")
         publish_semantic_audit(error.public_audit, output_path=args.out_public_audit)
         _release_publication_lock(lock_path)
         return 1
@@ -476,6 +486,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         out_map=args.out_map,
         out_private_audit=args.out_private_audit,
     )
+    expected_map_bytes, expected_private_audit_bytes = _private_output_bytes(result)
+    if (
+        args.out_map.read_bytes() != expected_map_bytes
+        or args.out_private_audit.read_bytes() != expected_private_audit_bytes
+        or _sha256(expected_map_bytes) != result.audit.artifact_hashes.candidate_map
+        or _sha256(expected_private_audit_bytes)
+        != result.audit.artifact_hashes.private_relation_audit
+    ):
+        raise ValueError("identifier publication artifact verification failed")
     publish_semantic_audit(result.audit, output_path=args.out_public_audit)
     _release_publication_lock(lock_path)
     return 0

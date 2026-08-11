@@ -12,7 +12,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import AbstractSet, Any
+from typing import AbstractSet, Any, cast
 
 from paper_search.domain.models import (
     Paper,
@@ -645,11 +645,11 @@ def analyze_run(
     ]
     promotable_variants.sort(
         key=lambda item: (
-            -item["metrics"]["macro_f1"],
-            -item["metrics"]["macro_recall"],
-            -item["metrics"]["macro_ndcg"],
-            -item["metrics"]["macro_mrr"],
-            item["name"],
+            -cast(dict[str, float], item["metrics"])["macro_f1"],
+            -cast(dict[str, float], item["metrics"])["macro_recall"],
+            -cast(dict[str, float], item["metrics"])["macro_ndcg"],
+            -cast(dict[str, float], item["metrics"])["macro_mrr"],
+            cast(str, item["name"]),
         )
     )
     run_record = json.loads((run / "run.json").read_text(encoding="utf-8"))

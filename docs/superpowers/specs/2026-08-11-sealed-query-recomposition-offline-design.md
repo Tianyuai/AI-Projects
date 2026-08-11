@@ -159,6 +159,8 @@ Prompt v2 的原始新增结果只允许与其绑定的 2026-08-09 源槽位组�
 
 ### 7.2 固定源与发布脚本
 
+修改 `scripts/rescore_identifier_semantics.py`，只把现有 Prompt v2 封存验证流程提取为公共只读 `load_verified_probe_materials()`；现有 `load_probe_source()` 改为消费该返回值，输出和 rescore schema 必须保持不变。对应回归测试继续放在 `tests/scripts/test_rescore_identifier_semantics.py`。不得借此重构其他来源适配器。
+
 新增 `scripts/analyze_sealed_query_recomposition.py`，负责：
 
 - 固定路径与固定命令 `run`、`render-markdown`；
@@ -231,7 +233,9 @@ Gold 和 identifier map 只进入评分层，不进入三个组合函数。测�
 
 ### 9.4 固定结论
 
-- 完整性门槛失败：`integrity_failure`，停止并请求人工检查，不得重跑正式命令；
+四种结论只适用于 generation、源绑定、capture/replay 和快照均已验证通过之后的实验结果。任何输入验证、隐私扫描或发布前置条件失败都不生成实验报告，CLI 使用固定安全错误退出，停止并请求人工检查，不得重跑正式命令。
+
+- 输入有效但 `append_v2` 复现、集合恒等或阶段守恒失败：`integrity_failure`，可发布聚合失败结论，随后停止并请求人工检查；
 - 没有方案达到信号门槛：`no_usable_recomposition_signal`，停止查询重组，下一步设计 title-informed 检索；
 - 有信号但未达到 30：`signal_insufficient`，记录合并层存在可用信号，但不继续调参，下一步仍设计 title-informed 检索；
 - 达到 30：`legacy_benchmark_met`，允许单独设计生产等价整合验证，但本实验仍不修改生产代码。

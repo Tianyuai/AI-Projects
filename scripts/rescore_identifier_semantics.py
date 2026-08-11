@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import os
+import sys
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Literal, TypeVar
@@ -11,10 +15,17 @@ from typing import Literal, TypeVar
 from pydantic import ValidationError, model_validator
 
 import scripts.probe_query_evolution as probe
+from paper_search.control.pricing import parse_quality_gate_policy_bytes
 from paper_search.domain.models import DomainModel, Paper, Sha256
 from paper_search.evaluation.business_results import (
     BusinessResultRecord,
     business_result_sha256,
+)
+from paper_search.evaluation.dataset import EvaluationQuery, read_jsonl
+from paper_search.evaluation.identifier_semantics import (
+    assert_public_json_safe,
+    assert_public_markdown_safe,
+    load_verified_identifier_generation,
 )
 from paper_search.evaluation.execution_adapter import EvaluationExecutionRecord
 from paper_search.evaluation.query_evolution_probe import (
@@ -26,8 +37,11 @@ from paper_search.evaluation.query_evolution_probe import (
     reconstruct_frozen_baseline,
 )
 from paper_search.evaluation.semantic_rescore import (
+    GenerationHashes,
+    SemanticRescoreReport,
     SourceLabel,
     SourceProjection,
+    build_rescore_report,
 )
 from paper_search.evaluation.validator import validate_run_directory
 from paper_search.storage.dependency_snapshot import (
@@ -37,6 +51,15 @@ from paper_search.storage.dependency_snapshot import (
 
 
 ROOT = probe.ROOT
+PUBLIC_AUDIT = ROOT / "docs/evidence/identifier-map-semantic-audit-2026-08-11.json"
+GOLD = ROOT / "data/dev/gold.jsonl"
+IDENTITY_EVIDENCE = ROOT / "data/annotation_work/identifier_semantics/identity-evidence.json"
+SNAPSHOT_MANIFEST = ROOT / "data/annotation_work/identifier_semantics/snapshots/snapshot-manifest.json"
+PRIVATE_AUDIT = ROOT / "data/annotation_work/identifier_semantics/relation-audit.v2.json"
+VERIFIED_MAP = ROOT / "data/annotation_work/identifier_semantics/dev-identifier-map.semantic-v2.json"
+QUALITY_POLICY = ROOT / "configs/quality_gates_v1.yaml"
+OUT_JSON = ROOT / "docs/evidence/identifier-map-semantic-rescore-2026-08-11.json"
+OUT_MARKDOWN = ROOT / "docs/identifier-map-semantic-rescore-2026-08-11.md"
 _FORMAL_FILES = (
     "run.json",
     "gates.json",
@@ -504,3 +527,161 @@ def load_fixed_sources(
             expected_query_ids,
         ),
     )
+
+
+def canonical_report_bytes(report: SemanticRescoreReport) -> bytes:
+    """Return the one canonical public JSON representation."""
+    return (
+        json.dumps(
+            report.model_dump(mode="json"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def render_markdown(report: SemanticRescoreReport) -> str:
+    """Render the aggregate report without recalculating any value."""
+    lines = [
+        "# Verified-Identifier Offline Rescore v2",
+        "",
+        f"Status: {report.status}",
+        f"Gold associations: {report.total_gold_associations}",
+        "",
+        "| Source | TP | Macro F1 | Macro recall | Micro recall | MRR | NDCG | Direct | not_retrieved | filtered_out | ranked_outside_top50 | selected_top50 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for run in report.runs:
+        stages = run.pipeline_stages
+        lines.append(
+            f"| {run.label} | {run.true_positive_count} | {run.macro_f1} | "
+            f"{run.macro_recall} | {run.micro_recall} | {run.macro_mrr} | "
+            f"{run.macro_ndcg} | {run.direct_same_arxiv_hit_count} | "
+            f"{stages.not_retrieved} | {stages.filtered_out} | "
+            f"{stages.ranked_outside_top50} | {stages.selected_top50} |"
+        )
+    decision = report.decision
+    lines.extend(
+        [
+            "",
+            "## Decision",
+            "",
+            f"- primary_loss_stage: {decision.primary_loss_stage}",
+            f"- next_direction: {decision.next_direction}",
+            f"- reason_codes: {', '.join(decision.reason_codes) or 'none'}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_fixed_report() -> SemanticRescoreReport:
+    """Build one report from only the fixed verified generation and sources."""
+    generation = load_verified_identifier_generation(
+        audit_path=PUBLIC_AUDIT,
+        gold_path=GOLD,
+        evidence_path=IDENTITY_EVIDENCE,
+        snapshot_manifest_path=SNAPSHOT_MANIFEST,
+        private_audit_path=PRIVATE_AUDIT,
+        map_path=VERIFIED_MAP,
+    )
+    gold = read_jsonl(GOLD, EvaluationQuery)
+    expected_query_ids = tuple(query.query_id for query in gold)
+    sources = load_fixed_sources(expected_query_ids)
+    policy_bytes = QUALITY_POLICY.read_bytes()
+    policy = parse_quality_gate_policy_bytes(policy_bytes)
+    report = build_rescore_report(
+        gold=gold,
+        identifier_map=generation.identifier_map,
+        sources=sources,
+        policy=policy,
+        generation_hashes=GenerationHashes(
+            public_audit_sha256=_sha256_file(PUBLIC_AUDIT),
+            gold_sha256=_sha256_file(GOLD),
+            identity_evidence_sha256=_sha256_file(IDENTITY_EVIDENCE),
+            snapshot_manifest_sha256=_sha256_file(SNAPSHOT_MANIFEST),
+            private_audit_sha256=_sha256_file(PRIVATE_AUDIT),
+            candidate_map_sha256=_sha256_file(VERIFIED_MAP),
+        ),
+        quality_policy_sha256=f"sha256:{hashlib.sha256(policy_bytes).hexdigest()}",
+    )
+    if report.runs[0].direct_same_arxiv_hit_count != 12:
+        raise ValueError("designated direct hit count must equal 12")
+    return report
+
+
+def _write_no_replace(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="xb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as temporary:
+            temporary.write(content)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            raise ValueError("publication target exists") from None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def publish_report(
+    report: SemanticRescoreReport, *, json_path: Path, markdown_path: Path
+) -> None:
+    if json_path.exists() or markdown_path.exists():
+        raise ValueError("publication target exists")
+    json_content = canonical_report_bytes(report)
+    markdown = render_markdown(report)
+    assert_public_json_safe(json_content)
+    assert_public_markdown_safe(markdown)
+    _write_no_replace(json_path, json_content)
+    _write_no_replace(markdown_path, markdown.encode("utf-8"))
+
+
+def render_markdown_from_json(json_path: Path, markdown_path: Path) -> None:
+    if markdown_path.exists():
+        raise ValueError("publication target exists")
+    try:
+        content = json_path.read_bytes()
+        report = SemanticRescoreReport.model_validate_json(content)
+    except (OSError, ValidationError):
+        raise ValueError("formal JSON is invalid") from None
+    if canonical_report_bytes(report) != content:
+        raise ValueError("formal JSON is not canonical")
+    assert_public_json_safe(content)
+    markdown = render_markdown(report)
+    assert_public_markdown_safe(markdown)
+    _write_no_replace(markdown_path, markdown.encode("utf-8"))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Verified identifier offline rescore")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("run")
+    commands.add_parser("render-markdown")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == "run":
+            publish_report(build_fixed_report(), json_path=OUT_JSON, markdown_path=OUT_MARKDOWN)
+        else:
+            render_markdown_from_json(OUT_JSON, OUT_MARKDOWN)
+    except (OSError, ValueError):
+        print("identifier rescore failed", file=sys.stderr)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

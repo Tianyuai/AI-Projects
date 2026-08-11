@@ -52,6 +52,14 @@ OPENALEX_BYTES = (
 )
 
 
+class RecordingSleeper:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
 class RecordingTransport:
     def __init__(
         self,
@@ -61,6 +69,7 @@ class RecordingTransport:
         openalex_response: bytes = OPENALEX_BYTES,
         statuses: Mapping[str, list[int]] | None = None,
         request_errors: Mapping[str, list[BaseException]] | None = None,
+        response_headers: Mapping[str, list[Mapping[str, str]]] | None = None,
     ) -> None:
         self.arxiv_response = arxiv_response
         self.doi_response = doi_response
@@ -68,6 +77,9 @@ class RecordingTransport:
         self.statuses = {key: list(values) for key, values in (statuses or {}).items()}
         self.request_errors = {
             key: list(values) for key, values in (request_errors or {}).items()
+        }
+        self.response_headers = {
+            key: list(values) for key, values in (response_headers or {}).items()
         }
         self.semantic_scholar_batches: list[list[str]] = []
         self.semantic_scholar_requests: list[tuple[dict[str, str], dict[str, object]]] = []
@@ -109,12 +121,14 @@ class RecordingTransport:
             raise route_errors.pop(0)
         route_statuses = self.statuses.get(route, [])
         status_code = route_statuses.pop(0) if route_statuses else 200
+        route_headers = self.response_headers.get(route, [])
+        response_headers = route_headers.pop(0) if route_headers else {}
         if status_code >= 400:
             content = b'{"error":"provider failure for 10.9999/private-value"}'
         return TransportResponse(
             status_code=status_code,
             content=content,
-            headers={"content-type": "application/json"},
+            headers={"content-type": "application/json", **response_headers},
         )
 
 
@@ -207,6 +221,7 @@ def _lock_and_runtime(
         output_root="private",
     )
     selected_transport = transport or RecordingTransport()
+    sleeper = RecordingSleeper()
     runtime = IdentifierCaptureRuntime(
         project_root=tmp_path,
         inventory_path=inventory_path,
@@ -226,6 +241,7 @@ def _lock_and_runtime(
         transport=selected_transport,
         allow_network=True,
         clock=lambda: CAPTURED_AT,
+        sleeper=sleeper,
     )
     return lock, runtime, selected_transport
 
@@ -371,6 +387,8 @@ def test_capture_uses_arxiv_batch_then_only_discovered_doi_batch(
     assert result.semantic_scholar_batch_count == 2
     assert result.semantic_scholar_http_attempt_count == 2
     assert result.openalex_request_count == 1
+    assert isinstance(runtime.sleeper, RecordingSleeper)
+    assert runtime.sleeper.calls == [1.0]
     assert all(state == "settled" for state in _ledger_states(runtime.ledger_path))
 
     snapshot_root = tmp_path / "private" / "snapshots"
@@ -571,6 +589,49 @@ def test_zero_discovered_dois_skips_second_batch_without_empty_request(
     ]
     assert result.derived_doi_lock.ids == []
     assert result.semantic_scholar_batch_count == 1
+    assert isinstance(runtime.sleeper, RecordingSleeper)
+    assert runtime.sleeper.calls == []
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "expected_delay"),
+    [
+        (None, 5.0),
+        ("not-a-number", 5.0),
+        ("0", 1.0),
+        ("2.5", 2.5),
+        ("31", 30.0),
+    ],
+)
+def test_semantic_scholar_retry_uses_bounded_delay_without_real_wait(
+    tmp_path: Path,
+    retry_after: str | None,
+    expected_delay: float,
+) -> None:
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    transport = RecordingTransport(
+        statuses={"s2-arxiv": [429, 200]},
+        response_headers={"s2-arxiv": [headers]},
+        arxiv_response=b"[null,null]",
+    )
+    lock, runtime, _ = _lock_and_runtime(tmp_path, transport, include_openalex=False)
+    sleep_calls: list[float] = []
+    runtime = runtime.model_copy(update={"sleeper": sleep_calls.append})
+
+    capture_identity(lock, runtime)
+
+    assert sleep_calls == [expected_delay]
+
+
+def test_openalex_retry_does_not_sleep(tmp_path: Path) -> None:
+    transport = RecordingTransport(statuses={"openalex": [500, 200]})
+    lock, runtime, _ = _lock_and_runtime(tmp_path, transport)
+    sleep_calls: list[float] = []
+    runtime = runtime.model_copy(update={"sleeper": sleep_calls.append})
+
+    capture_identity(lock, runtime)
+
+    assert sleep_calls == [1.0]
 
 
 def test_retry_consumes_attempt_allowance_and_terminalizes_each_reservation(
@@ -597,6 +658,8 @@ def test_terminal_http_failure_has_value_free_error_and_no_reserved_receipts(
     assert str(error.value) == "semantic scholar request failed: server_error"
     assert "10.9999" not in str(error.value)
     assert _ledger_states(runtime.ledger_path) == ["failed", "failed"]
+    assert isinstance(runtime.sleeper, RecordingSleeper)
+    assert runtime.sleeper.calls == [5.0]
 
 
 @pytest.mark.parametrize(

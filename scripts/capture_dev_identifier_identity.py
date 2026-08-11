@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -191,6 +193,7 @@ class IdentifierCaptureRuntime(BaseModel):
     allow_network: bool = False
     manual_doi_ids: tuple[str, ...] = ()
     clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+    sleeper: Callable[[float], None] = time.sleep
 
     def with_transport(self, transport: CaptureTransport) -> Self:
         return self.model_copy(update={"transport": transport})
@@ -483,6 +486,35 @@ def _status_failure_category(status_code: int) -> RequestFailureCategory:
     return "unexpected_status"
 
 
+def _s2_retry_delay(headers: Mapping[str, str] | None = None) -> float:
+    retry_after = next(
+        (
+            value
+            for name, value in (headers or {}).items()
+            if name.casefold() == "retry-after"
+        ),
+        None,
+    )
+    if retry_after is not None:
+        try:
+            seconds = float(retry_after)
+        except ValueError:
+            pass
+        else:
+            if math.isfinite(seconds):
+                return min(30.0, max(1.0, seconds))
+    return 5.0
+
+
+def _sleep_before_retry(
+    provider: Literal["semantic_scholar", "openalex"],
+    runtime: IdentifierCaptureRuntime,
+    headers: Mapping[str, str] | None = None,
+) -> None:
+    if provider == "semantic_scholar":
+        runtime.sleeper(_s2_retry_delay(headers))
+
+
 def _request_json(
     *,
     provider: Literal["semantic_scholar", "openalex"],
@@ -538,12 +570,14 @@ def _request_json(
             if retry_index == lock.retry_max:
                 category = _exception_failure_category(error)
                 raise ValueError(f"{error_message}: {category}") from None
+            _sleep_before_retry(provider, runtime)
             continue
         if not 200 <= response.status_code < 300:
             _terminalize(ledger, reservation, failed=True)
             if retry_index == lock.retry_max:
                 category = _status_failure_category(response.status_code)
                 raise ValueError(f"{error_message}: {category}")
+            _sleep_before_retry(provider, runtime, response.headers)
             continue
         try:
             payload = json.loads(response.content)
@@ -552,6 +586,7 @@ def _request_json(
             _terminalize(ledger, reservation, failed=True)
             if retry_index == lock.retry_max:
                 raise ValueError(invalid_message) from None
+            _sleep_before_retry(provider, runtime, response.headers)
             continue
         _terminalize(ledger, reservation, failed=False)
         return response, validated
@@ -745,6 +780,7 @@ def capture_identity(
         doi_ref = None
         doi_index_by_id: dict[str, int] = {}
         if derived_doi_ids:
+            runtime.sleeper(1.0)
             doi_identity = _s2_identity(derived_doi_ids, stage="doi")
             doi_response, _ = _request_json(
                 provider="semantic_scholar",

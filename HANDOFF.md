@@ -1,25 +1,27 @@
 # paper-search 项目交接
 
-更新于 2026-08-09。权威工作区：`D:\AI Projects\.worktrees\week3`。
+更新于 2026-08-11。权威工作区：`D:\AI Projects\.worktrees\week3`。
 
 ## 1. 项目目标
 
-VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建复杂学术查询的论文搜索与推荐系统。内部目标是冻结 dev 宏平均 F1 ≥ 0.30；当前已闭环基线为 `0.0050946874`。
+VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建复杂学术查询的论文搜索与推荐系统。内部目标是冻结 dev 宏平均 F1 ≥ 0.30；当前代码上的可复现闭环基线为 `0.0038000670`，尚未达到目标，也没有超过上一闭环的 `0.0050946874`。
 
 正式评测使用 live capture → verify → 零网络 replay → compare。基线必须 gate passed、`provenance_failures=0`，且 capture/replay 业务结果一致。
 
 ## 2. 当前状态
 
-- 通过的 live capture：`runs/dev-20260809T061903Z-9bd861e90299`；通过的零网络 replay：`runs/dev-20260809T063333Z-6897d295a3c8`。
-- 两轮均为 `formal_valid: true`、`quality_passed: true`、Gate `passed`；业务结果比较 `equivalent: true`。
+- 当前权威 live capture：`runs/dev-20260810T104256Z-d9e89476d484`；零网络 replay：`runs/dev-20260810T123542Z-e097e1aa48b2`。
+- capture 与 replay 均经正式 `verify-run` 验证，`valid: true`、`issue_codes: []`；两轮均为 `formal_valid: true`、`quality_passed: true`、Gate `passed`，业务结果比较 `equivalent: true`。
 - 查询分析与可解析检索响应均为 60/60；60 条全部使用 primary planner，无 fallback。
-- 基线 macro F1 `0.0050946874`、macro recall `0.0791666667`、micro recall `0.0575539568`；召回仍是主要瓶颈。
-- 闭环源提交为 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`；修复链为 `a720bbe` 与 `45ef874`。
+- 当前基线 macro F1 `0.0038000670`、macro recall `0.0541666667`、micro recall `0.0431654676`；相对上一闭环分别下降约 25.4%、31.6% 和 25.0%，因此本轮只固化可复现性，不声称质量提升，召回仍是主要瓶颈。
+- 当前闭环源提交为 `d70f1c5c3e84e36c7ddb07ffb42c2e65a8ccd5f1`。快照集 ID 为 `sha256:8364a7eb7d90b89ceed25a158a414df083732664ae6e10fa5337fc11aca8ba2c`，manifest 哈希为 `sha256:70332aaaa93604dacdebf18f6d0225e6d25dd85c0c0e9dc088a474bb742c753a`。
+- capture 封存 334 个响应，60 条本轮回执全部 `settled`，0 failures、0 integrity/provenance/sanitization/unaccounted-usage failures；实际用量为 60 次 LLM、274 次 OpenAlex、19,459 tokens、`0.031221` CNY。
 - 标题部分成功页修复已完成；封存离线对照精确重建 60/60 查询和 2,908 个 Top-50 结果。候选池 exact gold 从 19 增至 20，但最终仍为 13，没有排序变体晋级。
+- 标题实验的 19/20/13 与 Query Evolution 的 14/15/8 来自不同历史运行、投影阶段和关联去重口径，不得直接互换；标题报告绑定 `dev-20260805T035209Z-7af4b103f6cc` 及其 business/execution 哈希，共 2,908 条结果，Query Evolution 绑定 `dev-20260809T061903Z-9bd861e90299` 的另一组哈希，共 2,910 条结果。当前 Query Evolution 结论统一使用修订后的 unique resolved association 口径。
 - 15 个既有 mypy 错误已通过只涉及类型收窄和局部命名的最小修复清零；相关 85 个回归测试通过，业务行为未扩张。
-- 最新全量验证为 1923 passed / 36 skipped / 1 环境失败；进程级 Git ownership 兼容设置已消除 clone 失败，剩余失败是 Windows 当前 GBK locale 解码 `uv build` UTF-8 输出的问题，不涉及本次文档，已登记为本次诊断的 packaging 平台环境豁免，不能据此声称全量完全通过。Git 已跟踪 Python 文件 Ruff 全部通过，`mypy src scripts/analyze_gold_bottlenecks.py` 为 0 errors。
-- 最新项目 ledger 为 1989 条，根哈希为 `sha256:7e7e63a2e2ed0587d68af5a64792c1ce68949d9c49f7da714d7f14f5b47544f9`。
-- 两次 DOI 契约 availability rerun 曾在第 1 次 HTTP 尝试后失败；网络恢复后第三次获批重试成功，新的证据见 `docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json` 与对应 Markdown：134/134 个唯一 work `available`、0 个完整性失败，`diagnostic_complete=true`，推荐方向为 `retrieval_query_evolution_probe`。旧历史 evidence 保持不改。
+- 当前 `main` 合并后的最新离线验证为 2003 passed / 39 skipped / 1 online deselected；排除用户未跟踪 `deliverables/` 后的 tracked Ruff 通过，`mypy src scripts/probe_query_evolution.py` 对 96 个文件为 0 errors。
+- 最新正式项目 ledger 为 2049 条，根哈希为 `sha256:172d5c8d8946e1d1d44e738a33cd3bbb778354a48500908816b2f4742c938e91`。
+- 两次 DOI 契约 availability rerun 曾在第 1 次 HTTP 尝试后失败；网络恢复后第三次获批重试成功，新的证据见 `docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json` 与对应 Markdown：134/134 个唯一 work `available`、0 个完整性失败，`diagnostic_complete=true`。该证据当时推荐的 `retrieval_query_evolution_probe` 已执行，当前结论见第 12 节。旧历史 evidence 保持不改。
 - Gold 精确可用性 v2 的旧聚合诊断固定输入为 60/143/139/134，唯一 work 为 132 `available`、2 个 DOI `integrity_failure`；该报告是历史 evidence，保持不改。Task 1 已实现 DOI exact-endpoint acceptance contract，并由离线 `httpx.MockTransport` 合成测试覆盖：HTTP 200 且响应包含有效 OpenAlex Work ID 即为 `available`，顶层 DOI 缺失、不同或不可解析均不影响；OpenAlex-ID 请求仍严格要求规范化 ID 匹配。新的契约重跑结果已单独写入 retry3 evidence。
 
 ## 3. 活跃文件
@@ -36,7 +38,9 @@ VivaAI 参加第八届中国研究生人工智能创新大赛赛题三，构建�
 - `docs/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.md`：新 DOI 契约重跑的完整瓶颈诊断；
 - `docs/evidence/gold-bottleneck-attribution-2026-08-09-doi-contract-retry3.json`：新 DOI 契约重跑的固定 schema 证据；
 - `configs/title_candidates.yaml`：当前正式实验配置；
-- `runs/candidate.lock.yaml`：本地候选锁；
+- `runs/candidate.lock.yaml`：本轮已使用、因 ledger 推进而失效的本地候选锁；
+- `runs/dev-20260810T104256Z-d9e89476d484/`：当前权威 live capture、密封快照与 replay lock；
+- `runs/dev-20260810T123542Z-e097e1aa48b2/`：当前权威零网络 replay；
 - `data/dev/gold.jsonl`：冻结 dev gold。
 
 ## 4. 已否决尝试
@@ -45,19 +49,19 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 
 标题候选是唯一已有正向召回信号。部分成功页错误丢弃已修复：15 个含错误响应恢复 80 篇有效论文，57 篇成为新增合格候选，候选池多覆盖 1 个 exact gold。修复后标准 RRF 仍只有 13 个 Top-50 exact gold；权重与保留槽离线变体均未提高 macro F1，因此不得重复或进入 live capture。
 
-本轮实现提交从 `3fabf6d` 到 `70c9c3c`；设计与实施计划提交为 `5a92f2d`、`c5d05bb`。离线分析未发起网络请求，也未修改候选锁或 ledger。
+该历史标题阶段的实现提交从 `3fabf6d` 到 `70c9c3c`；设计与实施计划提交为 `5a92f2d`、`c5d05bb`。离线分析未发起网络请求，也未修改候选锁或 ledger。
 
-最新稳定化提交为 `437ba0d`、`44d7aab`、`ff0ea28`、`1dfac84`：增加 v2 完整性失败聚合、唯一诊断账本运行 ID，清零原有 15 个目标 mypy 错误，并补齐嵌套 schema、计数守恒和写盘重读校验。本轮只执行一次获准的 exact-ID 在线诊断，没有运行 readiness、capture、replay、compare 或 validation，也没有修改候选锁。
+该历史稳定化阶段的提交为 `437ba0d`、`44d7aab`、`ff0ea28`、`1dfac84`：增加 v2 完整性失败聚合、唯一诊断账本运行 ID，清零原有 15 个目标 mypy 错误，并补齐嵌套 schema、计数守恒和写盘重读校验。该阶段只执行一次获准的 exact-ID 在线诊断，没有运行 readiness、capture、replay、compare 或 validation，也没有修改候选锁。
 
 ## 5. 下一步
 
-1. DOI exact-endpoint acceptance contract 已离线决定并由固定合成夹具覆盖；新的在线重跑已确认 134/134 个唯一 work 可用，完整性瓶颈已排除。
-2. 当前唯一推荐方向为 `retrieval_query_evolution_probe`：先设计并执行有明确假设、低成本、可回滚的 bounded probe，不直接进入 live capture。
-3. 新方向若要进入正式 capture，仍需先通过离线指标、保留已有 gold、排序护栏和预算检查，并另行授权 readiness/capture。
+1. 当前正式 baseline、verified identifier rescore 和 sealed query recomposition 均已闭环；不得把 Gate passed 或局部排序增益解释为达到竞赛目标。
+2. 本次重组结论是 `signal_insufficient`：append/round-robin/RRF 的 selected Gold 分别为 19/24/25，均未达到旧版 title 基准 30，且主要损失仍为 `not_retrieved=101/143`。不得重跑或继续调重组参数。
+3. 下一步只设计独立的 `title-informed` 多查询检索干净基线，先预注册固定输入、查询族、指标、晋级门槛和停止条件；不联网、不修改生产检索。详细边界见第 13 节和路线图 Phase 11。
 
 ## 6. 锁状态
 
-当前 `runs/candidate.lock.yaml` 绑定提交 `45ef8749210c1ec6fcbfeb9b64b911f3ea4b0d55`，但其 ledger checkpoint 仍为 1924 条。最新诊断已将 ledger 推进到 1989 条，因此该锁只是已用基线证据，不得用于新 live run。新在线实验前必须重建锁并重跑 readiness；capture、validation 和任何新的在线实验仍需单独授权。
+当前 `runs/candidate.lock.yaml` 绑定提交 `d70f1c5c3e84e36c7ddb07ffb42c2e65a8ccd5f1` 和 1989 条 ledger checkpoint，已被本轮 capture 使用。正式 ledger 现为 2049 条，因此该锁已失效，不得再次用于 live run；2026-08-10 的 readiness 也已过期。`runs/dev-20260810T104256Z-d9e89476d484/replay.lock.yaml` 仅用于该密封快照，已成功完成 replay。任何新 live run 都必须先按最新 checkpoint 重建独立锁并刷新 readiness。
 
 ## 7. 环境与红线
 
@@ -82,7 +86,7 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - Preflight lock: `runs/_diag_query_evolution_preflight/probe.lock.json`; `probe_run_id=query-evolution-preflight`; future run directory `runs/_diag_query_evolution_query-evolution-preflight`.
 - Limits: 55/110 logical operations, 165/330 attempt caps, 3600-second global timeout, 3900-second ledger TTL.
 - Evidence hashes: availability `sha256:3f445486d5cf590f3f11a51930153a45916023880e856def379e0f01d053ad04`; probe code `sha256:07ce27806bd93a73ac4a8d499c3ca0e3ded83fbf4f7c702880e8ff6ba54a29d2`; lock `sha256:dc261edb560915f1907149f371e2266be54fb328a3c2019076da226ea96117d2`.
-- This phase did not read `.env`, make reservations, rebuild the candidate lock, run readiness, or execute live capture/replay/compare/validation. The live bounded run remains separately authorized work.
+- This phase did not read `.env`, make reservations, rebuild the candidate lock, run readiness, or execute live capture/replay/compare/validation. At that checkpoint, the live bounded run remained separately authorized; its later result is recorded below.
 - User-owned untracked `data/budget_ledger.sqlite3` and `deliverables/` were preserved.
 
 ## 9. Query Evolution live bounded probe result (2026-08-10)
@@ -104,7 +108,7 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - Offline canary lock: `runs/_locks/query_evolution_contract-20260810/canary.lock.json`; embedded lock hash `sha256:72579944c679ef03d42d0dd8771019aad070da2c036cb54344bf931852392df5`; physical file hash `sha256:44b580e3fa865825e72147f003a27650c205ab0ae08077b9191b41a092613cb5`.
 - The canary lock selects exactly 3 deterministic query IDs and fixes 3 logical operations, 9 LLM attempts, and a 600-second global timeout. Its ledger checkpoint is `sha256:0d3774553fc1bf7b67ba2794ed9d73522112463d63965cff8283083c082a3adc`.
 - This preparation ran without reading `.env`, making ledger reservations, constructing an OpenAlex provider, or sending network requests. It created only the two offline lock files.
-- Next action is a separately authorized three-query DeepSeek canary using the exact canary lock. Do not run it, and do not run the full 55-query probe, until the user grants live authorization. If the canary is not promoted, stop on its fixed failure reason and do not rerun unchanged.
+- At that checkpoint, the next action was a separately authorized three-query DeepSeek canary using the exact canary lock. The later authorized result and the independently revised Prompt-v2 path are recorded below; this historical lock must not be reused.
 
 ## 11. Query Evolution three-query canary result (2026-08-10)
 
@@ -113,5 +117,27 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - Outcomes were 2 `generated` and 1 `integrity_failure`; the failed query was rejected for duplicate subquery text after canonicalization. The canary result is `promoted=false` with fixed reason `canary_accounting_failed`.
 - Aggregate usage was 3 LLM calls, 2,541 input tokens, 345 output tokens, 3,877 ms, and `0.003231` CNY. Ledger readback shows 3/3 receipts `settled`, actual usage present, no remaining `reserved` receipt, and the per-receipt sums match the aggregate usage.
 - Snapshot manifest hash is `sha256:a3582e00ac3ebe24dcc78539e60a7fe843e52eefac85675c861e51be38fb4729`; snapshot set ID is `sha256:eefba557af57d4c33a9671412346ac9b36d522bae4ee65787a0bd378fcdd5fcb`.
-- The mismatch between the fixed result reason (`canary_accounting_failed`) and the terminal, numerically consistent ledger readback is now a diagnostic item. It must be explained before any new live run; this result does not support promotion, prompt editing, or a rerun.
-- Apply the stop rule: do not rerun this canary unchanged and do not execute the full 55-query probe. The next work is offline diagnosis of the reason classification/accounting path, followed by a new independently reviewed lock only if a changed hypothesis is justified.
+- At that checkpoint, the fixed reason (`canary_accounting_failed`) disagreed with the terminal, numerically consistent ledger readback and blocked promotion. Subsequent offline work produced the independently reviewed Prompt-v2 path recorded below; this historical mismatch is not the current blocker and the old canary still must not be reused.
+- The stop rule prohibited rerunning this canary unchanged. Subsequent offline diagnosis produced an independently reviewed Prompt-v2 hypothesis and lock; its full-probe result is recorded below. The historical canary lock remains non-reusable.
+
+## 12. Query Evolution Prompt-v2 full probe and Gate repair (2026-08-10)
+
+- The independently locked Prompt-v2 probe completed all 55 queries with 30 `generated` and 25 `no_op` outcomes. Capture and zero-network replay matched; all receipts reached terminal state, with no integrity, provenance, accounting, or snapshot failure.
+- The sealed historical `result.json` remains unchanged and reports Gate A `failed`. That conclusion was caused by two evaluation-contract defects: comparing 55 executed queries with the 60-query frozen metric denominator, and using selected/Top-50 IDs as the Gate-B retrieval stream.
+- Commits `3b4e94a` and `00168cb` repaired the contracts without changing ranking behavior: Gate A now checks locked versus terminal execution counts; Gate B uses full retrieved IDs; Gate C continues to use selected Top-50 IDs; canonical gold associations are counted once.
+- Offline recomputation from the sealed evidence is Gate A `passed`, Gate B `passed`, Gate C `failed`: unique retrieved gold improves 14 → 15, while Top-50 gold remains 8 → 8. This proves a small retrieval signal but no usable ranking/output gain, so the probe does not qualify for formal production capture.
+- The repair is merged into `main` at `d70f1c5`. Do not rewrite historical evidence or rerun the same live probe; diagnose why the added gold does not survive Top-50 offline first.
+
+## 13. Verified identifier rescore 与 sealed query recomposition 封存结论（2026-08-11）
+
+- Verified identifier rescore 已完成并发布：当前正式基线 selected verified Gold 为 `17/143`，旧版 title 外部基准为 `30/143`。对应证据为 `docs/evidence/identifier-map-semantic-rescore-2026-08-11.json` 与 `docs/identifier-map-semantic-rescore-2026-08-11.md`。
+- 为判断 Prompt-v2 的封存槽位中是否仍有可利用排序信号，已预注册并执行一次且仅一次零网络 `append_v2 / round_robin_slots / rrf_slots_k60` 对照。正式证据为 `docs/evidence/sealed-query-recomposition-offline-2026-08-11.json` 与 `docs/sealed-query-recomposition-offline-2026-08-11.md`。
+- 完整性基准精确复现：`append_v2` 的阶段计数为 `not_retrieved=101 / filtered_out=0 / ranked_outside_top50=23 / selected_top50=19`，总数守恒为 143，三种方法的 retrieved/post-filter 集合一致。
+- `round_robin_slots` 得到 24 个 selected Gold，但没有保留 append 的全部已选 Gold，因此不满足可用信号门槛；`rrf_slots_k60` 得到 25 个 selected Gold，保留 append 命中且指标不回退，被判定为可用重组信号。
+- RRF 的 25 仍低于旧版 title 基准 30，正式结论固定为 `signal_insufficient`，reason code 为 `usable_signal_below_legacy_benchmark`。这证明现有封存候选中存在一定排序信号，但仅靠重组无法恢复旧版水平；主要瓶颈仍是 `not_retrieved=101/143`。
+- 停止条件已经触发：不得重跑本次正式命令，不得继续增加重组变体、调 RRF 参数或按查询挑选方法，也不得据此重建 candidate lock、刷新 readiness 或启动 live capture。
+- 下一阶段的唯一建议是建立独立、干净的 `title-informed` 多查询检索基线：先写设计并预注册固定查询构造、指标、晋级门槛和停止条件；设计阶段只使用现有封存材料，不联网、不修改生产检索、不读取 `.env` 或 ledger。
+- 新基线的首要判据必须针对检索覆盖，而非先调排序：在相同 verified identifier 语义和 143 个 Gold 关联分母下，首先证明 `not_retrieved` 明显低于 101，再评估 Top-50 是否达到或超过外部基准 30。未降低 `not_retrieved` 时立即停止查询工程，转向数据源覆盖、标识符映射或 Gold/reference 输入诊断。
+- 相关实现、证据与验证器已经合并并推送到 `main`，实现与证据链截至 `2a538fc3643a1309ee8bf247039ac6639173ddc8`；本节的 HANDOFF/路线图封存提交位于其后。最终离线验证在含完整 sealed 材料的 week3 工作区为 `2233 passed, 35 skipped, 1 online deselected`，Ruff 与 mypy 均通过。
+- 主工作区缺少 Git 忽略的 sealed run、Gold 和 identifier-map 本地材料，因此在那里运行全量测试会有 58 个环境性失败；同一提交已在 week3 工作区通过完整离线测试。主工作区不依赖这些私有材料的相关测试为 `102 passed`。
+- 当前 week3 仍保留未提交的 `HANDOFF.md`、`docs/retrieval-roadmap.md`、`data/budget_ledger.sqlite3`、`deliverables/` 和 `docs/evidence/identifier-map-semantic-audit-2026-08-10.json`；除本次明确更新的两份文档外，其余文件不得清理、覆盖或误提交。

@@ -6,9 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from paper_search.domain.models import Paper
 from paper_search.recall_experiments.inputs import (
-    BoundPaperSource,
     FormalRunInputSource,
     GoldDocumentCatalogBuilder,
     GoldDocumentCatalogSource,
@@ -18,6 +16,7 @@ from paper_search.recall_experiments.recipes import (
     FormalRunInputBinding,
     HistoricalBaselineBinding,
     SampleBinding,
+    load_sample_binding,
 )
 
 
@@ -32,6 +31,10 @@ def _write_jsonl(path: Path, rows: list[dict[str, object]]) -> ArtifactBinding:
     )
     path.write_bytes(content)
     return ArtifactBinding(path=path.name, sha256=_hash(content))
+
+
+def _paper_source(tmp_path: Path, rows: list[dict[str, object]]) -> ArtifactBinding:
+    return _write_jsonl(tmp_path / "papers.jsonl", rows)
 
 
 def _fixture_binding(tmp_path: Path, *, query_ids: list[str]) -> SampleBinding:
@@ -183,7 +186,9 @@ def test_historical_baseline_requires_exact_query_ids_and_gold_denominator(tmp_p
         FormalRunInputSource(tmp_path).load_historical_baseline(mismatched)
 
 
-def test_catalog_builder_preserves_available_metadata_and_marks_missing_title_incomplete() -> None:
+def test_catalog_builder_preserves_available_metadata_and_marks_missing_title_incomplete(
+    tmp_path: Path,
+) -> None:
     from paper_search.evaluation.dataset import EvaluationQuery
 
     gold = [
@@ -193,51 +198,44 @@ def test_catalog_builder_preserves_available_metadata_and_marks_missing_title_in
             relevant_paper_ids=["arxiv:2401.00001", "arxiv:2401.00002"],
         )
     ]
-    sealed = GoldDocumentCatalogBuilder().build(
-        gold,
+    incomplete_source = _paper_source(
+        tmp_path,
         [
-            BoundPaperSource(
-                source_id="frozen-snapshot",
-                sha256="sha256:" + "1" * 64,
-                papers=[
-                    Paper(
-                        canonical_id="arxiv:2401.00001",
-                        title="Available title",
-                        abstract=None,
-                        authors=[],
-                        publication_year=None,
-                        sources=["openalex"],
-                    )
-                ],
-            )
+            {
+                "canonical_id": "arxiv:2401.00001",
+                "title": "Available title",
+                "sources": ["openalex"],
+            }
         ],
     )
+    sealed = GoldDocumentCatalogBuilder(tmp_path).build(gold, [incomplete_source])
 
     assert sealed.status == "incomplete"
+    assert sealed.source_manifest[0].path == "papers.jsonl"
+    assert sealed.source_manifest[0].sha256 == incomplete_source.sha256
+    assert sealed.source_manifest_sha256.startswith("sha256:")
     with pytest.raises(ValueError, match="oracle_catalog_incomplete"):
         sealed.to_generation_documents("q-one")
 
-    complete = GoldDocumentCatalogBuilder().build(gold[:1], [
-        BoundPaperSource(
-            source_id="frozen-snapshot",
-            sha256="sha256:" + "1" * 64,
-            papers=[
-                Paper(
-                    canonical_id="arxiv:2401.00001",
-                    title="Available title",
-                    abstract="Preserved abstract",
-                    authors=["Ada Author"],
-                    publication_year=2024,
-                    sources=["openalex"],
-                ),
-                Paper(
-                    canonical_id="arxiv:2401.00002",
-                    title="Second title",
-                    sources=["semantic_scholar"],
-                ),
-            ],
-        )
-    ])
+    complete_source = _paper_source(
+        tmp_path,
+        [
+            {
+                "canonical_id": "arxiv:2401.00001",
+                "title": "Available title",
+                "abstract": "Preserved abstract",
+                "authors": ["Ada Author"],
+                "publication_year": 2024,
+                "sources": ["openalex"],
+            },
+            {
+                "canonical_id": "arxiv:2401.00002",
+                "title": "Second title",
+                "sources": ["semantic_scholar"],
+            },
+        ],
+    )
+    complete = GoldDocumentCatalogBuilder(tmp_path).build(gold, [complete_source])
     documents = complete.to_generation_documents("q-one")
 
     assert documents[0].model_dump(mode="json") == {
@@ -258,7 +256,167 @@ def test_catalog_source_hash_binds_private_catalog_rows(tmp_path: Path) -> None:
     (tmp_path / "catalog.jsonl").write_bytes(content)
     binding = ArtifactBinding(path="catalog.jsonl", sha256=_hash(content))
 
-    catalog = GoldDocumentCatalogSource(tmp_path).load(binding)
+    from paper_search.evaluation.dataset import EvaluationQuery
+
+    gold = [
+        EvaluationQuery(
+            query_id="q-one", query="one", relevant_paper_ids=["arxiv:2401.00001"]
+        )
+    ]
+    catalog = GoldDocumentCatalogSource(tmp_path).load(binding, gold_associations=gold)
 
     assert catalog.status == "complete"
     assert catalog.to_generation_documents("q-one")[0].title == "Only title"
+
+
+def test_catalog_builder_requires_hash_bound_paper_artifacts(tmp_path: Path) -> None:
+    from paper_search.evaluation.dataset import EvaluationQuery
+
+    gold = [EvaluationQuery(query_id="q-one", query="one", relevant_paper_ids=["arxiv:2401.00001"])]
+    with pytest.raises(TypeError, match="ArtifactBinding"):
+        GoldDocumentCatalogBuilder(tmp_path).build(gold, [{"not": "a bound artifact"}])
+
+    changed = _paper_source(
+        tmp_path,
+        [{"canonical_id": "arxiv:2401.00001", "title": "Bound", "sources": ["openalex"]}],
+    ).model_copy(update={"sha256": "sha256:" + "f" * 64})
+    with pytest.raises(ValueError, match="hash mismatch"):
+        GoldDocumentCatalogBuilder(tmp_path).build(gold, [changed])
+
+    outside = tmp_path.parent / "outside-papers.jsonl"
+    outside.write_text(
+        '{"canonical_id":"arxiv:2401.00001","title":"Outside","sources":["openalex"]}\n',
+        encoding="utf-8",
+    )
+    escaped = ArtifactBinding.model_construct(path="../outside-papers.jsonl", sha256=_hash(outside.read_bytes()))
+    with pytest.raises(ValueError, match="escapes workspace root"):
+        GoldDocumentCatalogBuilder(tmp_path).build(gold, [escaped])
+
+
+def test_catalog_builder_reads_normalized_papers_from_bound_outcome_artifacts(tmp_path: Path) -> None:
+    from paper_search.evaluation.dataset import EvaluationQuery
+
+    gold = [EvaluationQuery(query_id="q-one", query="one", relevant_paper_ids=["arxiv:2401.00001"])]
+    source = _write_jsonl(
+        tmp_path / "outcomes.jsonl",
+        [
+            {
+                "query_id": "q-one",
+                "searches": [
+                    {
+                        "data": [
+                            {
+                                "canonical_id": "arxiv:2401.00001",
+                                "title": "Nested frozen Paper",
+                                "sources": ["openalex"],
+                            }
+                        ]
+                    }
+                ],
+            }
+        ],
+    )
+
+    catalog = GoldDocumentCatalogBuilder(tmp_path).build(gold, [source])
+
+    assert catalog.status == "complete"
+    assert catalog.to_generation_documents("q-one")[0].title == "Nested frozen Paper"
+
+
+def test_catalog_source_rejects_missing_extra_and_duplicate_selected_associations(tmp_path: Path) -> None:
+    from paper_search.evaluation.dataset import EvaluationQuery
+
+    gold = [
+        EvaluationQuery(
+            query_id="q-one",
+            query="one",
+            relevant_paper_ids=["arxiv:2401.00001", "arxiv:2401.00002"],
+        )
+    ]
+    rows = [
+        {"query_id": "q-one", "gold_paper_id": "arxiv:2401.00001", "title": "One"},
+        {"query_id": "q-one", "gold_paper_id": "arxiv:2401.00001", "title": "Duplicate"},
+        {"query_id": "q-other", "gold_paper_id": "arxiv:2401.00003", "title": "Extra"},
+    ]
+    binding = _write_jsonl(tmp_path / "catalog.jsonl", rows)
+
+    catalog = GoldDocumentCatalogSource(tmp_path).load(binding, gold_associations=gold)
+
+    assert catalog.status == "invalid"
+    with pytest.raises(ValueError, match="oracle_catalog_invalid"):
+        catalog.to_generation_documents("q-one")
+
+
+def test_catalog_generation_rejects_identifier_leakage_but_allows_provider_names(tmp_path: Path) -> None:
+    from paper_search.evaluation.dataset import EvaluationQuery
+
+    gold = [EvaluationQuery(query_id="q-one", query="one", relevant_paper_ids=["arxiv:2401.00001"])]
+    leaking = _write_jsonl(
+        tmp_path / "catalog.jsonl",
+        [
+            {
+                "query_id": "q-one",
+                "gold_paper_id": "arxiv:2401.00001",
+                "title": "Paper https://example.test/private",
+            }
+        ],
+    )
+    catalog = GoldDocumentCatalogSource(tmp_path).load(leaking, gold_associations=gold)
+    with pytest.raises(ValueError, match="forbidden"):
+        catalog.to_generation_documents("q-one")
+
+    safe = _write_jsonl(
+        tmp_path / "catalog.jsonl",
+        [
+            {
+                "query_id": "q-one",
+                "gold_paper_id": "arxiv:2401.00001",
+                "title": "OpenAlex and Semantic Scholar in ordinary prose",
+            }
+        ],
+    )
+    documents = GoldDocumentCatalogSource(tmp_path).load(safe, gold_associations=gold).to_generation_documents(
+        "q-one"
+    )
+    assert documents[0].title.startswith("OpenAlex")
+
+
+def test_catalog_generation_rejects_identifier_leakage_in_every_visible_text_field(
+    tmp_path: Path,
+) -> None:
+    from paper_search.evaluation.dataset import EvaluationQuery
+
+    gold = [EvaluationQuery(query_id="q-one", query="one", relevant_paper_ids=["arxiv:2401.00001"])]
+    for field, value in (
+        ("title", "Leaking doi:10.1000/example"),
+        ("abstract", "Read https://example.test/private"),
+        ("authors", ["S2:private-record"]),
+    ):
+        row: dict[str, object] = {
+            "query_id": "q-one",
+            "gold_paper_id": "arxiv:2401.00001",
+            "title": "Safe title",
+        }
+        row[field] = value
+        catalog = GoldDocumentCatalogSource(tmp_path).load(
+            _write_jsonl(tmp_path / "catalog.jsonl", [row]), gold_associations=gold
+        )
+        with pytest.raises(ValueError, match="forbidden"):
+            catalog.to_generation_documents("q-one")
+
+
+def test_bound_smoke_catalog_is_association_complete_but_oracle_incomplete() -> None:
+    workspace = Path(__file__).parents[2]
+    sample = load_sample_binding(
+        workspace / "configs" / "recall_experiments" / "samples" / "dev-smoke-3.yaml"
+    ).binding
+    dataset = FormalRunInputSource(workspace).load_queries(sample)
+    assert sample.gold_document_catalog is not None
+
+    catalog = GoldDocumentCatalogSource(workspace).load(
+        sample.gold_document_catalog,
+        gold_associations=dataset.evaluation_materials.gold_records,
+    )
+
+    assert catalog.status == "incomplete"
+    assert all(record.title is None for record in catalog.records)

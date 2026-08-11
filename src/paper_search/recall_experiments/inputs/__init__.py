@@ -8,16 +8,15 @@ from paper_search.recall_experiments.inputs.base import (
 )
 from paper_search.recall_experiments.inputs.formal_run import FormalRunInputSource
 from paper_search.recall_experiments.inputs.gold_catalog import (
-    BoundPaperSource,
     GoldDocumentCatalogBuilder,
     GoldDocumentCatalogSource,
     OracleCatalogStatus,
     SealedGoldDocumentCatalog,
     SealedGoldDocumentRecord,
+    SourceManifestEntry,
 )
 
 __all__ = [
-    "BoundPaperSource",
     "FormalRunInputSource",
     "FrozenInputSource",
     "FrozenRecallDataset",
@@ -28,4 +27,5 @@ __all__ = [
     "OracleCatalogStatus",
     "SealedGoldDocumentCatalog",
     "SealedGoldDocumentRecord",
+    "SourceManifestEntry",
 ]

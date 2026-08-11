@@ -5,19 +5,24 @@ import inspect
 import pytest
 
 from paper_search.domain.models import ErrorDetail, Paper
+import paper_search.recall_experiments.candidate_pool as candidate_pool_module
 from paper_search.recall_experiments.candidate_pool import CandidatePoolBuilder
 from paper_search.recall_experiments.contracts import RetrievalActionResult
 from paper_search.recall_experiments.stages import CandidateStagePipeline, StageResult
 
 
-class GoldTrap:
-    def __getattr__(self, name: str) -> object:
-        raise AssertionError(f"Gold data must not be accessed: {name}")
+class GuardedActionResult(RetrievalActionResult):
+    @property
+    def gold_documents(self) -> object:
+        raise AssertionError("candidate pools must not access Gold documents")
 
+    @property
+    def evaluation(self) -> object:
+        raise AssertionError("candidate pools must not access evaluation data")
 
-class IdentifierMapTrap:
-    def __getattr__(self, name: str) -> object:
-        raise AssertionError(f"Identifier map must not be accessed: {name}")
+    @property
+    def identifier_map(self) -> object:
+        raise AssertionError("candidate pools must not access identifier maps")
 
 
 def _paper(
@@ -147,15 +152,40 @@ def test_pool_keeps_partial_result_hits_and_handles_empty_results_deterministica
     assert builder.build("query-1", [partial, empty]) == builder.build("query-1", [partial, empty])
 
 
-def test_builder_rejects_unknown_policy_and_cannot_receive_gold_or_identifier_map() -> None:
+def test_builder_rejects_unknown_policy_and_cannot_receive_gold_or_identifier_map(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     with pytest.raises(ValueError, match="unknown candidate pool policy"):
         CandidatePoolBuilder("unknown-v1")
 
     signature = inspect.signature(CandidatePoolBuilder.build)
     assert "gold" not in signature.parameters
     assert "identifier_map" not in signature.parameters
-    assert GoldTrap()
-    assert IdentifierMapTrap()
+
+    original_deduplicator = candidate_pool_module.deduplicate_papers
+    calls: list[tuple[list[Paper], object]] = []
+
+    def deduplicator_spy(papers: list[Paper], *, id_map: object) -> object:
+        assert id_map is None
+        calls.append((papers, id_map))
+        return original_deduplicator(papers, id_map=None)
+
+    monkeypatch.setattr(candidate_pool_module, "deduplicate_papers", deduplicator_spy)
+    guarded_result = GuardedActionResult(
+        action_id="text-1",
+        action_type="text_search",
+        hits=[_paper("paper-1", "Safe candidate")],
+    )
+    pool = CandidatePoolBuilder("production-dedup-v1").build(
+        "query-1",
+        [guarded_result],
+    )
+
+    assert [entry.paper.canonical_id for entry in pool.entries] == ["paper-1"]
+    assert [evidence.action_id for evidence in pool.entries[0].source_evidence] == ["text-1"]
+    assert len(calls) == 1
+    assert calls[0][0] == guarded_result.hits
+    assert calls[0][1] is None
 
 
 class ReplacingStage:

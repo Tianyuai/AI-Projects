@@ -1,7 +1,7 @@
 # Verified-Identifier Offline Rescore v2 Design
 
 **Date:** 2026-08-11
-**Status:** Draft for written stakeholder review; design direction approved
+**Status:** Approved
 **Scope:** Task 4 offline rescore and bottleneck attribution only
 
 ## Decision

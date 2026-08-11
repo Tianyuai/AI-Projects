@@ -1,4 +1,4 @@
-"""Byte-preserving fixed action replay."""
+"""Frozen fixed-action replay."""
 
 from __future__ import annotations
 
@@ -6,12 +6,13 @@ import json
 from collections.abc import Collection, Mapping, Sequence
 
 from paper_search.recall_experiments.contracts import RecallGenerationContext
+from paper_search.recall_experiments.contracts import RecallActionBatch
 from paper_search.recall_experiments.generation.base import GenerationResult
 from paper_search.recall_experiments.validation import validate_action_batch
 
 
 class FixedActionGenerator:
-    """Replay hash-bound action payloads without changing their serialized form."""
+    """Validate and freeze one canonical action payload for every expected query."""
 
     def __init__(
         self,
@@ -26,7 +27,9 @@ class FixedActionGenerator:
             raise ValueError("expected query IDs must be unique")
         if set(actions_by_query) != set(expected):
             raise ValueError("fixed action query coverage does not match expected query IDs")
-        self._actions_by_query = dict(actions_by_query)
+        self._actions_by_query = {
+            query_id: _freeze_action_bytes(raw) for query_id, raw in actions_by_query.items()
+        }
         self._expected_query_ids = frozenset(expected)
         self._allowed_actions = frozenset(allowed_actions)
         self._max_actions = max_actions
@@ -34,8 +37,7 @@ class FixedActionGenerator:
     async def generate(self, context: RecallGenerationContext) -> GenerationResult:
         if context.query_id not in self._expected_query_ids:
             raise ValueError(f"unknown query ID for fixed generation: {context.query_id}")
-        raw = self._actions_by_query[context.query_id]
-        artifact_bytes = _as_bytes(raw)
+        artifact_bytes = self._actions_by_query[context.query_id]
         action_batch = validate_action_batch(
             artifact_bytes.decode("utf-8"),
             context,
@@ -49,14 +51,18 @@ class FixedActionGenerator:
         )
 
 
-def _as_bytes(raw: bytes | str | Mapping[str, object]) -> bytes:
-    if isinstance(raw, bytes):
-        raw.decode("utf-8")
-        return raw
-    if isinstance(raw, str):
-        raw.encode("utf-8").decode("utf-8")
-        return raw.encode("utf-8")
-    return json.dumps(raw, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+def _freeze_action_bytes(raw: bytes | str | Mapping[str, object]) -> bytes:
+    try:
+        if isinstance(raw, bytes):
+            decoded = json.loads(raw.decode("utf-8"))
+        elif isinstance(raw, str):
+            decoded = json.loads(raw)
+        else:
+            decoded = json.loads(json.dumps(raw, ensure_ascii=False))
+        RecallActionBatch.model_validate(decoded)
+    except (TypeError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError("fixed actions must contain a valid UTF-8 JSON action batch") from error
+    return json.dumps(decoded, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 __all__ = ["FixedActionGenerator"]

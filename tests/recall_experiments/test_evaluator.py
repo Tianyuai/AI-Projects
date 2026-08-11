@@ -211,6 +211,57 @@ def test_regenerated_comparison_returns_not_comparable_before_tolerance_math() -
     assert comparison.valid_repeat_count == 1
 
 
+def test_evaluate_rejects_legacy_pool_when_recipe_locks_production_policy() -> None:
+    from paper_search.recall_experiments.recipes import RecallMethodRecipe
+
+    recipe = RecallMethodRecipe.model_validate(
+        {
+            "method_id": "production-policy",
+            "generator": {
+                "type": "manual_actions",
+                "actions": "actions.json",
+                "gold_visibility": "blind",
+            },
+            "retrieval": {
+                "allowed_actions": ["text_search"],
+                "backend": "snapshot_replay",
+                "max_results_per_action": 1,
+                "max_total_actions": 1,
+            },
+            "candidate_pool": {"policy_version": "production-dedup-v1"},
+            "evaluation": {"repeat_count": 1, "max_repeat_attempts": 1},
+        }
+    )
+
+    with pytest.raises(ValueError, match="recipe candidate pool policy"):
+        CandidateRecallEvaluator(recipe).evaluate(
+            _dataset(),
+            [
+                _pool("q-one", "doi:10.1000/one", policy="canonical-id-first-v1"),
+                _pool("q-two", "doi:10.1000/two", policy="canonical-id-first-v1"),
+            ],
+        )
+
+
+@pytest.mark.parametrize(
+    "attempt_ids",
+    [
+        ["attempt-05"],
+        ["attempt-05", "attempt-03", "attempt-01"],
+        ["attempt-01", "attempt-03"],
+        ["attempt-02", "attempt-01"],
+        ["attempt-01", "attempt-01"],
+    ],
+)
+def test_regenerated_attempts_must_be_an_ordered_contiguous_prefix(
+    attempt_ids: list[str],
+) -> None:
+    attempts = [RecallAttempt(attempt_id=attempt_id, infrastructure_failure=True) for attempt_id in attempt_ids]
+
+    with pytest.raises(ValueError, match="ordered contiguous prefix"):
+        compare_regenerated(attempts, None, "production-dedup-v1")
+
+
 def test_regenerated_retention_uses_gold_associations_not_candidate_overlap() -> None:
     evaluator = CandidateRecallEvaluator()
     historical_result = evaluator.evaluate(

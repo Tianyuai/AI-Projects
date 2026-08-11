@@ -222,6 +222,11 @@ class CandidateRecallEvaluator:
         if len(policies) != 1:
             raise ValueError("candidate pools must use one locked policy version")
         policy_version = next(iter(policies))
+        if (
+            self._recipe is not None
+            and policy_version != self._recipe.candidate_pool.policy_version
+        ):
+            raise ValueError("candidate pool policy does not match recipe candidate pool policy")
 
         per_query: list[PerQueryCandidateRecall] = []
         for query_id in expected_ids:
@@ -378,8 +383,9 @@ def _as_historical_evidence(
 
 def _validate_attempt_sequence(attempts: Sequence[RecallAttempt]) -> None:
     attempt_ids = [attempt.attempt_id for attempt in attempts]
-    if len(attempt_ids) != len(set(attempt_ids)):
-        raise ValueError("attempt IDs must be unique")
+    expected_ids = [f"attempt-{ordinal:02d}" for ordinal in range(1, len(attempts) + 1)]
+    if attempt_ids != expected_ids:
+        raise ValueError("scheduled attempts must be an ordered contiguous prefix")
     ordinals = [attempt.valid_repeat_ordinal for attempt in attempts if not attempt.infrastructure_failure]
     if ordinals != list(range(1, len(ordinals) + 1)):
         raise ValueError("valid repeat ordinals must be consecutive and distinct")

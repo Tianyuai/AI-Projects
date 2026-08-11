@@ -1,0 +1,208 @@
+"""Budget-owning adapters for replaceable recall-action LLM analyzers.
+
+This module deliberately accepts an already composed analyzer.  It never reads
+credentials, constructs a client, or selects live versus replay execution.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Mapping
+from typing import Any, Literal, Protocol
+
+from pydantic import Field
+
+from paper_search.control.budget import (
+    BudgetExceededError,
+    HardBudgetController,
+    ReservationError,
+)
+from paper_search.domain.models import (
+    BudgetReservation,
+    DomainModel,
+    ErrorDetail,
+    ProviderResult,
+    UsageActual,
+    UsageEstimate,
+)
+
+
+LLMCallKind = Literal["initial", "repair"]
+_INFRASTRUCTURE_ERROR_CODES = frozenset(
+    {
+        "authentication_error",
+        "accounting_failure",
+        "budget_exhausted",
+        "network_error",
+        "provider_error",
+        "rate_limited",
+        "server_error",
+        "snapshot_unavailable",
+        "timeout",
+    }
+)
+
+
+class LLMGenerationRequest(DomainModel):
+    """The complete input visible to one recall-action generation call."""
+
+    prompt_name: str
+    payload: dict[str, object]
+
+
+class LLMBackendResult(DomainModel):
+    """Provider-neutral generation outcome consumed by action generators."""
+
+    data: dict[str, object] = Field(default_factory=dict)
+    usage: UsageActual = Field(default_factory=UsageActual)
+    provenance: dict[str, str] = Field(default_factory=dict)
+    errors: list[ErrorDetail] = Field(default_factory=list)
+    infrastructure_failure: bool = False
+    repairable: bool = False
+
+
+class LLMBackend(Protocol):
+    async def generate(
+        self,
+        request: LLMGenerationRequest,
+        call_kind: LLMCallKind,
+    ) -> LLMBackendResult: ...
+
+
+class _Analyzer(Protocol):
+    async def generate_json(
+        self,
+        *,
+        prompt_name: str,
+        payload: dict[str, object],
+        reservation: BudgetReservation,
+    ) -> ProviderResult[dict[str, Any]]: ...
+
+
+def _as_result(result: ProviderResult[dict[str, Any]]) -> LLMBackendResult:
+    code = result.errors[0].code if result.errors else None
+    infrastructure_failure = any(
+        error.code in _INFRASTRUCTURE_ERROR_CODES for error in result.errors
+    )
+    return LLMBackendResult(
+        data=dict(result.data),
+        usage=result.usage,
+        provenance=dict(result.provenance),
+        errors=list(result.errors),
+        infrastructure_failure=infrastructure_failure,
+        repairable=code == "invalid_json" and not infrastructure_failure,
+    )
+
+
+def _error_result(
+    *,
+    code: str,
+    message: str,
+    usage: UsageActual | None = None,
+) -> LLMBackendResult:
+    return LLMBackendResult(
+        usage=usage or UsageActual(),
+        provenance={"provider": "llm-backend"},
+        errors=[
+            ErrorDetail(
+                code=code,
+                message=message,
+                retryable=False,
+                provider="llm",
+            )
+        ],
+        infrastructure_failure=True,
+    )
+
+
+class BudgetedLLMBackend:
+    """Reserve exactly one budget receipt for each analyzer generation call."""
+
+    def __init__(
+        self,
+        *,
+        analyzer: _Analyzer,
+        controller: HardBudgetController,
+        initial_estimate: UsageEstimate,
+        repair_estimate: UsageEstimate,
+    ) -> None:
+        if initial_estimate.llm_calls < 1 or repair_estimate.llm_calls < 1:
+            raise ValueError("LLM backend estimates must reserve at least one LLM call")
+        self._analyzer = analyzer
+        self._controller = controller
+        self._estimates: Mapping[LLMCallKind, UsageEstimate] = {
+            "initial": initial_estimate,
+            "repair": repair_estimate,
+        }
+
+    def _settle_or_verify(
+        self,
+        reservation: BudgetReservation,
+        actual: UsageActual,
+    ) -> None:
+        terminal = self._controller.terminal_outcome(reservation)
+        if terminal is None:
+            self._controller.settle(reservation, actual)
+            return
+        mode, recorded = terminal
+        if mode != "settled" or recorded != actual:
+            raise ReservationError("LLM settlement receipt does not match result")
+
+    def _finalize_exception(self, reservation: BudgetReservation) -> None:
+        if self._controller.terminal_outcome(reservation) is not None:
+            return
+        try:
+            self._controller.release(reservation)
+        except ReservationError:
+            self._controller.fail_closed(reservation, UsageActual())
+
+    def _fail_accounting(self, reservation: BudgetReservation, actual: UsageActual) -> None:
+        if self._controller.terminal_outcome(reservation) is not None:
+            return
+        self._controller.fail_closed(reservation, actual)
+
+    async def generate(
+        self,
+        request: LLMGenerationRequest,
+        call_kind: LLMCallKind,
+    ) -> LLMBackendResult:
+        estimate = self._estimates[call_kind]
+        try:
+            reservation = self._controller.reserve(
+                f"recall.generate.{call_kind}", estimate
+            )
+        except BudgetExceededError as error:
+            return _error_result(code="budget_exhausted", message=str(error))
+        except ReservationError as error:
+            return _error_result(code="accounting_failure", message=str(error))
+
+        result: ProviderResult[dict[str, Any]] | None = None
+        try:
+            result = await self._analyzer.generate_json(
+                prompt_name=request.prompt_name,
+                payload=request.payload,
+                reservation=reservation,
+            )
+            self._settle_or_verify(reservation, result.usage)
+        except asyncio.CancelledError:
+            self._finalize_exception(reservation)
+            raise
+        except ReservationError as error:
+            if result is None:
+                self._finalize_exception(reservation)
+            else:
+                self._fail_accounting(reservation, result.usage)
+            return _error_result(code="accounting_failure", message=str(error))
+        except Exception as error:
+            self._finalize_exception(reservation)
+            return _error_result(code="provider_error", message=str(error))
+        return _as_result(result)
+
+
+__all__ = [
+    "BudgetedLLMBackend",
+    "LLMBackend",
+    "LLMBackendResult",
+    "LLMCallKind",
+    "LLMGenerationRequest",
+]

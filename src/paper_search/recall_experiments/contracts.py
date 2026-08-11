@@ -134,7 +134,7 @@ class RetrievalExecutionContext(DomainModel):
 
 
 class RetrievalActionHandler(Protocol):
-    def execute(
+    async def execute(
         self, action: RecallSearchAction, context: RetrievalExecutionContext
     ) -> RetrievalActionResult: ...
 

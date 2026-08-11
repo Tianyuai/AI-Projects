@@ -152,6 +152,7 @@ class ProviderCitationExpansionStage:
             f"semantic_scholar.{direction}:{paper_id.value}",
             self._call_estimate,
         )
+        result: ProviderResult[CitationExpansion] | None = None
         try:
             if direction == "references":
                 result = await self._provider.references(
@@ -172,7 +173,10 @@ class ProviderCitationExpansionStage:
             raise
         except ReservationError:
             if controller.terminal_outcome(reservation) is None:
-                controller.fail_closed(reservation)
+                controller.fail_closed(
+                    reservation,
+                    result.usage if result is not None else UsageActual(),
+                )
             raise
         except Exception:
             if controller.terminal_outcome(reservation) is None:

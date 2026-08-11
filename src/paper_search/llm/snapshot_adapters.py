@@ -273,15 +273,25 @@ class LiveCaptureLLMAnalyzer:
         prompt_name: str,
         payload: dict[str, object],
         reservation: BudgetReservation,
+        prompt_instructions: str | None = None,
+        prompt_artifact_sha256: str | None = None,
     ) -> ProviderResult[dict[str, Any]]:
         if reservation.reserved.llm_calls < 1:
             raise ValueError("reservation must include one LLM call")
         requested_at = self._clock()
+        effective_prompt_sha256 = validate_prompt_artifact_sha256(
+            prompt_artifact_sha256 or self._prompt_artifact_sha256
+        )
+        effective_prompt_instructions = (
+            prompt_instructions
+            if prompt_instructions is not None
+            else self._prompt_instructions
+        )
         identity = _identity(
             self._client,
             prompt_name=prompt_name,
             payload=payload,
-            prompt_artifact_sha256=self._prompt_artifact_sha256,
+            prompt_artifact_sha256=effective_prompt_sha256,
         )
         measured_attempts: list[UsageActual] = []
         valued_attempts: list[UsageActual] = []
@@ -304,7 +314,7 @@ class LiveCaptureLLMAnalyzer:
                     response = await self._client.request_response(
                         prompt_name=prompt_name,
                         payload=payload,
-                        prompt_instructions=self._prompt_instructions,
+                        prompt_instructions=effective_prompt_instructions,
                     )
                 except httpx.TimeoutException:
                     code, message, retryable = (
@@ -546,13 +556,19 @@ class ReplayLLMAnalyzer:
         prompt_name: str,
         payload: dict[str, object],
         reservation: BudgetReservation,
+        prompt_instructions: str | None = None,
+        prompt_artifact_sha256: str | None = None,
     ) -> ProviderResult[dict[str, Any]]:
         del reservation
+        del prompt_instructions
+        effective_prompt_sha256 = validate_prompt_artifact_sha256(
+            prompt_artifact_sha256 or self._prompt_artifact_sha256
+        )
         identity = _replay_identity(
             model_id=self._model_id,
             prompt_name=prompt_name,
             payload=payload,
-            prompt_artifact_sha256=self._prompt_artifact_sha256,
+            prompt_artifact_sha256=effective_prompt_sha256,
             prompt_version=self._prompt_version,
         )
         try:

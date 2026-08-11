@@ -94,6 +94,7 @@ async def _live(
     *,
     prompt_name: str = "query_analyze",
     prompt_instructions: str | None = None,
+    prompt_artifact_sha256: str | None = None,
 ) -> tuple[object, DependencyCaptureStore]:
     store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
     async with httpx.AsyncClient(transport=transport) as http_client:
@@ -117,6 +118,11 @@ async def _live(
             prompt_name=prompt_name,
             payload={"query": "graph retrieval"},
             reservation=reservation or _reservation(),
+            **(
+                {"prompt_artifact_sha256": prompt_artifact_sha256}
+                if prompt_artifact_sha256 is not None
+                else {}
+            ),
         )
     return result, store
 
@@ -182,6 +188,58 @@ def test_live_analyzer_sends_bound_instructions_for_query_evolve(
     assert seen[0]["messages"][0]["content"] == (
         "Respond with the QueryEvolutionProposal JSON contract."
     )
+
+
+def test_per_call_prompt_digest_is_used_for_live_capture_and_replay_identity(
+    tmp_path: Path,
+) -> None:
+    source = b"name: recall\n# exact-byte identity\n"
+    prompt_sha256 = "sha256:" + hashlib.sha256(source).hexdigest()
+    result, store = asyncio.run(
+        _live(
+            tmp_path,
+            httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, content=_response_bytes({"ok": True}), request=request
+                )
+            ),
+            SettlementRecorder(),
+            prompt_instructions="Exact recall instructions.",
+            prompt_artifact_sha256=prompt_sha256,
+        )
+    )
+    manifest = store.seal()
+    replay = ReplayLLMAnalyzer(
+        reader=DependencySnapshotReader(
+            store.manifest_path,
+            snapshot_manifest_sha256=store.manifest_sha256,
+            snapshot_set_id=manifest.snapshot_set_id,
+        ),
+        model_id="deepseek-test-v1",
+        prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
+        prompt_version="query-analyze-v1",
+    )
+
+    replayed = asyncio.run(
+        replay.generate_json(
+            prompt_name="query_analyze",
+            payload={"query": "graph retrieval"},
+            reservation=_reservation(),
+            prompt_instructions="Exact recall instructions.",
+            prompt_artifact_sha256=prompt_sha256,
+        )
+    )
+    wrong_identity = asyncio.run(
+        replay.generate_json(
+            prompt_name="query_analyze",
+            payload={"query": "graph retrieval"},
+            reservation=_reservation(),
+        )
+    )
+
+    assert result.data == {"ok": True}
+    assert replayed.data == {"ok": True}
+    assert wrong_identity.errors[0].code == "snapshot_unavailable"
 
 
 def _budget_controller(*, formal_live: bool = True) -> HardBudgetController:

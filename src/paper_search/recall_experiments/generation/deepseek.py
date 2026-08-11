@@ -12,6 +12,7 @@ import json
 from collections.abc import Collection, Mapping
 from typing import Literal
 
+import yaml
 from pydantic import Field, model_validator
 
 from paper_search.domain.models import DomainModel, ErrorDetail, NonEmptyStr
@@ -46,6 +47,18 @@ class RecallPromptArtifact(DomainModel):
     model: NonEmptyStr
     temperature: Literal[0]
     instructions: list[NonEmptyStr] = Field(min_length=1)
+    source_bytes: bytes = Field(min_length=1, exclude=True, repr=False)
+
+    @classmethod
+    def from_yaml_bytes(cls, source_bytes: bytes) -> RecallPromptArtifact:
+        """Parse YAML while preserving its exact bytes as the prompt identity."""
+        try:
+            decoded = yaml.safe_load(source_bytes)
+        except yaml.YAMLError as error:
+            raise ValueError("invalid recall prompt artifact") from error
+        if not isinstance(decoded, dict) or not all(isinstance(key, str) for key in decoded):
+            raise ValueError("invalid recall prompt artifact")
+        return cls.model_validate({**decoded, "source_bytes": source_bytes})
 
     @model_validator(mode="after")
     def validate_locked_generation_settings(self) -> RecallPromptArtifact:
@@ -56,7 +69,7 @@ class RecallPromptArtifact(DomainModel):
         return self
 
     def canonical_bytes(self) -> bytes:
-        """Stable prompt bytes whose digest must be bound by the LLM adapter."""
+        """Stable parsed representation, useful for display but not snapshot identity."""
         return json.dumps(
             self.model_dump(mode="json"),
             sort_keys=True,
@@ -66,7 +79,7 @@ class RecallPromptArtifact(DomainModel):
 
     @property
     def sha256(self) -> str:
-        return "sha256:" + hashlib.sha256(self.canonical_bytes()).hexdigest()
+        return "sha256:" + hashlib.sha256(self.source_bytes).hexdigest()
 
 
 class RecallGenerationFailure(RuntimeError):
@@ -188,7 +201,7 @@ class DeepSeekPromptGenerator:
             max_actions=self._max_actions,
         )
         initial = await self._backend.generate(
-            LLMGenerationRequest(prompt_name=self._prompt.name, payload=payload), "initial"
+            self._request(payload), "initial"
         )
         failure = _as_validation_failure(initial)
         if failure is None:
@@ -197,10 +210,7 @@ class DeepSeekPromptGenerator:
             except ActionValidationFailure as error:
                 failure = error
         repair = await self._backend.generate(
-            LLMGenerationRequest(
-                prompt_name=self._prompt.name,
-                payload=build_repair_payload(failure),
-            ),
+            self._request(build_repair_payload(failure)),
             "repair",
         )
         second_failure = _as_validation_failure(repair)
@@ -226,6 +236,15 @@ class DeepSeekPromptGenerator:
             artifact_bytes=json.dumps(
                 output, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
             ).encode("utf-8"),
+        )
+
+    def _request(self, payload: dict[str, object]) -> LLMGenerationRequest:
+        return LLMGenerationRequest(
+            prompt_name=self._prompt.name,
+            payload=payload,
+            prompt_instructions=render_recall_prompt(self._prompt),
+            prompt_bytes=self._prompt.source_bytes,
+            prompt_artifact_sha256=self._prompt.sha256,
         )
 
 
@@ -256,12 +275,14 @@ def _effective_visibility(
 
 def _safe_seed(paper: Mapping[str, object]) -> dict[str, object]:
     """Retain useful paper prose while removing all provider/canonical identifiers."""
-    return {
+    safe_seed = {
         "title": paper["title"],
         "abstract": paper["abstract"],
         "authors": paper["authors"],
         "publication_year": paper["publication_year"],
     }
+    assert_no_forbidden_identifier_keys_or_patterns(safe_seed)
+    return safe_seed
 
 
 __all__ = [

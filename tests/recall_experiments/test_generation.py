@@ -1,15 +1,33 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from paper_search.domain.models import QuerySpec
-from paper_search.domain.models import ErrorDetail
-from paper_search.recall_experiments.contracts import GoldDocument, RecallGenerationContext
-from paper_search.recall_experiments.generation.backends import LLMBackendResult
+from paper_search.control.budget import HardBudgetController
+from paper_search.domain.models import (
+    ErrorDetail,
+    Paper,
+    ProviderResult,
+    QuerySpec,
+    SearchBudget,
+    UsageActual,
+    UsageEstimate,
+)
+from paper_search.recall_experiments.contracts import (
+    GoldDocument,
+    RecallGenerationContext,
+    SeedCandidate,
+)
+from paper_search.recall_experiments.generation.backends import (
+    BudgetedLLMBackend,
+    LLMBackendResult,
+)
 from paper_search.recall_experiments.generation.deepseek import (
     DeepSeekPromptGenerator,
     RecallGenerationFailure,
@@ -165,12 +183,8 @@ class _RecordingLLMBackend:
 
 
 def _prompt() -> RecallPromptArtifact:
-    return RecallPromptArtifact(
-        name="recall_scheme_b",
-        version="recall-scheme-b-v1",
-        model="deepseek-v4-flash",
-        temperature=0,
-        instructions=["Generate only permitted retrieval actions."],
+    return RecallPromptArtifact.from_yaml_bytes(
+        b"# source bytes are identity-sensitive\nname: recall_scheme_b\nversion: recall-scheme-b-v1\nmodel: deepseek-v4-flash\ntemperature: 0\ninstructions:\n  - Generate only permitted retrieval actions.\n"
     )
 
 
@@ -318,6 +332,153 @@ def test_analyzer_invalid_json_triggers_one_repair_with_previous_output() -> Non
     repair_payload = getattr(backend.calls[1][1], "payload")
     assert repair_payload["validation_errors"] == [{"code": "invalid_json", "field_path": ""}]
     assert repair_payload["previous_output"] == {}
+
+
+def test_initial_and_repair_requests_carry_the_same_rendered_prompt_and_exact_source_identity() -> None:
+    source = b"# retained comment\nname: recall_scheme_b\nversion: recall-scheme-b-v1\nmodel: deepseek-v4-flash\ntemperature: 0\ninstructions:\n  - Generate only permitted retrieval actions.\n"
+    prompt = RecallPromptArtifact.from_yaml_bytes(source)
+    backend = _RecordingLLMBackend([_backend_result({"actions": [{}]}), _backend_result(_actions())])
+    generator = DeepSeekPromptGenerator(
+        backend=backend, prompt=prompt, visibility="blind", allowed_actions={"text_search"}, max_actions=1
+    )
+
+    asyncio.run(generator.generate(_context("query-1")))
+
+    initial_request = backend.calls[0][1]
+    repair_request = backend.calls[1][1]
+    expected_digest = "sha256:" + hashlib.sha256(source).hexdigest()
+    assert getattr(initial_request, "prompt_instructions") == render_recall_prompt(prompt)
+    assert getattr(repair_request, "prompt_instructions") == render_recall_prompt(prompt)
+    assert getattr(initial_request, "prompt_bytes") == source
+    assert getattr(repair_request, "prompt_bytes") == source
+    assert getattr(initial_request, "prompt_artifact_sha256") == expected_digest
+    assert getattr(repair_request, "prompt_artifact_sha256") == expected_digest
+
+
+class _ReservationRecordingAnalyzer:
+    def __init__(self) -> None:
+        self.results = iter([{"actions": [{}]}, _actions()])
+        self.calls: list[tuple[object, str | None, str | None]] = []
+
+    async def generate_json(
+        self,
+        *,
+        prompt_name: str,
+        payload: dict[str, object],
+        reservation: object,
+        prompt_instructions: str | None = None,
+        prompt_artifact_sha256: str | None = None,
+    ) -> ProviderResult[dict[str, object]]:
+        assert prompt_name == "recall_scheme_b"
+        assert payload
+        self.calls.append((reservation, prompt_instructions, prompt_artifact_sha256))
+        return ProviderResult(
+            data=next(self.results),
+            usage=UsageActual(llm_calls=1, cost_cny=Decimal("0.01")),
+            provenance={
+                "provider": "sealed-fake",
+                "endpoint": "/sealed",
+                "model_id": "fake-model",
+                "requested_at": datetime.now(UTC).isoformat(),
+                "response_hash": "sha256:sealed",
+            },
+            cache_hit=True,
+            latency_ms=0,
+            errors=[],
+        )
+
+
+def test_initial_and_repair_use_distinct_budget_reservations_with_the_exact_prompt_identity() -> None:
+    analyzer = _ReservationRecordingAnalyzer()
+    controller = HardBudgetController(
+        SearchBudget(
+            max_search_api_calls=1,
+            target_search_api_calls=1,
+            max_llm_calls=2,
+            target_llm_calls=2,
+            max_total_tokens=10,
+            max_cost_cny=Decimal("1"),
+            max_elapsed_seconds=60,
+            soft_deadline_seconds=10,
+        )
+    )
+    backend = BudgetedLLMBackend(
+        analyzer=analyzer,
+        controller=controller,
+        initial_estimate=UsageEstimate(llm_calls=1, cost_cny=Decimal("0.01")),
+        repair_estimate=UsageEstimate(llm_calls=1, cost_cny=Decimal("0.01")),
+    )
+    prompt = _prompt()
+    generator = DeepSeekPromptGenerator(
+        backend=backend, prompt=prompt, visibility="blind", allowed_actions={"text_search"}, max_actions=1
+    )
+
+    asyncio.run(generator.generate(_context("query-1")))
+
+    assert len(analyzer.calls) == 2
+    assert analyzer.calls[0][0].reservation_id != analyzer.calls[1][0].reservation_id
+    assert [item[1] for item in analyzer.calls] == [render_recall_prompt(prompt)] * 2
+    assert [item[2] for item in analyzer.calls] == [prompt.sha256] * 2
+    assert [item["action"] for item in controller.export_state()["terminal_outcomes"]] == [
+        "recall.generate.initial",
+        "recall.generate.repair",
+    ]
+
+
+def test_prompt_digest_is_the_exact_yaml_bytes_digest_and_matches_the_recipe_loader() -> None:
+    loaded = load_recall_recipe(Path("configs/recall_experiments/methods/scheme-b-blind.yaml"))
+    assert loaded.prompt_bytes is not None
+    prompt = RecallPromptArtifact.from_yaml_bytes(loaded.prompt_bytes)
+    changed_whitespace = RecallPromptArtifact.from_yaml_bytes(loaded.prompt_bytes + b"# changed\n")
+
+    assert prompt.sha256 == loaded.prompt_sha256
+    assert changed_whitespace.sha256 != prompt.sha256
+
+
+@pytest.mark.parametrize("forbidden", ["10.1234/seed", "https://example.invalid/paper", "W12345678", "S2:123"])
+def test_seed_prose_identifier_patterns_are_rejected_after_identifier_fields_are_removed(forbidden: str) -> None:
+    context = _context("query-1").model_copy(
+        update={
+            "seed_candidates": [
+                SeedCandidate(
+                    paper=Paper(
+                        canonical_id="seed-1",
+                        title=f"Ordinary {forbidden}",
+                        abstract="OpenAlex remains ordinary prose.",
+                        sources=["openalex"],
+                    )
+                )
+            ]
+        }
+    )
+
+    with pytest.raises(ValueError, match="forbidden identifier pattern"):
+        build_generation_payload(
+            context, visibility="blind", allowed_actions={"text_search"}, max_actions=1
+        )
+
+
+def test_seed_prose_can_mention_openalex_without_an_identifier() -> None:
+    context = _context("query-1").model_copy(
+        update={
+            "seed_candidates": [
+                SeedCandidate(
+                    paper=Paper(
+                        canonical_id="seed-1",
+                        title="OpenAlex coverage study",
+                        abstract="Semantic Scholar is discussed as ordinary prose.",
+                        sources=["openalex"],
+                    )
+                )
+            ]
+        }
+    )
+
+    payload = build_generation_payload(
+        context, visibility="blind", allowed_actions={"text_search"}, max_actions=1
+    )
+
+    assert payload["seed_candidates"][0]["title"] == "OpenAlex coverage study"
 
 
 def test_second_invalid_output_is_a_generation_failure() -> None:

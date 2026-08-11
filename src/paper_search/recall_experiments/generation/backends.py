@@ -7,10 +7,11 @@ credentials, constructs a client, or selects live versus replay execution.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from collections.abc import Mapping
 from typing import Any, Literal, Protocol
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from paper_search.control.budget import (
     BudgetExceededError,
@@ -24,6 +25,7 @@ from paper_search.domain.models import (
     ProviderResult,
     UsageActual,
     UsageEstimate,
+    Sha256,
 )
 
 
@@ -35,6 +37,20 @@ class LLMGenerationRequest(DomainModel):
 
     prompt_name: str
     payload: dict[str, object]
+    prompt_instructions: str | None = None
+    prompt_bytes: bytes | None = None
+    prompt_artifact_sha256: Sha256 | None = None
+
+    @model_validator(mode="after")
+    def validate_prompt_identity(self) -> LLMGenerationRequest:
+        values = (self.prompt_instructions, self.prompt_bytes, self.prompt_artifact_sha256)
+        if any(value is not None for value in values) and any(value is None for value in values):
+            raise ValueError("prompt instructions, bytes, and SHA-256 must be bound together")
+        if self.prompt_bytes is not None:
+            digest = "sha256:" + hashlib.sha256(self.prompt_bytes).hexdigest()
+            if digest != self.prompt_artifact_sha256:
+                raise ValueError("prompt SHA-256 does not match exact prompt bytes")
+        return self
 
 
 class LLMBackendResult(DomainModel):
@@ -63,6 +79,8 @@ class _Analyzer(Protocol):
         prompt_name: str,
         payload: dict[str, object],
         reservation: BudgetReservation,
+        prompt_instructions: str | None = None,
+        prompt_artifact_sha256: str | None = None,
     ) -> ProviderResult[dict[str, Any]]: ...
 
 
@@ -170,6 +188,7 @@ class BudgetedLLMBackend:
                 prompt_name=request.prompt_name,
                 payload=request.payload,
                 reservation=reservation,
+                **_prompt_identity_kwargs(request),
             )
             self._settle_or_verify(reservation, result.usage)
         except asyncio.CancelledError:
@@ -184,7 +203,20 @@ class BudgetedLLMBackend:
         except Exception as error:
             self._finalize_exception(reservation)
             return _error_result(code="provider_error", message=str(error))
-        return _as_result(result)
+        backend_result = _as_result(result)
+        provenance = dict(backend_result.provenance)
+        provenance["backend_call_id"] = reservation.reservation_id
+        return backend_result.model_copy(update={"provenance": provenance})
+
+
+def _prompt_identity_kwargs(request: LLMGenerationRequest) -> dict[str, str]:
+    if request.prompt_instructions is None:
+        return {}
+    assert request.prompt_artifact_sha256 is not None
+    return {
+        "prompt_instructions": request.prompt_instructions,
+        "prompt_artifact_sha256": request.prompt_artifact_sha256,
+    }
 
 
 __all__ = [

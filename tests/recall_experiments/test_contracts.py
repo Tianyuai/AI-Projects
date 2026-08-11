@@ -144,6 +144,51 @@ def test_action_batch_preserves_input_order() -> None:
     assert isinstance(batch.actions[2], CitationExpandAction)
 
 
+def test_validation_returns_typed_normalized_search_payloads() -> None:
+    actions = _valid_actions()[:2]
+    actions[0]["payload"] = {"query_text": "  graph   retrieval 2022  "}
+    actions[1]["payload"] = {"title_text": "  Exact   Candidate Title  "}
+
+    batch = _validate({"actions": actions})
+
+    text_action, title_action = batch.actions
+    assert isinstance(text_action, TextSearchAction)
+    assert text_action.payload.query_text == "graph retrieval 2022"
+    assert isinstance(title_action, TitleSearchAction)
+    assert title_action.payload.title_text == "Exact Candidate Title"
+
+
+def test_validation_rejects_unknown_batch_envelope_keys() -> None:
+    with pytest.raises(ActionValidationFailure) as caught:
+        _validate({"actions": _valid_actions()[:1], "unexpected": True})
+
+    assert {issue.code for issue in caught.value.issues} == {"invalid_json"}
+    assert caught.value.issues[0].field_path == "unexpected"
+
+
+def test_validation_closes_phase_one_types_when_caller_allows_unknown_type() -> None:
+    raw = {
+        "actions": [
+            {
+                "action_id": "a-web",
+                "action_type": "web_search",
+                "strategy": "unsupported",
+                "payload": {"query_text": "graph retrieval"},
+            }
+        ]
+    }
+
+    with pytest.raises(ActionValidationFailure) as caught:
+        validate_action_batch(
+            raw,
+            _context(),
+            allowed_actions={"text_search", "title_search", "citation_expand", "web_search"},
+            max_actions=3,
+        )
+
+    assert {issue.code for issue in caught.value.issues} == {"disallowed_action_type"}
+
+
 def test_validation_rejects_duplicate_action_ids() -> None:
     actions = _valid_actions()
     actions[1]["action_id"] = "a-text"

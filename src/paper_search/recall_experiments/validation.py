@@ -16,7 +16,9 @@ from paper_search.recall_experiments.contracts import (
     RecallGenerationContext,
     RecallSearchAction,
     TextSearchAction,
+    TextSearchPayload,
     TitleSearchAction,
+    TitleSearchPayload,
 )
 
 
@@ -33,6 +35,7 @@ ActionValidationCode = Literal[
 ]
 _YEAR_PATTERN = re.compile(r"\b(19\d{2}|20\d{2})\b")
 _MAX_ACTION_TEXT_CHARS = 300
+_PHASE_ONE_ACTION_TYPES = frozenset({"text_search", "title_search", "citation_expand"})
 
 
 class ActionValidationIssue(DomainModel):
@@ -64,6 +67,10 @@ def validate_action_batch(
     decoded = _decode_raw(raw)
     if not isinstance(decoded, Mapping):
         _raise("invalid_json", "", "action batch must be a JSON object", raw)
+    unknown_keys = set(decoded).difference({"actions"})
+    if unknown_keys:
+        key = sorted(str(item) for item in unknown_keys)[0]
+        _raise("invalid_json", key, "action batch contains an unknown field", raw)
 
     raw_actions = decoded.get("actions")
     if not isinstance(raw_actions, list):
@@ -88,7 +95,11 @@ def validate_action_batch(
             issues.append(_issue("invalid_json", field_prefix, "action must be an object"))
             continue
         action_type = candidate.get("action_type")
-        if not isinstance(action_type, str) or action_type not in allowed_actions:
+        if (
+            not isinstance(action_type, str)
+            or action_type not in _PHASE_ONE_ACTION_TYPES
+            or action_type not in allowed_actions
+        ):
             issues.append(
                 _issue(
                     "disallowed_action_type",
@@ -176,8 +187,8 @@ def _normalize_action(
             )
             return None
         if isinstance(action, TextSearchAction):
-            return action.model_copy(update={"payload": {"query_text": text}})
-        return action.model_copy(update={"payload": {"title_text": text}})
+            return action.model_copy(update={"payload": TextSearchPayload(query_text=text)})
+        return action.model_copy(update={"payload": TitleSearchPayload(title_text=text)})
 
     if action.payload.seed_canonical_id not in seed_ids:
         issues.append(

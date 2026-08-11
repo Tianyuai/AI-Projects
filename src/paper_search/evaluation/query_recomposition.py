@@ -37,6 +37,19 @@ RecompositionConclusion = Literal[
     "signal_insufficient",
     "legacy_benchmark_met",
 ]
+RecompositionReasonCode = Literal[
+    "experiment_integrity_failed",
+    "no_variant_passed_signal_gate",
+    "usable_signal_below_legacy_benchmark",
+    "legacy_benchmark_met",
+]
+
+_REASON_CODE_BY_CONCLUSION: dict[RecompositionConclusion, RecompositionReasonCode] = {
+    "integrity_failure": "experiment_integrity_failed",
+    "no_usable_recomposition_signal": "no_variant_passed_signal_gate",
+    "signal_insufficient": "usable_signal_below_legacy_benchmark",
+    "legacy_benchmark_met": "legacy_benchmark_met",
+}
 
 _FIXED_METHODS: tuple[RecompositionMethod, ...] = (
     "append_v2",
@@ -123,6 +136,7 @@ class SealedQueryRecompositionReport(DomainModel):
     legacy_title_selected: NonNegativeInt
     rows: tuple[SealedQueryRecompositionRow, ...] = Field(min_length=3, max_length=3)
     conclusion: RecompositionConclusion
+    reason_codes: tuple[RecompositionReasonCode] = Field(min_length=1, max_length=1)
 
     @model_validator(mode="after")
     def validate_fixed_rows(self) -> SealedQueryRecompositionReport:
@@ -131,6 +145,8 @@ class SealedQueryRecompositionReport(DomainModel):
         totals = {row.total_gold_associations for row in self.rows}
         if len(totals) != 1:
             raise ValueError("recomposition rows must use the same gold denominator")
+        if self.reason_codes != (_REASON_CODE_BY_CONCLUSION[self.conclusion],):
+            raise ValueError("reason code must match conclusion")
         return self
 
 
@@ -340,12 +356,14 @@ def build_report(
             )
         )
 
+    conclusion = _conclusion(tuple(rows), legacy_title_selected)
     return SealedQueryRecompositionReport(
         input_hashes=hashes,
         current_formal_selected=current_formal_selected,
         legacy_title_selected=legacy_title_selected,
         rows=tuple(rows),
-        conclusion=_conclusion(tuple(rows), legacy_title_selected),
+        conclusion=conclusion,
+        reason_codes=(_REASON_CODE_BY_CONCLUSION[conclusion],),
     )
 
 
@@ -507,6 +525,7 @@ def _integrity_failure_report(
         legacy_title_selected=legacy_title_selected,
         rows=rows,
         conclusion="integrity_failure",
+        reason_codes=("experiment_integrity_failed",),
     )
 
 

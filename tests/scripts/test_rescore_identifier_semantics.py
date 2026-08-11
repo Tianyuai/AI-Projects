@@ -284,6 +284,94 @@ def test_verified_probe_material_loader_reuses_full_probe_verification(
     ]
 
 
+@pytest.mark.parametrize(
+    ("tamper", "message"),
+    [
+        ("source", "expected directory"),
+        ("hash", "outcome hash mismatch"),
+        ("replay", "capture_replay_match must be matched"),
+        ("snapshot", "snapshot entry hash mismatch"),
+    ],
+)
+def test_verified_probe_material_loader_rejects_concrete_tampering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+    message: str,
+) -> None:
+    run_dir = tmp_path / "runs" / "probe"
+    (run_dir / "snapshots").mkdir(parents=True)
+    (run_dir / "probe.lock.json").write_bytes(b"lock")
+    (run_dir / "result.json").write_bytes(b"result")
+    (run_dir / "outcomes.jsonl").write_bytes(
+        b'{"query_id":"q-1","terminal":"generated","searches":[]}\n'
+    )
+    (run_dir / "snapshots" / "snapshot-manifest.json").write_bytes(b"manifest")
+    lock = SimpleNamespace(
+        expected_run_directory="runs/other" if tamper == "source" else "runs/probe",
+        source_hashes={
+            "business_results_sha256": HASH,
+            "executions_sha256": HASH,
+            "run_sha256": HASH,
+            "snapshot_manifest_sha256": HASH,
+        },
+        query_ids=("q-1",),
+    )
+    result = SimpleNamespace(
+        capture_business_sha256=HASH,
+        replay_business_sha256=HASH,
+        capture_replay_match="matched",
+        snapshot_manifest_sha256=HASH,
+        snapshot_set_id=HASH,
+        ledger_checkpoint_sha256=HASH,
+    )
+
+    class Reader:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def read(self, request: object) -> bytes:
+            if tamper == "snapshot":
+                raise ValueError("snapshot entry hash mismatch")
+            return b"snapshot"
+
+    monkeypatch.setattr(rescore, "ROOT", tmp_path)
+    monkeypatch.setattr(probe, "load_probe_lock", lambda path: lock)
+    monkeypatch.setattr(
+        probe, "verify_probe_source_bindings", lambda value: tmp_path / "source"
+    )
+    if tamper == "replay":
+        monkeypatch.setattr(
+            rescore,
+            "_load_probe_result",
+            lambda path: (_ for _ in ()).throw(
+                ValueError("probe result capture_replay_match must be matched")
+            ),
+        )
+    else:
+        monkeypatch.setattr(rescore, "_load_probe_result", lambda path: result)
+    monkeypatch.setattr(rescore, "DependencySnapshotReader", Reader)
+    monkeypatch.setattr(
+        rescore,
+        "DependencySnapshotManifestV2",
+        SimpleNamespace(
+            model_validate_json=lambda content: SimpleNamespace(
+                entries=(SimpleNamespace(request="entry"),)
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        probe,
+        "probe_outcome_hash",
+        lambda lock_value, payload: (
+            "sha256:" + "b" * 64 if tamper == "hash" else HASH
+        ),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        rescore.load_verified_probe_materials(run_dir, ("q-1",))
+
+
 def test_load_probe_source_is_thin_projection_over_verified_materials(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

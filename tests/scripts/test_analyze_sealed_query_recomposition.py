@@ -73,6 +73,12 @@ def _recomposition_report(
     conclusion: str = "legacy_benchmark_met",
     append_counts: tuple[int, int, int, int] = (101, 0, 23, 19),
 ) -> SealedQueryRecompositionReport:
+    reason_codes = {
+        "integrity_failure": "experiment_integrity_failed",
+        "no_usable_recomposition_signal": "no_variant_passed_signal_gate",
+        "signal_insufficient": "usable_signal_below_legacy_benchmark",
+        "legacy_benchmark_met": "legacy_benchmark_met",
+    }
     rows = []
     for method, selected in (
         ("append_v2", append_counts[3]),
@@ -107,11 +113,18 @@ def _recomposition_report(
             "legacy_title_selected": 30,
             "rows": rows,
             "conclusion": conclusion,
+            "reason_codes": [reason_codes[conclusion]],
         }
     )
 
 
-def _rescore_report(generation_hashes: dict[str, str] | None = None) -> SemanticRescoreReport:
+def _rescore_report(
+    generation_hashes: dict[str, str] | None = None,
+    *,
+    total_gold_associations: int = 143,
+    current_formal_selected: int = 17,
+    legacy_title_selected: int = 30,
+) -> SemanticRescoreReport:
     hashes = generation_hashes or {
         "public_audit_sha256": HASH,
         "gold_sha256": HASH,
@@ -124,7 +137,7 @@ def _rescore_report(generation_hashes: dict[str, str] | None = None) -> Semantic
         {
             "generation_hashes": hashes,
             "quality_policy_sha256": HASH,
-            "total_gold_associations": 143,
+            "total_gold_associations": total_gold_associations,
             "runs": [
                 {
                     "label": label,
@@ -140,10 +153,10 @@ def _rescore_report(generation_hashes: dict[str, str] | None = None) -> Semantic
                     "macro_ndcg": 0.5,
                     "direct_same_arxiv_hit_count": 0,
                     "pipeline_stages": {
-                        "total_gold_associations": 143,
-                        "not_retrieved": 100,
+                        "total_gold_associations": total_gold_associations,
+                        "not_retrieved": total_gold_associations - selected,
                         "filtered_out": 0,
-                        "ranked_outside_top50": 143 - 100 - selected,
+                        "ranked_outside_top50": 0,
                         "selected_top50": selected,
                     },
                     "metric_quality_checks": checks,
@@ -154,7 +167,7 @@ def _rescore_report(generation_hashes: dict[str, str] | None = None) -> Semantic
                         "formal_run",
                         "formal_validated",
                         "not_applicable",
-                        17,
+                        current_formal_selected,
                         [
                             {
                                 "rule_id": "hard-filter-recall-loss",
@@ -232,7 +245,7 @@ def _rescore_report(generation_hashes: dict[str, str] | None = None) -> Semantic
                         "legacy_hash_bound_run",
                         "legacy_hash_bound",
                         "not_applicable",
-                        30,
+                        legacy_title_selected,
                         [],
                     ),
                     (
@@ -344,6 +357,57 @@ def test_external_rescore_must_be_canonical_passed_and_generation_bound(
     path.write_bytes(rescore.canonical_report_bytes(_rescore_report(hashes)))
     with pytest.raises(ValueError, match="generation hashes"):
         analyze.load_external_rescore_benchmark(path, mismatched)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"total_gold_associations": 144},
+        {"current_formal_selected": 18},
+        {"legacy_title_selected": 31},
+    ],
+)
+def test_external_rescore_rejects_fixed_benchmark_drift(
+    tmp_path: Path, overrides: dict[str, int]
+) -> None:
+    report = _rescore_report(**overrides)
+    path = tmp_path / "rescore.json"
+    path.write_bytes(rescore.canonical_report_bytes(report))
+
+    with pytest.raises(ValueError, match="benchmark values drifted"):
+        analyze.load_external_rescore_benchmark(
+            path, report.generation_hashes.model_dump(mode="json")
+        )
+
+
+def test_external_rescore_privacy_scan_precedes_parsing_and_publishes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    private_bytes = b'{"private_marker":"secret"}\n'
+    rescore_path = tmp_path / "rescore.json"
+    json_path = tmp_path / "out.json"
+    markdown_path = tmp_path / "out.md"
+    rescore_path.write_bytes(private_bytes)
+    events: list[bytes] = []
+
+    def reject(content: bytes) -> None:
+        events.append(content)
+        raise ValueError("private external benchmark")
+
+    monkeypatch.setattr(analyze, "assert_public_json_safe", reject)
+    monkeypatch.setattr(
+        analyze,
+        "build_fixed_report",
+        lambda: analyze.load_external_rescore_benchmark(rescore_path, {}),
+    )
+    monkeypatch.setattr(analyze, "OUT_JSON", json_path)
+    monkeypatch.setattr(analyze, "OUT_MARKDOWN", markdown_path)
+
+    assert analyze.main(["run"]) == 3
+    assert events == [private_bytes]
+    assert capsys.readouterr().err == "sealed query recomposition failed\n"
+    assert not json_path.exists()
+    assert not markdown_path.exists()
 
 
 def test_composition_occurs_before_identifier_map_enters_scoring(
@@ -479,6 +543,7 @@ def test_exact_append_gate_publishes_integrity_failure_before_other_interpretati
     gated = analyze.enforce_append_gate(report)
 
     assert gated.conclusion == "integrity_failure"
+    assert gated.reason_codes == ("experiment_integrity_failed",)
     assert [row.method for row in gated.rows] == [
         "append_v2",
         "round_robin_slots",
@@ -539,9 +604,11 @@ def test_report_rendering_is_canonical_and_public() -> None:
         + b"\n"
     )
     assert serialized.endswith(b"\n") and not serialized.endswith(b"\n\n")
+    assert b'"reason_codes":["legacy_benchmark_met"]' in serialized
     assert analyze.render_markdown(report) == markdown
     assert "append_v2" in markdown
     assert "legacy_benchmark_met" in markdown
+    assert "Reason code: legacy_benchmark_met" in markdown
 
 
 def test_publish_scans_both_artifacts_before_any_write(

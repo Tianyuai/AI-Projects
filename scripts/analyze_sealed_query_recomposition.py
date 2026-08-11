@@ -96,6 +96,7 @@ def load_external_rescore_benchmark(
     """Load the canonical passed rescore benchmark and bind generation hashes."""
     try:
         content = path.read_bytes()
+        assert_public_json_safe(content)
         report = SemanticRescoreReport.model_validate_json(content)
     except (OSError, ValidationError) as error:
         raise ValueError("external rescore benchmark is invalid") from error
@@ -112,6 +113,12 @@ def load_external_rescore_benchmark(
         if run.label == "formal_baseline_2026_08_10"
     )
     legacy = next(run for run in report.runs if run.label == "legacy_title_2026_08_05")
+    if (
+        report.total_gold_associations != 143
+        or current.pipeline_stages.selected_top50 != 17
+        or legacy.pipeline_stages.selected_top50 != 30
+    ):
+        raise ValueError("external rescore benchmark values drifted")
     return ExternalBenchmark(
         current_formal_selected=current.pipeline_stages.selected_top50,
         legacy_title_selected=legacy.pipeline_stages.selected_top50,
@@ -157,6 +164,7 @@ def _integrity_failure_like(
     total = report.rows[0].total_gold_associations
     payload = report.model_dump(mode="json")
     payload["conclusion"] = "integrity_failure"
+    payload["reason_codes"] = ["experiment_integrity_failed"]
     payload["rows"] = [
         {
             **row,
@@ -250,6 +258,7 @@ def render_markdown(report: SealedQueryRecompositionReport) -> str:
         "# Sealed Query Recomposition Offline Diagnostic",
         "",
         f"Conclusion: {report.conclusion}",
+        f"Reason code: {report.reason_codes[0]}",
         f"Current formal selected gold: {report.current_formal_selected}",
         f"Legacy title selected gold: {report.legacy_title_selected}",
         "",

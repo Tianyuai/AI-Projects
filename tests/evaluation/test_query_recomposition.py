@@ -261,7 +261,7 @@ def test_project_all_rejects_duplicate_query_ids() -> None:
 
 
 @pytest.mark.parametrize(
-    ("counts", "expected_conclusion"),
+    ("counts", "expected_conclusion", "expected_reason_code"),
     [
         (
             {
@@ -270,6 +270,7 @@ def test_project_all_rejects_duplicate_query_ids() -> None:
                 "rrf_slots_k60": 19,
             },
             "no_usable_recomposition_signal",
+            "no_variant_passed_signal_gate",
         ),
         (
             {
@@ -278,6 +279,7 @@ def test_project_all_rejects_duplicate_query_ids() -> None:
                 "rrf_slots_k60": 29,
             },
             "signal_insufficient",
+            "usable_signal_below_legacy_benchmark",
         ),
         (
             {
@@ -286,12 +288,14 @@ def test_project_all_rejects_duplicate_query_ids() -> None:
                 "rrf_slots_k60": 30,
             },
             "legacy_benchmark_met",
+            "legacy_benchmark_met",
         ),
     ],
 )
 def test_build_report_orders_rows_and_classifies_conclusions(
     counts: dict[RecompositionMethod, int],
     expected_conclusion: str,
+    expected_reason_code: str,
 ) -> None:
     projections = _projections_for_selected_counts(counts)
     report = build_report(
@@ -311,6 +315,7 @@ def test_build_report_orders_rows_and_classifies_conclusions(
         "rrf_slots_k60",
     ]
     assert report.conclusion == expected_conclusion
+    assert report.reason_codes == (expected_reason_code,)
     assert report.current_formal_selected == 17
     assert report.legacy_title_selected == 30
     assert all(math.isfinite(row.macro_f1) for row in report.rows)
@@ -352,6 +357,41 @@ def test_build_report_returns_integrity_failure_for_mismatched_projection() -> N
     )
 
     assert report.conclusion == "integrity_failure"
+    assert report.reason_codes == ("experiment_integrity_failed",)
+
+
+@pytest.mark.parametrize(
+    ("conclusion", "reason_code"),
+    [
+        ("integrity_failure", "no_variant_passed_signal_gate"),
+        ("no_usable_recomposition_signal", "experiment_integrity_failed"),
+        ("signal_insufficient", "legacy_benchmark_met"),
+        ("legacy_benchmark_met", "usable_signal_below_legacy_benchmark"),
+    ],
+)
+def test_report_rejects_reason_code_that_does_not_match_conclusion(
+    conclusion: str, reason_code: str
+) -> None:
+    report = build_report(
+        gold=_gold(),
+        identifier_map=IdentifierMap.from_bytes(b"{}"),
+        projections=_projections_for_selected_counts(
+            {
+                "append_v2": 19,
+                "round_robin_slots": 29,
+                "rrf_slots_k60": 30,
+            }
+        ),
+        input_hashes={"gold": "sha256:" + "1" * 64},
+        current_formal_selected=17,
+        legacy_title_selected=30,
+    )
+    payload = report.model_dump(mode="json")
+    payload["conclusion"] = conclusion
+    payload["reason_codes"] = [reason_code]
+
+    with pytest.raises(ValueError, match="reason code must match conclusion"):
+        SealedQueryRecompositionReport.model_validate(payload)
 
 
 def test_build_report_counts_all_pipeline_stages_by_precedence() -> None:

@@ -9,9 +9,10 @@ import tempfile
 from hashlib import sha256
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 import yaml
+from pydantic import Field
 
 from paper_search.domain.models import DomainModel
 from paper_search.recall_experiments.generation.base import GenerationResult
@@ -29,7 +30,7 @@ _SENSITIVE_VALUE = re.compile(
 class ArtifactAttemptMetadata(DomainModel):
     attempt_id: str
     attempt_status: AttemptStatus
-    valid_repeat_ordinal: int | None
+    valid_repeat_ordinal: Annotated[int, Field(strict=True, ge=1, le=3)] | None
 
 
 class RecallArtifactWriter:
@@ -52,8 +53,7 @@ class RecallArtifactWriter:
         recipe_lock: bytes | str | Mapping[str, object],
         sample_manifest: Mapping[str, object],
     ) -> Path:
-        if not run_id or Path(run_id).name != run_id:
-            raise ValueError("run ID must be a single path component")
+        _safe_component(run_id, "run ID")
         self._output_root.mkdir(parents=True, exist_ok=True)
         run_path = self._output_root / run_id
         if run_path.exists():
@@ -186,7 +186,12 @@ def _recipe_bytes(value: bytes | str | Mapping[str, object]) -> bytes:
 
 
 def _canonical_json(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
+    return (
+        json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        ).encode("utf-8")
+        + b"\n"
+    )
 
 
 def _sanitize(value: object) -> object:
@@ -207,7 +212,11 @@ def _sanitize(value: object) -> object:
 
 
 def _safe_component(value: str, label: str) -> None:
-    if not value or value in {".", ".."} or "/" in value or "\\" in value:
+    if (
+        not value
+        or value in {".", ".."}
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value) is None
+    ):
         raise ValueError(f"{label} must be a single path component")
 
 

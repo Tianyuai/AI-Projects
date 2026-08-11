@@ -106,3 +106,48 @@ def test_writer_preserves_fixed_source_bytes_and_rejects_unsafe_paths_and_secret
     )
     assert "top-secret" not in retrieval.read_text(encoding="utf-8")
     assert "abc123" not in retrieval.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("unsafe", ["C:", "C:stream", "query:alternate", "\\\\server", "/root", ".", ".."])
+def test_writer_rejects_portable_unsafe_path_components(tmp_path, unsafe: str) -> None:
+    writer = RecallArtifactWriter(tmp_path)
+    writer.start_run("run-01", recipe_lock={}, sample_manifest={})
+
+    with pytest.raises(ValueError, match="path component"):
+        writer.write_generation(
+            unsafe,
+            "query-1",
+            {"actions": []},
+            attempt_status="succeeded",
+            valid_repeat_ordinal=1,
+        )
+
+
+@pytest.mark.parametrize("ordinal", [0, 4])
+def test_writer_rejects_repeat_ordinals_outside_one_through_three(tmp_path, ordinal: int) -> None:
+    writer = RecallArtifactWriter(tmp_path)
+    writer.start_run("run-01", recipe_lock={}, sample_manifest={})
+
+    with pytest.raises(ValueError, match="valid_repeat_ordinal"):
+        writer.write_generation(
+            "attempt-01",
+            "query-1",
+            {"actions": []},
+            attempt_status="succeeded",
+            valid_repeat_ordinal=ordinal,
+        )
+
+
+@pytest.mark.parametrize("invalid_number", [float("nan"), float("inf"), float("-inf")])
+def test_writer_rejects_non_finite_json_numbers(tmp_path, invalid_number: float) -> None:
+    writer = RecallArtifactWriter(tmp_path)
+    writer.start_run("run-01", recipe_lock={}, sample_manifest={})
+
+    with pytest.raises(ValueError):
+        writer.write_retrieval(
+            "attempt-01",
+            "query-1",
+            {"value": invalid_number},
+            attempt_status="failed",
+            valid_repeat_ordinal=None,
+        )

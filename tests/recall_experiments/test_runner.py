@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -13,7 +14,13 @@ from paper_search.recall_experiments.contracts import (
     RetrievalActionResult,
 )
 from paper_search.recall_experiments.generation.base import GenerationResult
-from paper_search.recall_experiments.runner import RecallExperimentRequest, RecallExperimentRunner
+from paper_search.recall_experiments.generation.fixed import FixedActionGenerator
+from paper_search.recall_experiments.generation.manual import ManualActionGenerator
+from paper_search.recall_experiments.runner import (
+    RecallExperimentAttempt,
+    RecallExperimentRequest,
+    RecallExperimentRunner,
+)
 
 
 class _InputSource:
@@ -41,21 +48,22 @@ class _Generator:
         self.events = events
 
     async def generate(self, context: RecallGenerationContext) -> GenerationResult:
+        batch = RecallActionBatch.model_validate(
+            {
+                "actions": [
+                    {
+                        "action_id": "search-1",
+                        "action_type": "text_search",
+                        "strategy": "existing-action",
+                        "payload": {"query_text": "graph retrieval"},
+                    }
+                ]
+            }
+        )
         return GenerationResult(
             query_id=context.query_id,
-            action_batch=RecallActionBatch.model_validate(
-                {
-                    "actions": [
-                        {
-                            "action_id": "search-1",
-                            "action_type": "text_search",
-                            "strategy": "existing-action",
-                            "payload": {"query_text": "graph retrieval"},
-                        }
-                    ]
-                }
-            ),
-            artifact_bytes=b'{"actions":[]}',
+            action_batch=batch,
+            artifact_bytes=batch.model_dump_json().encode("utf-8"),
         )
 
 
@@ -225,3 +233,93 @@ def test_runner_writes_completed_phase_statuses_instead_of_permanent_running_sta
     asyncio.run(runner.run(_request()))
 
     assert writer.statuses == ["succeeded", "succeeded", "succeeded"]
+
+
+def test_runner_rejects_generation_bytes_that_disagree_with_the_action_batch() -> None:
+    events: list[str] = []
+    writer = _Writer(events)
+
+    class MismatchedGenerator(_Generator):
+        async def generate(self, context: RecallGenerationContext) -> GenerationResult:
+            result = await super().generate(context)
+            return result.model_copy(update={"artifact_bytes": b'{"actions":[]}'})
+
+    runner = RecallExperimentRunner(
+        input_source=_InputSource(events),
+        generator=MismatchedGenerator(events),
+        registry=_Registry(events, _Handler()),
+        pool_builder=_PoolBuilder(events),
+        stages=_Stages(events),
+        evaluator=_Evaluator(events, _context()),
+        writer=writer,
+    )
+
+    with pytest.raises(ValueError, match="artifact bytes"):
+        asyncio.run(runner.run(_request()))
+
+
+@pytest.mark.parametrize("generator_kind", ["fixed", "manual"])
+def test_runner_rejects_fixed_or_manual_empty_bytes_with_nonempty_action_batch(
+    tmp_path, generator_kind: str
+) -> None:
+    empty = {"query-1": {"actions": []}}
+    if generator_kind == "fixed":
+        source = FixedActionGenerator(
+            empty,
+            expected_query_ids=["query-1"],
+            allowed_actions={"text_search"},
+            max_actions=1,
+        )
+    else:
+        actions_path = tmp_path / "manual.json"
+        actions_path.write_text(json.dumps(empty), encoding="utf-8")
+        source = ManualActionGenerator(
+            actions_path,
+            expected_query_ids=["query-1"],
+            allowed_actions={"text_search"},
+            max_actions=1,
+        )
+
+    class ForgedGenerator:
+        async def generate(self, context: RecallGenerationContext) -> GenerationResult:
+            empty_result = await source.generate(context)
+            nonempty = await _Generator([]).generate(context)
+            return empty_result.model_copy(update={"action_batch": nonempty.action_batch})
+
+    events: list[str] = []
+    runner = RecallExperimentRunner(
+        input_source=_InputSource(events),
+        generator=ForgedGenerator(),
+        registry=_Registry(events, _Handler()),
+        pool_builder=_PoolBuilder(events),
+        stages=_Stages(events),
+        evaluator=_Evaluator(events, _context()),
+        writer=_Writer(events),
+    )
+
+    with pytest.raises(ValueError, match="artifact bytes"):
+        asyncio.run(runner.run(_request()))
+
+
+def test_runner_rejects_repeat_counts_above_the_supported_ordinal_range() -> None:
+    with pytest.raises(ValueError, match="repeat_count"):
+        RecallExperimentRequest(
+            run_id="run-01",
+            sample=object(),
+            recipe_lock={},
+            sample_manifest={},
+            allowed_actions={"text_search"},
+            max_actions=1,
+            max_results_per_action=1,
+            repeat_count=4,
+        )
+
+
+@pytest.mark.parametrize("ordinal", [0, 4])
+def test_attempt_model_rejects_out_of_range_repeat_ordinals(ordinal: int) -> None:
+    with pytest.raises(ValueError, match="valid_repeat_ordinal"):
+        RecallExperimentAttempt(
+            attempt_id="attempt-01",
+            attempt_status="succeeded",
+            valid_repeat_ordinal=ordinal,
+        )

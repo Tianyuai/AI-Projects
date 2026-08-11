@@ -76,6 +76,8 @@ class RecallExperimentRequest:
     def __post_init__(self) -> None:
         if self.repeat_count < 1:
             raise ValueError("repeat_count must be positive")
+        if self.repeat_count > 3:
+            raise ValueError("repeat_count must not exceed 3")
         if self.max_actions < 1 or self.max_results_per_action < 1:
             raise ValueError("retrieval limits must be positive")
         if self.max_attempts < self.repeat_count or self.max_attempts > 5:
@@ -92,6 +94,13 @@ class RecallExperimentAttempt:
     attempt_status: str
     valid_repeat_ordinal: int | None
     result: object | None = None
+
+    def __post_init__(self) -> None:
+        if self.valid_repeat_ordinal is not None and (
+            type(self.valid_repeat_ordinal) is not int
+            or not 1 <= self.valid_repeat_ordinal <= 3
+        ):
+            raise ValueError("valid_repeat_ordinal must be None or an integer from 1 through 3")
 
 
 @dataclass(frozen=True)
@@ -265,14 +274,15 @@ def _validate_generation(
 ) -> None:
     if generation.query_id != context.query_id:
         raise ValueError("generation result query ID does not match context")
+    try:
+        artifact_text = generation.artifact_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("generation artifact bytes must be UTF-8") from error
     validated = validate_action_batch(
-        generation.action_batch.model_dump(mode="json"),
-        context,
-        allowed_actions=request.allowed_actions,
-        max_actions=request.max_actions,
+        artifact_text, context, allowed_actions=request.allowed_actions, max_actions=request.max_actions
     )
     if validated != generation.action_batch:
-        raise ValueError("generation result must already be normalized")
+        raise ValueError("generation artifact bytes do not match the action batch")
 
 
 def _sample_manifest(manifest: Mapping[str, object], dataset: object) -> dict[str, object]:

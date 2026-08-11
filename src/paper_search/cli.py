@@ -10,6 +10,7 @@ import sys
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from paper_search.application.composition import ApplicationBundle, CompositionRoot
@@ -28,6 +29,9 @@ from paper_search.evaluation.validator import (
     compare_replay_command,
     verify_run_command,
 )
+
+if TYPE_CHECKING:
+    from paper_search.recall_experiments.composition import RecallRuntimeFactory
 
 
 _SMOKE_QUERY = "resource-aware scholarly paper search"
@@ -130,8 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_recall.add_argument("--snapshot-manifest", type=Path)
     run_recall.add_argument("--allow-live", action="store_true")
     run_recall.add_argument("--out", type=Path, required=True)
-    compare_recall = recall_commands.add_parser("compare", help="compare a recall run")
-    compare_recall.add_argument("run_directory", type=Path)
+    compare_recall = recall_commands.add_parser("compare", help="compare explicit recall artifacts")
+    compare_recall.add_argument("--current", type=Path, required=True)
+    compare_recall.add_argument("--historical", type=Path)
+    compare_recall.add_argument("--out", type=Path, required=True)
     inventory = recall_commands.add_parser(
         "inventory-history", help="verify frozen historical recall evidence"
     )
@@ -303,11 +309,15 @@ def _run_serve(args: argparse.Namespace) -> int:
             awaitable.close()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    recall_runtime_factory: RecallRuntimeFactory | None = None,
+) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "recall":
-        return _run_recall_command(args)
+        return _run_recall_command(args, recall_runtime_factory=recall_runtime_factory)
     if args.command == "verify-run":
         return verify_run_command(args.run_directory)
     if args.command == "compare-replay":
@@ -373,10 +383,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     return exit_code
 
 
-def _run_recall_command(args: argparse.Namespace) -> int:
+def _run_recall_command(
+    args: argparse.Namespace,
+    *,
+    recall_runtime_factory: RecallRuntimeFactory | None,
+) -> int:
     """Dispatch recall composition without opening runtime state for offline paths."""
     from paper_search.recall_experiments.composition import (
         RecallTerminalError,
+        compare_recall_artifacts,
         prepare_recall_run,
         run_recall_experiment,
         validate_pasted_actions,
@@ -384,6 +399,7 @@ def _run_recall_command(args: argparse.Namespace) -> int:
     )
 
     output = Path(getattr(args, "out", Path(".")))
+    summary: dict[str, object]
     try:
         if args.recall_command == "prepare-context":
             prepared = prepare_recall_run(args.recipe, args.sample, workspace_root=Path.cwd())
@@ -405,8 +421,17 @@ def _run_recall_command(args: argparse.Namespace) -> int:
                     actions_path=args.actions,
                     allow_live=bool(args.allow_live),
                     snapshot_manifest_path=args.snapshot_manifest,
+                    live_runtime_factory=recall_runtime_factory,
                 )
             )
+        elif args.recall_command == "compare":
+            comparison = compare_recall_artifacts(
+                current_run=args.current,
+                historical_run=args.historical,
+                output_path=output,
+            )
+            path = output
+            summary = {"path": str(path), "status": "complete", **comparison}
         elif args.recall_command == "inventory-history":
             from paper_search.recall_experiments.inventory import build_inventory
 
@@ -436,7 +461,9 @@ def _run_recall_command(args: argparse.Namespace) -> int:
             )
         )
         return 2
-    print(json.dumps({"path": str(path), "status": "complete"}, ensure_ascii=False, sort_keys=True))
+    if args.recall_command != "compare":
+        summary = {"path": str(path), "status": "complete"}
+    print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return 0
 
 

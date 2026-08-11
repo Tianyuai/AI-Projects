@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -19,7 +19,12 @@ from paper_search.domain.models import ErrorDetail, Paper, SearchBudget, UsageEs
 from paper_search.recall_experiments.artifacts import RecallArtifactWriter
 from paper_search.recall_experiments.candidate_pool import CandidatePoolBuilder
 from paper_search.recall_experiments.contracts import RecallGenerationContext
-from paper_search.recall_experiments.evaluator import CandidateRecallEvaluator, PreparedEvaluationContext
+from paper_search.recall_experiments.evaluator import (
+    CandidateRecallEvaluator,
+    PreparedEvaluationContext,
+    RecallRepeatResult,
+    compare_exact_replay,
+)
 from paper_search.recall_experiments.generation.backends import (
     BudgetedLLMBackend,
     LLMBackend,
@@ -87,6 +92,7 @@ class PreparedRecallRun:
     loaded_recipe: LoadedRecallRecipe
     loaded_sample: LoadedSampleBinding
     prepared: PreparedEvaluationContext
+    evaluator: CandidateRecallEvaluator
 
     @property
     def contexts(self) -> tuple[RecallGenerationContext, ...]:
@@ -102,6 +108,9 @@ class RecallRuntime:
     llm_backend: LLMBackend
 
 
+RecallRuntimeFactory = Callable[[LoadedRecallRecipe], RecallRuntime]
+
+
 def prepare_recall_run(recipe_path: Path, sample_path: Path, *, workspace_root: Path) -> PreparedRecallRun:
     """Verify frozen inputs and construct generator-safe contexts offline."""
     try:
@@ -115,7 +124,7 @@ def prepare_recall_run(recipe_path: Path, sample_path: Path, *, workspace_root: 
             sample=loaded_sample.binding,
             gold_catalog=catalog,
         )
-        return PreparedRecallRun(loaded_recipe, loaded_sample, evaluator.preflight(dataset))
+        return PreparedRecallRun(loaded_recipe, loaded_sample, evaluator.preflight(dataset), evaluator)
     except RecallTerminalError:
         raise
     except ValueError as error:
@@ -179,26 +188,30 @@ async def run_recall_experiment(
     actions_path: Path | None,
     allow_live: bool,
     snapshot_manifest_path: Path | None = None,
+    live_runtime_factory: RecallRuntimeFactory | None = None,
 ) -> Path:
     """Run injected generator and handlers; live selection is explicit and fail-closed."""
     loaded_recipe = load_recall_recipe(recipe_path)
     recipe = loaded_recipe.recipe
+    if actions_path is not None and not isinstance(recipe.generator, ManualActionsGeneratorRecipe):
+        raise RecallTerminalError("invalid_actions")
     if recipe.retrieval.backend == "live_provider":
         try:
             authorize_live_backend(recipe, allow_live=allow_live)
         except PermissionError as error:
             raise RecallTerminalError("live_not_authorized") from error
-        # The production live adapters require an operator-approved runtime
-        # budget/pricing binding.  This CLI intentionally never guesses one.
-        raise RecallTerminalError("live_runtime_unavailable")
-
     prepared = prepare_recall_run(recipe_path, sample_path, workspace_root=workspace_root)
     contexts = prepared.contexts
-    runtime = (
-        build_replay_runtime(snapshot_manifest_path, loaded_recipe)
-        if snapshot_manifest_path is not None
-        else unavailable_runtime()
-    )
+    if recipe.retrieval.backend == "live_provider":
+        if live_runtime_factory is None:
+            raise RecallTerminalError("live_runtime_unavailable")
+        runtime = live_runtime_factory(loaded_recipe)
+    else:
+        runtime = (
+            build_replay_runtime(snapshot_manifest_path, loaded_recipe)
+            if snapshot_manifest_path is not None
+            else unavailable_runtime()
+        )
     generator = _build_offline_generator(loaded_recipe, contexts, actions_path, runtime.llm_backend)
     registry = build_handler_registry(runtime)
     writer = RecallArtifactWriter(output_path.parent)
@@ -226,6 +239,26 @@ async def run_recall_experiment(
     if any(attempt.attempt_status == "failed" for attempt in result.attempts):
         raise RecallTerminalError("snapshot_unavailable")
     return output_path
+
+
+def compare_recall_artifacts(
+    *, current_run: Path, historical_run: Path | None, output_path: Path
+) -> dict[str, object]:
+    """Compare explicit recall-report artifacts without inventing historical evidence."""
+    try:
+        current = _result_from_report(current_run)
+        historical = _result_from_report(historical_run) if historical_run is not None else None
+        comparison = compare_exact_replay(current, historical)
+        payload = {
+            **comparison.model_dump(mode="json"),
+            "path": str(output_path),
+            "status": "complete",
+        }
+        output_path.mkdir(parents=True, exist_ok=False)
+        _write_new_json(output_path / "recall-comparison.json", payload)
+        return payload
+    except (OSError, TypeError, ValueError, KeyError) as error:
+        raise RecallTerminalError("config_mismatch") from error
 
 
 def build_manual_generator(
@@ -402,8 +435,8 @@ class _PreparedEvaluator:
         return self._prepared.prepared
 
     def evaluate(self, prepared: object, pools: object) -> object:
-        del prepared, pools
-        raise AssertionError("snapshot-unavailable retrieval must not be evaluated")
+        del prepared
+        return self._prepared.evaluator.evaluate(self._prepared.prepared, cast(Any, pools))
 
 
 def _build_offline_generator(
@@ -503,6 +536,17 @@ def _recipe_lock(loaded: LoadedRecallRecipe) -> dict[str, object]:
     return {"recipe_sha256": loaded.recipe_sha256, "recipe": loaded.recipe.model_dump(mode="json")}
 
 
+def _result_from_report(run_path: Path) -> RecallRepeatResult:
+    report = json.loads((run_path / "recall-report.json").read_bytes())
+    attempts = report.get("attempts")
+    if not isinstance(attempts, list):
+        raise ValueError("recall report lacks attempts")
+    results = [attempt.get("result") for attempt in attempts if attempt.get("attempt_status") == "succeeded"]
+    if len(results) != 1 or not isinstance(results[0], Mapping):
+        raise ValueError("recall report lacks one successful repeat")
+    return RecallRepeatResult.model_validate(results[0])
+
+
 def _snapshot_error(provider: str) -> ErrorDetail:
     return ErrorDetail(
         code="snapshot_unavailable",
@@ -529,6 +573,8 @@ def _llm_estimate() -> UsageEstimate:
 __all__ = [
     "PreparedRecallRun",
     "RecallTerminalError",
+    "RecallRuntime",
+    "RecallRuntimeFactory",
     "build_citation_handler",
     "build_deepseek_generator",
     "build_fixed_generator",
@@ -537,6 +583,7 @@ __all__ = [
     "build_live_runtime",
     "build_replay_runtime",
     "build_text_handler",
+    "compare_recall_artifacts",
     "build_title_handler",
     "generator_factories",
     "prepare_recall_run",

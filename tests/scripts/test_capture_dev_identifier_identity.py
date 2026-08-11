@@ -776,6 +776,134 @@ def test_missing_semantic_scholar_side_is_preserved_without_false_evidence(
     ]
 
 
+def test_mixed_s2_arxiv_batch_preserves_only_matching_items(tmp_path: Path) -> None:
+    arxiv_response = (
+        b'[{"paperId":"S2-A","externalIds":{"ArXiv":"2501.00001",'
+        b'"DOI":"10.1000/a","CorpusId":123}},'
+        b'{"paperId":"S2-B","externalIds":{"ArXiv":"not-an-arxiv-id",'
+        b'"DOI":"10.1000/b","CorpusId":{"value":456}}}]'
+    )
+    transport = RecordingTransport(
+        arxiv_response=arxiv_response,
+        doi_response=(
+            b'[{"paperId":"S2-A","externalIds":{"ArXiv":"2501.00001",'
+            b'"DOI":"10.1000/a"}}]'
+        ),
+    )
+    lock, runtime, _ = _lock_and_runtime(tmp_path, transport, include_openalex=False)
+
+    result = capture_identity(lock, runtime)
+
+    assert result.derived_doi_lock.ids == ["DOI:10.1000/a"]
+    assert [
+        (ref.arxiv_id, ref.alias)
+        for ref in result.evidence_refs
+        if ref.alias.startswith("doi:")
+    ] == [("arxiv:2501.00001", "doi:10.1000/a")]
+    manifest = DependencySnapshotManifestV2.model_validate_json(
+        (tmp_path / "private" / "snapshots" / "snapshot-manifest.json").read_bytes()
+    )
+    assert arxiv_response in {
+        (tmp_path / "private" / "snapshots" / entry.response_path).read_bytes()
+        for entry in manifest.entries
+    }
+
+
+@pytest.mark.parametrize(
+    "second_paper_id",
+    [b"", b'"paperId":"   ",'],
+    ids=["missing", "blank"],
+)
+def test_s2_arxiv_item_without_valid_string_paper_id_cannot_derive_doi(
+    tmp_path: Path, second_paper_id: bytes
+) -> None:
+    transport = RecordingTransport(
+        arxiv_response=(
+            b'[{"paperId":"S2-A","externalIds":{"ArXiv":"2501.00001",'
+            b'"DOI":"10.1000/a"}},{'
+            + second_paper_id
+            + b'"externalIds":{"ArXiv":"2501.00002",'
+            b'"DOI":"10.1000/b"}}]'
+        ),
+        doi_response=(
+            b'[{"paperId":"S2-A","externalIds":{"DOI":"10.1000/a"}}]'
+        ),
+    )
+    lock, runtime, _ = _lock_and_runtime(tmp_path, transport, include_openalex=False)
+
+    result = capture_identity(lock, runtime)
+
+    assert result.derived_doi_lock.ids == ["DOI:10.1000/a"]
+
+
+def test_s2_doi_stage_mismatch_preserves_raw_batch_for_offline_audit(
+    tmp_path: Path,
+) -> None:
+    doi_response = (
+        b'[{"paperId":"S2-A","externalIds":{"ArXiv":"2501.00001",'
+        b'"DOI":"10.1000/not-requested"}},'
+        b'{"paperId":"S2-B","externalIds":{"ArXiv":"2501.00002"}}]'
+    )
+    transport = RecordingTransport(doi_response=doi_response)
+    lock, runtime, _ = _lock_and_runtime(tmp_path, transport, include_openalex=False)
+
+    result = capture_identity(lock, runtime)
+
+    assert result.derived_doi_lock.ids == ["DOI:10.1000/a", "DOI:10.1000/b"]
+    assert [
+        ref.semantic_scholar_doi_item_index
+        for ref in result.evidence_refs
+        if ref.alias.startswith("doi:")
+    ] == [0, 1]
+    manifest = DependencySnapshotManifestV2.model_validate_json(
+        (tmp_path / "private" / "snapshots" / "snapshot-manifest.json").read_bytes()
+    )
+    assert doi_response in {
+        (tmp_path / "private" / "snapshots" / entry.response_path).read_bytes()
+        for entry in manifest.entries
+    }
+
+
+@pytest.mark.parametrize(
+    "arxiv_response",
+    [
+        b'{}',
+        b'[null]',
+        b'[[],null]',
+        b'[{"paperId":123,"externalIds":{"ArXiv":"2501.00001"}},null]',
+        b'[{"paperId":"S2-A","externalIds":[]},null]',
+        b'[{"paperId":"S2-A","externalIds":{"ArXiv":123}},null]',
+        b'[{"paperId":"S2-A","externalIds":{"ArXiv":null}},null]',
+        b'[{"paperId":"S2-A","externalIds":{"ArXiv":"2501.00001",'
+        b'"DOI":123}},null]',
+        b'[{"paperId":"S2-A","externalIds":{"ArXiv":"2501.00001",'
+        b'"DOI":null}},null]',
+    ],
+    ids=[
+        "non-list",
+        "wrong-length",
+        "non-object-item",
+        "invalid-paper-id-type",
+        "invalid-external-ids-container",
+        "invalid-arxiv-value-type",
+        "null-arxiv-value",
+        "invalid-doi-value-type",
+        "null-doi-value",
+    ],
+)
+def test_s2_structural_errors_still_fail_closed(
+    tmp_path: Path, arxiv_response: bytes
+) -> None:
+    transport = RecordingTransport(arxiv_response=arxiv_response)
+    lock, runtime, _ = _lock_and_runtime(tmp_path, transport, include_openalex=False)
+
+    with pytest.raises(ValueError) as error:
+        capture_identity(lock, runtime)
+
+    assert str(error.value) == "semantic scholar response is invalid"
+    assert _ledger_states(runtime.ledger_path) == ["failed", "failed"]
+
+
 @pytest.mark.parametrize(
     "results",
     [

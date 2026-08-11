@@ -608,23 +608,34 @@ def _validate_s2_batch(payload: object, expected_ids: Sequence[str]) -> object:
         if paper_id is not None and not isinstance(paper_id, str):
             raise _InvalidProviderResponse
         if not isinstance(external_ids, dict) or not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in external_ids.items()
+            isinstance(key, str) for key in external_ids
         ):
             raise _InvalidProviderResponse
+        for relevant_key in ("ArXiv", "DOI"):
+            if relevant_key in external_ids and not isinstance(
+                external_ids[relevant_key], str
+            ):
+                raise _InvalidProviderResponse
         expected_kind = "arxiv" if expected_id.startswith("ARXIV:") else "doi"
         expected_value = normalize_paper_id(expected_id, kind=expected_kind)
         provider_value = external_ids.get("ArXiv" if expected_kind == "arxiv" else "DOI")
+        if (
+            not isinstance(paper_id, str)
+            or not paper_id.strip()
+            or not isinstance(provider_value, str)
+        ):
+            records.append(None)
+            continue
         try:
-            normalized_provider_value = (
-                normalize_paper_id(provider_value, kind=expected_kind)
-                if isinstance(provider_value, str)
-                else None
+            normalized_provider_value = normalize_paper_id(
+                provider_value, kind=expected_kind
             )
         except ValueError:
-            raise _InvalidProviderResponse from None
+            records.append(None)
+            continue
         if normalized_provider_value != expected_value:
-            raise _InvalidProviderResponse
+            records.append(None)
+            continue
         records.append(cast(dict[str, object], item))
     return records
 

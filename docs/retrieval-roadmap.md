@@ -156,3 +156,11 @@ Phase 11 的推荐顺序只有三步：先写正式设计；再做矛盾、遗�
 - Snapshot replay 只支持 hash-bound exact request：novel action 明确终止为 `snapshot_unavailable`，没有隐式 live fallback。每次 LLM initial/repair 调用各自占用并终结预算 receipt。此阶段未读 `.env`、未联网、未动 ledger、未创建或运行 live Scheme B 尝试。
 - 历史回放覆盖是证据边界，不是 regenerated compatibility：Query Rewrite、LLM Query Variants、Title Candidates 为 `aggregate_only`；Query Evolution 只验证已封存 actions/provider responses，因未绑定 identifier-map 和独立 per-query Gold-hit 而为 `not_comparable`；Citation Expansion 缺 seed actions/provider responses，为 `insufficient_historical_evidence`。因此 Scheme B 仍为 `insufficient_historical_evidence`，不满足两种跨 action family 的 exact replay 条件。
 - Task 0 绑定、保存 inventory 与当前文件的 10 个历史源/Gold hash 全部一致。Oracle catalog 仍被 `oracle_catalog_blocked` 阻断；在完整、hash-bound Gold-document catalog 和明确 live 授权之前，不得进行 Oracle 生成、DeepSeek、provider 调用或 Scheme B regenerated repeat。
+
+## Phase 13A：Scheme B 可验证 live runtime（已完成，未执行 live）
+
+- OpenAlex、Semantic Scholar 与 DeepSeek 的现有 capture 对象现在从实际冻结 transport config 生成只读 identity；请求与 identity 同源，endpoint/model/dependency/adapter 被篡改时在 dispatch 前 fail-closed。
+- Scheme B budgeted adapters 只接纳受信的现有 capture provider/analyzer，并绑定相同的实际 pricer、正式预算控制器及其 pricing/budget/formal-live/TTL fingerprints；调用方复制合法字段的 duck object 不能进入 live composition。
+- CLI 的 recipe backend 与 `--allow-live` 双门保持不变。离线 fake-live 已证明合法组合能复用公共 generator/registry/candidate-pool/evaluator/artifacts，未授权或 identity 不匹配时零 provider calls；未运行任何真实网络或付费请求。
+- 框架复用合同固定：Prompt/槽位方法只改 Prompt/YAML，预生成动作走 manual-action，新方法最多新增一个接口模块及 registry 项；不得新增方法专属 runner、候选池、evaluator、比较器或脚本。
+- 下一操作不是新工程方案，而是单独授权的 Query Evolution 三查询 canary：复用 `dev-smoke-3.yaml`、公共 runner 和候选召回 evaluator，capture 后立即 exact replay；只有 canary 可行后才按相同 recipe 获取三次有效重复。

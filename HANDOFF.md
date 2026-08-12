@@ -151,3 +151,12 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - 历史证据仍为精确受限结论：Query Rewrite、LLM Query Variants 与 Title Candidates 是 `aggregate_only`；Query Evolution 的 action/provider snapshot bytes 可验，但缺少独立绑定的 identifier-map/per-query Gold 命中，故为 `not_comparable`；Citation Expansion 为 `insufficient_historical_evidence`。Scheme B 总结仍为 `insufficient_historical_evidence`，不能给出 overall `passed`。
 - 5 个 historical bindings 的 9 个 source hashes 加 1 个 Gold association hash（共 `10/10`）与当前 bytes、Task 0 inventory 及 Task 0 review binding 完全一致；其中 1 个路径 tracked、9 个由 `.gitignore` 覆盖。Oracle Gold-document catalog 仍为 `oracle_catalog_blocked`，未授权前不得执行 Oracle/DeepSeek 或任何 live comparison。
 - 用户路径保持本轮开始时的未跟踪状态且未写入：`data/budget_ledger.sqlite3` SHA-256 `56f7f6871a6c642223786900462e81c8a877824a94bd952dfd2b395268956750`、`docs/evidence/identifier-map-semantic-audit-2026-08-10.json` SHA-256 `79e0c02ab59f8e61d243d8f5d73a2d713c6cd1d846aff61c6f2a3aa90ea03c8c`、`deliverables/`（2059 files）tree SHA-256 `6aa105b4bda3482fe8bb64a7097b6fc73d92531c3be29010ddc1a3ef2ae8a6b1`。
+
+## 15. Scheme B 可验证 live runtime（2026-08-12）
+
+- 已补齐一次性的 live 基础设施缺口：现有 OpenAlex、Semantic Scholar 与 DeepSeek capture 对象从其真实冻结执行配置提供只读身份，方案 B 的 budgeted adapters 绑定同一实际 `ActualCostPricer` 与 `HardBudgetController`，组合层不接受调用方自报身份。
+- LLM 与检索请求使用的 endpoint、model、dependency、adapter 和 identity 来自同一个冻结且带完整性校验的 transport config；相似域名、userinfo、query/fragment/port、非法 endpoint/operation、对象篡改和 exact-surface duck object 都会在 provider dispatch 前终止。
+- 价格策略、完整预算、`formal_live=True`、reservation TTL 与控制器版本进入运行身份；未知实际成本仍 fail-closed。CLI 继续要求 recipe 的 live backend 与运行时 `--allow-live` 双重满足。
+- Prompt/搜索槽位方法今后只改 Prompt/YAML；预生成搜索词走现有 manual-action；新生成或检索方法只实现并注册对应模块。禁止新增方法专属 runner、候选池、evaluator、产物格式、比较命令或独立脚本。
+- 离线 `httpx.MockTransport` 已验证合法 runtime 可进入公共生成/检索链路，未授权时零 provider calls；snapshot/replay、manual/fixed actions、严格 execution identity 和历史结论均保持兼容。独立 whole-feature 复审为 Critical 0 / Important 0 / Minor 0。
+- 本阶段没有读取 `.env`、没有调用 DeepSeek/OpenAlex/Semantic Scholar、没有写 ledger，也没有产生方案 B 性能结果。下一步仍是单独授权的 Query Evolution 三查询 canary：使用已有冻结 binding 和公共 runner，封存一次 live capture 后立即离线 exact replay，不再写新方法框架。

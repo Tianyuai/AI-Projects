@@ -71,6 +71,14 @@ class SettlementRecorder:
         self.settled: list[tuple[BudgetReservation, UsageActual]] = []
         self.failed: list[tuple[BudgetReservation, UsageActual]] = []
 
+    @property
+    def policy_fingerprint(self) -> str:
+        return "sha256:" + "d" * 64
+
+    @property
+    def formal_live(self) -> bool:
+        return True
+
     def settle(self, reservation: BudgetReservation, actual: UsageActual) -> None:
         self.settled.append((reservation, actual))
 
@@ -270,6 +278,156 @@ def _controller_reservation(controller: HardBudgetController) -> BudgetReservati
     )
 
 
+def test_live_analyzer_identity_binds_client_pricer_and_controller_without_prompt(
+    tmp_path: Path,
+) -> None:
+    requests = 0
+
+    def no_request(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        raise AssertionError(request)
+
+    async def run() -> None:
+        pricer = _pricer()
+        controller = _budget_controller()
+        prompt_instructions = "PRIVATE PROMPT INSTRUCTIONS"
+        payload_sentinel = "PRIVATE REQUEST PAYLOAD"
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(no_request)
+        ) as http_client:
+            client = OpenAICompatibleLLMClient(
+                client=http_client,
+                base_url="https://api.deepseek.com",
+                model="deepseek-test-v1",
+                api_key="private-api-key",
+            )
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=client,
+                capture_store=DependencyCaptureStore(
+                    tmp_path / "private-capture-root"
+                ),
+                pricer=pricer,
+                controller=controller,
+                prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
+                prompt_instructions=prompt_instructions,
+            )
+            evidence = analyzer.live_identity_evidence
+            assert evidence.provider is client.live_provider_descriptor
+            assert evidence.pricing_policy_sha256 == pricer.policy_sha256
+            assert evidence.controller_policy_sha256 == controller.policy_fingerprint
+            assert analyzer.live_pricer is pricer
+            assert analyzer.live_controller is controller
+            serialized = evidence.model_dump_json()
+            for protected in (
+                "private-api-key",
+                prompt_instructions,
+                PROMPT_ARTIFACT_SHA256,
+                payload_sentinel,
+                "private-capture-root",
+            ):
+                assert protected not in serialized
+
+    asyncio.run(run())
+    assert requests == 0
+
+
+@pytest.mark.parametrize("kind", ["nonformal", "fake"])
+def test_live_analyzer_rejects_unverified_controller_before_dispatch(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    requests = 0
+
+    def no_request(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        raise AssertionError(request)
+
+    controller: object = (
+        _budget_controller(formal_live=False) if kind == "nonformal" else object()
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(no_request)
+        ) as http_client:
+            client = OpenAICompatibleLLMClient(
+                client=http_client,
+                base_url="https://api.deepseek.com",
+                model="deepseek-test-v1",
+                api_key="private-api-key",
+            )
+            with pytest.raises((AttributeError, ValueError)):
+                LiveCaptureLLMAnalyzer(
+                    client=client,
+                    capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                    pricer=_pricer(),
+                    controller=controller,  # type: ignore[arg-type]
+                    prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
+                )
+
+    asyncio.run(run())
+    assert requests == 0
+
+
+def test_live_analyzer_evidence_changes_with_pricing_budget_or_ttl(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        policy = load_pricing_policy(PRICING_FIXTURE)
+        changed_policy = policy.model_copy(
+            update={"source_identity": "operator-verified-changed-policy"}
+        )
+        pricers = (
+            ActualCostPricer(policy, valued_at=CAPTURED_AT),
+            ActualCostPricer(changed_policy, valued_at=CAPTURED_AT),
+        )
+        baseline_controller = _budget_controller()
+        changed_budget = HardBudgetController(
+            baseline_controller.budget.model_copy(update={"max_llm_calls": 11}),
+            formal_live=True,
+            clock=lambda: CAPTURED_AT,
+        )
+        changed_ttl = HardBudgetController(
+            baseline_controller.budget,
+            formal_live=True,
+            reservation_ttl_seconds=121,
+            clock=lambda: CAPTURED_AT,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as http_client:
+            client = OpenAICompatibleLLMClient(
+                client=http_client,
+                base_url="https://api.deepseek.com",
+                model="deepseek-test-v1",
+                api_key="private-api-key",
+            )
+
+            def evidence(
+                pricer: ActualCostPricer,
+                controller: HardBudgetController,
+            ) -> object:
+                return LiveCaptureLLMAnalyzer(
+                    client=client,
+                    capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                    pricer=pricer,
+                    controller=controller,
+                    prompt_artifact_sha256=PROMPT_ARTIFACT_SHA256,
+                ).live_identity_evidence
+
+            baseline = evidence(pricers[0], baseline_controller)
+            pricing = evidence(pricers[1], baseline_controller)
+            budget = evidence(pricers[0], changed_budget)
+            ttl = evidence(pricers[0], changed_ttl)
+            assert baseline != pricing
+            assert baseline != budget
+            assert baseline != ttl
+
+    asyncio.run(run())
+
+
 def test_real_budget_controller_success_settles_once(tmp_path: Path) -> None:
     controller = _budget_controller()
     settlement = HardBudgetSettlementAdapter(controller)
@@ -436,6 +594,8 @@ def test_real_budget_controller_terminal_failure_records_usage_and_hard_stops(
     tmp_path: Path,
 ) -> None:
     class BrokenPricer:
+        policy_sha256 = "sha256:" + "e" * 64
+
         def value_actual(self, **_: object) -> UsageActual:
             raise ValueError("sensitive pricing failure")
 
@@ -962,6 +1122,7 @@ def test_pricing_failure_preserves_prior_valued_attempts_in_real_controller(
 
     class SecondAttemptPricingFailure:
         attempts = 0
+        policy_sha256 = delegate.policy_sha256
 
         def value_actual(self, **kwargs: object) -> UsageActual:
             self.attempts += 1
@@ -1027,6 +1188,8 @@ def test_terminal_internal_failure_records_accumulated_usage_fail_closed(
     tmp_path: Path,
 ) -> None:
     class BrokenPricer:
+        policy_sha256 = "sha256:" + "e" * 64
+
         def value_actual(self, **_: object) -> UsageActual:
             raise ValueError("sensitive pricing failure")
 
@@ -1073,10 +1236,15 @@ def test_terminal_settlement_failure_is_fixed_no_chain_adapter_error(
     settlement_error: type[Exception],
 ) -> None:
     class BrokenPricer:
+        policy_sha256 = "sha256:" + "e" * 64
+
         def value_actual(self, **_: object) -> UsageActual:
             raise ValueError("sensitive pricing failure")
 
     class FailingSettlementController:
+        policy_fingerprint = "sha256:" + "f" * 64
+        formal_live = True
+
         def settle(self, *_: object) -> None:
             raise AssertionError("settle must not be called")
 
@@ -1122,6 +1290,9 @@ def test_cancellation_preserves_cancelled_error_when_terminal_settlement_fails(
     settlement_error: type[Exception],
 ) -> None:
     class FailingSettlementController:
+        policy_fingerprint = "sha256:" + "f" * 64
+        formal_live = True
+
         def settle(self, *_: object) -> None:
             raise AssertionError("settle must not be called")
 

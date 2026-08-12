@@ -32,6 +32,7 @@ from paper_search.llm.client import (
     validate_prompt_artifact_sha256,
     validate_prompt_version,
 )
+from paper_search.live_identity import LiveDependencyEvidence
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
     DependencyRequestIdentity,
@@ -51,6 +52,12 @@ def _sha256(value: bytes) -> str:
 
 
 class RequestSettlementController(Protocol):
+    @property
+    def policy_fingerprint(self) -> str: ...
+
+    @property
+    def formal_live(self) -> bool: ...
+
     def settle(self, reservation: BudgetReservation, actual: UsageActual) -> None: ...
 
     def fail_closed(
@@ -73,6 +80,14 @@ class HardBudgetSettlementAdapter:
     @property
     def committed_usage(self) -> UsageActual:
         return self._controller.committed_usage
+
+    @property
+    def policy_fingerprint(self) -> str:
+        return self._controller.policy_fingerprint
+
+    @property
+    def formal_live(self) -> bool:
+        return self._controller.formal_live
 
     def stop_status(self) -> str:
         return self._controller.stop_status()
@@ -254,6 +269,8 @@ class LiveCaptureLLMAnalyzer:
         clock: Clock = _utc_now,
         prompt_instructions: str | None = None,
     ) -> None:
+        if getattr(controller, "formal_live", False) is not True:
+            raise ValueError("live capture requires formal-live budget enforcement")
         self._client = client
         self._capture_store = capture_store
         self._pricer = pricer
@@ -266,6 +283,25 @@ class LiveCaptureLLMAnalyzer:
         )
         self._prompt_instructions = prompt_instructions
         self._clock = clock
+        self._live_identity_evidence = LiveDependencyEvidence(
+            identity_schema_version="live-dependency-evidence-v1",
+            provider=client.live_provider_descriptor,
+            pricing_policy_sha256=pricer.policy_sha256,
+            controller_policy_sha256=controller.policy_fingerprint,
+            formal_live=True,
+        )
+
+    @property
+    def live_identity_evidence(self) -> LiveDependencyEvidence:
+        return self._live_identity_evidence
+
+    @property
+    def live_pricer(self) -> ActualCostPricer:
+        return self._pricer
+
+    @property
+    def live_controller(self) -> RequestSettlementController:
+        return self._controller
 
     async def generate_json(
         self,

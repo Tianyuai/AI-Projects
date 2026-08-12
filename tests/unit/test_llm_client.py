@@ -28,6 +28,73 @@ def _reservation() -> BudgetReservation:
     )
 
 
+def test_deepseek_client_descriptor_binds_endpoint_model_and_adapter_not_key() -> None:
+    def make_client(
+        http_client: httpx.AsyncClient, *, base_url: str, model: str, key: str
+    ) -> OpenAICompatibleLLMClient:
+        return OpenAICompatibleLLMClient(
+            client=http_client,
+            base_url=base_url,
+            model=model,
+            api_key=key,
+        )
+
+    async def run() -> None:
+        transport = httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            first = make_client(
+                http_client,
+                base_url="https://api.deepseek.com",
+                model="deepseek-chat",
+                key="credential-one",
+            )
+            second = make_client(
+                http_client,
+                base_url="https://api.deepseek.com/",
+                model="deepseek-chat",
+                key="credential-two",
+            )
+            assert first.live_provider_descriptor == second.live_provider_descriptor
+            descriptor = first.live_provider_descriptor
+            assert descriptor.provider == "deepseek"
+            assert descriptor.model == "deepseek-chat"
+            assert descriptor.endpoints == (
+                "https://api.deepseek.com/chat/completions",
+            )
+            assert descriptor.operations == ("generate_json",)
+            serialized = descriptor.model_dump_json()
+            assert "credential-one" not in serialized
+            assert "credential-two" not in serialized
+
+    asyncio.run(run())
+
+
+def test_llm_descriptor_changes_with_endpoint_or_model() -> None:
+    async def run() -> None:
+        transport = httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            def make(base_url: str, model: str) -> OpenAICompatibleLLMClient:
+                return OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url=base_url,
+                    model=model,
+                    api_key="credential",
+                )
+
+            baseline = make("https://api.deepseek.com", "deepseek-chat")
+            assert baseline.live_provider_descriptor != make(
+                "https://api.deepseek.com", "deepseek-reasoner"
+            ).live_provider_descriptor
+            dashscope = make(
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "deepseek-v3",
+            ).live_provider_descriptor
+            assert baseline.live_provider_descriptor != dashscope
+            assert dashscope.provider == "dashscope"
+
+    asyncio.run(run())
+
+
 def test_generate_json_returns_data_usage_and_safe_provenance() -> None:
     seen: list[httpx.Request] = []
 

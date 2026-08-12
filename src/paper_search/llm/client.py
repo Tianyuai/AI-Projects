@@ -19,6 +19,7 @@ from paper_search.domain.models import (
     ProviderResult,
     UsageActual,
 )
+from paper_search.live_identity import LiveProviderDescriptor
 
 
 Clock = Callable[[], datetime]
@@ -270,6 +271,27 @@ class OpenAICompatibleLLMClient:
         self._prompt_version = validate_prompt_version(prompt_version)
         self._clock = clock
         self._decoder = LLMResponseDecoder(prompt_version=prompt_version)
+        provider = (
+            "deepseek"
+            if self._deepseek_compatible
+            else "dashscope"
+            if self._dashscope_compatible
+            else "openai_compatible"
+        )
+        self._live_provider_descriptor = LiveProviderDescriptor(
+            identity_schema_version="live-provider-descriptor-v1",
+            provider=provider,
+            dependency="llm",
+            adapter="openai-compatible-json",
+            version="openai-compatible-client-v1",
+            model=self._model,
+            endpoints=(self._transport_endpoint,),
+            operations=("generate_json",),
+        )
+
+    @property
+    def live_provider_descriptor(self) -> LiveProviderDescriptor:
+        return self._live_provider_descriptor
 
     @property
     def endpoint(self) -> str:

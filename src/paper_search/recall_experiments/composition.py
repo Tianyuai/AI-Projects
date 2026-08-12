@@ -41,6 +41,7 @@ from paper_search.recall_experiments.inputs.gold_catalog import (
     GoldDocumentCatalogSource,
     SealedGoldDocumentCatalog,
 )
+from paper_search.recall_experiments.identity import ExecutionIdentity
 from paper_search.recall_experiments.recipes import (
     DeepSeekPromptGeneratorRecipe,
     FixedActionsGeneratorRecipe,
@@ -425,7 +426,15 @@ def build_citation_handler(runtime: RecallRuntime) -> CitationExpandHandler:
 
 def unavailable_runtime() -> RecallRuntime:
     unavailable = _SnapshotUnavailableRuntime()
-    return RecallRuntime(unavailable, unavailable, _SnapshotUnavailableLLMBackend())
+    return RecallRuntime(
+        unavailable,
+        unavailable,
+        _SnapshotUnavailableLLMBackend(),
+        identity={
+            "identity_schema_version": "candidate-recall-unavailable-runtime-v1",
+            "backend_identity": "snapshot_unavailable",
+        },
+    )
 
 
 def build_replay_runtime(manifest_path: Path, loaded_recipe: LoadedRecallRecipe) -> RecallRuntime:
@@ -651,7 +660,7 @@ def _execution_identity(
     allow_live: bool,
     runtime: RecallRuntime,
 ) -> dict[str, object]:
-    return {
+    payload = {
         "identity_schema_version": "candidate-recall-execution-identity-v1",
         "method_id": recipe.method_id,
         "recipe_sha256": loaded.recipe_sha256,
@@ -670,6 +679,7 @@ def _execution_identity(
         "live_authorized": allow_live,
         "runtime": dict(runtime.identity),
     }
+    return ExecutionIdentity.model_validate(payload).model_dump(mode="json")
 
 
 def _valid_live_runtime_identity(runtime: RecallRuntime) -> bool:
@@ -718,8 +728,8 @@ def _validate_comparison_identity(
     historical_schema: str | None,
 ) -> None:
     """Only explicit legacy-v0 pairs bypass the v1 identity envelope."""
-    _validate_report_identity(current, current_schema)
-    _validate_report_identity(historical, historical_schema)
+    current_validated = _validate_report_identity(current, current_schema)
+    historical_validated = _validate_report_identity(historical, historical_schema)
     if (
         current_schema == "candidate-recall-report-legacy-v0"
         and historical_schema == "candidate-recall-report-legacy-v0"
@@ -729,25 +739,21 @@ def _validate_comparison_identity(
         return
     if (
         current_schema != historical_schema
-        or current is None
-        or historical is None
-        or dict(current) != dict(historical)
+        or current_validated is None
+        or historical_validated is None
+        or current_validated != historical_validated
     ):
         raise ValueError("recall report execution identities do not match")
 
 
 def _validate_report_identity(
     identity: Mapping[str, object] | None, schema: str | None
-) -> None:
+) -> ExecutionIdentity | None:
     if schema == "candidate-recall-report-legacy-v0" and identity is None:
-        return
-    if (
-        schema != "candidate-recall-report-v1"
-        or identity is None
-        or identity.get("identity_schema_version")
-        != "candidate-recall-execution-identity-v1"
-    ):
+        return None
+    if schema != "candidate-recall-report-v1" or identity is None:
         raise ValueError("recall report execution identity is invalid")
+    return ExecutionIdentity.model_validate(dict(identity))
 
 
 def _snapshot_error(provider: str) -> ErrorDetail:

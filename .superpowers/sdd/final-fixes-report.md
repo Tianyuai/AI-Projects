@@ -164,3 +164,45 @@ Fresh final verification:
 
 No network or live provider call was made, `.env` was not read, and the user-owned untracked
 paths remain untouched and unstaged.
+
+## Strict execution-identity validation follow-up
+
+The final review found that a v1 execution identity containing only
+`identity_schema_version` still passed current-only validation. RED tests demonstrated that the
+version shell, deletion of every required top-level field, malformed/zero SHA-256 values,
+boolean-as-integer values, invalid repeat bounds, generator binding contradictions, and replay
+marked as live were accepted.
+
+GREEN introduces a frozen, extra-forbid `ExecutionIdentity` model that exactly covers the
+current `_execution_identity` payload: method, recipe/sample/prompt hashes, generator type/model,
+retrieval backend, snapshot/actions hashes, action/result limits, candidate-pool policy,
+repeat/max-attempt counts, live authorization, and the complete versioned runtime identity.
+Comparison now canonicalizes both reports through that model before equality testing, and the
+producer validates/canonicalizes the identity before writing it.
+
+Conditional validation requires:
+
+- nonzero, correctly formatted SHA-256 identities and strict integer/boolean types;
+- manual/fixed generators to bind actions and omit prompt/model;
+- DeepSeek generators to bind prompt/model and omit fixed action bytes;
+- sealed replay to be non-live and bind the same manifest hash in the outer and runtime identity;
+- snapshot-unavailable offline execution to use an explicit versioned unavailable runtime and no
+  manifest hash;
+- live execution to be authorized, snapshot-free, and to carry a complete versioned live runtime
+  whose search/citation/LLM dependencies share the controller and pricing fingerprints.
+
+The first full verification exposed one useful regression: the pre-existing empty runtime for an
+omitted snapshot became `config_mismatch` before producing the truthful `snapshot_unavailable`
+attempt. That state now has an explicit `candidate-recall-unavailable-runtime-v1` identity rather
+than weakening the successful replay rules.
+
+Fresh verification:
+
+- strict-identity focused tests: `27 passed in 1.26s`
+- recall suite: `260 passed in 7.23s`
+- Ruff: `All checks passed!`
+- mypy: `Success: no issues found in 29 source files`
+- `git diff --check`: no whitespace errors (only expected LF/CRLF notices)
+
+No network/live execution or `.env` read occurred. User-owned untracked paths remain untouched
+and unstaged.

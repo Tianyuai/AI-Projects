@@ -29,6 +29,34 @@ from paper_search.recall_experiments.retrieval.backends import (
 WORKSPACE_ROOT = Path(__file__).parents[2]
 
 
+def _valid_execution_identity() -> dict[str, object]:
+    snapshot_sha = "sha256:" + "d" * 64
+    return {
+        "identity_schema_version": "candidate-recall-execution-identity-v1",
+        "method_id": "synthetic-manual",
+        "recipe_sha256": "sha256:" + "a" * 64,
+        "sample_sha256": "sha256:" + "b" * 64,
+        "prompt_sha256": None,
+        "generator_type": "manual_actions",
+        "generator_model": None,
+        "retrieval_backend": "snapshot_replay",
+        "snapshot_manifest_sha256": snapshot_sha,
+        "actions_sha256": "sha256:" + "c" * 64,
+        "max_total_actions": 1,
+        "max_results_per_action": 5,
+        "candidate_pool_policy_version": "production-dedup-v1",
+        "repeat_count": 1,
+        "max_repeat_attempts": 1,
+        "live_authorized": False,
+        "runtime": {
+            "backend_identity": "sealed_dependency_snapshot",
+            "budget_policy": "recall-replay-v1",
+            "pricing_provenance": "snapshot_bound_usage",
+            "snapshot_manifest_sha256": snapshot_sha,
+        },
+    }
+
+
 def _write_synthetic_inputs(tmp_path: Path, *, backend: str = "snapshot_replay") -> tuple[Path, Path, Path]:
     gold = b'{"query_id":"q-one","query":"synthetic query","relevant_paper_ids":["arxiv:2401.00001"]}\n'
     identifier_map = b'{"arxiv:2401.00001":"doi:10.1000/synthetic"}\n'
@@ -334,11 +362,11 @@ def test_compare_without_historical_validates_current_then_reports_insufficient_
     }
     (current / "recall-report.json").write_text(
         json.dumps(
-            {
-                "schema_version": "candidate-recall-report-v1",
-                "execution_identity": {"identity_schema_version": "candidate-recall-execution-identity-v1"},
-                "attempts": [{"attempt_status": "succeeded", "result": result}],
-            }
+                {
+                    "schema_version": "candidate-recall-report-v1",
+                    "execution_identity": _valid_execution_identity(),
+                    "attempts": [{"attempt_status": "succeeded", "result": result}],
+                }
         ),
         encoding="utf-8",
     )
@@ -351,6 +379,116 @@ def test_compare_without_historical_validates_current_then_reports_insufficient_
 
     assert comparison["conclusion"] == "insufficient_historical_evidence"
     assert comparison["per_query_comparison"] == "not_provable"
+
+
+def test_compare_rejects_execution_identity_version_shell(tmp_path: Path) -> None:
+    current = tmp_path / "current"
+    current.mkdir()
+    result = {
+        "candidate_pool_policy_version": "production-dedup-v1",
+        "gold_association_count": 1,
+        "gold_hit_count": 1,
+        "macro_candidate_recall": 1.0,
+        "per_query": [],
+    }
+    (current / "recall-report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "candidate-recall-report-v1",
+                "execution_identity": {
+                    "identity_schema_version": "candidate-recall-execution-identity-v1"
+                },
+                "attempts": [{"attempt_status": "succeeded", "result": result}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RecallTerminalError, match="config_mismatch"):
+        compare_recall_artifacts(
+            current_run=current,
+            historical_run=None,
+            output_path=tmp_path / "comparison",
+        )
+
+
+@pytest.mark.parametrize("missing_field", tuple(_valid_execution_identity()))
+def test_compare_rejects_execution_identity_with_any_required_field_deleted(
+    tmp_path: Path, missing_field: str
+) -> None:
+    current = tmp_path / "current"
+    current.mkdir()
+    identity = _valid_execution_identity()
+    del identity[missing_field]
+    result = {
+        "candidate_pool_policy_version": "production-dedup-v1",
+        "gold_association_count": 1,
+        "gold_hit_count": 1,
+        "macro_candidate_recall": 1.0,
+        "per_query": [],
+    }
+    (current / "recall-report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "candidate-recall-report-v1",
+                "execution_identity": identity,
+                "attempts": [{"attempt_status": "succeeded", "result": result}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RecallTerminalError, match="config_mismatch"):
+        compare_recall_artifacts(
+            current_run=current,
+            historical_run=None,
+            output_path=tmp_path / f"comparison-{missing_field}",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("recipe_sha256", "not-a-sha"),
+        ("sample_sha256", "sha256:" + "0" * 64),
+        ("max_total_actions", True),
+        ("repeat_count", 0),
+        ("generator_model", "unexpected-model"),
+        ("live_authorized", True),
+        ("live_authorized", 0),
+    ],
+)
+def test_compare_rejects_malformed_or_conditionally_invalid_execution_identity(
+    tmp_path: Path, field: str, bad_value: object
+) -> None:
+    current = tmp_path / "current"
+    current.mkdir()
+    identity = _valid_execution_identity()
+    identity[field] = bad_value
+    result = {
+        "candidate_pool_policy_version": "production-dedup-v1",
+        "gold_association_count": 1,
+        "gold_hit_count": 1,
+        "macro_candidate_recall": 1.0,
+        "per_query": [],
+    }
+    (current / "recall-report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "candidate-recall-report-v1",
+                "execution_identity": identity,
+                "attempts": [{"attempt_status": "succeeded", "result": result}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RecallTerminalError, match="config_mismatch"):
+        compare_recall_artifacts(
+            current_run=current,
+            historical_run=None,
+            output_path=tmp_path / f"comparison-{field}",
+        )
 
 
 def test_authorized_live_run_rejects_caller_declared_fake_runtime_identity(

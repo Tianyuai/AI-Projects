@@ -41,7 +41,10 @@ from paper_search.recall_experiments.inputs.gold_catalog import (
     GoldDocumentCatalogSource,
     SealedGoldDocumentCatalog,
 )
-from paper_search.recall_experiments.identity import ExecutionIdentity
+from paper_search.recall_experiments.identity import (
+    ExecutionIdentity,
+    LiveRuntimeIdentity,
+)
 from paper_search.recall_experiments.recipes import (
     DeepSeekPromptGeneratorRecipe,
     FixedActionsGeneratorRecipe,
@@ -68,7 +71,7 @@ from paper_search.recall_experiments.retrieval.text_search import TextSearchHand
 from paper_search.recall_experiments.retrieval.title_search import TitleSearchHandler
 from paper_search.recall_experiments.runner import RecallExperimentRequest, RecallExperimentRunner
 from paper_search.recall_experiments.stages import CandidateStagePipeline
-from paper_search.retrieval.snapshot_adapters import LiveCaptureSearchProvider, ReplaySearchProvider
+from paper_search.retrieval.snapshot_adapters import ReplaySearchProvider
 from paper_search.storage.dependency_snapshot import DependencySnapshotReader
 
 
@@ -498,14 +501,26 @@ def build_replay_runtime(manifest_path: Path, loaded_recipe: LoadedRecallRecipe)
 
 def build_live_runtime(
     *,
-    search_provider: LiveCaptureSearchProvider,
-    citation_provider: LiveCaptureSearchProvider,
-    llm_backend: LLMBackend,
-    controller: HardBudgetController,
+    search_backend: BudgetedSearchBackend,
+    citation_backend: BudgetedCitationBackend,
+    llm_backend: BudgetedLLMBackend,
 ) -> RecallRuntime:
-    """Fail closed until all actual live adapters expose verifiable runtime identity."""
-    del search_provider, citation_provider, llm_backend, controller
-    raise RecallTerminalError("live_runtime_unavailable")
+    """Compose only the exact self-identifying adapters that will execute."""
+    identity = _live_runtime_identity(
+        search_backend=search_backend,
+        citation_backend=citation_backend,
+        llm_backend=llm_backend,
+    )
+    controller = search_backend.live_controller
+    pricer = search_backend.live_pricer
+    return RecallRuntime(
+        search_backend=search_backend,
+        citation_backend=citation_backend,
+        llm_backend=llm_backend,
+        identity=identity.model_dump(mode="json"),
+        controller=controller,
+        pricing_policy_bytes=pricer.canonical_policy_bytes,
+    )
 
 
 class _SnapshotUnavailableLLMBackend(LLMBackend):
@@ -683,8 +698,86 @@ def _execution_identity(
 
 
 def _valid_live_runtime_identity(runtime: RecallRuntime) -> bool:
-    del runtime
-    return False
+    if not isinstance(runtime.search_backend, BudgetedSearchBackend):
+        return False
+    if not isinstance(runtime.citation_backend, BudgetedCitationBackend):
+        return False
+    if not isinstance(runtime.llm_backend, BudgetedLLMBackend):
+        return False
+    try:
+        expected = _live_runtime_identity(
+            search_backend=runtime.search_backend,
+            citation_backend=runtime.citation_backend,
+            llm_backend=runtime.llm_backend,
+        )
+        actual = LiveRuntimeIdentity.model_validate(runtime.identity)
+        controller = runtime.search_backend.live_controller
+        pricer = runtime.search_backend.live_pricer
+    except (RecallTerminalError, TypeError, ValueError):
+        return False
+    return (
+        actual == expected
+        and runtime.controller is controller
+        and runtime.pricing_policy_bytes == pricer.canonical_policy_bytes
+    )
+
+
+def _live_runtime_identity(
+    *,
+    search_backend: BudgetedSearchBackend,
+    citation_backend: BudgetedCitationBackend,
+    llm_backend: BudgetedLLMBackend,
+) -> LiveRuntimeIdentity:
+    try:
+        dependencies = {
+            "search": search_backend.dependency_identity,
+            "citation": citation_backend.dependency_identity,
+            "llm": llm_backend.dependency_identity,
+        }
+        controllers = (
+            search_backend.live_controller,
+            citation_backend.live_controller,
+            llm_backend.live_controller,
+        )
+        pricers = (
+            search_backend.live_pricer,
+            citation_backend.live_pricer,
+            llm_backend.live_pricer,
+        )
+    except (AttributeError, ValueError) as error:
+        raise RecallTerminalError("live_runtime_unavailable") from error
+    if not all(controller is controllers[0] for controller in controllers[1:]):
+        raise RecallTerminalError("config_mismatch")
+    if not all(pricer is pricers[0] for pricer in pricers[1:]):
+        raise RecallTerminalError("config_mismatch")
+    controller = controllers[0]
+    pricer = pricers[0]
+    if controller.formal_live is not True:
+        raise RecallTerminalError("config_mismatch")
+    if dependencies["search"].dependency != "openalex":
+        raise RecallTerminalError("config_mismatch")
+    if dependencies["citation"].dependency != "semantic_scholar":
+        raise RecallTerminalError("config_mismatch")
+    if (
+        dependencies["llm"].dependency != "llm"
+        or dependencies["llm"].provider != "deepseek"
+    ):
+        raise RecallTerminalError("config_mismatch")
+    for dependency in dependencies.values():
+        if (
+            dependency.controller_policy_sha256 != controller.policy_fingerprint
+            or dependency.pricing_policy_sha256 != pricer.policy_sha256
+        ):
+            raise RecallTerminalError("config_mismatch")
+    try:
+        return LiveRuntimeIdentity(
+            identity_schema_version="candidate-recall-live-runtime-v1",
+            controller_policy_sha256=controller.policy_fingerprint,
+            pricing_policy_sha256=pricer.policy_sha256,
+            dependencies=dependencies,
+        )
+    except ValueError as error:
+        raise RecallTerminalError("config_mismatch") from error
 
 
 def _budget_policy_sha256(controller: HardBudgetController) -> str:

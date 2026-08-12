@@ -185,6 +185,28 @@ def test_run_rejects_live_recipe_without_explicit_authorization(
     assert payload["status"] == "failed"
 
 
+def test_authorized_live_recipe_without_runtime_factory_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    recipe, sample, actions = _write_synthetic_inputs(
+        tmp_path, backend="live_provider"
+    )
+
+    with pytest.raises(RecallTerminalError, match="live_runtime_unavailable"):
+        run(
+            run_recall_experiment(
+                recipe_path=recipe,
+                sample_path=sample,
+                output_path=tmp_path / "live",
+                workspace_root=tmp_path,
+                actions_path=actions,
+                allow_live=True,
+            )
+        )
+
+
 def test_manual_actions_prepare_and_validate_with_complete_synthetic_frozen_inputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -559,18 +581,27 @@ def test_budget_policy_fingerprint_covers_formal_live_and_reservation_ttl() -> N
     assert _budget_policy_sha256(formal) != _budget_policy_sha256(different_ttl)
 
 
-def test_build_live_runtime_fails_closed_until_actual_adapters_expose_identity(
+def test_build_live_runtime_accepts_exact_self_identifying_adapters(
     tmp_path: Path,
 ) -> None:
     import httpx
 
-    from paper_search.control.pricing import ActualCostPricer, parse_pricing_policy_bytes
+    from paper_search.control.pricing import (
+        ActualCostPricer,
+        canonical_pricing_policy_bytes,
+        parse_pricing_policy_bytes,
+    )
     from paper_search.llm.client import OpenAICompatibleLLMClient
     from paper_search.llm.snapshot_adapters import LiveCaptureLLMAnalyzer
     from paper_search.recall_experiments.composition import (
         build_live_runtime,
     )
     from paper_search.recall_experiments.generation.backends import BudgetedLLMBackend
+    from paper_search.recall_experiments.identity import LiveRuntimeIdentity
+    from paper_search.recall_experiments.retrieval.backends import (
+        BudgetedCitationBackend,
+        BudgetedSearchBackend,
+    )
     from paper_search.retrieval.snapshot_adapters import LiveCaptureSearchProvider
     from paper_search.storage.dependency_snapshot import DependencyCaptureStore
     from paper_search.domain.models import UsageEstimate
@@ -584,7 +615,9 @@ def test_build_live_runtime_fails_closed_until_actual_adapters_expose_identity(
         formal_live=True,
         reservation_ttl_seconds=91,
     )
-    client = httpx.AsyncClient()
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+    )
     capture = DependencyCaptureStore(tmp_path / "capture")
     try:
         search = LiveCaptureSearchProvider(
@@ -603,7 +636,7 @@ def test_build_live_runtime_fails_closed_until_actual_adapters_expose_identity(
         )
         llm_client = OpenAICompatibleLLMClient(
             client=client,
-            base_url="https://example.invalid/v1",
+            base_url="https://api.deepseek.com",
             model="deepseek-test-v1",
             api_key="test-only",
         )
@@ -621,14 +654,318 @@ def test_build_live_runtime_fails_closed_until_actual_adapters_expose_identity(
             initial_estimate=estimate,
             repair_estimate=estimate,
         )
+        search_backend = BudgetedSearchBackend(
+            provider=search,
+            controller=controller,
+            call_estimate=UsageEstimate(search_api_calls=1, cost_cny=0),
+        )
+        citation_backend = BudgetedCitationBackend(
+            provider=citation,
+            controller=controller,
+            call_estimate=UsageEstimate(search_api_calls=1, cost_cny=0),
+        )
 
-        with pytest.raises(RecallTerminalError, match="live_runtime_unavailable"):
+        runtime = build_live_runtime(
+            search_backend=search_backend,
+            citation_backend=citation_backend,
+            llm_backend=llm,
+        )
+        identity = LiveRuntimeIdentity.model_validate(runtime.identity)
+        assert set(identity.dependencies) == {"search", "citation", "llm"}
+        assert runtime.search_backend is search_backend
+        assert runtime.citation_backend is citation_backend
+        assert runtime.llm_backend is llm
+        assert runtime.controller is controller
+        assert runtime.pricing_policy_bytes == canonical_pricing_policy_bytes(
+            parse_pricing_policy_bytes(pricing_bytes)
+        )
+    finally:
+        run(client.aclose())
+
+
+def test_build_live_runtime_rejects_distinct_pricer_object_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    import httpx
+
+    from paper_search.control.pricing import ActualCostPricer, parse_pricing_policy_bytes
+    from paper_search.domain.models import UsageEstimate
+    from paper_search.llm.client import OpenAICompatibleLLMClient
+    from paper_search.llm.snapshot_adapters import LiveCaptureLLMAnalyzer
+    from paper_search.recall_experiments.composition import build_live_runtime
+    from paper_search.recall_experiments.generation.backends import BudgetedLLMBackend
+    from paper_search.recall_experiments.retrieval.backends import (
+        BudgetedCitationBackend,
+        BudgetedSearchBackend,
+    )
+    from paper_search.retrieval.snapshot_adapters import LiveCaptureSearchProvider
+    from paper_search.storage.dependency_snapshot import DependencyCaptureStore
+
+    pricing_bytes = (
+        WORKSPACE_ROOT / "tests/fixtures/pricing/pricing-policy-test-v1.yaml"
+    ).read_bytes()
+    policy = parse_pricing_policy_bytes(pricing_bytes)
+    first_pricer = ActualCostPricer(policy)
+    second_pricer = ActualCostPricer(policy)
+    controller = HardBudgetController(
+        SearchBudget(max_total_tokens=10_000, max_cost_cny=1), formal_live=True
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+    )
+    store = DependencyCaptureStore(tmp_path / "capture")
+    try:
+        search_provider = LiveCaptureSearchProvider(
+            dependency="openalex",
+            client=client,
+            capture_store=store,
+            pricer=first_pricer,
+            controller=controller,
+        )
+        citation_provider = LiveCaptureSearchProvider(
+            dependency="semantic_scholar",
+            client=client,
+            capture_store=store,
+            pricer=first_pricer,
+            controller=controller,
+        )
+        analyzer = LiveCaptureLLMAnalyzer(
+            client=OpenAICompatibleLLMClient(
+                client=client,
+                base_url="https://api.deepseek.com",
+                model="deepseek-test-v1",
+                api_key="test-only",
+            ),
+            capture_store=store,
+            pricer=second_pricer,
+            controller=controller,
+            prompt_artifact_sha256="sha256:" + "a" * 64,
+        )
+        search = BudgetedSearchBackend(
+            provider=search_provider,
+            controller=controller,
+            call_estimate=UsageEstimate(search_api_calls=1),
+        )
+        citation = BudgetedCitationBackend(
+            provider=citation_provider,
+            controller=controller,
+            call_estimate=UsageEstimate(search_api_calls=1),
+        )
+        llm = BudgetedLLMBackend(
+            analyzer=analyzer,
+            controller=controller,
+            initial_estimate=UsageEstimate(llm_calls=1),
+            repair_estimate=UsageEstimate(llm_calls=1),
+        )
+        with pytest.raises(RecallTerminalError, match="config_mismatch"):
             build_live_runtime(
-                search_provider=search,
-                citation_provider=citation,
+                search_backend=search,
+                citation_backend=citation,
                 llm_backend=llm,
-                controller=controller,
             )
+    finally:
+        run(client.aclose())
+
+
+def test_valid_injected_live_runtime_reaches_mock_llm_and_search_only_when_authorized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    from paper_search.control.pricing import ActualCostPricer, parse_pricing_policy_bytes
+    from paper_search.domain.models import UsageEstimate
+    from paper_search.llm.client import OpenAICompatibleLLMClient
+    from paper_search.llm.snapshot_adapters import LiveCaptureLLMAnalyzer
+    from paper_search.recall_experiments.composition import build_live_runtime
+    from paper_search.recall_experiments.generation.backends import BudgetedLLMBackend
+    from paper_search.recall_experiments.retrieval.backends import (
+        BudgetedCitationBackend,
+        BudgetedSearchBackend,
+    )
+    from paper_search.retrieval.snapshot_adapters import LiveCaptureSearchProvider
+    from paper_search.storage.dependency_snapshot import DependencyCaptureStore
+
+    monkeypatch.chdir(tmp_path)
+    _manual_recipe, sample, _actions = _write_synthetic_inputs(
+        tmp_path, backend="live_provider"
+    )
+    prompt = tmp_path / "prompt.yaml"
+    prompt.write_text(
+        "name: synthetic\nversion: v1\nmodel: deepseek-v4-flash\n"
+        "temperature: 0\ninstructions: [Generate one text search.]\n",
+        encoding="utf-8",
+    )
+    recipe = tmp_path / "live-recipe.yaml"
+    recipe.write_text(
+        """method_id: synthetic-live
+generator:
+  type: deepseek_prompt
+  prompt: prompt.yaml
+  model: deepseek-v4-flash
+  temperature: 0
+  gold_visibility: blind
+  max_generated_actions: 1
+  repair_attempts: 1
+retrieval:
+  allowed_actions: [text_search]
+  backend: live_provider
+  max_results_per_action: 5
+  max_total_actions: 1
+evaluation:
+  repeat_count: 1
+  max_repeat_attempts: 1
+""",
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            calls.append("llm")
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {
+                            "message": {
+                                "content": json.dumps(
+                                    {
+                                        "actions": [
+                                            {
+                                                "action_id": "a-1",
+                                                "action_type": "text_search",
+                                                "strategy": "synthetic",
+                                                "payload": {
+                                                    "query_text": "synthetic query"
+                                                },
+                                            }
+                                        ]
+                                    }
+                                )
+                            }
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 3},
+                },
+                request=request,
+            )
+        calls.append("openalex")
+        return httpx.Response(
+            200,
+            json={
+                "meta": {"count": 1, "per_page": 5, "next_cursor": None},
+                "results": [
+                    {
+                        "id": "https://openalex.org/W1",
+                        "doi": "https://doi.org/10.1000/synthetic",
+                        "title": "Synthetic",
+                        "display_name": "Synthetic",
+                        "authorships": [],
+                        "publication_year": 2026,
+                        "primary_location": None,
+                        "cited_by_count": 0,
+                        "is_retracted": False,
+                    }
+                ],
+            },
+            request=request,
+        )
+
+    pricing_bytes = (
+        WORKSPACE_ROOT / "tests/fixtures/pricing/pricing-policy-test-v1.yaml"
+    ).read_bytes().replace(b"deepseek-test-v1", b"deepseek-v4-flash")
+    pricer = ActualCostPricer(parse_pricing_policy_bytes(pricing_bytes))
+    controller = HardBudgetController(
+        SearchBudget(max_total_tokens=10_000, max_cost_cny=1), formal_live=True
+    )
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    store = DependencyCaptureStore(tmp_path / "capture")
+    try:
+        search_provider = LiveCaptureSearchProvider(
+            dependency="openalex",
+            client=client,
+            capture_store=store,
+            pricer=pricer,
+            controller=controller,
+        )
+        citation_provider = LiveCaptureSearchProvider(
+            dependency="semantic_scholar",
+            client=client,
+            capture_store=store,
+            pricer=pricer,
+            controller=controller,
+        )
+        analyzer = LiveCaptureLLMAnalyzer(
+            client=OpenAICompatibleLLMClient(
+                client=client,
+                base_url="https://api.deepseek.com",
+                model="deepseek-v4-flash",
+                api_key="test-only",
+            ),
+            capture_store=store,
+            pricer=pricer,
+            controller=controller,
+            prompt_artifact_sha256="sha256:" + sha256(prompt.read_bytes()).hexdigest(),
+        )
+        runtime = build_live_runtime(
+            search_backend=BudgetedSearchBackend(
+                provider=search_provider,
+                controller=controller,
+                call_estimate=UsageEstimate(search_api_calls=1, cost_cny=0.01),
+            ),
+            citation_backend=BudgetedCitationBackend(
+                provider=citation_provider,
+                controller=controller,
+                call_estimate=UsageEstimate(search_api_calls=1, cost_cny=0.01),
+            ),
+            llm_backend=BudgetedLLMBackend(
+                analyzer=analyzer,
+                controller=controller,
+                initial_estimate=UsageEstimate(
+                    llm_calls=1,
+                    input_tokens=100,
+                    output_tokens=100,
+                    cost_cny=0.01,
+                ),
+                repair_estimate=UsageEstimate(
+                    llm_calls=1,
+                    input_tokens=100,
+                    output_tokens=100,
+                    cost_cny=0.01,
+                ),
+            ),
+        )
+        output = tmp_path / "authorized"
+        run(
+            run_recall_experiment(
+                recipe_path=recipe,
+                sample_path=sample,
+                output_path=output,
+                workspace_root=tmp_path,
+                actions_path=None,
+                allow_live=True,
+                live_runtime_factory=lambda _recipe: runtime,
+            )
+        )
+        assert calls == ["llm", "openalex"]
+        report = json.loads((output / "recall-report.json").read_bytes())
+        assert report["execution_identity"]["runtime"] == dict(runtime.identity)
+
+        calls.clear()
+        with pytest.raises(RecallTerminalError, match="live_not_authorized"):
+            run(
+                run_recall_experiment(
+                    recipe_path=recipe,
+                    sample_path=sample,
+                    output_path=tmp_path / "unauthorized",
+                    workspace_root=tmp_path,
+                    actions_path=None,
+                    allow_live=False,
+                    live_runtime_factory=lambda _recipe: runtime,
+                )
+            )
+        assert calls == []
     finally:
         run(client.aclose())
 

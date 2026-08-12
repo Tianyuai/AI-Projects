@@ -440,6 +440,10 @@ class ActualCostPricer:
     def policy_sha256(self) -> Sha256:
         return pricing_policy_sha256(self._policy)
 
+    @property
+    def canonical_policy_bytes(self) -> bytes:
+        return canonical_pricing_policy_bytes(self._policy)
+
     def value_actual(
         self,
         *,

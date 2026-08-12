@@ -18,6 +18,7 @@ from paper_search.control.budget import (
     HardBudgetController,
     ReservationError,
 )
+from paper_search.control.pricing import ActualCostPricer
 from paper_search.domain.models import (
     BudgetReservation,
     DomainModel,
@@ -26,6 +27,11 @@ from paper_search.domain.models import (
     UsageActual,
     UsageEstimate,
     Sha256,
+)
+from paper_search.live_identity import LiveDependencyEvidence
+from paper_search.recall_experiments.identity import (
+    LiveDependencyIdentity,
+    dependency_identity_from_evidence,
 )
 
 
@@ -131,7 +137,6 @@ class BudgetedLLMBackend:
         controller: HardBudgetController,
         initial_estimate: UsageEstimate,
         repair_estimate: UsageEstimate,
-        pricing_policy_sha256: str | None = None,
     ) -> None:
         if initial_estimate.llm_calls < 1 or repair_estimate.llm_calls < 1:
             raise ValueError("LLM backend estimates must reserve at least one LLM call")
@@ -141,7 +146,42 @@ class BudgetedLLMBackend:
             "initial": initial_estimate,
             "repair": repair_estimate,
         }
-        self.pricing_policy_sha256 = pricing_policy_sha256
+        self._dependency_identity: LiveDependencyIdentity | None = None
+        self._live_pricer: ActualCostPricer | None = None
+        evidence = getattr(analyzer, "live_identity_evidence", None)
+        if evidence is not None:
+            if not isinstance(evidence, LiveDependencyEvidence):
+                raise ValueError("live identity evidence is invalid")
+            if getattr(analyzer, "live_controller", None) is not controller:
+                raise ValueError("live analyzer controller does not match backend controller")
+            if controller.formal_live is not True:
+                raise ValueError("live analyzer controller must use formal-live enforcement")
+            pricer = getattr(analyzer, "live_pricer", None)
+            if not isinstance(pricer, ActualCostPricer):
+                raise ValueError("live analyzer pricer is invalid")
+            identity = dependency_identity_from_evidence(evidence)
+            if identity.dependency != "llm":
+                raise ValueError("live LLM dependency identity is invalid")
+            self._dependency_identity = identity
+            self._live_pricer = pricer
+
+    @property
+    def dependency_identity(self) -> LiveDependencyIdentity:
+        if self._dependency_identity is None:
+            raise ValueError("live identity unavailable")
+        return self._dependency_identity
+
+    @property
+    def live_pricer(self) -> ActualCostPricer:
+        if self._live_pricer is None:
+            raise ValueError("live identity unavailable")
+        return self._live_pricer
+
+    @property
+    def live_controller(self) -> HardBudgetController:
+        if self._dependency_identity is None:
+            raise ValueError("live identity unavailable")
+        return self._controller
 
     def _settle_or_verify(
         self,

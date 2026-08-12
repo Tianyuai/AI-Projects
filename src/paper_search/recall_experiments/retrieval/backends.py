@@ -14,6 +14,7 @@ from paper_search.control.budget import (
     HardBudgetController,
     ReservationError,
 )
+from paper_search.control.pricing import ActualCostPricer
 from paper_search.domain.models import (
     BudgetReservation,
     CitationExpansion,
@@ -29,6 +30,7 @@ from paper_search.graph.provider_stage import (
     CitationExpansionUnavailableError,
     ProviderCitationExpansionStage,
 )
+from paper_search.live_identity import LiveDependencyEvidence
 from paper_search.recall_experiments.contracts import (
     CitationDirection,
     CitationExpandAction,
@@ -37,6 +39,10 @@ from paper_search.recall_experiments.contracts import (
     RetrievalExecutionContext,
     TextSearchAction,
     TitleSearchAction,
+)
+from paper_search.recall_experiments.identity import (
+    LiveDependencyIdentity,
+    dependency_identity_from_evidence,
 )
 from paper_search.retrieval.base import SearchProvider
 
@@ -159,6 +165,52 @@ class _BudgetedProviderCall:
             raise ValueError("retrieval backend calls require a search API estimate")
         self._controller = controller
         self._call_estimate = call_estimate
+        self._dependency_identity: LiveDependencyIdentity | None = None
+        self._live_pricer: ActualCostPricer | None = None
+
+    def _bind_live_provider(
+        self,
+        provider: object,
+        *,
+        dependency: Literal["openalex", "semantic_scholar"],
+        role: str,
+    ) -> None:
+        evidence = getattr(provider, "live_identity_evidence", None)
+        if evidence is None:
+            return
+        if not isinstance(evidence, LiveDependencyEvidence):
+            raise ValueError("live identity evidence is invalid")
+        provider_controller = getattr(provider, "live_controller", None)
+        provider_pricer = getattr(provider, "live_pricer", None)
+        if provider_controller is not self._controller:
+            raise ValueError("live provider controller does not match backend controller")
+        if self._controller.formal_live is not True:
+            raise ValueError("live provider controller must use formal-live enforcement")
+        if not isinstance(provider_pricer, ActualCostPricer):
+            raise ValueError("live provider pricer is invalid")
+        identity = dependency_identity_from_evidence(evidence)
+        if identity.dependency != dependency:
+            raise ValueError(f"live {role} dependency identity is invalid")
+        self._dependency_identity = identity
+        self._live_pricer = provider_pricer
+
+    @property
+    def dependency_identity(self) -> LiveDependencyIdentity:
+        if self._dependency_identity is None:
+            raise ValueError("live identity unavailable")
+        return self._dependency_identity
+
+    @property
+    def live_pricer(self) -> ActualCostPricer:
+        if self._live_pricer is None:
+            raise ValueError("live identity unavailable")
+        return self._live_pricer
+
+    @property
+    def live_controller(self) -> HardBudgetController:
+        if self._dependency_identity is None:
+            raise ValueError("live identity unavailable")
+        return self._controller
 
     def _reserve(self, action: str) -> BudgetReservation:
         return self._controller.reserve(action, self._call_estimate)
@@ -201,6 +253,7 @@ class BudgetedSearchBackend(_BudgetedProviderCall):
     ) -> None:
         super().__init__(controller=controller, call_estimate=call_estimate)
         self._provider = provider
+        self._bind_live_provider(provider, dependency="openalex", role="search")
 
     async def search(
         self,
@@ -264,6 +317,11 @@ class BudgetedCitationBackend(_BudgetedProviderCall):
     ) -> None:
         super().__init__(controller=controller, call_estimate=call_estimate)
         self._provider = provider
+        self._bind_live_provider(
+            provider,
+            dependency="semantic_scholar",
+            role="citation",
+        )
 
     @staticmethod
     def _seed_id(seed: Paper) -> ProviderPaperId | None:

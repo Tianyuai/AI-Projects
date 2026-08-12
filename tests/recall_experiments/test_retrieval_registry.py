@@ -7,9 +7,11 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
+import httpx
 import pytest
 
 from paper_search.control.budget import HardBudgetController
+from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
 from paper_search.domain.models import (
     CitationExpansion,
     ErrorDetail,
@@ -19,11 +21,13 @@ from paper_search.domain.models import (
     UsageActual,
     UsageEstimate,
 )
+from paper_search.live_identity import LiveDependencyEvidence, LiveProviderDescriptor
 from paper_search.recall_experiments.contracts import (
     RetrievalExecutionContext,
     TextSearchAction,
     TextSearchPayload,
 )
+from paper_search.recall_experiments.identity import dependency_identity_from_evidence
 from paper_search.recall_experiments.retrieval.backends import (
     BackendSearchResult,
     BudgetedCitationBackend,
@@ -31,7 +35,10 @@ from paper_search.recall_experiments.retrieval.backends import (
     SearchActionHandler,
 )
 from paper_search.recall_experiments.retrieval.registry import RetrievalActionRegistry
-from paper_search.retrieval.snapshot_adapters import ReplaySearchProvider
+from paper_search.retrieval.snapshot_adapters import (
+    LiveCaptureSearchProvider,
+    ReplaySearchProvider,
+)
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
     DependencySnapshotReader,
@@ -56,6 +63,140 @@ def _paper() -> Paper:
         title="Offline adapter paper",
         sources=["openalex"],
     )
+
+
+def test_dependency_identity_is_converted_from_strict_generic_evidence() -> None:
+    evidence = LiveDependencyEvidence(
+        identity_schema_version="live-dependency-evidence-v1",
+        provider=LiveProviderDescriptor(
+            identity_schema_version="live-provider-descriptor-v1",
+            provider="openalex",
+            dependency="openalex",
+            adapter="openalex-works-v1",
+            model=None,
+            version="live-capture-search-v1",
+            endpoints=("https://api.openalex.org/works",),
+            operations=("search",),
+        ),
+        pricing_policy_sha256="sha256:" + "a" * 64,
+        controller_policy_sha256="sha256:" + "b" * 64,
+        formal_live=True,
+    )
+
+    identity = dependency_identity_from_evidence(evidence)
+
+    assert identity.model_dump(mode="json") == {
+        "identity_schema_version": "live-dependency-runtime-identity-v1",
+        "provider": "openalex",
+        "dependency": "openalex",
+        "adapter": "openalex-works-v1",
+        "model": None,
+        "version": "live-capture-search-v1",
+        "endpoints": ["https://api.openalex.org/works"],
+        "operations": ["search"],
+        "pricing_policy_sha256": "sha256:" + "a" * 64,
+        "controller_policy_sha256": "sha256:" + "b" * 64,
+    }
+
+
+def test_live_retrieval_backends_bind_provider_owned_identity_and_exact_objects(
+    tmp_path: Path,
+) -> None:
+    controller = HardBudgetController(_budget(), formal_live=True)
+    pricer = ActualCostPricer(
+        load_pricing_policy(Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")),
+        valued_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as client:
+            store = DependencyCaptureStore(tmp_path / "snapshot")
+            search_provider = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=store,
+                pricer=pricer,
+                controller=controller,
+            )
+            citation_provider = LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=store,
+                pricer=pricer,
+                controller=controller,
+            )
+            estimate = UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.01"))
+            search = BudgetedSearchBackend(
+                provider=search_provider,
+                controller=controller,
+                call_estimate=estimate,
+            )
+            citation = BudgetedCitationBackend(
+                provider=citation_provider,
+                controller=controller,
+                call_estimate=estimate,
+            )
+            assert search.dependency_identity.dependency == "openalex"
+            assert citation.dependency_identity.dependency == "semantic_scholar"
+            assert {"references", "citations"}.issubset(
+                citation.dependency_identity.operations
+            )
+            assert search.live_pricer is pricer
+            assert citation.live_pricer is pricer
+            assert search.live_controller is controller
+            assert citation.live_controller is controller
+
+    asyncio.run(run())
+
+
+def test_live_retrieval_backends_reject_wrong_role_or_controller(
+    tmp_path: Path,
+) -> None:
+    controller = HardBudgetController(_budget(), formal_live=True)
+    other_controller = HardBudgetController(_budget(), formal_live=True)
+    pricer = ActualCostPricer(
+        load_pricing_policy(Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")),
+        valued_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=pricer,
+                controller=controller,
+            )
+            estimate = UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.01"))
+            with pytest.raises(ValueError, match="controller"):
+                BudgetedSearchBackend(
+                    provider=provider,
+                    controller=other_controller,
+                    call_estimate=estimate,
+                )
+            with pytest.raises(ValueError, match="citation"):
+                BudgetedCitationBackend(
+                    provider=provider,
+                    controller=controller,
+                    call_estimate=estimate,
+                )
+
+    asyncio.run(run())
+
+
+def test_offline_backend_has_no_live_identity() -> None:
+    backend = BudgetedSearchBackend(
+        provider=_OfflineSearchProvider(_result()),
+        controller=HardBudgetController(_budget()),
+        call_estimate=UsageEstimate(search_api_calls=1),
+    )
+    with pytest.raises(ValueError, match="live identity unavailable"):
+        _ = backend.dependency_identity
 
 
 def _result(*, errors: list[ErrorDetail] | None = None) -> ProviderResult[list[Paper]]:

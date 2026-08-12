@@ -5,15 +5,21 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
+import httpx
 import pytest
 
 from paper_search.control.budget import HardBudgetController
+from paper_search.control.pricing import ActualCostPricer, load_pricing_policy
 from paper_search.domain.models import ErrorDetail, ProviderResult, SearchBudget, UsageActual, UsageEstimate
 from paper_search.recall_experiments.generation.backends import (
     BudgetedLLMBackend,
     LLMGenerationRequest,
 )
+from paper_search.llm.client import OpenAICompatibleLLMClient
+from paper_search.llm.snapshot_adapters import LiveCaptureLLMAnalyzer
+from paper_search.storage.dependency_snapshot import DependencyCaptureStore
 
 
 def _budget() -> SearchBudget:
@@ -92,6 +98,81 @@ def _estimate() -> UsageEstimate:
         elapsed_ms=20,
         cost_cny=Decimal("0.02"),
     )
+
+
+def test_live_llm_backend_binds_analyzer_identity_and_exact_objects(
+    tmp_path: Path,
+) -> None:
+    controller = HardBudgetController(_budget(), formal_live=True)
+    pricer = ActualCostPricer(
+        load_pricing_policy(Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")),
+        valued_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://api.deepseek.com",
+                    model="deepseek-test-v1",
+                    api_key="private-key",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=pricer,
+                controller=controller,
+                prompt_artifact_sha256="sha256:" + "a" * 64,
+            )
+            backend = BudgetedLLMBackend(
+                analyzer=analyzer,
+                controller=controller,
+                initial_estimate=_estimate(),
+                repair_estimate=_estimate(),
+            )
+            assert backend.dependency_identity.dependency == "llm"
+            assert backend.dependency_identity.provider == "deepseek"
+            assert backend.dependency_identity.model == "deepseek-test-v1"
+            assert backend.live_pricer is pricer
+            assert backend.live_controller is controller
+
+    asyncio.run(run())
+
+
+def test_live_llm_backend_rejects_mismatched_controller(tmp_path: Path) -> None:
+    controller = HardBudgetController(_budget(), formal_live=True)
+    other_controller = HardBudgetController(_budget(), formal_live=True)
+    pricer = ActualCostPricer(
+        load_pricing_policy(Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")),
+        valued_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://api.deepseek.com",
+                    model="deepseek-test-v1",
+                    api_key="private-key",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=pricer,
+                controller=controller,
+                prompt_artifact_sha256="sha256:" + "a" * 64,
+            )
+            with pytest.raises(ValueError, match="controller"):
+                BudgetedLLMBackend(
+                    analyzer=analyzer,
+                    controller=other_controller,
+                    initial_estimate=_estimate(),
+                    repair_estimate=_estimate(),
+                )
+
+    asyncio.run(run())
 
 
 def test_initial_and_repair_calls_receive_independent_terminal_reservations() -> None:

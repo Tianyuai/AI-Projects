@@ -7,6 +7,7 @@ from typing import Annotated, Literal
 from pydantic import AfterValidator, Field, model_validator
 
 from paper_search.domain.models import DomainModel, NonEmptyStr, Sha256
+from paper_search.live_identity import LiveDependencyEvidence
 
 
 def _reject_zero_sha256(value: str) -> str:
@@ -52,6 +53,23 @@ class LiveDependencyIdentity(DomainModel):
         if len(set(self.operations)) != len(self.operations):
             raise ValueError("live dependency operations must be unique")
         return self
+
+
+def dependency_identity_from_evidence(
+    evidence: LiveDependencyEvidence,
+) -> LiveDependencyIdentity:
+    return LiveDependencyIdentity(
+        identity_schema_version="live-dependency-runtime-identity-v1",
+        provider=evidence.provider.provider,
+        dependency=evidence.provider.dependency,
+        adapter=evidence.provider.adapter,
+        model=evidence.provider.model,
+        version=evidence.provider.version,
+        endpoints=evidence.provider.endpoints,
+        operations=evidence.provider.operations,
+        pricing_policy_sha256=evidence.pricing_policy_sha256,
+        controller_policy_sha256=evidence.controller_policy_sha256,
+    )
 
 
 class LiveRuntimeIdentity(DomainModel):
@@ -150,4 +168,4 @@ class ExecutionIdentity(DomainModel):
         return self
 
 
-__all__ = ["ExecutionIdentity"]
+__all__ = ["ExecutionIdentity", "dependency_identity_from_evidence"]

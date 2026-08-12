@@ -44,6 +44,7 @@ from paper_search.recall_experiments.inputs.gold_catalog import (
 from paper_search.recall_experiments.identity import (
     ExecutionIdentity,
     LiveRuntimeIdentity,
+    validate_scheme_b_dependency_identity,
 )
 from paper_search.recall_experiments.recipes import (
     DeepSeekPromptGeneratorRecipe,
@@ -217,9 +218,15 @@ async def run_recall_experiment(
     if recipe.retrieval.backend == "live_provider":
         if live_runtime_factory is None:
             raise RecallTerminalError("live_runtime_unavailable")
-        runtime = live_runtime_factory(loaded_recipe)
+        try:
+            runtime = live_runtime_factory(loaded_recipe)
+        except RecallTerminalError:
+            raise
+        except (TypeError, ValueError) as error:
+            raise RecallTerminalError("config_mismatch") from error
         if not _valid_live_runtime_identity(runtime):
             raise RecallTerminalError("config_mismatch")
+        _validate_live_recipe_runtime_model(recipe, runtime)
     else:
         runtime = (
             build_replay_runtime(snapshot_manifest_path, loaded_recipe)
@@ -722,6 +729,18 @@ def _valid_live_runtime_identity(runtime: RecallRuntime) -> bool:
     )
 
 
+def _validate_live_recipe_runtime_model(
+    recipe: RecallMethodRecipe,
+    runtime: RecallRuntime,
+) -> None:
+    try:
+        identity = LiveRuntimeIdentity.model_validate(runtime.identity)
+    except ValueError as error:
+        raise RecallTerminalError("config_mismatch") from error
+    if getattr(recipe.generator, "model", None) != identity.dependencies["llm"].model:
+        raise RecallTerminalError("config_mismatch")
+
+
 def _live_runtime_identity(
     *,
     search_backend: BudgetedSearchBackend,
@@ -746,6 +765,12 @@ def _live_runtime_identity(
         )
     except (AttributeError, ValueError) as error:
         raise RecallTerminalError("live_runtime_unavailable") from error
+    try:
+        validate_scheme_b_dependency_identity("search", dependencies["search"])
+        validate_scheme_b_dependency_identity("citation", dependencies["citation"])
+        validate_scheme_b_dependency_identity("llm", dependencies["llm"])
+    except ValueError as error:
+        raise RecallTerminalError("config_mismatch") from error
     if not all(controller is controllers[0] for controller in controllers[1:]):
         raise RecallTerminalError("config_mismatch")
     if not all(pricer is pricers[0] for pricer in pricers[1:]):

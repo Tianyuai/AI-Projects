@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -80,6 +81,46 @@ def validate_prompt_artifact_sha256(value: str) -> str:
     ):
         raise ValueError("LLM prompt artifact SHA-256 is invalid")
     return normalized
+
+
+def _normalized_transport_endpoint(base_url: str) -> tuple[str, str]:
+    if base_url != base_url.strip():
+        raise ValueError("LLM base_url is invalid")
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("LLM base_url is invalid") from error
+    hostname = parsed.hostname
+    if (
+        parsed.scheme != "https"
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or port is not None
+    ):
+        raise ValueError("LLM base_url is invalid")
+    try:
+        hostname.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError("LLM base_url is invalid") from error
+    hostname = hostname.casefold()
+    path = parsed.path.rstrip("/")
+    if hostname == "api.deepseek.com":
+        if path not in {"", "/v1"}:
+            raise ValueError("LLM base_url path is not approved")
+        provider = "deepseek"
+    elif hostname == "dashscope.aliyuncs.com":
+        if path != "/compatible-mode/v1":
+            raise ValueError("LLM base_url path is not approved")
+        provider = "dashscope"
+    else:
+        if "deepseek" in hostname or "dashscope" in hostname:
+            raise ValueError("LLM base_url hostname is not approved")
+        provider = "openai_compatible"
+    return f"https://{hostname}{path}/chat/completions", provider
 
 
 def usage_from_response_bytes(response_bytes: bytes) -> UsageActual:
@@ -257,27 +298,18 @@ class OpenAICompatibleLLMClient:
         prompt_version: str = "query-analyze-v1",
         clock: Clock = _utc_now,
     ) -> None:
-        normalized_url = base_url.rstrip("/")
-        if not normalized_url.startswith("https://"):
-            raise ValueError("LLM base_url must use HTTPS")
         if not model.strip() or not api_key:
             raise ValueError("LLM model and API key must not be empty")
+        transport_endpoint, provider = _normalized_transport_endpoint(base_url)
         self._client = client
-        self._transport_endpoint = f"{normalized_url}/chat/completions"
-        self._dashscope_compatible = "dashscope.aliyuncs.com" in normalized_url
-        self._deepseek_compatible = "api.deepseek.com" in normalized_url
+        self._transport_endpoint = transport_endpoint
+        self._dashscope_compatible = provider == "dashscope"
+        self._deepseek_compatible = provider == "deepseek"
         self._model = validate_model_id(model)
         self._api_key = api_key
         self._prompt_version = validate_prompt_version(prompt_version)
         self._clock = clock
         self._decoder = LLMResponseDecoder(prompt_version=prompt_version)
-        provider = (
-            "deepseek"
-            if self._deepseek_compatible
-            else "dashscope"
-            if self._dashscope_compatible
-            else "openai_compatible"
-        )
         self._live_provider_descriptor = LiveProviderDescriptor(
             identity_schema_version="live-provider-descriptor-v1",
             provider=provider,

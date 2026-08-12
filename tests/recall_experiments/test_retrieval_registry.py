@@ -27,7 +27,11 @@ from paper_search.recall_experiments.contracts import (
     TextSearchAction,
     TextSearchPayload,
 )
-from paper_search.recall_experiments.identity import dependency_identity_from_evidence
+from paper_search.recall_experiments.identity import (
+    LiveDependencyIdentity,
+    dependency_identity_from_evidence,
+    validate_scheme_b_dependency_identity,
+)
 from paper_search.recall_experiments.retrieval.backends import (
     BackendSearchResult,
     BudgetedCitationBackend,
@@ -97,6 +101,66 @@ def test_dependency_identity_is_converted_from_strict_generic_evidence() -> None
         "pricing_policy_sha256": "sha256:" + "a" * 64,
         "controller_policy_sha256": "sha256:" + "b" * 64,
     }
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"provider": "openalex.evil"},
+        {"adapter": "openalex-works-v2"},
+        {"version": "live-capture-search-v2"},
+        {"model": "unexpected-model"},
+        {"endpoints": ("https://api.openalex.org/evil",)},
+        {"operations": ("search", "exfiltrate")},
+    ],
+)
+def test_scheme_b_search_identity_rejects_every_unadmitted_surface_change(
+    changes: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "identity_schema_version": "live-dependency-runtime-identity-v1",
+        "provider": "openalex",
+        "dependency": "openalex",
+        "adapter": "openalex-works-v1",
+        "model": None,
+        "version": "live-capture-search-v1",
+        "endpoints": ("https://api.openalex.org/works",),
+        "operations": ("search",),
+        "pricing_policy_sha256": "sha256:" + "a" * 64,
+        "controller_policy_sha256": "sha256:" + "b" * 64,
+    }
+    payload.update(changes)
+    identity = LiveDependencyIdentity.model_validate(payload)
+
+    with pytest.raises(ValueError, match="search surface"):
+        validate_scheme_b_dependency_identity("search", identity)
+
+
+def test_scheme_b_citation_identity_requires_the_exact_semantic_scholar_surface() -> None:
+    identity = LiveDependencyIdentity(
+        identity_schema_version="live-dependency-runtime-identity-v1",
+        provider="semantic_scholar",
+        dependency="semantic_scholar",
+        adapter="semantic-graph-v1",
+        model=None,
+        version="live-capture-search-v1",
+        endpoints=(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            "https://api.semanticscholar.org/graph/v1/paper/batch",
+            "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/references",
+            "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/citations",
+        ),
+        operations=("search", "batch", "references", "citations"),
+        pricing_policy_sha256="sha256:" + "a" * 64,
+        controller_policy_sha256="sha256:" + "b" * 64,
+    )
+
+    assert validate_scheme_b_dependency_identity("citation", identity) is identity
+    with pytest.raises(ValueError, match="citation surface"):
+        validate_scheme_b_dependency_identity(
+            "citation",
+            identity.model_copy(update={"operations": ("references",)}),
+        )
 
 
 def test_live_retrieval_backends_bind_provider_owned_identity_and_exact_objects(
@@ -182,6 +246,20 @@ def test_live_retrieval_backends_reject_wrong_role_or_controller(
             with pytest.raises(ValueError, match="citation"):
                 BudgetedCitationBackend(
                     provider=provider,
+                    controller=controller,
+                    call_estimate=estimate,
+                )
+            unadmitted = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "unadmitted"),
+                pricer=pricer,
+                controller=controller,
+                adapter_version="openalex-works-v2",
+            )
+            with pytest.raises(ValueError, match="search surface"):
+                BudgetedSearchBackend(
+                    provider=unadmitted,
                     controller=controller,
                     call_estimate=estimate,
                 )

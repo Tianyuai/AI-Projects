@@ -95,6 +95,61 @@ def test_llm_descriptor_changes_with_endpoint_or_model() -> None:
     asyncio.run(run())
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.deepseek.com.evil.invalid/v1",
+        "https://api.deepseek.com@evil.invalid/v1",
+        "https://api.deepseek.com/v1?redirect=https://evil.invalid",
+        "https://api.deepseek.com/v1#private-fragment",
+        "https://dashscope.aliyuncs.com.evil.invalid/compatible-mode/v1",
+        "https://dashscope.aliyuncs.com/not-approved",
+    ],
+)
+def test_llm_client_rejects_spoofed_or_ambiguous_provider_urls_before_dispatch(
+    base_url: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def no_request(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError(request)
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(no_request)
+        ) as http_client:
+            with pytest.raises(ValueError, match="base_url"):
+                OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url=base_url,
+                    model="deepseek-chat",
+                    api_key="PRIVATE API KEY",
+                )
+
+    asyncio.run(run())
+    assert requests == []
+
+
+def test_llm_client_structurally_normalizes_approved_deepseek_origin_and_path() -> None:
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as http_client:
+            client = OpenAICompatibleLLMClient(
+                client=http_client,
+                base_url="https://API.DEEPSEEK.COM/v1/",
+                model="deepseek-chat",
+                api_key="PRIVATE API KEY",
+            )
+            assert client.live_provider_descriptor.provider == "deepseek"
+            assert client.live_provider_descriptor.endpoints == (
+                "https://api.deepseek.com/v1/chat/completions",
+            )
+
+    asyncio.run(run())
+
+
 def test_generate_json_returns_data_usage_and_safe_provenance() -> None:
     seen: list[httpx.Request] = []
 

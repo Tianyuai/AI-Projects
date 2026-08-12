@@ -17,6 +17,10 @@ from paper_search.recall_experiments.generation.backends import (
     BudgetedLLMBackend,
     LLMGenerationRequest,
 )
+from paper_search.recall_experiments.identity import (
+    LiveDependencyIdentity,
+    validate_scheme_b_dependency_identity,
+)
 from paper_search.llm.client import OpenAICompatibleLLMClient
 from paper_search.llm.snapshot_adapters import LiveCaptureLLMAnalyzer
 from paper_search.storage.dependency_snapshot import DependencyCaptureStore
@@ -100,6 +104,39 @@ def _estimate() -> UsageEstimate:
     )
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"provider": "openai_compatible"},
+        {"adapter": "evil-json"},
+        {"version": "openai-compatible-client-v2"},
+        {"model": "unexpected-model"},
+        {"endpoints": ("https://api.deepseek.com/chat/completions",)},
+        {"operations": ("generate_json", "exfiltrate")},
+    ],
+)
+def test_scheme_b_llm_identity_rejects_every_unadmitted_surface_change(
+    changes: dict[str, object],
+) -> None:
+    payload: dict[str, object] = {
+        "identity_schema_version": "live-dependency-runtime-identity-v1",
+        "provider": "deepseek",
+        "dependency": "llm",
+        "adapter": "openai-compatible-json",
+        "model": "deepseek-v4-flash",
+        "version": "openai-compatible-client-v1",
+        "endpoints": ("https://api.deepseek.com/v1/chat/completions",),
+        "operations": ("generate_json",),
+        "pricing_policy_sha256": "sha256:" + "a" * 64,
+        "controller_policy_sha256": "sha256:" + "b" * 64,
+    }
+    payload.update(changes)
+    identity = LiveDependencyIdentity.model_validate(payload)
+
+    with pytest.raises(ValueError, match="LLM surface"):
+        validate_scheme_b_dependency_identity("llm", identity)
+
+
 def test_live_llm_backend_binds_analyzer_identity_and_exact_objects(
     tmp_path: Path,
 ) -> None:
@@ -116,8 +153,8 @@ def test_live_llm_backend_binds_analyzer_identity_and_exact_objects(
             analyzer = LiveCaptureLLMAnalyzer(
                 client=OpenAICompatibleLLMClient(
                     client=http_client,
-                    base_url="https://api.deepseek.com",
-                    model="deepseek-test-v1",
+                    base_url="https://api.deepseek.com/v1",
+                    model="deepseek-v4-flash",
                     api_key="private-key",
                 ),
                 capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
@@ -133,7 +170,7 @@ def test_live_llm_backend_binds_analyzer_identity_and_exact_objects(
             )
             assert backend.dependency_identity.dependency == "llm"
             assert backend.dependency_identity.provider == "deepseek"
-            assert backend.dependency_identity.model == "deepseek-test-v1"
+            assert backend.dependency_identity.model == "deepseek-v4-flash"
             assert backend.live_pricer is pricer
             assert backend.live_controller is controller
 
@@ -168,6 +205,40 @@ def test_live_llm_backend_rejects_mismatched_controller(tmp_path: Path) -> None:
                 BudgetedLLMBackend(
                     analyzer=analyzer,
                     controller=other_controller,
+                    initial_estimate=_estimate(),
+                    repair_estimate=_estimate(),
+                )
+
+    asyncio.run(run())
+
+
+def test_live_llm_backend_rejects_unadmitted_model_surface(tmp_path: Path) -> None:
+    controller = HardBudgetController(_budget(), formal_live=True)
+    pricer = ActualCostPricer(
+        load_pricing_policy(Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")),
+        valued_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as http_client:
+            analyzer = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://api.deepseek.com/v1",
+                    model="deepseek-test-v1",
+                    api_key="private-key",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=pricer,
+                controller=controller,
+                prompt_artifact_sha256="sha256:" + "a" * 64,
+            )
+            with pytest.raises(ValueError, match="LLM surface"):
+                BudgetedLLMBackend(
+                    analyzer=analyzer,
+                    controller=controller,
                     initial_estimate=_estimate(),
                     repair_estimate=_estimate(),
                 )

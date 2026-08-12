@@ -32,6 +32,7 @@ from paper_search.live_identity import LiveDependencyEvidence
 from paper_search.recall_experiments.identity import (
     LiveDependencyIdentity,
     dependency_identity_from_evidence,
+    validate_scheme_b_dependency_identity,
 )
 
 
@@ -159,7 +160,10 @@ class BudgetedLLMBackend:
             pricer = getattr(analyzer, "live_pricer", None)
             if not isinstance(pricer, ActualCostPricer):
                 raise ValueError("live analyzer pricer is invalid")
-            identity = dependency_identity_from_evidence(evidence)
+            identity = validate_scheme_b_dependency_identity(
+                "llm",
+                dependency_identity_from_evidence(evidence),
+            )
             if identity.dependency != "llm":
                 raise ValueError("live LLM dependency identity is invalid")
             self._dependency_identity = identity

@@ -43,6 +43,7 @@ from paper_search.recall_experiments.contracts import (
 from paper_search.recall_experiments.identity import (
     LiveDependencyIdentity,
     dependency_identity_from_evidence,
+    validate_scheme_b_dependency_identity,
 )
 from paper_search.retrieval.base import SearchProvider
 
@@ -173,7 +174,7 @@ class _BudgetedProviderCall:
         provider: object,
         *,
         dependency: Literal["openalex", "semantic_scholar"],
-        role: str,
+        role: Literal["search", "citation"],
     ) -> None:
         evidence = getattr(provider, "live_identity_evidence", None)
         if evidence is None:
@@ -188,7 +189,10 @@ class _BudgetedProviderCall:
             raise ValueError("live provider controller must use formal-live enforcement")
         if not isinstance(provider_pricer, ActualCostPricer):
             raise ValueError("live provider pricer is invalid")
-        identity = dependency_identity_from_evidence(evidence)
+        identity = validate_scheme_b_dependency_identity(
+            role,
+            dependency_identity_from_evidence(evidence),
+        )
         if identity.dependency != dependency:
             raise ValueError(f"live {role} dependency identity is invalid")
         self._dependency_identity = identity

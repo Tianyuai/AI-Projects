@@ -72,6 +72,52 @@ def dependency_identity_from_evidence(
     )
 
 
+def validate_scheme_b_dependency_identity(
+    role: Literal["search", "citation", "llm"],
+    identity: LiveDependencyIdentity,
+) -> LiveDependencyIdentity:
+    expected: dict[str, object]
+    if role == "search":
+        expected = {
+            "provider": "openalex",
+            "dependency": "openalex",
+            "adapter": "openalex-works-v1",
+            "model": None,
+            "version": "live-capture-search-v1",
+            "endpoints": ("https://api.openalex.org/works",),
+            "operations": ("search",),
+        }
+    elif role == "citation":
+        expected = {
+            "provider": "semantic_scholar",
+            "dependency": "semantic_scholar",
+            "adapter": "semantic-graph-v1",
+            "model": None,
+            "version": "live-capture-search-v1",
+            "endpoints": (
+                "https://api.semanticscholar.org/graph/v1/paper/search",
+                "https://api.semanticscholar.org/graph/v1/paper/batch",
+                "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/references",
+                "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/citations",
+            ),
+            "operations": ("search", "batch", "references", "citations"),
+        }
+    else:
+        expected = {
+            "provider": "deepseek",
+            "dependency": "llm",
+            "adapter": "openai-compatible-json",
+            "model": "deepseek-v4-flash",
+            "version": "openai-compatible-client-v1",
+            "endpoints": ("https://api.deepseek.com/v1/chat/completions",),
+            "operations": ("generate_json",),
+        }
+    if any(getattr(identity, field) != value for field, value in expected.items()):
+        label = "LLM" if role == "llm" else role
+        raise ValueError(f"Scheme B {label} surface is not admitted")
+    return identity
+
+
 class LiveRuntimeIdentity(DomainModel):
     identity_schema_version: Literal["candidate-recall-live-runtime-v1"]
     controller_policy_sha256: IdentitySha256
@@ -165,7 +211,13 @@ class ExecutionIdentity(DomainModel):
             or not isinstance(self.runtime, LiveRuntimeIdentity)
         ):
             raise ValueError("live retrieval requires authorized, snapshot-free live runtime")
+        elif self.generator_model != self.runtime.dependencies["llm"].model:
+            raise ValueError("generator model must match the live runtime LLM model")
         return self
 
 
-__all__ = ["ExecutionIdentity", "dependency_identity_from_evidence"]
+__all__ = [
+    "ExecutionIdentity",
+    "dependency_identity_from_evidence",
+    "validate_scheme_b_dependency_identity",
+]

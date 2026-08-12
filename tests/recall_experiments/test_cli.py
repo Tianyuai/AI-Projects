@@ -20,6 +20,7 @@ from paper_search.recall_experiments.composition import (
     run_recall_experiment,
 )
 from paper_search.recall_experiments.generation.backends import LLMBackendResult
+from paper_search.recall_experiments.identity import ExecutionIdentity
 from paper_search.recall_experiments.retrieval.backends import (
     BackendCitationResult,
     BackendSearchResult,
@@ -55,6 +56,78 @@ def _valid_execution_identity() -> dict[str, object]:
             "snapshot_manifest_sha256": snapshot_sha,
         },
     }
+
+
+def _live_runtime_identity(*, model: str = "deepseek-v4-flash") -> dict[str, object]:
+    pricing_hash = "sha256:" + "e" * 64
+    controller_hash = "sha256:" + "f" * 64
+    return {
+        "identity_schema_version": "candidate-recall-live-runtime-v1",
+        "controller_policy_sha256": controller_hash,
+        "pricing_policy_sha256": pricing_hash,
+        "dependencies": {
+            "search": {
+                "identity_schema_version": "live-dependency-runtime-identity-v1",
+                "provider": "openalex",
+                "dependency": "openalex",
+                "adapter": "openalex-works-v1",
+                "model": None,
+                "version": "live-capture-search-v1",
+                "endpoints": ["https://api.openalex.org/works"],
+                "operations": ["search"],
+                "pricing_policy_sha256": pricing_hash,
+                "controller_policy_sha256": controller_hash,
+            },
+            "citation": {
+                "identity_schema_version": "live-dependency-runtime-identity-v1",
+                "provider": "semantic_scholar",
+                "dependency": "semantic_scholar",
+                "adapter": "semantic-graph-v1",
+                "model": None,
+                "version": "live-capture-search-v1",
+                "endpoints": [
+                    "https://api.semanticscholar.org/graph/v1/paper/search",
+                    "https://api.semanticscholar.org/graph/v1/paper/batch",
+                    "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/references",
+                    "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/citations",
+                ],
+                "operations": ["search", "batch", "references", "citations"],
+                "pricing_policy_sha256": pricing_hash,
+                "controller_policy_sha256": controller_hash,
+            },
+            "llm": {
+                "identity_schema_version": "live-dependency-runtime-identity-v1",
+                "provider": "deepseek",
+                "dependency": "llm",
+                "adapter": "openai-compatible-json",
+                "model": model,
+                "version": "openai-compatible-client-v1",
+                "endpoints": ["https://api.deepseek.com/v1/chat/completions"],
+                "operations": ["generate_json"],
+                "pricing_policy_sha256": pricing_hash,
+                "controller_policy_sha256": controller_hash,
+            },
+        },
+    }
+
+
+def test_execution_identity_requires_generator_and_live_runtime_llm_models_to_match() -> None:
+    payload = _valid_execution_identity()
+    payload.update(
+        {
+            "prompt_sha256": "sha256:" + "9" * 64,
+            "generator_type": "deepseek_prompt",
+            "generator_model": "unexpected-model",
+            "retrieval_backend": "live_provider",
+            "snapshot_manifest_sha256": None,
+            "actions_sha256": None,
+            "live_authorized": True,
+            "runtime": _live_runtime_identity(),
+        }
+    )
+
+    with pytest.raises(ValueError, match="generator model"):
+        ExecutionIdentity.model_validate(payload)
 
 
 def _write_synthetic_inputs(tmp_path: Path, *, backend: str = "snapshot_replay") -> tuple[Path, Path, Path]:
@@ -205,6 +278,114 @@ def test_authorized_live_recipe_without_runtime_factory_fails_closed(
                 allow_live=True,
             )
         )
+
+
+def test_live_runtime_factory_surface_error_is_classified_as_config_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    recipe, sample, actions = _write_synthetic_inputs(
+        tmp_path, backend="live_provider"
+    )
+
+    def invalid_factory(_recipe: object) -> RecallRuntime:
+        raise ValueError("unadmitted provider surface")
+
+    with pytest.raises(RecallTerminalError, match="config_mismatch"):
+        run(
+            run_recall_experiment(
+                recipe_path=recipe,
+                sample_path=sample,
+                output_path=tmp_path / "live",
+                workspace_root=tmp_path,
+                actions_path=actions,
+                allow_live=True,
+                live_runtime_factory=invalid_factory,
+            )
+        )
+
+
+def test_live_recipe_model_mismatch_fails_before_generator_or_provider_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import paper_search.recall_experiments.composition as composition
+
+    monkeypatch.chdir(tmp_path)
+    _manual_recipe, sample, _actions = _write_synthetic_inputs(
+        tmp_path, backend="live_provider"
+    )
+    prompt = tmp_path / "mismatched-prompt.yaml"
+    prompt.write_text(
+        "name: mismatch\nversion: v1\nmodel: unexpected-model\n"
+        "temperature: 0\ninstructions: [Never reached.]\n",
+        encoding="utf-8",
+    )
+    recipe = tmp_path / "mismatched-recipe.yaml"
+    recipe.write_text(
+        """method_id: synthetic-mismatch
+generator:
+  type: deepseek_prompt
+  prompt: mismatched-prompt.yaml
+  model: unexpected-model
+  temperature: 0
+  gold_visibility: blind
+  max_generated_actions: 1
+  repair_attempts: 1
+retrieval:
+  allowed_actions: [text_search]
+  backend: live_provider
+  max_results_per_action: 5
+  max_total_actions: 1
+evaluation:
+  repeat_count: 1
+  max_repeat_attempts: 1
+""",
+        encoding="utf-8",
+    )
+    generator_calls: list[str] = []
+    provider_calls: list[str] = []
+
+    class FakeRuntime:
+        async def search(self, *_args: object, **_kwargs: object) -> BackendSearchResult:
+            provider_calls.append("search")
+            return BackendSearchResult()
+
+        async def expand(
+            self, *_args: object, **_kwargs: object
+        ) -> BackendCitationResult:
+            provider_calls.append("citation")
+            return BackendCitationResult(direction="references")
+
+        async def generate(self, *_args: object, **_kwargs: object) -> LLMBackendResult:
+            provider_calls.append("llm")
+            return LLMBackendResult()
+
+    fake = FakeRuntime()
+    runtime = RecallRuntime(fake, fake, fake, identity=_live_runtime_identity())
+    monkeypatch.setattr(composition, "_valid_live_runtime_identity", lambda _: True)
+
+    def generator_tripwire(*_args: object, **_kwargs: object) -> object:
+        generator_calls.append("constructed")
+        raise AssertionError("generator construction must not be reached")
+
+    monkeypatch.setattr(composition, "_build_offline_generator", generator_tripwire)
+
+    with pytest.raises(RecallTerminalError, match="config_mismatch"):
+        run(
+            run_recall_experiment(
+                recipe_path=recipe,
+                sample_path=sample,
+                output_path=tmp_path / "mismatch",
+                workspace_root=tmp_path,
+                actions_path=None,
+                allow_live=True,
+                live_runtime_factory=lambda _recipe: runtime,
+            )
+        )
+    assert generator_calls == []
+    assert provider_calls == []
 
 
 def test_manual_actions_prepare_and_validate_with_complete_synthetic_frozen_inputs(
@@ -636,8 +817,8 @@ def test_build_live_runtime_accepts_exact_self_identifying_adapters(
         )
         llm_client = OpenAICompatibleLLMClient(
             client=client,
-            base_url="https://api.deepseek.com",
-            model="deepseek-test-v1",
+            base_url="https://api.deepseek.com/v1",
+            model="deepseek-v4-flash",
             api_key="test-only",
         )
         analyzer = LiveCaptureLLMAnalyzer(
@@ -679,6 +860,29 @@ def test_build_live_runtime_accepts_exact_self_identifying_adapters(
         assert runtime.pricing_policy_bytes == canonical_pricing_policy_bytes(
             parse_pricing_policy_bytes(pricing_bytes)
         )
+        tampering = (
+            (search_backend, {"provider": "openalex.evil"}),
+            (
+                search_backend,
+                {"endpoints": ("https://api.openalex.org/evil",)},
+            ),
+            (search_backend, {"operations": ("search", "exfiltrate")}),
+            (llm, {"model": "unexpected-model"}),
+        )
+        for backend, update in tampering:
+            original = backend.dependency_identity
+            backend._dependency_identity = original.model_copy(  # type: ignore[attr-defined]
+                update=update
+            )
+            try:
+                with pytest.raises(RecallTerminalError, match="config_mismatch"):
+                    build_live_runtime(
+                        search_backend=search_backend,
+                        citation_backend=citation_backend,
+                        llm_backend=llm,
+                    )
+            finally:
+                backend._dependency_identity = original  # type: ignore[attr-defined]
     finally:
         run(client.aclose())
 
@@ -732,8 +936,8 @@ def test_build_live_runtime_rejects_distinct_pricer_object_before_dispatch(
         analyzer = LiveCaptureLLMAnalyzer(
             client=OpenAICompatibleLLMClient(
                 client=client,
-                base_url="https://api.deepseek.com",
-                model="deepseek-test-v1",
+                base_url="https://api.deepseek.com/v1",
+                model="deepseek-v4-flash",
                 api_key="test-only",
             ),
             capture_store=store,
@@ -899,7 +1103,7 @@ evaluation:
         analyzer = LiveCaptureLLMAnalyzer(
             client=OpenAICompatibleLLMClient(
                 client=client,
-                base_url="https://api.deepseek.com",
+                base_url="https://api.deepseek.com/v1",
                 model="deepseek-v4-flash",
                 api_key="test-only",
             ),

@@ -779,6 +779,30 @@ def test_repair_instructions_are_executable_without_initial_request_context(
     assert payload["validation_errors"][0]["repair_instruction"] == expected_instruction
 
 
+def test_title_informed_prompt_recipe_is_a_blind_four_action_text_search_method() -> None:
+    loaded = load_recall_recipe(
+        Path("configs/recall_experiments/methods/title-informed-blind-live.yaml")
+    )
+
+    assert loaded.recipe.method_id == "title-informed-blind"
+    assert loaded.recipe.generator.type == "deepseek_prompt"
+    assert loaded.recipe.generator.gold_visibility == "blind"
+    assert loaded.recipe.generator.max_generated_actions == 4
+    assert loaded.recipe.retrieval.allowed_actions == ["text_search"]
+    assert loaded.recipe.retrieval.backend == "live_provider"
+    assert loaded.recipe.retrieval.max_total_actions == 4
+    assert loaded.prompt_bytes is not None
+    prompt = RecallPromptArtifact.from_yaml_bytes(loaded.prompt_bytes)
+    rendered = render_recall_prompt(prompt)
+    assert "query.original_query is the fixed content insertion point" in rendered
+    assert "anchor_full" in rendered
+    assert "subject_task" in rendered
+    assert "method_task" in rendered
+    assert "dataset_task" in rendered
+    assert "Omit a combination slot" in rendered
+    assert "Do not use Gold" in rendered
+
+
 @pytest.mark.parametrize("mode", ["oracle", "blind"])
 def test_scheme_b_exploration_recipes_lock_the_deepseek_generation_recipe(mode: str) -> None:
     loaded = load_recall_recipe(Path(f"configs/recall_experiments/methods/scheme-b-{mode}.yaml"))

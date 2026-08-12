@@ -131,6 +131,7 @@ class BudgetedLLMBackend:
         controller: HardBudgetController,
         initial_estimate: UsageEstimate,
         repair_estimate: UsageEstimate,
+        pricing_policy_sha256: str | None = None,
     ) -> None:
         if initial_estimate.llm_calls < 1 or repair_estimate.llm_calls < 1:
             raise ValueError("LLM backend estimates must reserve at least one LLM call")
@@ -140,6 +141,7 @@ class BudgetedLLMBackend:
             "initial": initial_estimate,
             "repair": repair_estimate,
         }
+        self.pricing_policy_sha256 = pricing_policy_sha256
 
     def _settle_or_verify(
         self,

@@ -86,3 +86,42 @@
 - v1 compare 有意采用严格 identity 全等；需要比较“不同 recipe 但被人工证明等价”的未来场景时，必须先设计独立、版本化的 compatibility identity，不能放宽当前 fail-closed 规则。
 - live pricing 仍由授权组合根提供；缺少 hash-bound pricing/budget identity 时现在会拒绝运行。
 - generation failure artifact 记录结构化安全错误与 provenance，不保存 provider 原始敏感响应。
+
+## Independent-review follow-up
+
+The post-implementation review identified five additional audit-boundary gaps. Each was
+reproduced with a minimal failing regression before implementation:
+
+1. Live policy identity: RED accepted caller-declared invalid, zero, or controller-mismatched
+   hashes. GREEN derives the budget hash from the injected controller's canonical budget,
+   parses and hashes the supplied verified pricing-policy bytes, and requires the injected LLM
+   backend to expose the same pricing-policy identity. Missing or inconsistent evidence fails
+   closed; no live price is guessed.
+2. Action/snapshot TOCTOU: RED showed execution consumed bytes before identity reopened the
+   path. GREEN has fixed/manual generators retain the SHA-256 of the exact action bytes they
+   parsed, while replay constructs the snapshot reader and report identity from one manifest
+   byte buffer. Regression tests mutate the paths afterward and prove the consumed identity and
+   behavior remain bound to the original bytes.
+3. Legacy compare bypass: RED showed deleting `execution_identity` from two v1 reports still
+   allowed comparison. GREEN requires every `candidate-recall-report-v1` report to contain an
+   equal v1 identity envelope. Only two reports explicitly marked
+   `candidate-recall-report-legacy-v0` may take the legacy compatibility path; mixed, unknown,
+   or identity-less v1 inputs return `config_mismatch`.
+4. Generation call audit: RED retained only final-call provenance after repair. GREEN persists a
+   typed receipt for each initial/repair call, including kind, usage, provenance, errors, and
+   terminal state, plus `repair_count`, through success/failure generation artifacts and the
+   report provenance envelope.
+5. Citation prompt contract: RED found the system instruction prohibited the same seed ID the
+   validator requires. GREEN explicitly permits only the supplied `seed_canonical_id` to be
+   returned verbatim for `citation_expand`; other identifiers remain prohibited.
+
+Fresh verification after the follow-up:
+
+- focused tests: `104 passed in 2.77s`
+- recall suite: `231 passed in 7.59s`
+- Ruff (changed recall/storage/tests scope): `All checks passed!`
+- mypy (recall package plus dependency snapshot): `Success: no issues found in 29 source files`
+- `git diff --check`: no whitespace errors (only the repository's expected LF/CRLF notices)
+
+No network or live provider call was made, `.env` was not read, and the three user-owned
+untracked paths listed above remain untouched and unstaged.

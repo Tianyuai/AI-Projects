@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 from paper_search.control.budget import HardBudgetController
+from paper_search.control.pricing import parse_pricing_policy_bytes, pricing_policy_sha256
 from paper_search.domain.models import ErrorDetail, Paper, SearchBudget, UsageEstimate
 from paper_search.recall_experiments.artifacts import RecallArtifactWriter
 from paper_search.recall_experiments.candidate_pool import CandidatePoolBuilder
@@ -111,6 +112,8 @@ class RecallRuntime:
     citation_backend: CitationBackend
     llm_backend: LLMBackend
     identity: Mapping[str, object] = field(default_factory=dict)
+    controller: HardBudgetController | None = None
+    pricing_policy_bytes: bytes | None = None
 
 
 RecallRuntimeFactory = Callable[[LoadedRecallRecipe], RecallRuntime]
@@ -211,7 +214,7 @@ async def run_recall_experiment(
         if live_runtime_factory is None:
             raise RecallTerminalError("live_runtime_unavailable")
         runtime = live_runtime_factory(loaded_recipe)
-        if not _valid_live_runtime_identity(runtime.identity):
+        if not _valid_live_runtime_identity(runtime):
             raise RecallTerminalError("config_mismatch")
     else:
         runtime = (
@@ -245,8 +248,7 @@ async def run_recall_experiment(
             loaded_recipe,
             prepared.loaded_sample,
             recipe=recipe,
-            actions_path=actions_path,
-            snapshot_manifest_path=snapshot_manifest_path,
+            generator=generator,
             allow_live=allow_live,
             runtime=runtime,
         ),
@@ -271,11 +273,14 @@ def compare_recall_artifacts(
 ) -> dict[str, object]:
     """Compare explicit recall-report artifacts without inventing historical evidence."""
     try:
-        current, current_identity = _result_from_report(current_run)
+        current, current_identity, current_schema = _result_from_report(current_run)
         historical_payload = _result_from_report(historical_run) if historical_run is not None else None
         historical = historical_payload[0] if historical_payload is not None else None
         historical_identity = historical_payload[1] if historical_payload is not None else None
-        _validate_comparison_identity(current_identity, historical_identity)
+        historical_schema = historical_payload[2] if historical_payload is not None else None
+        _validate_comparison_identity(
+            current_identity, historical_identity, current_schema, historical_schema
+        )
         comparison = compare_exact_replay(current, historical)
         payload = {
             **comparison.model_dump(mode="json"),
@@ -356,7 +361,8 @@ def build_manual_generator(
 def build_fixed_generator(
     actions_path: Path, *, contexts: Sequence[RecallGenerationContext], recipe: RecallMethodRecipe
 ) -> FixedActionGenerator:
-    decoded = json.loads(actions_path.read_bytes().decode("utf-8"))
+    content = actions_path.read_bytes()
+    decoded = json.loads(content.decode("utf-8"))
     if not isinstance(decoded, Mapping):
         raise ValueError("fixed actions must map query IDs to action batches")
     return FixedActionGenerator(
@@ -364,6 +370,7 @@ def build_fixed_generator(
         expected_query_ids=[context.query_id for context in contexts],
         allowed_actions=recipe.retrieval.allowed_actions,
         max_actions=recipe.retrieval.max_total_actions,
+        source_sha256="sha256:" + hashlib.sha256(content).hexdigest(),
     )
 
 
@@ -424,6 +431,7 @@ def build_replay_runtime(manifest_path: Path, loaded_recipe: LoadedRecallRecipe)
     reader = DependencySnapshotReader(
         manifest_path,
         snapshot_manifest_sha256="sha256:" + hashlib.sha256(content).hexdigest(),
+        manifest_bytes=content,
     )
     controller = _recall_controller()
     search = BudgetedSearchBackend(
@@ -445,6 +453,7 @@ def build_replay_runtime(manifest_path: Path, loaded_recipe: LoadedRecallRecipe)
                 "backend_identity": "sealed_dependency_snapshot",
                 "budget_policy": "recall-replay-v1",
                 "pricing_provenance": "snapshot_bound_usage",
+                "snapshot_manifest_sha256": "sha256:" + hashlib.sha256(content).hexdigest(),
             },
         )
     assert loaded_recipe.prompt_sha256 is not None
@@ -470,6 +479,7 @@ def build_replay_runtime(manifest_path: Path, loaded_recipe: LoadedRecallRecipe)
             "backend_identity": "sealed_dependency_snapshot",
             "budget_policy": "recall-replay-v1",
             "pricing_provenance": "snapshot_bound_usage",
+            "snapshot_manifest_sha256": "sha256:" + hashlib.sha256(content).hexdigest(),
         },
     )
 
@@ -480,9 +490,13 @@ def build_live_runtime(
     citation_provider: LiveCaptureSearchProvider,
     llm_backend: LLMBackend,
     controller: HardBudgetController,
-    runtime_identity: Mapping[str, object],
+    backend_identity: str,
+    pricing_policy_bytes: bytes,
 ) -> RecallRuntime:
     """Wrap explicitly supplied live providers; client creation remains outside runners."""
+    pricing_sha256 = _pricing_policy_sha256(pricing_policy_bytes)
+    if getattr(llm_backend, "pricing_policy_sha256", None) != pricing_sha256:
+        raise ValueError("LLM backend pricing policy identity does not match verified policy")
     return RecallRuntime(
         search_backend=BudgetedSearchBackend(
             provider=search_provider, controller=controller, call_estimate=_search_estimate()
@@ -491,7 +505,13 @@ def build_live_runtime(
             provider=citation_provider, controller=controller, call_estimate=_search_estimate()
         ),
         llm_backend=llm_backend,
-        identity=dict(runtime_identity),
+        identity={
+            "backend_identity": backend_identity,
+            "budget_policy_sha256": _budget_policy_sha256(controller),
+            "pricing_policy_sha256": pricing_sha256,
+        },
+        controller=controller,
+        pricing_policy_bytes=pricing_policy_bytes,
     )
 
 
@@ -643,16 +663,10 @@ def _execution_identity(
     sample: LoadedSampleBinding,
     *,
     recipe: RecallMethodRecipe,
-    actions_path: Path | None,
-    snapshot_manifest_path: Path | None,
+    generator: QueryGenerator,
     allow_live: bool,
     runtime: RecallRuntime,
 ) -> dict[str, object]:
-    effective_actions = actions_path
-    if effective_actions is None and isinstance(
-        recipe.generator, (ManualActionsGeneratorRecipe, FixedActionsGeneratorRecipe)
-    ):
-        effective_actions = Path(recipe.generator.actions)
     return {
         "identity_schema_version": "candidate-recall-execution-identity-v1",
         "method_id": recipe.method_id,
@@ -662,8 +676,8 @@ def _execution_identity(
         "generator_type": recipe.generator.type,
         "generator_model": getattr(recipe.generator, "model", None),
         "retrieval_backend": recipe.retrieval.backend,
-        "snapshot_manifest_sha256": _optional_path_sha256(snapshot_manifest_path),
-        "actions_sha256": _optional_path_sha256(effective_actions),
+        "snapshot_manifest_sha256": runtime.identity.get("snapshot_manifest_sha256"),
+        "actions_sha256": getattr(generator, "source_sha256", None),
         "max_total_actions": recipe.retrieval.max_total_actions,
         "max_results_per_action": recipe.retrieval.max_results_per_action,
         "candidate_pool_policy_version": recipe.candidate_pool.policy_version,
@@ -674,24 +688,49 @@ def _execution_identity(
     }
 
 
-def _valid_live_runtime_identity(identity: Mapping[str, object]) -> bool:
-    return all(
-        isinstance(identity.get(key), str) and bool(identity[key])
-        for key in (
-            "backend_identity",
-            "budget_policy_sha256",
-            "pricing_policy_sha256",
+def _valid_live_runtime_identity(runtime: RecallRuntime) -> bool:
+    identity = runtime.identity
+    if runtime.controller is None or runtime.pricing_policy_bytes is None:
+        return False
+    try:
+        return (
+            isinstance(identity.get("backend_identity"), str)
+            and bool(identity["backend_identity"])
+            and identity.get("budget_policy_sha256")
+            == _budget_policy_sha256(runtime.controller)
+            and identity.get("pricing_policy_sha256")
+            == _pricing_policy_sha256(runtime.pricing_policy_bytes)
+            and getattr(runtime.llm_backend, "pricing_policy_sha256", None)
+            == identity.get("pricing_policy_sha256")
         )
-    )
+    except ValueError:
+        return False
 
 
-def _optional_path_sha256(path: Path | None) -> str | None:
-    if path is None:
-        return None
-    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+def _budget_policy_sha256(controller: HardBudgetController) -> str:
+    content = json.dumps(
+        controller.budget.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _nonzero_sha256(content)
 
 
-def _result_from_report(run_path: Path) -> tuple[RecallRepeatResult, Mapping[str, object] | None]:
+def _nonzero_sha256(content: bytes) -> str:
+    digest = "sha256:" + hashlib.sha256(content).hexdigest()
+    if digest == "sha256:" + "0" * 64:
+        raise ValueError("identity SHA-256 must not be zero")
+    return digest
+
+
+def _pricing_policy_sha256(content: bytes) -> str:
+    return pricing_policy_sha256(parse_pricing_policy_bytes(content))
+
+
+def _result_from_report(
+    run_path: Path,
+) -> tuple[RecallRepeatResult, Mapping[str, object] | None, str | None]:
     report = json.loads((run_path / "recall-report.json").read_bytes())
     attempts = report.get("attempts")
     if not isinstance(attempts, list):
@@ -702,16 +741,33 @@ def _result_from_report(run_path: Path) -> tuple[RecallRepeatResult, Mapping[str
     identity = report.get("execution_identity")
     if identity is not None and not isinstance(identity, Mapping):
         raise ValueError("recall report execution identity is invalid")
-    return RecallRepeatResult.model_validate(results[0]), identity
+    schema = report.get("schema_version")
+    if schema is not None and not isinstance(schema, str):
+        raise ValueError("recall report schema version is invalid")
+    return RecallRepeatResult.model_validate(results[0]), identity, schema
 
 
 def _validate_comparison_identity(
-    current: Mapping[str, object] | None, historical: Mapping[str, object] | None
+    current: Mapping[str, object] | None,
+    historical: Mapping[str, object] | None,
+    current_schema: str | None,
+    historical_schema: str | None,
 ) -> None:
-    """Keep legacy-v0 reports readable, but never mix them with or mismatch v1 identities."""
-    if current is None and historical is None:
+    """Only explicit legacy-v0 pairs bypass the v1 identity envelope."""
+    if (
+        current_schema == "candidate-recall-report-legacy-v0"
+        and historical_schema == "candidate-recall-report-legacy-v0"
+        and current is None
+        and historical is None
+    ):
         return
-    if current is None or historical is None or dict(current) != dict(historical):
+    if (
+        current_schema != "candidate-recall-report-v1"
+        or historical_schema != "candidate-recall-report-v1"
+        or current is None
+        or historical is None
+        or dict(current) != dict(historical)
+    ):
         raise ValueError("recall report execution identities do not match")
 
 

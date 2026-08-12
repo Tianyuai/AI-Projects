@@ -21,6 +21,7 @@ class FixedActionGenerator:
         expected_query_ids: Sequence[str],
         allowed_actions: Collection[str],
         max_actions: int,
+        source_sha256: str | None = None,
     ) -> None:
         expected = tuple(expected_query_ids)
         if len(expected) != len(set(expected)):
@@ -33,6 +34,7 @@ class FixedActionGenerator:
         self._expected_query_ids = frozenset(expected)
         self._allowed_actions = frozenset(allowed_actions)
         self._max_actions = max_actions
+        self.source_sha256 = source_sha256
 
     async def generate(self, context: RecallGenerationContext) -> GenerationResult:
         if context.query_id not in self._expected_query_ids:

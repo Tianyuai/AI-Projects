@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
@@ -22,7 +23,8 @@ class ManualActionGenerator(FixedActionGenerator):
     ) -> None:
         path = Path(actions_path)
         try:
-            decoded = json.loads(path.read_bytes().decode("utf-8"))
+            content = path.read_bytes()
+            decoded = json.loads(content.decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ValueError("manual actions must be a UTF-8 JSON artifact") from error
         if not isinstance(decoded, Mapping) or not all(isinstance(key, str) for key in decoded):
@@ -32,6 +34,7 @@ class ManualActionGenerator(FixedActionGenerator):
             expected_query_ids=expected_query_ids,
             allowed_actions=allowed_actions,
             max_actions=max_actions,
+            source_sha256="sha256:" + hashlib.sha256(content).hexdigest(),
         )
 
 

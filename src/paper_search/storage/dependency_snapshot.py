@@ -465,11 +465,16 @@ class DependencySnapshotReader:
         *,
         snapshot_manifest_sha256: Sha256,
         snapshot_set_id: Sha256 | None = None,
+        manifest_bytes: bytes | None = None,
     ) -> None:
         self._manifest_path = Path(manifest_path)
         if not self._manifest_path.is_file():
             raise FileNotFoundError("sealed manifest is unavailable")
-        content = self._manifest_path.read_bytes()
+        content = (
+            manifest_bytes
+            if manifest_bytes is not None
+            else self._manifest_path.read_bytes()
+        )
         if _sha256(content) != snapshot_manifest_sha256:
             raise ValueError("snapshot manifest hash does not match lock")
         try:

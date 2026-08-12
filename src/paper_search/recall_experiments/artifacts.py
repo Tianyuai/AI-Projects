@@ -90,6 +90,10 @@ class RecallArtifactWriter:
                 "immutable_action_batch_utf8": source,
                 "immutable_action_batch_sha256": "sha256:" + sha256(generation.artifact_bytes).hexdigest(),
                 "generation_provenance": dict(generation.provenance),
+                "llm_call_receipts": [
+                    receipt.model_dump(mode="json") for receipt in generation.call_receipts
+                ],
+                "repair_count": generation.repair_count,
             }
         else:
             payload = generation

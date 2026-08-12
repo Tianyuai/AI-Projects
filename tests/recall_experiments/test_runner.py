@@ -371,6 +371,13 @@ def test_generation_failure_is_recorded_and_later_attempts_continue() -> None:
         ("attempt-01", "generation_failure"),
         ("attempt-02", "succeeded"),
     ]
-    assert writer.generation_failures == [{"failure_code": "generation_failure", "errors": []}]
+    assert writer.generation_failures == [
+        {
+            "failure_code": "generation_failure",
+            "errors": [],
+            "llm_call_receipts": [],
+            "repair_count": 0,
+        }
+    ]
     assert writer.report is not None
     assert writer.report["attempts"][0]["failure_code"] == "generation_failure"

@@ -26,7 +26,7 @@ from paper_search.recall_experiments.generation.backends import (
     LLMBackendResult,
     LLMGenerationRequest,
 )
-from paper_search.recall_experiments.generation.base import GenerationResult
+from paper_search.recall_experiments.generation.base import GenerationResult, LLMCallReceipt
 from paper_search.recall_experiments.validation import (
     ActionValidationFailure,
     ActionValidationIssue,
@@ -85,9 +85,15 @@ class RecallPromptArtifact(DomainModel):
 class RecallGenerationFailure(RuntimeError):
     """A terminal outcome that callers can classify without provider details."""
 
-    def __init__(self, code: Literal["generation_failure", "infrastructure_failure"], errors: list[ErrorDetail]) -> None:
+    def __init__(
+        self,
+        code: Literal["generation_failure", "infrastructure_failure"],
+        errors: list[ErrorDetail],
+        call_receipts: list[LLMCallReceipt] | None = None,
+    ) -> None:
         self.code = code
         self.errors = tuple(errors)
+        self.call_receipts = tuple(call_receipts or ())
         super().__init__(code)
 
 
@@ -102,7 +108,7 @@ def render_recall_prompt(prompt: RecallPromptArtifact) -> str:
             "Supported action contracts include text_search, title_search, and citation_expand.",
             "The top-level object must contain only actions.",
             "Each action requires action_id, action_type, strategy, and payload.",
-            "Do not return Markdown, identifiers, URLs, prior hits, or evaluation results.",
+            "Do not return Markdown, URLs, prior hits, evaluation results, or identifiers except a supplied seed_canonical_id used verbatim by citation_expand.",
             *(f"- {instruction}" for instruction in prompt.instructions),
         ]
     )
@@ -203,26 +209,33 @@ class DeepSeekPromptGenerator:
         initial = await self._backend.generate(
             self._request(payload), "initial"
         )
-        failure = _as_validation_failure(initial)
+        receipts = [_call_receipt("initial", initial)]
+        failure = _as_validation_failure(initial, receipts)
         if failure is None:
             try:
-                return self._validated_result(initial, context)
+                return self._validated_result(initial, context, receipts, repair_count=0)
             except ActionValidationFailure as error:
                 failure = error
         repair = await self._backend.generate(
             self._request(build_repair_payload(failure)),
             "repair",
         )
-        second_failure = _as_validation_failure(repair)
+        receipts.append(_call_receipt("repair", repair))
+        second_failure = _as_validation_failure(repair, receipts)
         if second_failure is not None:
-            raise RecallGenerationFailure("generation_failure", list(repair.errors))
+            raise RecallGenerationFailure("generation_failure", list(repair.errors), receipts)
         try:
-            return self._validated_result(repair, context)
+            return self._validated_result(repair, context, receipts, repair_count=1)
         except ActionValidationFailure as error:
-            raise RecallGenerationFailure("generation_failure", []) from error
+            raise RecallGenerationFailure("generation_failure", [], receipts) from error
 
     def _validated_result(
-        self, backend_result: LLMBackendResult, context: RecallGenerationContext
+        self,
+        backend_result: LLMBackendResult,
+        context: RecallGenerationContext,
+        call_receipts: list[LLMCallReceipt],
+        *,
+        repair_count: int,
     ) -> GenerationResult:
         output = backend_result.data
         action_batch = validate_action_batch(
@@ -238,6 +251,8 @@ class DeepSeekPromptGenerator:
                 output, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
             ).encode("utf-8"),
             provenance=dict(backend_result.provenance),
+            call_receipts=call_receipts,
+            repair_count=repair_count,
         )
 
     def _request(self, payload: dict[str, object]) -> LLMGenerationRequest:
@@ -250,17 +265,38 @@ class DeepSeekPromptGenerator:
         )
 
 
-def _as_validation_failure(result: LLMBackendResult) -> ActionValidationFailure | None:
+def _as_validation_failure(
+    result: LLMBackendResult, receipts: list[LLMCallReceipt]
+) -> ActionValidationFailure | None:
     if result.infrastructure_failure:
-        raise RecallGenerationFailure("infrastructure_failure", list(result.errors))
+        raise RecallGenerationFailure("infrastructure_failure", list(result.errors), receipts)
     if result.errors:
         if not result.repairable:
-            raise RecallGenerationFailure("infrastructure_failure", list(result.errors))
+            raise RecallGenerationFailure("infrastructure_failure", list(result.errors), receipts)
         return ActionValidationFailure(
             [ActionValidationIssue(code="invalid_json", field_path="", message="invalid JSON")],
             previous_output=result.data,
         )
     return None
+
+
+def _call_receipt(
+    call_kind: Literal["initial", "repair"], result: LLMBackendResult
+) -> LLMCallReceipt:
+    terminal_state: Literal["succeeded", "repairable_failure", "infrastructure_failure"]
+    if result.infrastructure_failure:
+        terminal_state = "infrastructure_failure"
+    elif result.repairable:
+        terminal_state = "repairable_failure"
+    else:
+        terminal_state = "succeeded"
+    return LLMCallReceipt(
+        call_kind=call_kind,
+        usage=result.usage,
+        provenance=result.provenance,
+        errors=result.errors,
+        terminal_state=terminal_state,
+    )
 
 
 def _effective_visibility(

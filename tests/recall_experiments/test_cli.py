@@ -11,7 +11,8 @@ from pathlib import Path
 import pytest
 
 from paper_search.cli import build_parser, main
-from paper_search.domain.models import Paper
+from paper_search.control.budget import HardBudgetController
+from paper_search.domain.models import Paper, SearchBudget
 from paper_search.recall_experiments.composition import (
     RecallRuntime,
     RecallTerminalError,
@@ -242,7 +243,13 @@ def test_compare_writes_truthful_result_from_explicit_run_artifacts(
         path = tmp_path / name
         path.mkdir()
         (path / "recall-report.json").write_text(
-            json.dumps({"attempts": [{"attempt_status": "succeeded", "result": result}]}), encoding="utf-8"
+            json.dumps(
+                {
+                    "schema_version": "candidate-recall-report-legacy-v0",
+                    "attempts": [{"attempt_status": "succeeded", "result": result}],
+                }
+            ),
+            encoding="utf-8",
         )
 
     assert main(["recall", "compare", "--current", str(tmp_path / "current"), "--historical", str(tmp_path / "historical"), "--out", str(tmp_path / "comparison")]) == 0
@@ -285,6 +292,34 @@ def test_compare_rejects_execution_identity_mismatch(tmp_path: Path) -> None:
         )
 
 
+def test_v1_compare_rejects_missing_execution_identity(tmp_path: Path) -> None:
+    result = {
+        "candidate_pool_policy_version": "production-dedup-v1",
+        "gold_association_count": 1,
+        "gold_hit_count": 1,
+        "macro_candidate_recall": 1.0,
+        "per_query": [],
+    }
+    for name in ("current", "historical"):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "recall-report.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "candidate-recall-report-v1",
+                    "attempts": [{"attempt_status": "succeeded", "result": result}],
+                }
+            ),
+            encoding="utf-8",
+        )
+    with pytest.raises(RecallTerminalError, match="config_mismatch"):
+        compare_recall_artifacts(
+            current_run=tmp_path / "current",
+            historical_run=tmp_path / "historical",
+            output_path=tmp_path / "comparison",
+        )
+
+
 def test_authorized_live_run_uses_injected_runtime_without_constructing_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -292,6 +327,8 @@ def test_authorized_live_run_uses_injected_runtime_without_constructing_client(
     recipe, sample, actions = _write_synthetic_inputs(tmp_path, backend="live_provider")
 
     class FakeRuntime:
+        pricing_policy_sha256: str | None = None
+
         async def search(self, *_args: object, **_kwargs: object) -> BackendSearchResult:
             return BackendSearchResult(hits=[Paper(canonical_id="doi:10.1000/synthetic", title="Synthetic", sources=["openalex"])])
 
@@ -302,15 +339,26 @@ def test_authorized_live_run_uses_injected_runtime_without_constructing_client(
             return LLMBackendResult()
 
     runtime = FakeRuntime()
+    controller = HardBudgetController(SearchBudget(max_total_tokens=10_000, max_cost_cny=1))
+    pricing_bytes = (
+        WORKSPACE_ROOT / "tests/fixtures/pricing/pricing-policy-test-v1.yaml"
+    ).read_bytes()
+    from paper_search.recall_experiments.composition import (
+        _budget_policy_sha256,
+        _pricing_policy_sha256,
+    )
+    runtime.pricing_policy_sha256 = _pricing_policy_sha256(pricing_bytes)
     injected = RecallRuntime(
         runtime,
         runtime,
         runtime,
         identity={
             "backend_identity": "fake-live-v1",
-            "budget_policy_sha256": "sha256:" + "1" * 64,
-            "pricing_policy_sha256": "sha256:" + "2" * 64,
+            "budget_policy_sha256": _budget_policy_sha256(controller),
+            "pricing_policy_sha256": _pricing_policy_sha256(pricing_bytes),
         },
+        controller=controller,
+        pricing_policy_bytes=pricing_bytes,
     )
 
     assert main(["recall", "run", "--recipe", str(recipe), "--sample", str(sample), "--actions", str(actions), "--allow-live", "--out", str(tmp_path / "live")], recall_runtime_factory=lambda _recipe: injected) == 0
@@ -348,6 +396,40 @@ def test_live_runtime_rejects_unbound_budget_or_pricing_identity(
                 live_runtime_factory=lambda _recipe: injected,
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("budget_hash", "pricing_hash"),
+    [("not-a-hash", "also-not-a-hash"), ("sha256:" + "0" * 64, "sha256:" + "0" * 64)],
+)
+def test_live_runtime_identity_rejects_forged_policy_hashes(
+    budget_hash: str, pricing_hash: str
+) -> None:
+    from paper_search.recall_experiments.composition import _valid_live_runtime_identity
+
+    class FakeRuntime:
+        pricing_policy_sha256: str | None = None
+
+    runtime = FakeRuntime()
+    controller = HardBudgetController(SearchBudget(max_total_tokens=10_000, max_cost_cny=1))
+    pricing_bytes = (
+        WORKSPACE_ROOT / "tests/fixtures/pricing/pricing-policy-test-v1.yaml"
+    ).read_bytes()
+    runtime.pricing_policy_sha256 = pricing_hash
+    injected = RecallRuntime(
+        runtime,  # type: ignore[arg-type]
+        runtime,  # type: ignore[arg-type]
+        runtime,  # type: ignore[arg-type]
+        identity={
+            "backend_identity": "fake",
+            "budget_policy_sha256": budget_hash,
+            "pricing_policy_sha256": pricing_hash,
+        },
+        controller=controller,
+        pricing_policy_bytes=pricing_bytes,
+    )
+
+    assert not _valid_live_runtime_identity(injected)
 
 
 def test_fixed_actions_reject_command_line_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

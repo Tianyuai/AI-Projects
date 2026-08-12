@@ -172,6 +172,24 @@ def test_manual_generation_reads_user_prepared_json_without_an_llm(tmp_path) -> 
     assert result.action_batch.actions[0].payload.query_text == "graph retrieval"
 
 
+def test_manual_generation_identity_hashes_the_exact_consumed_bytes(tmp_path) -> None:
+    actions_path = tmp_path / "actions.json"
+    original = json.dumps({"query-1": _actions()}).encode("utf-8")
+    actions_path.write_bytes(original)
+    generator = ManualActionGenerator(
+        actions_path,
+        expected_query_ids=["query-1"],
+        allowed_actions={"text_search"},
+        max_actions=1,
+    )
+
+    actions_path.write_text('{"query-1":{"actions":[]}}', encoding="utf-8")
+
+    assert generator.source_sha256 == f"sha256:{hashlib.sha256(original).hexdigest()}"
+    result = asyncio.run(generator.generate(_context("query-1")))
+    assert result.action_batch.actions[0].payload.query_text == "graph retrieval"
+
+
 class _RecordingLLMBackend:
     def __init__(self, results: list[LLMBackendResult]) -> None:
         self._results = iter(results)
@@ -179,7 +197,10 @@ class _RecordingLLMBackend:
 
     async def generate(self, request: object, call_kind: str) -> LLMBackendResult:
         self.calls.append((call_kind, request))
-        return next(self._results)
+        result = next(self._results)
+        return result.model_copy(
+            update={"provenance": {"backend_call_id": f"call-{len(self.calls)}"}}
+        )
 
 
 def _prompt() -> RecallPromptArtifact:
@@ -282,6 +303,7 @@ def test_rendered_recall_prompt_is_deterministic_and_locks_deepseek_settings() -
     assert "deepseek-v4-flash" in message
     assert "temperature 0" in message
     assert "text_search" in message
+    assert "supplied seed_canonical_id" in message
 
 
 @pytest.mark.parametrize(
@@ -328,6 +350,9 @@ def test_analyzer_invalid_json_triggers_one_repair_with_previous_output() -> Non
     result = asyncio.run(generator.generate(_context("query-1")))
 
     assert result.action_batch.actions[0].action_id == "search-1"
+    assert [receipt.call_kind for receipt in result.call_receipts] == ["initial", "repair"]
+    assert result.repair_count == 1
+    assert len({receipt.provenance["backend_call_id"] for receipt in result.call_receipts}) == 2
     assert [kind for kind, _ in backend.calls] == ["initial", "repair"]
     repair_payload = getattr(backend.calls[1][1], "payload")
     assert repair_payload["validation_errors"] == [{"code": "invalid_json", "field_path": ""}]

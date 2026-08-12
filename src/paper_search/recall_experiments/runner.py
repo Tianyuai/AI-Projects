@@ -209,18 +209,40 @@ class RecallExperimentRunner:
                     {
                         "failure_code": failure.code,
                         "errors": [_payload(error) for error in failure.errors],
+                        "llm_call_receipts": [
+                            _payload(receipt) for receipt in failure.call_receipts
+                        ],
+                        "repair_count": sum(
+                            receipt.call_kind == "repair" for receipt in failure.call_receipts
+                        ),
                     },
                     attempt_status="failed",
                     valid_repeat_ordinal=None,
                 )
                 generation_provenance.append(
-                    {"query_id": context.query_id, "failure_code": failure.code}
+                    {
+                        "query_id": context.query_id,
+                        "failure_code": failure.code,
+                        "llm_call_receipts": [
+                            _payload(receipt) for receipt in failure.call_receipts
+                        ],
+                        "repair_count": sum(
+                            receipt.call_kind == "repair" for receipt in failure.call_receipts
+                        ),
+                    }
                 )
                 return pools, failure.code, generation_provenance
             self._event("generate-and-validate")
             _validate_generation(generation, context, request)
             generation_provenance.append(
-                {"query_id": context.query_id, **generation.provenance}
+                {
+                    "query_id": context.query_id,
+                    **generation.provenance,
+                    "llm_call_receipts": [
+                        _payload(receipt) for receipt in generation.call_receipts
+                    ],
+                    "repair_count": generation.repair_count,
+                }
             )
             self._event("write-generation")
             self._writer.write_generation(

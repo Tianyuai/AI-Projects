@@ -259,6 +259,27 @@ def test_manifest_is_read_once_but_payload_is_verified_on_every_read(
         reader.read(identity)
 
 
+def test_reader_uses_the_verified_manifest_bytes_supplied_by_runtime(tmp_path: Path) -> None:
+    store = DependencyCaptureStore(tmp_path, clock=lambda: CAPTURED_AT)
+    identity = _identity()
+    store.stage_success(
+        identity, response_bytes=b"original", safe_headers={}, captured_at=CAPTURED_AT
+    )
+    manifest = store.seal()
+    verified_bytes = store.manifest_path.read_bytes()
+    verified_hash = store.manifest_sha256
+    store.manifest_path.write_text("changed after verification", encoding="utf-8")
+
+    reader = DependencySnapshotReader(
+        store.manifest_path,
+        snapshot_manifest_sha256=verified_hash,
+        snapshot_set_id=manifest.snapshot_set_id,
+        manifest_bytes=verified_bytes,
+    )
+
+    assert reader.read(identity).response_bytes == b"original"
+
+
 def _rewrite_self_consistent_manifest(
     manifest_path: Path, payload: dict[str, object]
 ) -> str:

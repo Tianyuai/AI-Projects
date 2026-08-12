@@ -326,6 +326,16 @@ def test_attempt_model_rejects_out_of_range_repeat_ordinals(ordinal: int) -> Non
         )
 
 
+def test_attempt_model_rejects_failure_code_as_attempt_status() -> None:
+    with pytest.raises(ValueError, match="attempt_status"):
+        RecallExperimentAttempt(
+            attempt_id="attempt-01",
+            attempt_status="generation_failure",
+            valid_repeat_ordinal=None,
+            failure_code="generation_failure",
+        )
+
+
 def test_generation_failure_is_recorded_and_later_attempts_continue() -> None:
     events: list[str] = []
 
@@ -368,7 +378,7 @@ def test_generation_failure_is_recorded_and_later_attempts_continue() -> None:
     result = asyncio.run(runner.run(request))
 
     assert [(attempt.attempt_id, attempt.attempt_status) for attempt in result.attempts] == [
-        ("attempt-01", "generation_failure"),
+        ("attempt-01", "failed"),
         ("attempt-02", "succeeded"),
     ]
     assert writer.generation_failures == [
@@ -380,4 +390,5 @@ def test_generation_failure_is_recorded_and_later_attempts_continue() -> None:
         }
     ]
     assert writer.report is not None
+    assert writer.report["attempts"][0]["attempt_status"] == "failed"
     assert writer.report["attempts"][0]["failure_code"] == "generation_failure"

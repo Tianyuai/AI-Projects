@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -118,6 +120,23 @@ class HardBudgetController:
     @property
     def budget(self) -> SearchBudget:
         return self._budget
+
+    @property
+    def policy_fingerprint(self) -> str:
+        """Hash every immutable setting that changes hard-budget enforcement."""
+        content = json.dumps(
+            {
+                "identity_schema_version": "hard-budget-enforcement-identity-v1",
+                "controller_version": "hard-budget-controller-v1",
+                "budget": self._budget.model_dump(mode="json"),
+                "formal_live": self.formal_live,
+                "reservation_ttl_seconds": self.reservation_ttl_seconds,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(content).hexdigest()
 
     @property
     def reserved_usage(self) -> UsageEstimate:

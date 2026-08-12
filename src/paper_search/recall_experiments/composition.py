@@ -278,9 +278,12 @@ def compare_recall_artifacts(
         historical = historical_payload[0] if historical_payload is not None else None
         historical_identity = historical_payload[1] if historical_payload is not None else None
         historical_schema = historical_payload[2] if historical_payload is not None else None
-        _validate_comparison_identity(
-            current_identity, historical_identity, current_schema, historical_schema
-        )
+        if historical_payload is None:
+            _validate_report_identity(current_identity, current_schema)
+        else:
+            _validate_comparison_identity(
+                current_identity, historical_identity, current_schema, historical_schema
+            )
         comparison = compare_exact_replay(current, historical)
         payload = {
             **comparison.model_dump(mode="json"),
@@ -490,29 +493,10 @@ def build_live_runtime(
     citation_provider: LiveCaptureSearchProvider,
     llm_backend: LLMBackend,
     controller: HardBudgetController,
-    backend_identity: str,
-    pricing_policy_bytes: bytes,
 ) -> RecallRuntime:
-    """Wrap explicitly supplied live providers; client creation remains outside runners."""
-    pricing_sha256 = _pricing_policy_sha256(pricing_policy_bytes)
-    if getattr(llm_backend, "pricing_policy_sha256", None) != pricing_sha256:
-        raise ValueError("LLM backend pricing policy identity does not match verified policy")
-    return RecallRuntime(
-        search_backend=BudgetedSearchBackend(
-            provider=search_provider, controller=controller, call_estimate=_search_estimate()
-        ),
-        citation_backend=BudgetedCitationBackend(
-            provider=citation_provider, controller=controller, call_estimate=_search_estimate()
-        ),
-        llm_backend=llm_backend,
-        identity={
-            "backend_identity": backend_identity,
-            "budget_policy_sha256": _budget_policy_sha256(controller),
-            "pricing_policy_sha256": pricing_sha256,
-        },
-        controller=controller,
-        pricing_policy_bytes=pricing_policy_bytes,
-    )
+    """Fail closed until all actual live adapters expose verifiable runtime identity."""
+    del search_provider, citation_provider, llm_backend, controller
+    raise RecallTerminalError("live_runtime_unavailable")
 
 
 class _SnapshotUnavailableLLMBackend(LLMBackend):
@@ -689,32 +673,12 @@ def _execution_identity(
 
 
 def _valid_live_runtime_identity(runtime: RecallRuntime) -> bool:
-    identity = runtime.identity
-    if runtime.controller is None or runtime.pricing_policy_bytes is None:
-        return False
-    try:
-        return (
-            isinstance(identity.get("backend_identity"), str)
-            and bool(identity["backend_identity"])
-            and identity.get("budget_policy_sha256")
-            == _budget_policy_sha256(runtime.controller)
-            and identity.get("pricing_policy_sha256")
-            == _pricing_policy_sha256(runtime.pricing_policy_bytes)
-            and getattr(runtime.llm_backend, "pricing_policy_sha256", None)
-            == identity.get("pricing_policy_sha256")
-        )
-    except ValueError:
-        return False
+    del runtime
+    return False
 
 
 def _budget_policy_sha256(controller: HardBudgetController) -> str:
-    content = json.dumps(
-        controller.budget.model_dump(mode="json"),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return _nonzero_sha256(content)
+    return controller.policy_fingerprint
 
 
 def _nonzero_sha256(content: bytes) -> str:
@@ -754,6 +718,8 @@ def _validate_comparison_identity(
     historical_schema: str | None,
 ) -> None:
     """Only explicit legacy-v0 pairs bypass the v1 identity envelope."""
+    _validate_report_identity(current, current_schema)
+    _validate_report_identity(historical, historical_schema)
     if (
         current_schema == "candidate-recall-report-legacy-v0"
         and historical_schema == "candidate-recall-report-legacy-v0"
@@ -762,13 +728,26 @@ def _validate_comparison_identity(
     ):
         return
     if (
-        current_schema != "candidate-recall-report-v1"
-        or historical_schema != "candidate-recall-report-v1"
+        current_schema != historical_schema
         or current is None
         or historical is None
         or dict(current) != dict(historical)
     ):
         raise ValueError("recall report execution identities do not match")
+
+
+def _validate_report_identity(
+    identity: Mapping[str, object] | None, schema: str | None
+) -> None:
+    if schema == "candidate-recall-report-legacy-v0" and identity is None:
+        return
+    if (
+        schema != "candidate-recall-report-v1"
+        or identity is None
+        or identity.get("identity_schema_version")
+        != "candidate-recall-execution-identity-v1"
+    ):
+        raise ValueError("recall report execution identity is invalid")
 
 
 def _snapshot_error(provider: str) -> ErrorDetail:

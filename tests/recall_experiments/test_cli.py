@@ -320,8 +320,41 @@ def test_v1_compare_rejects_missing_execution_identity(tmp_path: Path) -> None:
         )
 
 
-def test_authorized_live_run_uses_injected_runtime_without_constructing_client(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_compare_without_historical_validates_current_then_reports_insufficient_evidence(
+    tmp_path: Path,
+) -> None:
+    current = tmp_path / "current"
+    current.mkdir()
+    result = {
+        "candidate_pool_policy_version": "production-dedup-v1",
+        "gold_association_count": 1,
+        "gold_hit_count": 1,
+        "macro_candidate_recall": 1.0,
+        "per_query": [],
+    }
+    (current / "recall-report.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "candidate-recall-report-v1",
+                "execution_identity": {"identity_schema_version": "candidate-recall-execution-identity-v1"},
+                "attempts": [{"attempt_status": "succeeded", "result": result}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    comparison = compare_recall_artifacts(
+        current_run=current,
+        historical_run=None,
+        output_path=tmp_path / "comparison",
+    )
+
+    assert comparison["conclusion"] == "insufficient_historical_evidence"
+    assert comparison["per_query_comparison"] == "not_provable"
+
+
+def test_authorized_live_run_rejects_caller_declared_fake_runtime_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     recipe, sample, actions = _write_synthetic_inputs(tmp_path, backend="live_provider")
@@ -361,8 +394,105 @@ def test_authorized_live_run_uses_injected_runtime_without_constructing_client(
         pricing_policy_bytes=pricing_bytes,
     )
 
-    assert main(["recall", "run", "--recipe", str(recipe), "--sample", str(sample), "--actions", str(actions), "--allow-live", "--out", str(tmp_path / "live")], recall_runtime_factory=lambda _recipe: injected) == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "complete"
+    with pytest.raises(RecallTerminalError, match="config_mismatch"):
+        run(
+            run_recall_experiment(
+                recipe_path=recipe,
+                sample_path=sample,
+                output_path=tmp_path / "live",
+                workspace_root=tmp_path,
+                actions_path=actions,
+                allow_live=True,
+                live_runtime_factory=lambda _recipe: injected,
+            )
+        )
+
+
+def test_budget_policy_fingerprint_covers_formal_live_and_reservation_ttl() -> None:
+    from paper_search.recall_experiments.composition import _budget_policy_sha256
+
+    budget = SearchBudget(max_total_tokens=10_000, max_cost_cny=1)
+    ordinary = HardBudgetController(budget, formal_live=False, reservation_ttl_seconds=120)
+    formal = HardBudgetController(budget, formal_live=True, reservation_ttl_seconds=120)
+    different_ttl = HardBudgetController(budget, formal_live=True, reservation_ttl_seconds=121)
+
+    assert _budget_policy_sha256(formal) == formal.policy_fingerprint
+    assert _budget_policy_sha256(ordinary) != _budget_policy_sha256(formal)
+    assert _budget_policy_sha256(formal) != _budget_policy_sha256(different_ttl)
+
+
+def test_build_live_runtime_fails_closed_until_actual_adapters_expose_identity(
+    tmp_path: Path,
+) -> None:
+    import httpx
+
+    from paper_search.control.pricing import ActualCostPricer, parse_pricing_policy_bytes
+    from paper_search.llm.client import OpenAICompatibleLLMClient
+    from paper_search.llm.snapshot_adapters import LiveCaptureLLMAnalyzer
+    from paper_search.recall_experiments.composition import (
+        build_live_runtime,
+    )
+    from paper_search.recall_experiments.generation.backends import BudgetedLLMBackend
+    from paper_search.retrieval.snapshot_adapters import LiveCaptureSearchProvider
+    from paper_search.storage.dependency_snapshot import DependencyCaptureStore
+    from paper_search.domain.models import UsageEstimate
+
+    pricing_bytes = (
+        WORKSPACE_ROOT / "tests/fixtures/pricing/pricing-policy-test-v1.yaml"
+    ).read_bytes()
+    pricer = ActualCostPricer(parse_pricing_policy_bytes(pricing_bytes))
+    controller = HardBudgetController(
+        SearchBudget(max_total_tokens=10_000, max_cost_cny=1),
+        formal_live=True,
+        reservation_ttl_seconds=91,
+    )
+    client = httpx.AsyncClient()
+    capture = DependencyCaptureStore(tmp_path / "capture")
+    try:
+        search = LiveCaptureSearchProvider(
+            dependency="openalex",
+            client=client,
+            capture_store=capture,
+            pricer=pricer,
+            controller=controller,
+        )
+        citation = LiveCaptureSearchProvider(
+            dependency="semantic_scholar",
+            client=client,
+            capture_store=capture,
+            pricer=pricer,
+            controller=controller,
+        )
+        llm_client = OpenAICompatibleLLMClient(
+            client=client,
+            base_url="https://example.invalid/v1",
+            model="deepseek-test-v1",
+            api_key="test-only",
+        )
+        analyzer = LiveCaptureLLMAnalyzer(
+            client=llm_client,
+            capture_store=capture,
+            pricer=pricer,
+            controller=controller,
+            prompt_artifact_sha256="sha256:" + "a" * 64,
+        )
+        estimate = UsageEstimate(llm_calls=1, cost_cny=0)
+        llm = BudgetedLLMBackend(
+            analyzer=analyzer,
+            controller=controller,
+            initial_estimate=estimate,
+            repair_estimate=estimate,
+        )
+
+        with pytest.raises(RecallTerminalError, match="live_runtime_unavailable"):
+            build_live_runtime(
+                search_provider=search,
+                citation_provider=citation,
+                llm_backend=llm,
+                controller=controller,
+            )
+    finally:
+        run(client.aclose())
 
 
 def test_live_runtime_rejects_unbound_budget_or_pricing_identity(

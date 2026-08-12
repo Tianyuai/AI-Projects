@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Protocol
+from typing import Literal, Protocol
 
 from paper_search.recall_experiments.contracts import (
     CandidatePool,
@@ -93,13 +93,17 @@ class RecallExperimentRequest:
 @dataclass(frozen=True)
 class RecallExperimentAttempt:
     attempt_id: str
-    attempt_status: str
+    attempt_status: Literal["succeeded", "failed"]
     valid_repeat_ordinal: int | None
     result: object | None = None
     failure_code: str | None = None
     generation_provenance: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
+        if self.attempt_status not in {"succeeded", "failed"}:
+            raise ValueError("attempt_status must be succeeded or failed")
+        if (self.attempt_status == "failed") != (self.failure_code is not None):
+            raise ValueError("failed attempt status and failure_code must be recorded together")
         if self.valid_repeat_ordinal is not None and (
             type(self.valid_repeat_ordinal) is not int
             or not 1 <= self.valid_repeat_ordinal <= 3
@@ -162,7 +166,7 @@ class RecallExperimentRunner:
                 attempts.append(
                     RecallExperimentAttempt(
                         attempt_id=attempt_id,
-                        attempt_status=failure_code,
+                        attempt_status="failed",
                         valid_repeat_ordinal=None,
                         failure_code=failure_code,
                         generation_provenance=tuple(generation_provenance),

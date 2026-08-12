@@ -125,3 +125,42 @@ Fresh verification after the follow-up:
 
 No network or live provider call was made, `.env` was not read, and the three user-owned
 untracked paths listed above remain untouched and unstaged.
+
+## Final fail-closed review follow-up
+
+Four remaining review findings were reproduced independently and fixed with RED/GREEN tests:
+
+1. Missing historical evidence: RED showed `historical_run=None` was incorrectly sent through
+   pairwise identity comparison and became `config_mismatch`. GREEN validates the current
+   report's declared schema/identity by itself, then emits the evaluator's truthful
+   `insufficient_historical_evidence` / `not_provable` result. Invalid current reports still fail
+   closed.
+2. Live runtime introspection: RED proved a caller-built fake backend plus caller-declared hashes
+   could execute. The underlying live adapters do not yet expose a shared public, immutable,
+   versioned identity contract covering provider/dependency, adapter/model/version,
+   endpoint/operation, actual pricer, and controller. The safe minimal GREEN therefore removes
+   the caller `backend_identity` and pricing-bytes inputs from `build_live_runtime` and disables
+   recall live-runtime construction/acceptance before any provider call. Constructing through
+   the official boundary returns `live_runtime_unavailable`; injected declarations return
+   `config_mismatch`. Live support must remain unavailable until those actual adapters expose
+   the complete introspectable contract; private-field inspection is deliberately not used as
+   evidence.
+3. Formal-live enforcement identity: RED showed controllers with different `formal_live` and
+   reservation TTL values had the same budget hash. GREEN adds a read-only controller policy
+   fingerprint over a versioned controller identity, the complete `SearchBudget`, `formal_live`,
+   and `reservation_ttl_seconds`. Because live recall is now disabled, no controller lacking
+   `formal_live=True` can reach execution.
+4. Attempt status semantics: RED showed generation failures used `generation_failure` as the
+   status. GREEN records every failed attempt as `attempt_status="failed"` and keeps the reason
+   only in `failure_code`. The attempt model now rejects any other status and requires failed
+   status/failure code to appear together.
+
+Fresh final verification:
+
+- focused RED/GREEN checks: `5 passed`, followed by runner scope `11 passed`
+- recall suite: `235 passed in 6.95s`
+- Ruff (changed control/recall/tests scope): `All checks passed!`
+- mypy (budget controller plus recall package): `Success: no issues found in 29 source files`
+
+No network or live provider call was made, `.env` was not read, and the user-owned untracked
+paths remain untouched and unstaged.

@@ -22,8 +22,57 @@
 - Unknown actual cost remains fail-closed and is never normalized to zero.
 - Keep search, citation, and LLM backends independently replaceable. Do not add imports between retrieval handlers or add method IDs/action branches to the runner.
 - Do not change Scheme B recipes, Prompts, sample selection, action limits, candidate-pool policy, evaluation thresholds, historical evidence, or Oracle catalog status.
-- Every production change follows RED -> GREEN TDD and receives an independent task review before the next task.
+- Every production change follows RED -> GREEN TDD. Tasks 1-5 are executed as one continuous infrastructure patch with focused test checkpoints; request one independent whole-feature review after the focused and aggregate gates pass.
 - Use `D:\AI Projects\Projects\.venv\Scripts\python.exe` for all project tests and checks.
+
+## Framework reuse invariant
+
+This plan repairs one missing cross-cutting capability of the existing Scheme B framework: safe live-provider construction. It does not create a new search-method framework.
+
+After this one-time repair, a normal candidate-recall experiment must use this fixed path:
+
+```text
+frozen sample binding
+        +
+method module/configuration
+        |
+existing generator registry
+        |
+existing text/title/citation handlers
+        |
+existing live-or-replay backends
+        |
+existing candidate pool
+        |
+existing candidate-recall evaluator
+        |
+existing artifacts and matched historical compare
+```
+
+For future methods:
+
+- a Prompt/search-slot change modifies only Prompt/YAML;
+- pre-generated DeepSeek search terms use the existing manual-action artifact;
+- a new generation algorithm implements only `QueryGenerator` and registers it;
+- a new retrieval mechanism implements only the relevant backend or handler and registers it;
+- filtering/ranking enters only through the existing post-pool stage seam;
+- frozen/local search changes only the input source or backend;
+- no method may add a method-specific runner, candidate-pool builder, evaluator, artifact layout, comparison command, or standalone experiment script.
+
+A new method does not require a new design/spec/implementation plan when it fits an existing interface. It requires only a small module/config change, focused interface tests, the three-query canary, and—if viable—the existing repeat/comparison workflow. A new design is required only if the method changes an interface or evidence contract shared by multiple modules.
+
+## Execution shape
+
+Tasks 1-5 are implementation checkpoints inside one bounded infrastructure change, not five separately designed frameworks. Execute them continuously in this order and stop only for a failing contract or architectural contradiction:
+
+1. define the shared identity value types;
+2. expose identity from the already-existing retrieval and LLM live objects;
+3. bind the already-existing Scheme B budgeted adapters to those objects;
+4. reopen the already-existing live composition path under the existing CLI dual gate;
+5. run focused and aggregate offline checks;
+6. request one independent review and then one fresh final gate.
+
+Do not write another design or implementation plan between these checkpoints.
 
 ## File and interface map
 
@@ -758,3 +807,21 @@ The subsequent separately authorized canary must declare all of the following be
 - authorization to seal provider responses and replay them offline.
 
 Without that explicit authorization, the completed code remains offline-ready only.
+
+## Fixed method-test workflow after this plan
+
+The first use of the repaired framework is not another implementation project. It is the existing Task 13 canary executed through configuration and frozen artifacts:
+
+1. Select the already frozen `dev-smoke-3.yaml`; do not select queries after seeing results.
+2. Select one inventory-supported method. Start with Query Evolution because it has the strongest exact action/provider-response evidence.
+3. Bind its existing generation Prompt/method settings in the recipe. Do not edit the runner or create a Query Evolution script.
+4. Before retrieval, generate search actions through the existing DeepSeek generator or prepare the same output through the existing manual-action path.
+5. Validate and freeze that action artifact before inspecting candidate-recall results.
+6. Under separate authorization, run one live capture through the common search/title/citation registry and common candidate-pool builder.
+7. Seal provider request/response and usage evidence, then replay the exact capture offline through the same runtime interface.
+8. Report the three-query candidate recall and infrastructure state. Treat this as an end-to-end viability check, not a general performance conclusion.
+9. If the canary is viable, obtain three valid repeats within five attempts using the same recipe and existing runner. Do not tune search terms after seeing results.
+10. Compare only to the matched historical method when the required historical identity, denominator, and per-query Gold-hit evidence are present; otherwise retain `not_comparable` or `insufficient_historical_evidence`.
+11. To try the next method, replace only its Prompt/YAML/manual actions or registered generator/backend module and repeat Steps 1-10. Reuse every other component and command.
+
+The expected engineering delta for a Prompt/slot-only method after this plan is zero Python production files and no new script. The expected delta for a genuinely new method family is one focused module plus its registry entry and interface tests.

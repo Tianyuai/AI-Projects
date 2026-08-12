@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -77,6 +77,9 @@ TerminalCode = Literal[
     "live_runtime_unavailable",
     "oracle_catalog_incomplete",
     "snapshot_unavailable",
+    "generation_failure",
+    "retrieval_infrastructure_failure",
+    "insufficient_valid_repeats",
 ]
 
 
@@ -107,6 +110,7 @@ class RecallRuntime:
     search_backend: SearchBackend
     citation_backend: CitationBackend
     llm_backend: LLMBackend
+    identity: Mapping[str, object] = field(default_factory=dict)
 
 
 RecallRuntimeFactory = Callable[[LoadedRecallRecipe], RecallRuntime]
@@ -207,6 +211,8 @@ async def run_recall_experiment(
         if live_runtime_factory is None:
             raise RecallTerminalError("live_runtime_unavailable")
         runtime = live_runtime_factory(loaded_recipe)
+        if not _valid_live_runtime_identity(runtime.identity):
+            raise RecallTerminalError("config_mismatch")
     else:
         runtime = (
             build_replay_runtime(snapshot_manifest_path, loaded_recipe)
@@ -235,10 +241,28 @@ async def run_recall_experiment(
         max_results_per_action=recipe.retrieval.max_results_per_action,
         repeat_count=recipe.evaluation.repeat_count,
         max_repeat_attempts=recipe.evaluation.max_repeat_attempts,
+        execution_identity=_execution_identity(
+            loaded_recipe,
+            prepared.loaded_sample,
+            recipe=recipe,
+            actions_path=actions_path,
+            snapshot_manifest_path=snapshot_manifest_path,
+            allow_live=allow_live,
+            runtime=runtime,
+        ),
     )
     result = await runner.run(request)
-    if any(attempt.attempt_status == "failed" for attempt in result.attempts):
-        raise RecallTerminalError("snapshot_unavailable")
+    succeeded = sum(attempt.attempt_status == "succeeded" for attempt in result.attempts)
+    if succeeded < recipe.evaluation.repeat_count:
+        failure_codes = [attempt.failure_code for attempt in result.attempts if attempt.failure_code]
+        code = failure_codes[-1] if failure_codes else "insufficient_valid_repeats"
+        if code not in {
+            "snapshot_unavailable",
+            "generation_failure",
+            "retrieval_infrastructure_failure",
+        }:
+            code = "insufficient_valid_repeats"
+        raise RecallTerminalError(cast(TerminalCode, code))
     return output_path
 
 
@@ -247,8 +271,11 @@ def compare_recall_artifacts(
 ) -> dict[str, object]:
     """Compare explicit recall-report artifacts without inventing historical evidence."""
     try:
-        current = _result_from_report(current_run)
-        historical = _result_from_report(historical_run) if historical_run is not None else None
+        current, current_identity = _result_from_report(current_run)
+        historical_payload = _result_from_report(historical_run) if historical_run is not None else None
+        historical = historical_payload[0] if historical_payload is not None else None
+        historical_identity = historical_payload[1] if historical_payload is not None else None
+        _validate_comparison_identity(current_identity, historical_identity)
         comparison = compare_exact_replay(current, historical)
         payload = {
             **comparison.model_dump(mode="json"),
@@ -410,7 +437,16 @@ def build_replay_runtime(manifest_path: Path, loaded_recipe: LoadedRecallRecipe)
         call_estimate=_search_estimate(),
     )
     if not isinstance(loaded_recipe.recipe.generator, DeepSeekPromptGeneratorRecipe):
-        return RecallRuntime(search, citation, _SnapshotUnavailableLLMBackend())
+        return RecallRuntime(
+            search,
+            citation,
+            _SnapshotUnavailableLLMBackend(),
+            identity={
+                "backend_identity": "sealed_dependency_snapshot",
+                "budget_policy": "recall-replay-v1",
+                "pricing_provenance": "snapshot_bound_usage",
+            },
+        )
     assert loaded_recipe.prompt_sha256 is not None
     from paper_search.llm.snapshot_adapters import ReplayLLMAnalyzer
 
@@ -419,13 +455,23 @@ def build_replay_runtime(manifest_path: Path, loaded_recipe: LoadedRecallRecipe)
         model_id=loaded_recipe.recipe.generator.model,
         prompt_artifact_sha256=loaded_recipe.prompt_sha256,
     )
+    initial_estimate, repair_estimate = _llm_replay_estimates_from_manifest(content)
     llm = BudgetedLLMBackend(
         analyzer=analyzer,
         controller=controller,
-        initial_estimate=_llm_estimate(),
-        repair_estimate=_llm_estimate(),
+        initial_estimate=initial_estimate,
+        repair_estimate=repair_estimate,
     )
-    return RecallRuntime(search, citation, llm)
+    return RecallRuntime(
+        search,
+        citation,
+        llm,
+        identity={
+            "backend_identity": "sealed_dependency_snapshot",
+            "budget_policy": "recall-replay-v1",
+            "pricing_provenance": "snapshot_bound_usage",
+        },
+    )
 
 
 def build_live_runtime(
@@ -434,6 +480,7 @@ def build_live_runtime(
     citation_provider: LiveCaptureSearchProvider,
     llm_backend: LLMBackend,
     controller: HardBudgetController,
+    runtime_identity: Mapping[str, object],
 ) -> RecallRuntime:
     """Wrap explicitly supplied live providers; client creation remains outside runners."""
     return RecallRuntime(
@@ -444,6 +491,7 @@ def build_live_runtime(
             provider=citation_provider, controller=controller, call_estimate=_search_estimate()
         ),
         llm_backend=llm_backend,
+        identity=dict(runtime_identity),
     )
 
 
@@ -590,7 +638,60 @@ def _recipe_lock(loaded: LoadedRecallRecipe) -> dict[str, object]:
     return {"recipe_sha256": loaded.recipe_sha256, "recipe": loaded.recipe.model_dump(mode="json")}
 
 
-def _result_from_report(run_path: Path) -> RecallRepeatResult:
+def _execution_identity(
+    loaded: LoadedRecallRecipe,
+    sample: LoadedSampleBinding,
+    *,
+    recipe: RecallMethodRecipe,
+    actions_path: Path | None,
+    snapshot_manifest_path: Path | None,
+    allow_live: bool,
+    runtime: RecallRuntime,
+) -> dict[str, object]:
+    effective_actions = actions_path
+    if effective_actions is None and isinstance(
+        recipe.generator, (ManualActionsGeneratorRecipe, FixedActionsGeneratorRecipe)
+    ):
+        effective_actions = Path(recipe.generator.actions)
+    return {
+        "identity_schema_version": "candidate-recall-execution-identity-v1",
+        "method_id": recipe.method_id,
+        "recipe_sha256": loaded.recipe_sha256,
+        "sample_sha256": sample.binding_sha256,
+        "prompt_sha256": loaded.prompt_sha256,
+        "generator_type": recipe.generator.type,
+        "generator_model": getattr(recipe.generator, "model", None),
+        "retrieval_backend": recipe.retrieval.backend,
+        "snapshot_manifest_sha256": _optional_path_sha256(snapshot_manifest_path),
+        "actions_sha256": _optional_path_sha256(effective_actions),
+        "max_total_actions": recipe.retrieval.max_total_actions,
+        "max_results_per_action": recipe.retrieval.max_results_per_action,
+        "candidate_pool_policy_version": recipe.candidate_pool.policy_version,
+        "repeat_count": recipe.evaluation.repeat_count,
+        "max_repeat_attempts": recipe.evaluation.max_repeat_attempts,
+        "live_authorized": allow_live,
+        "runtime": dict(runtime.identity),
+    }
+
+
+def _valid_live_runtime_identity(identity: Mapping[str, object]) -> bool:
+    return all(
+        isinstance(identity.get(key), str) and bool(identity[key])
+        for key in (
+            "backend_identity",
+            "budget_policy_sha256",
+            "pricing_policy_sha256",
+        )
+    )
+
+
+def _optional_path_sha256(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _result_from_report(run_path: Path) -> tuple[RecallRepeatResult, Mapping[str, object] | None]:
     report = json.loads((run_path / "recall-report.json").read_bytes())
     attempts = report.get("attempts")
     if not isinstance(attempts, list):
@@ -598,7 +699,20 @@ def _result_from_report(run_path: Path) -> RecallRepeatResult:
     results = [attempt.get("result") for attempt in attempts if attempt.get("attempt_status") == "succeeded"]
     if len(results) != 1 or not isinstance(results[0], Mapping):
         raise ValueError("recall report lacks one successful repeat")
-    return RecallRepeatResult.model_validate(results[0])
+    identity = report.get("execution_identity")
+    if identity is not None and not isinstance(identity, Mapping):
+        raise ValueError("recall report execution identity is invalid")
+    return RecallRepeatResult.model_validate(results[0]), identity
+
+
+def _validate_comparison_identity(
+    current: Mapping[str, object] | None, historical: Mapping[str, object] | None
+) -> None:
+    """Keep legacy-v0 reports readable, but never mix them with or mismatch v1 identities."""
+    if current is None and historical is None:
+        return
+    if current is None or historical is None or dict(current) != dict(historical):
+        raise ValueError("recall report execution identities do not match")
 
 
 def _snapshot_error(provider: str) -> ErrorDetail:
@@ -620,8 +734,36 @@ def _search_estimate() -> UsageEstimate:
     return UsageEstimate(search_api_calls=1, elapsed_ms=30_000)
 
 
-def _llm_estimate() -> UsageEstimate:
-    return UsageEstimate(llm_calls=1, input_tokens=2_000, output_tokens=1_000, elapsed_ms=30_000)
+def _llm_replay_estimates_from_manifest(content: bytes) -> tuple[UsageEstimate, UsageEstimate]:
+    """Reserve replay calls from sealed usage only; never invent a live model price."""
+    decoded = json.loads(content)
+    entries = decoded.get("entries") if isinstance(decoded, Mapping) else None
+    if not isinstance(entries, list):
+        raise ValueError("snapshot manifest lacks entries")
+    usages: list[UsageEstimate] = []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        request = entry.get("request")
+        if not isinstance(request, Mapping) or request.get("dependency") != "llm":
+            continue
+        raw_usage = entry.get("usage")
+        if raw_usage is None:
+            usages.append(UsageEstimate(llm_calls=1, cost_cny=0))
+        elif isinstance(raw_usage, Mapping):
+            usages.append(UsageEstimate.model_validate(raw_usage))
+        else:
+            raise ValueError("snapshot LLM usage is invalid")
+    if not usages:
+        raise ValueError("snapshot manifest has no LLM entries")
+    estimate = UsageEstimate(
+        llm_calls=max(1, max(item.llm_calls for item in usages)),
+        input_tokens=max(item.input_tokens for item in usages),
+        output_tokens=max(item.output_tokens for item in usages),
+        cost_cny=max((item.cost_cny or 0) for item in usages),
+        elapsed_ms=max(item.elapsed_ms for item in usages),
+    )
+    return estimate, estimate
 
 
 __all__ = [

@@ -217,7 +217,9 @@ def test_historical_comparison_uses_only_the_approved_thresholds() -> None:
 
 def test_load_recall_recipe_binds_exact_recipe_and_prompt_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
-    prompt = _write(tmp_path / "prompt.yaml", "version: one\n")
+    prompt = _write(
+        tmp_path / "prompt.yaml", "version: one\nmodel: deepseek-v4-flash\n"
+    )
     recipe_path = _write(
         tmp_path / "recipe.yaml",
         """method_id: prompted-example
@@ -319,7 +321,10 @@ def test_new_method_uses_generator_type_as_the_only_implementation_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
-    _write(tmp_path / "prompt.yaml", "prompt: custom ordinary method\n")
+    _write(
+        tmp_path / "prompt.yaml",
+        "prompt: custom ordinary method\nmodel: deepseek-v4-flash\n",
+    )
     loaded = load_recall_recipe(
         _write(
             tmp_path / "ordinary-method.yaml",
@@ -366,3 +371,37 @@ seed_canonical_ids: [seed-a]
 
     assert loaded.binding_bytes == binding_path.read_bytes()
     assert loaded.binding_sha256 == _sha256(binding_path.read_bytes())
+
+
+def test_deepseek_recipe_model_must_match_prompt_artifact_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write(
+        tmp_path / "prompt.yaml",
+        "name: recall\nversion: v1\nmodel: deepseek-v4-flash\ntemperature: 0\ninstructions: [safe]\n",
+    )
+    recipe = _write(
+        tmp_path / "recipe.yaml",
+        """method_id: mismatch
+generator:
+  type: deepseek_prompt
+  prompt: prompt.yaml
+  model: different-model
+  temperature: 0
+  gold_visibility: blind
+  max_generated_actions: 1
+  repair_attempts: 1
+retrieval:
+  allowed_actions: [text_search]
+  backend: snapshot_replay
+  max_results_per_action: 1
+  max_total_actions: 1
+evaluation:
+  repeat_count: 1
+  max_repeat_attempts: 1
+""",
+    )
+
+    with pytest.raises(ValueError, match="prompt artifact model"):
+        load_recall_recipe(recipe)

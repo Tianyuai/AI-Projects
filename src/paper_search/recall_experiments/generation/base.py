@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from paper_search.domain.models import DomainModel
+from pydantic import Field
 from paper_search.recall_experiments.contracts import RecallActionBatch, RecallGenerationContext
 
 
@@ -14,6 +15,7 @@ class GenerationResult(DomainModel):
     query_id: str
     action_batch: RecallActionBatch
     artifact_bytes: bytes
+    provenance: dict[str, str] = Field(default_factory=dict)
 
 
 class QueryGenerator(Protocol):

@@ -89,6 +89,7 @@ class RecallArtifactWriter:
                 **generation.action_batch.model_dump(mode="json"),
                 "immutable_action_batch_utf8": source,
                 "immutable_action_batch_sha256": "sha256:" + sha256(generation.artifact_bytes).hexdigest(),
+                "generation_provenance": dict(generation.provenance),
             }
         else:
             payload = generation

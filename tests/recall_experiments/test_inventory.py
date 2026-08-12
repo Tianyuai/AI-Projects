@@ -93,6 +93,14 @@ def test_frozen_and_novel_requests_have_distinct_backend_classifications() -> No
     )
 
 
+def test_overall_compatibility_accepts_citation_as_the_non_text_family() -> None:
+    from paper_search.recall_experiments.inventory import _has_overall_compatibility
+
+    assert _has_overall_compatibility(
+        [{"action_family": "text_search"}, {"action_family": "citation_expand"}]
+    )
+
+
 def test_bound_snapshot_entries_are_verified_and_reported() -> None:
     manifest = (
         WORKSPACE_ROOT

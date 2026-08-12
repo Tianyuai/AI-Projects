@@ -211,6 +211,9 @@ def load_recall_recipe(path: str | Path) -> LoadedRecallRecipe:
         prompt_path = _workspace_path(recipe.generator.prompt)
         prompt_bytes = prompt_path.read_bytes()
         prompt_sha256 = _sha256(prompt_bytes)
+        prompt_payload = _load_yaml_mapping(prompt_bytes, prompt_path)
+        if prompt_payload.get("model") != recipe.generator.model:
+            raise ValueError("recipe generator model does not match prompt artifact model")
     return LoadedRecallRecipe(
         recipe=recipe,
         recipe_path=recipe_path.resolve(),

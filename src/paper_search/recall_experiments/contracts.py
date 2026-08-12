@@ -196,4 +196,7 @@ def _scan_identifier_payload(value: object, *, path: tuple[str, ...]) -> None:
 
 
 def _is_seed_candidate_path(path: tuple[str, ...]) -> bool:
-    return len(path) >= 2 and path[0] == "seed_candidates"
+    return path[:1] == ("seed_candidates",) and (
+        (len(path) == 3 and path[2] == "seed_canonical_id")
+        or (len(path) >= 4 and path[2] == "paper")
+    )

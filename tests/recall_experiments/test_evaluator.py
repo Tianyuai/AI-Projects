@@ -291,6 +291,31 @@ def test_regenerated_retention_uses_gold_associations_not_candidate_overlap() ->
     assert [attempt.historical_gold_retention for attempt in comparison.attempts] == [0.5, 0.5, 0.5]
 
 
+def test_regenerated_gold_tolerance_compares_hits_not_denominator() -> None:
+    evaluator = CandidateRecallEvaluator()
+    historical = evaluator.evaluate(
+        _dataset(),
+        [_pool("q-one", "doi:10.1000/one"), _pool("q-two", "doi:10.1000/two")],
+    )
+    current = historical.model_copy(update={"gold_hit_count": historical.gold_hit_count + 2})
+
+    comparison = compare_regenerated(
+        [
+            RecallAttempt(
+                attempt_id=f"attempt-{ordinal:02d}",
+                valid_repeat_ordinal=ordinal,
+                result=current,
+            )
+            for ordinal in range(1, 4)
+        ],
+        HistoricalReplayEvidence.from_repeat(historical),
+        "production-dedup-v1",
+    )
+
+    assert comparison.conclusion == "failed"
+    assert comparison.passing_repeat_count == 0
+
+
 def test_oracle_preflight_rejects_blind_overlap_and_missing_catalog_titles() -> None:
     recipe = {
         "method_id": "oracle-method",

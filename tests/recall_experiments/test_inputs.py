@@ -154,6 +154,26 @@ def test_formal_input_source_selects_explicit_ids_in_frozen_source_order(tmp_pat
     assert [seed.paper.canonical_id for seed in dataset.seed_candidates] == ["seed-two", "seed-one"]
 
 
+def test_formal_input_parses_the_same_verified_bytes_without_reopening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binding = _fixture_binding(tmp_path, query_ids=["q-first"])
+    import paper_search.recall_experiments.inputs.formal_run as formal_run
+
+    monkeypatch.setattr(
+        formal_run,
+        "read_jsonl",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("verified input was reopened by path")
+        ),
+        raising=False,
+    )
+
+    dataset = FormalRunInputSource(tmp_path).load_queries(binding)
+
+    assert [query.query_id for query in dataset.queries] == ["q-first"]
+
+
 def test_formal_input_source_fails_closed_for_hash_drift_and_missing_configured_id(
     tmp_path: Path,
 ) -> None:

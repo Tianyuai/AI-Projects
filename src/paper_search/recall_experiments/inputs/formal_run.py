@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import TypeVar
 
-from paper_search.domain.models import Sha256
+from paper_search.domain.models import DomainModel, Sha256
 from paper_search.evaluation.business_results import BusinessResultRecord
-from paper_search.evaluation.dataset import EvaluationQuery, read_jsonl
+from paper_search.evaluation.dataset import EvaluationQuery
 from paper_search.evaluation.execution_adapter import EvaluationExecutionRecord
 from paper_search.recall_experiments.inputs.base import (
     FrozenRecallDataset,
@@ -39,11 +40,7 @@ class FormalRunInputSource:
         }
         for index, paper_source in enumerate(binding.bound_paper_sources):
             self._read_bound_bytes(paper_source, f"bound_paper_source_{index}")
-        gold_records = read_jsonl(
-            self._path(binding.gold_associations.path), EvaluationQuery
-        )
-        if gold_bytes != self._path(binding.gold_associations.path).read_bytes():
-            raise ValueError("gold_associations changed while loading")
+        gold_records = _parse_jsonl_bytes(gold_bytes, EvaluationQuery)
         selected = _select_source_order(gold_records, sample_binding.query_ids)
         return FrozenRecallDataset(
             queries=selected,
@@ -63,15 +60,17 @@ class FormalRunInputSource:
     def load_historical_baseline(
         self, binding: HistoricalBaselineBinding
     ) -> HistoricalRecallBaseline:
-        gold_records = read_jsonl(
-            self._verified_path(binding.gold_associations, "gold_associations"), EvaluationQuery
+        gold_records = _parse_jsonl_bytes(
+            self._read_bound_bytes(binding.gold_associations, "gold_associations"), EvaluationQuery
         )
         selected = _select_source_order(gold_records, binding.query_ids)
-        business_results = read_jsonl(
-            self._verified_path(binding.business_results, "business_results"), BusinessResultRecord
+        business_results = _parse_jsonl_bytes(
+            self._read_bound_bytes(binding.business_results, "business_results"),
+            BusinessResultRecord,
         )
-        executions = read_jsonl(
-            self._verified_path(binding.executions, "executions"), EvaluationExecutionRecord
+        executions = _parse_jsonl_bytes(
+            self._read_bound_bytes(binding.executions, "executions"),
+            EvaluationExecutionRecord,
         )
         expected_ids = [record.query_id for record in selected]
         if [record.query_id for record in business_results] != expected_ids:
@@ -98,10 +97,6 @@ class FormalRunInputSource:
             raise ValueError(f"{label} hash mismatch")
         return content
 
-    def _verified_path(self, binding: ArtifactBinding, label: str) -> Path:
-        self._read_bound_bytes(binding, label)
-        return self._path(binding.path)
-
     def _path(self, relative_path: str) -> Path:
         path = (self._workspace_root / relative_path).resolve(strict=True)
         if not path.is_relative_to(self._workspace_root):
@@ -123,3 +118,10 @@ def _select_source_order(
 
 def _sha256(content: bytes) -> Sha256:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
+
+
+_RecordT = TypeVar("_RecordT", bound=DomainModel)
+
+
+def _parse_jsonl_bytes(content: bytes, model: type[_RecordT]) -> list[_RecordT]:
+    return [model.model_validate_json(line) for line in content.splitlines() if line.strip()]

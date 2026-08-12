@@ -51,7 +51,7 @@ class CitationExpandHandler:
             action_id=action.action_id,
             seed=seed,
             direction=action.payload.direction,
-            limit=action.payload.limit,
+            limit=min(action.payload.limit, context.max_results_per_action),
         )
         return RetrievalActionResult(
             action_id=action.action_id,

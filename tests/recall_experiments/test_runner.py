@@ -15,6 +15,7 @@ from paper_search.recall_experiments.contracts import (
 )
 from paper_search.recall_experiments.generation.base import GenerationResult
 from paper_search.recall_experiments.generation.fixed import FixedActionGenerator
+from paper_search.recall_experiments.generation.deepseek import RecallGenerationFailure
 from paper_search.recall_experiments.generation.manual import ManualActionGenerator
 from paper_search.recall_experiments.runner import (
     RecallExperimentAttempt,
@@ -323,3 +324,53 @@ def test_attempt_model_rejects_out_of_range_repeat_ordinals(ordinal: int) -> Non
             attempt_status="succeeded",
             valid_repeat_ordinal=ordinal,
         )
+
+
+def test_generation_failure_is_recorded_and_later_attempts_continue() -> None:
+    events: list[str] = []
+
+    class FailOnceGenerator(_Generator):
+        calls = 0
+
+        async def generate(self, context: RecallGenerationContext) -> GenerationResult:
+            self.calls += 1
+            if self.calls == 1:
+                raise RecallGenerationFailure("generation_failure", [])
+            return await super().generate(context)
+
+    class RecordingWriter(_Writer):
+        def __init__(self, captured_events: list[str]) -> None:
+            super().__init__(captured_events)
+            self.generation_failures: list[dict[str, object]] = []
+            self.report: dict[str, object] | None = None
+
+        def write_generation(self, *args: object, **kwargs: object) -> None:
+            if kwargs["attempt_status"] == "failed":
+                self.generation_failures.append(dict(args[2]))
+
+        def write_report(self, report: dict[str, object]) -> None:
+            self.report = report
+
+    writer = RecordingWriter(events)
+    runner = RecallExperimentRunner(
+        input_source=_InputSource(events),
+        generator=FailOnceGenerator(events),
+        registry=_Registry(events, _Handler()),
+        pool_builder=_PoolBuilder(events),
+        stages=_Stages(events),
+        evaluator=_Evaluator(events, _context()),
+        writer=writer,
+    )
+    request = RecallExperimentRequest(
+        **{**_request().__dict__, "max_repeat_attempts": 2}
+    )
+
+    result = asyncio.run(runner.run(request))
+
+    assert [(attempt.attempt_id, attempt.attempt_status) for attempt in result.attempts] == [
+        ("attempt-01", "generation_failure"),
+        ("attempt-02", "succeeded"),
+    ]
+    assert writer.generation_failures == [{"failure_code": "generation_failure", "errors": []}]
+    assert writer.report is not None
+    assert writer.report["attempts"][0]["failure_code"] == "generation_failure"

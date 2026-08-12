@@ -194,10 +194,13 @@ def _snapshot_response_path(manifest_path: Path, workspace_root: Path, value: ob
     return response_path
 
 
-def frozen_request_identities(manifest_path: Path, *, workspace_root: Path) -> list[str]:
+def frozen_request_identities(
+    manifest_path: Path, *, workspace_root: Path, manifest_bytes: bytes | None = None
+) -> list[str]:
     """Verify every response named by a snapshot manifest and return its request identities."""
     manifest = _require_mapping(
-        json.loads(manifest_path.read_text(encoding="utf-8")), str(manifest_path)
+        json.loads((manifest_bytes if manifest_bytes is not None else manifest_path.read_bytes())),
+        str(manifest_path),
     )
     entries = _require_list(manifest.get("entries"), "snapshot manifest entries")
     request_identities: set[str] = set()
@@ -388,10 +391,7 @@ def build_inventory(config_root: Path, *, workspace_root: Path | None = None) ->
         decisions.append("core_framework_ready")
     else:
         decisions.append("core_framework_blocked")
-    if len(exact_methods) >= 2 and {method["action_family"] for method in exact_methods} >= {
-        "text_search",
-        "title_search",
-    }:
+    if _has_overall_compatibility(exact_methods):
         decisions.append("overall_compatibility_ready")
     oracle_catalog_ready = all(item["all_gold_have_titles"] for item in coverage)
     if not oracle_catalog_ready:
@@ -416,6 +416,13 @@ def build_inventory(config_root: Path, *, workspace_root: Path | None = None) ->
         },
         "continuation_decisions": decisions,
     }
+
+
+def _has_overall_compatibility(methods: list[dict[str, Any]]) -> bool:
+    families = {method.get("action_family") for method in methods}
+    return len(methods) >= 2 and "text_search" in families and bool(
+        families.intersection({"title_search", "citation_expand"})
+    )
 
 
 def main(argv: list[str] | None = None) -> int:

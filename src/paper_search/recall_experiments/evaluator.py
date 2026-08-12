@@ -360,7 +360,7 @@ def compare_regenerated(
             / len(historical_associations)
         )
         passes = (
-            abs(attempt.result.gold_association_count - evidence.gold_association_count) <= 1
+            abs(attempt.result.gold_hit_count - evidence.gold_hit_count) <= 1
             and abs(attempt.result.macro_candidate_recall - evidence.macro_candidate_recall) <= 0.02
             and retention >= 0.90
         )

@@ -13,6 +13,7 @@ from paper_search.recall_experiments.contracts import (
     RetrievalExecutionContext,
 )
 from paper_search.recall_experiments.generation.base import GenerationResult, QueryGenerator
+from paper_search.recall_experiments.generation.deepseek import RecallGenerationFailure
 from paper_search.recall_experiments.validation import validate_action_batch
 
 
@@ -72,6 +73,7 @@ class RecallExperimentRequest:
     repeat_count: int
     max_repeat_attempts: int | None = None
     provider_filters: Mapping[str, object] = field(default_factory=dict)
+    execution_identity: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.repeat_count < 1:
@@ -94,6 +96,8 @@ class RecallExperimentAttempt:
     attempt_status: str
     valid_repeat_ordinal: int | None
     result: object | None = None
+    failure_code: str | None = None
+    generation_provenance: tuple[Mapping[str, object], ...] = ()
 
     def __post_init__(self) -> None:
         if self.valid_repeat_ordinal is not None and (
@@ -151,15 +155,17 @@ class RecallExperimentRunner:
             if valid_repeat_ordinal == request.repeat_count:
                 break
             attempt_id = f"attempt-{ordinal:02d}"
-            pools, failed = await self._run_attempt(
+            pools, failure_code, generation_provenance = await self._run_attempt(
                 attempt_id, contexts, request, valid_repeat_ordinal + 1
             )
-            if failed:
+            if failure_code is not None:
                 attempts.append(
                     RecallExperimentAttempt(
                         attempt_id=attempt_id,
-                        attempt_status="failed",
+                        attempt_status=failure_code,
                         valid_repeat_ordinal=None,
+                        failure_code=failure_code,
+                        generation_provenance=tuple(generation_provenance),
                     )
                 )
                 continue
@@ -172,12 +178,13 @@ class RecallExperimentRunner:
                     attempt_status="succeeded",
                     valid_repeat_ordinal=valid_repeat_ordinal,
                     result=result,
+                    generation_provenance=tuple(generation_provenance),
                 )
             )
 
         completed = RecallExperimentResult(run_id=request.run_id, attempts=tuple(attempts))
         self._event("write-report")
-        self._writer.write_report(_report_payload(completed))
+        self._writer.write_report(_report_payload(completed, request.execution_identity))
         return completed
 
     async def _run_attempt(
@@ -186,13 +193,35 @@ class RecallExperimentRunner:
         contexts: Sequence[RecallGenerationContext],
         request: RecallExperimentRequest,
         valid_repeat_ordinal: int,
-    ) -> tuple[list[CandidatePool], bool]:
+    ) -> tuple[list[CandidatePool], str | None, list[Mapping[str, object]]]:
         pools: list[CandidatePool] = []
+        generation_provenance: list[Mapping[str, object]] = []
         for context in contexts:
             self._event("build-generation-context")
-            generation = await self._generator.generate(context)
+            try:
+                generation = await self._generator.generate(context)
+            except RecallGenerationFailure as failure:
+                self._event("generate-and-validate")
+                self._event("write-generation")
+                self._writer.write_generation(
+                    attempt_id,
+                    context.query_id,
+                    {
+                        "failure_code": failure.code,
+                        "errors": [_payload(error) for error in failure.errors],
+                    },
+                    attempt_status="failed",
+                    valid_repeat_ordinal=None,
+                )
+                generation_provenance.append(
+                    {"query_id": context.query_id, "failure_code": failure.code}
+                )
+                return pools, failure.code, generation_provenance
             self._event("generate-and-validate")
             _validate_generation(generation, context, request)
+            generation_provenance.append(
+                {"query_id": context.query_id, **generation.provenance}
+            )
             self._event("write-generation")
             self._writer.write_generation(
                 attempt_id,
@@ -228,7 +257,8 @@ class RecallExperimentRunner:
                 errors=[_payload(error) for result in action_results for error in result.errors],
             )
             if infrastructure_failure:
-                return pools, True
+                failure_code = _retrieval_failure_code(action_results)
+                return pools, failure_code, generation_provenance
 
             self._event("build-candidate-pool")
             pool = self._pool_builder.build(context.query_id, action_results)
@@ -243,7 +273,7 @@ class RecallExperimentRunner:
                 valid_repeat_ordinal=valid_repeat_ordinal,
             )
             pools.append(pool)
-        return pools, False
+        return pools, None, generation_provenance
 
     def _event(self, name: str) -> None:
         if self._event_sink is not None:
@@ -300,19 +330,32 @@ def _payload(value: object) -> object:
     return value
 
 
-def _report_payload(result: RecallExperimentResult) -> dict[str, object]:
+def _report_payload(
+    result: RecallExperimentResult, execution_identity: Mapping[str, object]
+) -> dict[str, object]:
     return {
+        "schema_version": "candidate-recall-report-v1",
         "run_id": result.run_id,
+        "execution_identity": dict(execution_identity),
         "attempts": [
             {
                 "attempt_id": attempt.attempt_id,
                 "attempt_status": attempt.attempt_status,
                 "valid_repeat_ordinal": attempt.valid_repeat_ordinal,
                 "result": _payload(attempt.result),
+                "failure_code": attempt.failure_code,
+                "generation_provenance": [dict(item) for item in attempt.generation_provenance],
             }
             for attempt in result.attempts
         ],
     }
+
+
+def _retrieval_failure_code(results: Sequence[RetrievalActionResult]) -> str:
+    codes = [error.code for result in results for error in result.errors]
+    if codes and all(code == "snapshot_unavailable" for code in codes):
+        return "snapshot_unavailable"
+    return "retrieval_infrastructure_failure"
 
 
 __all__ = [

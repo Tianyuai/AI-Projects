@@ -481,6 +481,27 @@ def test_seed_prose_can_mention_openalex_without_an_identifier() -> None:
     assert payload["seed_candidates"][0]["title"] == "OpenAlex coverage study"
 
 
+def test_citation_seed_id_is_exposed_for_a_valid_generated_action() -> None:
+    context = _context("query-1").model_copy(
+        update={
+            "seed_candidates": [
+                SeedCandidate(
+                    paper=Paper(
+                        canonical_id="seed-1",
+                        title="Frozen citation seed",
+                        sources=["semantic_scholar"],
+                    )
+                )
+            ]
+        }
+    )
+    payload = build_generation_payload(
+        context, visibility="blind", allowed_actions={"citation_expand"}, max_actions=1
+    )
+
+    assert payload["seed_candidates"][0]["seed_canonical_id"] == "seed-1"
+
+
 def test_second_invalid_output_is_a_generation_failure() -> None:
     backend = _RecordingLLMBackend(
         [_backend_result({"actions": [{}]}), _backend_result({"actions": [{}]})]

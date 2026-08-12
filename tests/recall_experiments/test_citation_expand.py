@@ -118,6 +118,25 @@ def test_citation_expand_delegates_the_selected_frozen_seed_direction_and_limit(
     }
 
 
+def test_citation_expand_clamps_action_limit_to_recipe_execution_limit() -> None:
+    backend = FakeCitationBackend(BackendCitationResult(direction="references"))
+    handler = CitationExpandHandler(backend=backend)
+    context = _context(_seed())
+    action = _action(seed_id=context.seed_candidates[0].paper.canonical_id).model_copy(
+        update={
+            "payload": CitationExpandPayload(
+                seed_canonical_id=context.seed_candidates[0].paper.canonical_id,
+                direction="references",
+                limit=99,
+            )
+        }
+    )
+
+    asyncio.run(handler.execute(action, context))
+
+    assert backend.calls[0][3] == context.max_results_per_action
+
+
 def test_citation_expand_rejects_an_unknown_non_frozen_seed_without_calling_the_backend() -> None:
     backend = FakeCitationBackend(BackendCitationResult(direction="references"))
     handler = CitationExpandHandler(backend=backend)

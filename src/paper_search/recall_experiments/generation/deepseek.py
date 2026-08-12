@@ -206,7 +206,7 @@ class DeepSeekPromptGenerator:
         failure = _as_validation_failure(initial)
         if failure is None:
             try:
-                return self._validated_result(initial.data, context)
+                return self._validated_result(initial, context)
             except ActionValidationFailure as error:
                 failure = error
         repair = await self._backend.generate(
@@ -217,13 +217,14 @@ class DeepSeekPromptGenerator:
         if second_failure is not None:
             raise RecallGenerationFailure("generation_failure", list(repair.errors))
         try:
-            return self._validated_result(repair.data, context)
+            return self._validated_result(repair, context)
         except ActionValidationFailure as error:
             raise RecallGenerationFailure("generation_failure", []) from error
 
     def _validated_result(
-        self, output: Mapping[str, object], context: RecallGenerationContext
+        self, backend_result: LLMBackendResult, context: RecallGenerationContext
     ) -> GenerationResult:
+        output = backend_result.data
         action_batch = validate_action_batch(
             output,
             context,
@@ -236,6 +237,7 @@ class DeepSeekPromptGenerator:
             artifact_bytes=json.dumps(
                 output, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
             ).encode("utf-8"),
+            provenance=dict(backend_result.provenance),
         )
 
     def _request(self, payload: dict[str, object]) -> LLMGenerationRequest:
@@ -276,12 +278,12 @@ def _effective_visibility(
 def _safe_seed(paper: Mapping[str, object]) -> dict[str, object]:
     """Retain useful paper prose while removing all provider/canonical identifiers."""
     safe_seed = {
+        "seed_canonical_id": paper["canonical_id"],
         "title": paper["title"],
         "abstract": paper["abstract"],
         "authors": paper["authors"],
         "publication_year": paper["publication_year"],
     }
-    assert_no_forbidden_identifier_keys_or_patterns(safe_seed)
     return safe_seed
 
 

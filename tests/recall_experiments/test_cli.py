@@ -15,6 +15,7 @@ from paper_search.domain.models import Paper
 from paper_search.recall_experiments.composition import (
     RecallRuntime,
     RecallTerminalError,
+    compare_recall_artifacts,
     run_recall_experiment,
 )
 from paper_search.recall_experiments.generation.backends import LLMBackendResult
@@ -251,6 +252,39 @@ def test_compare_writes_truthful_result_from_explicit_run_artifacts(
     assert json.loads((tmp_path / "comparison" / "recall-comparison.json").read_text()) == payload
 
 
+def test_compare_rejects_execution_identity_mismatch(tmp_path: Path) -> None:
+    result = {
+        "candidate_pool_policy_version": "production-dedup-v1",
+        "gold_association_count": 1,
+        "gold_hit_count": 1,
+        "macro_candidate_recall": 1.0,
+        "per_query": [],
+    }
+    for name, recipe_sha in (("current", "a"), ("historical", "b")):
+        path = tmp_path / name
+        path.mkdir()
+        (path / "recall-report.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "candidate-recall-report-v1",
+                    "execution_identity": {
+                        "recipe_sha256": "sha256:" + recipe_sha * 64,
+                        "sample_sha256": "sha256:" + "c" * 64,
+                    },
+                    "attempts": [{"attempt_status": "succeeded", "result": result}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    with pytest.raises(RecallTerminalError, match="config_mismatch"):
+        compare_recall_artifacts(
+            current_run=tmp_path / "current",
+            historical_run=tmp_path / "historical",
+            output_path=tmp_path / "comparison",
+        )
+
+
 def test_authorized_live_run_uses_injected_runtime_without_constructing_client(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -268,10 +302,52 @@ def test_authorized_live_run_uses_injected_runtime_without_constructing_client(
             return LLMBackendResult()
 
     runtime = FakeRuntime()
-    injected = RecallRuntime(runtime, runtime, runtime)
+    injected = RecallRuntime(
+        runtime,
+        runtime,
+        runtime,
+        identity={
+            "backend_identity": "fake-live-v1",
+            "budget_policy_sha256": "sha256:" + "1" * 64,
+            "pricing_policy_sha256": "sha256:" + "2" * 64,
+        },
+    )
 
     assert main(["recall", "run", "--recipe", str(recipe), "--sample", str(sample), "--actions", str(actions), "--allow-live", "--out", str(tmp_path / "live")], recall_runtime_factory=lambda _recipe: injected) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "complete"
+
+
+def test_live_runtime_rejects_unbound_budget_or_pricing_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    recipe, sample, actions = _write_synthetic_inputs(tmp_path, backend="live_provider")
+
+    class FakeRuntime:
+        async def search(self, *_args: object, **_kwargs: object) -> BackendSearchResult:
+            return BackendSearchResult()
+
+        async def expand(self, *_args: object, **_kwargs: object) -> BackendCitationResult:
+            return BackendCitationResult(direction="references")
+
+        async def generate(self, *_args: object, **_kwargs: object) -> LLMBackendResult:
+            return LLMBackendResult()
+
+    runtime = FakeRuntime()
+    injected = RecallRuntime(runtime, runtime, runtime, identity={"backend_identity": "fake"})
+
+    with pytest.raises(RecallTerminalError, match="config_mismatch"):
+        run(
+            run_recall_experiment(
+                recipe_path=recipe,
+                sample_path=sample,
+                output_path=tmp_path / "live",
+                workspace_root=tmp_path,
+                actions_path=actions,
+                allow_live=True,
+                live_runtime_factory=lambda _recipe: injected,
+            )
+        )
 
 
 def test_fixed_actions_reject_command_line_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -337,3 +413,36 @@ def test_manifest_backed_novel_replay_has_no_live_fallback(
 
     assert main(["recall", "run", "--recipe", str(recipe), "--sample", str(sample), "--actions", str(actions), "--snapshot-manifest", str(manifest), "--out", str(tmp_path / "replay")]) == 2
     assert json.loads(capsys.readouterr().out)["error_code"] == "snapshot_unavailable"
+
+
+def test_replay_llm_budget_estimate_uses_only_manifest_bound_usage() -> None:
+    from paper_search.recall_experiments import composition
+
+    manifest = {
+        "schema_version": "dependency-snapshot-v2",
+        "snapshot_set_id": "sha256:" + "1" * 64,
+        "sealed_at": "2026-08-12T00:00:00Z",
+        "entries": [
+            {
+                "request": {"dependency": "llm"},
+                "usage": {
+                    "llm_calls": 1,
+                    "input_tokens": 123,
+                    "output_tokens": 45,
+                    "cost_cny": "0.12",
+                    "elapsed_ms": 900,
+                },
+            },
+            {"request": {"dependency": "openalex"}, "usage": {"cost_cny": "9.99"}},
+        ],
+    }
+
+    initial, repair = composition._llm_replay_estimates_from_manifest(
+        json.dumps(manifest).encode("utf-8")
+    )
+
+    assert initial == repair
+    assert initial.llm_calls == 1
+    assert initial.input_tokens == 123
+    assert initial.output_tokens == 45
+    assert str(initial.cost_cny) == "0.12"

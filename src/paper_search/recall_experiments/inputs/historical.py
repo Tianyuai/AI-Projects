@@ -10,13 +10,14 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
 
 import yaml
 
 from paper_search.domain.models import DomainModel, Paper
-from paper_search.evaluation.dataset import EvaluationQuery, read_jsonl
+from paper_search.evaluation.dataset import EvaluationQuery
 from paper_search.evaluation.query_evolution_probe import offline_provider_result
 from paper_search.recall_experiments.candidate_pool import CandidatePoolBuilder
 from paper_search.recall_experiments.contracts import RetrievalActionResult
@@ -87,6 +88,13 @@ _METHOD_IDS = frozenset(
         "citation-expansion",
     }
 )
+
+
+@dataclass(frozen=True)
+class _VerifiedSource:
+    path: Path
+    content: bytes
+    sha256: str
 def load_historical_replays(
     *, inventory_path: Path, config_root: Path, workspace_root: Path | None = None
 ) -> HistoricalReplaySet:
@@ -97,7 +105,7 @@ def load_historical_replays(
     bindings = _load_bindings(config_root, root)
     if set(inventory_methods) != _METHOD_IDS or set(bindings) != _METHOD_IDS:
         raise HistoricalReplayError("historical inventory must bind exactly the five candidate methods")
-    association_path, association_sha256 = _verified_denominator_binding(
+    association_source = _verified_denominator_binding(
         inventory, bindings.values(), root
     )
 
@@ -110,8 +118,7 @@ def load_historical_replays(
         normalized_source = _normalized_source(
             query_ids,
             sources,
-            association_path=association_path,
-            association_sha256=association_sha256,
+            association_source=association_source,
         )
         evidence_level = _evidence_level(record)
         candidate_pool_policy = _verified_candidate_pool_policy(record, binding)
@@ -189,7 +196,7 @@ def _load_bindings(config_root: Path, root: Path) -> dict[str, Mapping[str, obje
 
 def _verified_sources(
     record: Mapping[str, object], binding: Mapping[str, object], root: Path
-) -> dict[str, Path]:
+) -> dict[str, _VerifiedSource]:
     inventory_paths = _string_list(record.get("source_paths"), "inventory source_paths")
     inventory_hashes = _string_list(record.get("source_sha256"), "inventory source_sha256")
     binding_paths = _string_list(binding.get("source_paths"), "binding source_paths")
@@ -198,15 +205,16 @@ def _verified_sources(
         raise HistoricalReplayError("inventory hash mismatch: binding source record")
     if not inventory_paths or len(inventory_paths) != len(inventory_hashes):
         raise HistoricalReplayError("historical source paths and hashes are not aligned")
-    result: dict[str, Path] = {}
+    result: dict[str, _VerifiedSource] = {}
     for source_path, expected_hash in zip(inventory_paths, inventory_hashes, strict=True):
         path = _workspace_path(root, source_path)
         if not path.is_file():
             raise HistoricalReplayError("bound historical source is missing")
-        actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        content = path.read_bytes()
+        actual_hash = hashlib.sha256(content).hexdigest()
         if actual_hash != _hash_value(expected_hash):
             raise HistoricalReplayError(f"inventory hash mismatch: {source_path}")
-        result[source_path] = path
+        result[source_path] = _VerifiedSource(path=path, content=content, sha256=actual_hash)
     return result
 
 
@@ -214,7 +222,7 @@ def _verified_denominator_binding(
     inventory: Mapping[str, object],
     bindings: Iterable[Mapping[str, object]],
     root: Path,
-) -> tuple[Path, str]:
+) -> _VerifiedSource:
     catalog = _mapping(inventory.get("gold_catalog"), "Task 0 gold catalog")
     inventory_association = _association_binding(
         catalog.get("association_source"), "Task 0 Gold association binding"
@@ -229,9 +237,12 @@ def _verified_denominator_binding(
             )
     path_value, sha256 = inventory_association
     path = _workspace_path(root, path_value)
-    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != sha256:
+    if not path.is_file():
         raise HistoricalReplayError("Task 0 Gold association binding hash mismatch")
-    return path, sha256
+    content = path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != sha256:
+        raise HistoricalReplayError("Task 0 Gold association binding hash mismatch")
+    return _VerifiedSource(path=path, content=content, sha256=sha256)
 
 
 def _association_binding(value: object, label: str) -> tuple[str, str]:
@@ -245,23 +256,24 @@ def _association_binding(value: object, label: str) -> tuple[str, str]:
 
 def _normalized_source(
     query_ids: list[str],
-    sources: Mapping[str, Path],
+    sources: Mapping[str, _VerifiedSource],
     *,
-    association_path: Path,
-    association_sha256: str,
+    association_source: _VerifiedSource,
 ) -> HistoricalNormalizedSource:
-    association_bytes = association_path.read_bytes()
-    if hashlib.sha256(association_bytes).hexdigest() != association_sha256:
-        raise HistoricalReplayError("historical Gold association hash mismatch")
-    all_queries = read_jsonl(association_path, EvaluationQuery)
+    association_bytes = association_source.content
+    all_queries = [
+        EvaluationQuery.model_validate_json(line)
+        for line in association_bytes.splitlines()
+        if line.strip()
+    ]
     by_id = {query.query_id: query for query in all_queries}
     if any(query_id not in by_id for query_id in query_ids):
         raise HistoricalReplayError("historical source includes a query absent from Gold associations")
     selected = [by_id[query_id] for query_id in query_ids]
     source_hashes = {
         **{
-            f"historical_source_{index}": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
-            for index, path in enumerate(sources.values())
+            f"historical_source_{index}": "sha256:" + source.sha256
+            for index, source in enumerate(sources.values())
         },
         "gold_associations": "sha256:" + hashlib.sha256(association_bytes).hexdigest(),
     }
@@ -277,15 +289,15 @@ def _normalized_source(
 def _query_evolution_replay(
     *,
     record: Mapping[str, object],
-    sources: Mapping[str, Path],
+    sources: Mapping[str, _VerifiedSource],
     normalized_source: HistoricalNormalizedSource,
     evidence_level: Literal["exact", "aggregate_only", "insufficient", "not_comparable"],
     metric_report: Mapping[str, object],
     candidate_pool_policy: str,
     provider_responses_available: bool,
 ) -> HistoricalMethodReplay:
-    outcomes_path = _source_with_name(sources, "outcomes.jsonl")
-    outcomes = [_mapping(json.loads(line), "query-evolution outcome") for line in outcomes_path.read_text(encoding="utf-8").splitlines() if line]
+    outcomes_source = _source_with_name(sources, "outcomes.jsonl")
+    outcomes = [_mapping(json.loads(line), "query-evolution outcome") for line in outcomes_source.content.splitlines() if line]
     outcome_by_id = {_required_string(item, "query_id"): item for item in outcomes}
     query_ids = [query.query_id for query in normalized_source.queries]
     if set(outcome_by_id) != set(query_ids):
@@ -328,7 +340,7 @@ def _query_evolution_replay(
         actions[query_id] = {"actions": action_rows}
         pool = CandidatePoolBuilder(candidate_pool_policy).build(query_id, results)
         pools[query_id] = tuple(entry.paper.canonical_id for entry in pool.entries)
-    lock = _load_json(_source_with_name(sources, "probe.lock.json"))
+    lock = _load_json_source(_source_with_name(sources, "probe.lock.json"))
     return HistoricalMethodReplay(
         method_id="query-evolution",
         source_run_id=_required_string(lock, "source_run_id"),
@@ -362,14 +374,14 @@ def _aggregate_replay(
     *,
     method_id: str,
     record: Mapping[str, object],
-    sources: Mapping[str, Path],
+    sources: Mapping[str, _VerifiedSource],
     normalized_source: HistoricalNormalizedSource,
     evidence_level: Literal["exact", "aggregate_only", "insufficient", "not_comparable"],
     metric_report: Mapping[str, object],
     candidate_pool_policy: str,
     provider_responses_available: bool,
 ) -> HistoricalMethodReplay:
-    report = _load_json(next(iter(sources.values())))
+    report = _load_json_source(next(iter(sources.values())))
     terminal: HistoricalTerminalState = (
         "insufficient_historical_evidence"
         if evidence_level == "insufficient"
@@ -418,7 +430,7 @@ def _query_evolution_metrics(report: Mapping[str, object]) -> dict[str, object]:
 
 
 def _metric_report(
-    record: Mapping[str, object], sources: Mapping[str, Path]
+    record: Mapping[str, object], sources: Mapping[str, _VerifiedSource]
 ) -> Mapping[str, object]:
     evidence = _mapping(record.get("metric_evidence"), "Task 0 metric evidence")
     path = evidence.get("path")
@@ -426,7 +438,7 @@ def _metric_report(
         raise HistoricalReplayError("Task 0 metric evidence is unavailable")
     if path not in sources:
         raise HistoricalReplayError("Task 0 metric evidence path is not a bound historical source")
-    return _load_json(sources[path])
+    return _load_json_source(sources[path])
 
 
 def _verified_candidate_pool_policy(
@@ -442,7 +454,7 @@ def _verified_candidate_pool_policy(
 
 
 def _verified_provider_response_evidence(
-    record: Mapping[str, object], sources: Mapping[str, Path], root: Path
+    record: Mapping[str, object], sources: Mapping[str, _VerifiedSource], root: Path
 ) -> bool:
     evidence = _mapping(record.get("provider_response_evidence"), "provider response evidence")
     if evidence.get("available") is False:
@@ -453,7 +465,10 @@ def _verified_provider_response_evidence(
     if path not in sources:
         raise HistoricalReplayError("provider response evidence path is not a bound historical source")
     try:
-        frozen_request_identities(sources[path], workspace_root=root)
+        source = sources[path]
+        frozen_request_identities(
+            source.path, workspace_root=root, manifest_bytes=source.content
+        )
     except InventoryError as error:
         raise HistoricalReplayError(str(error)) from error
     return True
@@ -483,21 +498,23 @@ def _evidence_level(record: Mapping[str, object]) -> Literal["exact", "aggregate
     return cast(Literal["exact", "aggregate_only", "insufficient", "not_comparable"], value)
 
 
-def _source_hashes(sources: Mapping[str, Path]) -> dict[str, str]:
-    return {path: "sha256:" + hashlib.sha256(source.read_bytes()).hexdigest() for path, source in sources.items()}
+def _source_hashes(sources: Mapping[str, _VerifiedSource]) -> dict[str, str]:
+    return {path: "sha256:" + source.sha256 for path, source in sources.items()}
 
 
-def _source_with_name(sources: Mapping[str, Path], name: str) -> Path:
-    matches = [path for path_text, path in sources.items() if path_text.endswith(name)]
+def _source_with_name(
+    sources: Mapping[str, _VerifiedSource], name: str
+) -> _VerifiedSource:
+    matches = [source for path_text, source in sources.items() if path_text.endswith(name)]
     if len(matches) != 1:
         raise HistoricalReplayError(f"historical source does not bind exactly one {name}")
     return matches[0]
 
 
-def _load_json(path: Path) -> Mapping[str, object]:
+def _load_json_source(source: _VerifiedSource) -> Mapping[str, object]:
     try:
-        return _mapping(json.loads(path.read_text(encoding="utf-8")), str(path))
-    except (OSError, json.JSONDecodeError) as error:
+        return _mapping(json.loads(source.content), str(source.path))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise HistoricalReplayError("historical JSON source is unreadable") from error
 
 

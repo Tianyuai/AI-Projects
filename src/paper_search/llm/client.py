@@ -7,6 +7,7 @@ import json
 import re
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
@@ -121,6 +122,33 @@ def _normalized_transport_endpoint(base_url: str) -> tuple[str, str]:
             raise ValueError("LLM base_url hostname is not approved")
         provider = "openai_compatible"
     return f"https://{hostname}{path}/chat/completions", provider
+
+
+@dataclass(frozen=True, slots=True)
+class _LLMTransportConfig:
+    descriptor: LiveProviderDescriptor
+
+    @property
+    def endpoint(self) -> str:
+        return self.descriptor.endpoints[0]
+
+    @property
+    def provider(self) -> str:
+        return self.descriptor.provider
+
+    @property
+    def model(self) -> str:
+        model = self.descriptor.model
+        if model is None:
+            raise ValueError("LLM transport model is missing")
+        return model
+
+    def canonical_bytes(self) -> bytes:
+        return json.dumps(
+            self.descriptor.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
 
 def usage_from_response_bytes(response_bytes: bytes) -> UsageActual:
@@ -302,28 +330,35 @@ class OpenAICompatibleLLMClient:
             raise ValueError("LLM model and API key must not be empty")
         transport_endpoint, provider = _normalized_transport_endpoint(base_url)
         self._client = client
-        self._transport_endpoint = transport_endpoint
-        self._dashscope_compatible = provider == "dashscope"
-        self._deepseek_compatible = provider == "deepseek"
-        self._model = validate_model_id(model)
+        self._transport_config = _LLMTransportConfig(
+            descriptor=LiveProviderDescriptor(
+                identity_schema_version="live-provider-descriptor-v1",
+                provider=provider,
+                dependency="llm",
+                adapter="openai-compatible-json",
+                version="openai-compatible-client-v1",
+                model=validate_model_id(model),
+                endpoints=(transport_endpoint,),
+                operations=("generate_json",),
+            )
+        )
+        self._transport_config_sha256 = _hash(
+            self._transport_config.canonical_bytes()
+        )
         self._api_key = api_key
         self._prompt_version = validate_prompt_version(prompt_version)
         self._clock = clock
         self._decoder = LLMResponseDecoder(prompt_version=prompt_version)
-        self._live_provider_descriptor = LiveProviderDescriptor(
-            identity_schema_version="live-provider-descriptor-v1",
-            provider=provider,
-            dependency="llm",
-            adapter="openai-compatible-json",
-            version="openai-compatible-client-v1",
-            model=self._model,
-            endpoints=(self._transport_endpoint,),
-            operations=("generate_json",),
-        )
+
+    def _validated_transport_config(self) -> _LLMTransportConfig:
+        config = self._transport_config
+        if _hash(config.canonical_bytes()) != self._transport_config_sha256:
+            raise ValueError("LLM transport configuration was modified")
+        return config
 
     @property
     def live_provider_descriptor(self) -> LiveProviderDescriptor:
-        return self._live_provider_descriptor
+        return self._validated_transport_config().descriptor
 
     @property
     def endpoint(self) -> str:
@@ -331,7 +366,7 @@ class OpenAICompatibleLLMClient:
 
     @property
     def model_id(self) -> str:
-        return self._model
+        return self._validated_transport_config().model
 
     @property
     def prompt_version(self) -> str:
@@ -344,8 +379,9 @@ class OpenAICompatibleLLMClient:
         payload: dict[str, object],
         prompt_instructions: str | None = None,
     ) -> dict[str, object]:
+        config = self._validated_transport_config()
         request: dict[str, object] = {
-            "model": self._model,
+            "model": config.model,
             "messages": [
                 {
                     "role": "system",
@@ -367,9 +403,9 @@ class OpenAICompatibleLLMClient:
             "response_format": {"type": "json_object"},
             "temperature": 0,
         }
-        if self._dashscope_compatible:
+        if config.provider == "dashscope":
             request["enable_thinking"] = False
-        elif self._deepseek_compatible:
+        elif config.provider == "deepseek":
             request["thinking"] = {"type": "disabled"}
         return request
 
@@ -397,8 +433,9 @@ class OpenAICompatibleLLMClient:
         payload: dict[str, object],
         prompt_instructions: str | None = None,
     ) -> httpx.Response:
+        config = self._validated_transport_config()
         return await self._client.post(
-            self._transport_endpoint,
+            config.endpoint,
             headers={
                 "Authorization": f"Bearer {self._api_key}",
                 "Content-Type": "application/json",
@@ -436,7 +473,7 @@ class OpenAICompatibleLLMClient:
                 code="timeout",
                 message="LLM request timed out",
                 retryable=True,
-                model_id=self._model,
+                model_id=self.model_id,
                 prompt_version=self._prompt_version,
                 requested_at=requested_at,
                 latency_ms=elapsed_ms,
@@ -447,7 +484,7 @@ class OpenAICompatibleLLMClient:
                 code="network_error",
                 message="LLM network request failed",
                 retryable=True,
-                model_id=self._model,
+                model_id=self.model_id,
                 prompt_version=self._prompt_version,
                 requested_at=requested_at,
                 latency_ms=elapsed_ms,
@@ -460,7 +497,7 @@ class OpenAICompatibleLLMClient:
                 code="provider_error",
                 message=f"LLM provider returned HTTP {response.status_code}",
                 retryable=response.status_code == 429 or response.status_code >= 500,
-                model_id=self._model,
+                model_id=self.model_id,
                 prompt_version=self._prompt_version,
                 requested_at=requested_at,
                 response_bytes=response.content,
@@ -469,7 +506,7 @@ class OpenAICompatibleLLMClient:
             )
         decoded = self._decoder.decode(
             response.content,
-            model_id=self._model,
+            model_id=self.model_id,
             captured_at=requested_at,
             cache_hit=False,
             snapshot_ref=None,

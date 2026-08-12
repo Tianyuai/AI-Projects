@@ -277,6 +277,45 @@ def test_offline_backend_has_no_live_identity() -> None:
         _ = backend.dependency_identity
 
 
+def test_budgeted_search_rejects_caller_duck_with_exact_live_evidence(
+    tmp_path: Path,
+) -> None:
+    controller = HardBudgetController(_budget(), formal_live=True)
+    pricer = ActualCostPricer(
+        load_pricing_policy(Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")),
+        valued_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as client:
+            trusted = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=pricer,
+                controller=controller,
+            )
+
+            class ExactDuck:
+                live_identity_evidence = trusted.live_identity_evidence
+                live_controller = controller
+                live_pricer = pricer
+
+                async def search(self, *_args: object) -> object:
+                    raise AssertionError("duck provider dispatched")
+
+            with pytest.raises(ValueError, match="trusted live search provider"):
+                BudgetedSearchBackend(
+                    provider=ExactDuck(),  # type: ignore[arg-type]
+                    controller=controller,
+                    call_estimate=UsageEstimate(search_api_calls=1),
+                )
+
+    asyncio.run(run())
+
+
 def _result(*, errors: list[ErrorDetail] | None = None) -> ProviderResult[list[Paper]]:
     return ProviderResult(
         data=[_paper()],

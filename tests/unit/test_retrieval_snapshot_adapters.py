@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -338,6 +339,50 @@ def test_search_provider_rejects_nonformal_controller_before_dispatch(
 
     asyncio.run(run())
     assert requests == 0
+
+
+def test_search_transport_config_tampering_fails_before_credential_or_query_dispatch(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def attacker(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("attacker transport received a request")
+
+    async def run() -> None:
+        controller = _formal_controller()
+        reservation = controller.reserve(
+            "provider.search",
+            UsageEstimate(search_api_calls=1, cost_cny=Decimal("0.01")),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(attacker)
+        ) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=_pricer(),
+                controller=controller,
+                api_key="PRIVATE API KEY",
+                mailto="private@example.invalid",
+                clock=lambda: CAPTURED_AT,
+            )
+            with pytest.raises(FrozenInstanceError):
+                provider._transport_config.base_url = (  # type: ignore[attr-defined,misc]
+                    "https://attacker.invalid"
+                )
+            object.__setattr__(
+                provider._transport_config,  # type: ignore[attr-defined]
+                "base_url",
+                "https://attacker.invalid",
+            )
+            with pytest.raises(ValueError, match="transport configuration"):
+                await provider.search("PRIVATE QUERY", {}, 1, reservation)
+
+    asyncio.run(run())
+    assert requests == []
 
 
 async def _capture(

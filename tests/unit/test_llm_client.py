@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -148,6 +149,42 @@ def test_llm_client_structurally_normalizes_approved_deepseek_origin_and_path() 
             )
 
     asyncio.run(run())
+
+
+def test_llm_transport_config_tampering_fails_before_secret_or_prompt_dispatch() -> None:
+    requests: list[httpx.Request] = []
+
+    def attacker(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("attacker transport received a request")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(attacker)
+        ) as http_client:
+            client = OpenAICompatibleLLMClient(
+                client=http_client,
+                base_url="https://api.deepseek.com/v1",
+                model="deepseek-chat",
+                api_key="PRIVATE API KEY",
+            )
+            with pytest.raises(FrozenInstanceError):
+                client._transport_config.descriptor = (  # type: ignore[attr-defined,misc]
+                    client.live_provider_descriptor
+                )
+            object.__setattr__(
+                client._transport_config.descriptor,  # type: ignore[attr-defined]
+                "endpoints",
+                ("https://attacker.invalid/chat/completions",),
+            )
+            with pytest.raises(ValueError, match="transport configuration"):
+                await client.request_response(
+                    prompt_name="PRIVATE PROMPT",
+                    payload={"query": "PRIVATE QUERY"},
+                )
+
+    asyncio.run(run())
+    assert requests == []
 
 
 def test_generate_json_returns_data_usage_and_safe_provenance() -> None:

@@ -130,6 +130,24 @@ def test_execution_identity_requires_generator_and_live_runtime_llm_models_to_ma
         ExecutionIdentity.model_validate(payload)
 
 
+def test_execution_identity_allows_manual_live_retrieval_without_generator_model() -> None:
+    payload = _valid_execution_identity()
+    payload.update(
+        {
+            "retrieval_backend": "live_provider",
+            "snapshot_manifest_sha256": None,
+            "live_authorized": True,
+            "runtime": _live_runtime_identity(),
+        }
+    )
+
+    identity = ExecutionIdentity.model_validate(payload)
+
+    assert identity.generator_type == "manual_actions"
+    assert identity.generator_model is None
+    assert identity.runtime.dependencies["llm"].model == "deepseek-v4-flash"
+
+
 def _write_synthetic_inputs(tmp_path: Path, *, backend: str = "snapshot_replay") -> tuple[Path, Path, Path]:
     gold = b'{"query_id":"q-one","query":"synthetic query","relevant_paper_ids":["arxiv:2401.00001"]}\n'
     identifier_map = b'{"arxiv:2401.00001":"doi:10.1000/synthetic"}\n'
@@ -386,6 +404,70 @@ evaluation:
         )
     assert generator_calls == []
     assert provider_calls == []
+
+
+def test_authorized_manual_live_run_does_not_bind_an_unused_llm_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import paper_search.recall_experiments.composition as composition
+
+    monkeypatch.chdir(tmp_path)
+    recipe, sample, actions = _write_synthetic_inputs(
+        tmp_path, backend="live_provider"
+    )
+    provider_calls: list[str] = []
+
+    class FakeRuntime:
+        async def search(
+            self, *_args: object, **_kwargs: object
+        ) -> BackendSearchResult:
+            provider_calls.append("search")
+            return BackendSearchResult(
+                hits=[
+                    Paper(
+                        canonical_id="doi:10.1000/synthetic",
+                        title="Synthetic",
+                        sources=["openalex"],
+                    )
+                ]
+            )
+
+        async def expand(
+            self, *_args: object, **_kwargs: object
+        ) -> BackendCitationResult:
+            provider_calls.append("citation")
+            return BackendCitationResult(direction="references")
+
+        async def generate(
+            self, *_args: object, **_kwargs: object
+        ) -> LLMBackendResult:
+            provider_calls.append("llm")
+            return LLMBackendResult()
+
+    fake = FakeRuntime()
+    runtime = RecallRuntime(fake, fake, fake, identity=_live_runtime_identity())
+    monkeypatch.setattr(composition, "_valid_live_runtime_identity", lambda _: True)
+
+    output = tmp_path / "manual-live"
+    run(
+        run_recall_experiment(
+            recipe_path=recipe,
+            sample_path=sample,
+            output_path=output,
+            workspace_root=tmp_path,
+            actions_path=actions,
+            allow_live=True,
+            live_runtime_factory=lambda _recipe: runtime,
+        )
+    )
+
+    assert provider_calls == ["search"]
+    report = json.loads((output / "recall-report.json").read_bytes())
+    execution_identity = report["execution_identity"]
+    assert execution_identity["generator_type"] == "manual_actions"
+    assert execution_identity["generator_model"] is None
+    assert execution_identity["runtime"]["dependencies"]["llm"]["model"] == "deepseek-v4-flash"
 
 
 def test_manual_actions_prepare_and_validate_with_complete_synthetic_frozen_inputs(

@@ -29,6 +29,7 @@ from paper_search.domain.models import (
     Sha256,
 )
 from paper_search.live_identity import LiveDependencyEvidence
+from paper_search.llm.snapshot_adapters import LiveCaptureLLMAnalyzer
 from paper_search.recall_experiments.identity import (
     LiveDependencyIdentity,
     dependency_identity_from_evidence,
@@ -151,6 +152,8 @@ class BudgetedLLMBackend:
         self._live_pricer: ActualCostPricer | None = None
         evidence = getattr(analyzer, "live_identity_evidence", None)
         if evidence is not None:
+            if not isinstance(analyzer, LiveCaptureLLMAnalyzer):
+                raise ValueError("trusted live LLM analyzer required")
             if not isinstance(evidence, LiveDependencyEvidence):
                 raise ValueError("live identity evidence is invalid")
             if getattr(analyzer, "live_controller", None) is not controller:

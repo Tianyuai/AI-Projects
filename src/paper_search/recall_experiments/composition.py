@@ -737,7 +737,10 @@ def _validate_live_recipe_runtime_model(
         identity = LiveRuntimeIdentity.model_validate(runtime.identity)
     except ValueError as error:
         raise RecallTerminalError("config_mismatch") from error
-    if getattr(recipe.generator, "model", None) != identity.dependencies["llm"].model:
+    if (
+        isinstance(recipe.generator, DeepSeekPromptGeneratorRecipe)
+        and recipe.generator.model != identity.dependencies["llm"].model
+    ):
         raise RecallTerminalError("config_mismatch")
 
 

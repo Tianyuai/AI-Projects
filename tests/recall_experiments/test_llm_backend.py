@@ -246,6 +246,62 @@ def test_live_llm_backend_rejects_unadmitted_model_surface(tmp_path: Path) -> No
     asyncio.run(run())
 
 
+def test_live_llm_backend_rejects_caller_duck_with_exact_live_evidence(
+    tmp_path: Path,
+) -> None:
+    controller = HardBudgetController(_budget(), formal_live=True)
+    policy = load_pricing_policy(
+        Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")
+    ).model_copy(
+        update={
+            "rates": [
+                rate.model_copy(update={"model_or_adapter": "deepseek-v4-flash"})
+                if rate.dependency == "llm"
+                else rate
+                for rate in load_pricing_policy(
+                    Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")
+                ).rates
+            ]
+        }
+    )
+    pricer = ActualCostPricer(policy, valued_at=datetime(2026, 8, 1, tzinfo=UTC))
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as http_client:
+            trusted = LiveCaptureLLMAnalyzer(
+                client=OpenAICompatibleLLMClient(
+                    client=http_client,
+                    base_url="https://api.deepseek.com/v1",
+                    model="deepseek-v4-flash",
+                    api_key="private-key",
+                ),
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                pricer=pricer,
+                controller=controller,
+                prompt_artifact_sha256="sha256:" + "a" * 64,
+            )
+
+            class ExactDuck:
+                live_identity_evidence = trusted.live_identity_evidence
+                live_controller = controller
+                live_pricer = pricer
+
+                async def generate_json(self, **_kwargs: object) -> object:
+                    raise AssertionError("duck analyzer dispatched")
+
+            with pytest.raises(ValueError, match="trusted live LLM analyzer"):
+                BudgetedLLMBackend(
+                    analyzer=ExactDuck(),  # type: ignore[arg-type]
+                    controller=controller,
+                    initial_estimate=_estimate(),
+                    repair_estimate=_estimate(),
+                )
+
+    asyncio.run(run())
+
+
 def test_initial_and_repair_calls_receive_independent_terminal_reservations() -> None:
     controller = HardBudgetController(_budget())
     analyzer = _FakeAnalyzer([_result(), _result()])

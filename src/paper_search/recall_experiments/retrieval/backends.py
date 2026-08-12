@@ -46,6 +46,7 @@ from paper_search.recall_experiments.identity import (
     validate_scheme_b_dependency_identity,
 )
 from paper_search.retrieval.base import SearchProvider
+from paper_search.retrieval.snapshot_adapters import LiveCaptureSearchProvider
 
 
 _INFRASTRUCTURE_ERROR_CODES = frozenset(
@@ -179,6 +180,8 @@ class _BudgetedProviderCall:
         evidence = getattr(provider, "live_identity_evidence", None)
         if evidence is None:
             return
+        if not isinstance(provider, LiveCaptureSearchProvider):
+            raise ValueError("trusted live search provider required")
         if not isinstance(evidence, LiveDependencyEvidence):
             raise ValueError("live identity evidence is invalid")
         provider_controller = getattr(provider, "live_controller", None)

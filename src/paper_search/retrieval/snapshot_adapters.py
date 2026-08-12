@@ -99,6 +99,26 @@ _LIVE_DESCRIPTOR_SURFACES: dict[ProviderName, _LiveDescriptorSurface] = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class _SearchTransportConfig:
+    dependency: ProviderName
+    adapter: str
+    base_url: str
+    descriptor: LiveProviderDescriptor
+
+    def canonical_bytes(self) -> bytes:
+        return json.dumps(
+            {
+                "adapter": self.adapter,
+                "base_url": self.base_url,
+                "dependency": self.dependency,
+                "descriptor": self.descriptor.model_dump(mode="json"),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -390,7 +410,6 @@ class LiveCaptureSearchProvider:
     ) -> None:
         if controller.formal_live is not True:
             raise ValueError("live capture requires formal-live budget enforcement")
-        self._dependency = dependency
         self._client = client
         self._capture_store = capture_store
         self._pricer = pricer
@@ -405,17 +424,26 @@ class LiveCaptureSearchProvider:
         self._key_cursor = 0
         self._api_key = api_key
         self._mailto = mailto
-        self._adapter = adapter_version or _ADAPTERS[dependency]
+        adapter = adapter_version or _ADAPTERS[dependency]
         surface = _LIVE_DESCRIPTOR_SURFACES[dependency]
         descriptor = LiveProviderDescriptor(
             identity_schema_version="live-provider-descriptor-v1",
             provider=surface["provider"],
             dependency=dependency,
-            adapter=self._adapter,
+            adapter=adapter,
             version=surface["version"],
             model=surface["model"],
             endpoints=surface["endpoints"],
             operations=surface["operations"],
+        )
+        self._transport_config = _SearchTransportConfig(
+            dependency=dependency,
+            adapter=adapter,
+            base_url=_BASE_URLS[dependency],
+            descriptor=descriptor,
+        )
+        self._transport_config_sha256 = _sha256(
+            self._transport_config.canonical_bytes()
         )
         self._live_identity_evidence = LiveDependencyEvidence(
             identity_schema_version="live-dependency-evidence-v1",
@@ -430,7 +458,22 @@ class LiveCaptureSearchProvider:
 
     @property
     def live_identity_evidence(self) -> LiveDependencyEvidence:
+        self._validated_transport_config()
         return self._live_identity_evidence
+
+    def _validated_transport_config(self) -> _SearchTransportConfig:
+        config = self._transport_config
+        if _sha256(config.canonical_bytes()) != self._transport_config_sha256:
+            raise ValueError("search transport configuration was modified")
+        return config
+
+    @property
+    def _dependency(self) -> ProviderName:
+        return self._validated_transport_config().dependency
+
+    @property
+    def _adapter(self) -> str:
+        return self._validated_transport_config().adapter
 
     @property
     def live_pricer(self) -> ActualCostPricer:
@@ -520,7 +563,7 @@ class LiveCaptureSearchProvider:
                 async with asyncio.timeout(attempt_timeout):
                     response = await self._client.request(
                         method,
-                        f"{_BASE_URLS[self._dependency]}{endpoint}",
+                        f"{self._validated_transport_config().base_url}{endpoint}",
                         params=request_params,
                         json=body,
                         headers=headers,

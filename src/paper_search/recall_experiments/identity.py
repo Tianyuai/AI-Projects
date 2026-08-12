@@ -211,7 +211,10 @@ class ExecutionIdentity(DomainModel):
             or not isinstance(self.runtime, LiveRuntimeIdentity)
         ):
             raise ValueError("live retrieval requires authorized, snapshot-free live runtime")
-        elif self.generator_model != self.runtime.dependencies["llm"].model:
+        elif (
+            self.generator_type == "deepseek_prompt"
+            and self.generator_model != self.runtime.dependencies["llm"].model
+        ):
             raise ValueError("generator model must match the live runtime LLM model")
         return self
 

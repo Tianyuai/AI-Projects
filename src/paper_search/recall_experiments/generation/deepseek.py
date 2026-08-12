@@ -107,7 +107,24 @@ def render_recall_prompt(prompt: RecallPromptArtifact) -> str:
             "Use only action types supplied by allowed_action_schema.",
             "Supported action contracts include text_search, title_search, and citation_expand.",
             "The top-level object must contain only actions.",
+            "actions must be a JSON array of action objects.",
             "Each action requires action_id, action_type, strategy, and payload.",
+            "action_id must be a unique non-empty JSON string, never a number.",
+            "action_type must be a JSON string exactly equal to one supplied "
+            "allowed_action_types value.",
+            "strategy must be a non-empty JSON string.",
+            'text_search payload keys: exactly ["query_text"]; query_text must be a '
+            "non-empty JSON string of at most 300 characters.",
+            'title_search payload keys: exactly ["title_text"]; title_text must be a '
+            "non-empty JSON string of at most 300 characters.",
+            'citation_expand payload keys: exactly '
+            '["seed_canonical_id", "direction", "limit"].',
+            "seed_canonical_id must copy a supplied seed verbatim as a non-empty JSON string.",
+            'direction must be exactly "references", "citations", or "both".',
+            "limit must be a positive JSON integer, never a boolean.",
+            "Do not add any unlisted keys to an action or payload.",
+            "Do not add limit to text_search or title_search payloads; "
+            "the runner applies result limits.",
             "Do not return Markdown, URLs, prior hits, evaluation results, or identifiers except a supplied seed_canonical_id used verbatim by citation_expand.",
             *(f"- {instruction}" for instruction in prompt.instructions),
         ]
@@ -162,10 +179,60 @@ def build_repair_payload(failure: ActionValidationFailure) -> dict[str, object]:
     return {
         "previous_output": failure.previous_output,
         "validation_errors": [
-            {"code": issue.code, "field_path": issue.field_path} for issue in failure.issues
+            {
+                "code": issue.code,
+                "field_path": issue.field_path,
+                "message": issue.message,
+                "repair_instruction": _repair_instruction(issue),
+            }
+            for issue in failure.issues
         ],
         "allowed_change_scope": list(failure.allowed_change_scope),
+        "repair_instruction": (
+            "Correct every listed validation error; preserve only valid action content; "
+            "return the complete corrected RecallActionBatch JSON object."
+        ),
     }
+
+
+def _repair_instruction(issue: ActionValidationIssue) -> str:
+    """Return a deterministic correction derived only from local validation facts."""
+    path = issue.field_path
+    if path == "":
+        return "Return one valid JSON object with only the top-level actions key."
+    if path == "actions":
+        if issue.code == "action_limit_exceeded":
+            return "Reduce actions to the configured maximum and return a JSON array."
+        return "Replace actions with a JSON array of valid action objects."
+    if path.endswith(".action_id"):
+        if issue.code == "duplicate_action":
+            return "Replace this action_id with a unique non-empty JSON string."
+        return "Replace action_id with a unique non-empty JSON string, never a number."
+    if path.endswith(".action_type"):
+        return "Delete the entire action containing this disallowed action_type."
+    if path.endswith(".strategy"):
+        return "Replace strategy with a non-empty JSON string."
+    if path.endswith(".payload.query_text") or path.endswith(".payload.title_text"):
+        if issue.code == "action_too_long":
+            return "Shorten this search text to 300 characters or fewer."
+        if issue.code == "duplicate_action":
+            return "Replace this search text with a distinct non-empty JSON string."
+        if issue.code == "year_conflict":
+            return "Remove every explicit year from this search text."
+        return "Replace this value with a non-empty JSON string of at most 300 characters."
+    if path.endswith(".payload.seed_canonical_id"):
+        return "Delete the entire citation_expand action containing this unknown seed."
+    if path.endswith(".payload.direction"):
+        return 'Replace direction with exactly "references", "citations", or "both".'
+    if path.endswith(".payload.limit"):
+        if issue.code == "missing_required_field":
+            return "Add limit as a positive JSON integer, never a boolean."
+        return "Remove this unlisted field from text/title payloads, or use a positive JSON integer only for citation_expand."
+    if issue.code == "missing_required_field":
+        return "Add the required field using the exact action contract."
+    if issue.code == "duplicate_action":
+        return "Remove or replace this duplicate action with a distinct valid action."
+    return "Remove this unlisted field or replace it using the exact action contract."
 
 
 class DeepSeekPromptGenerator:

@@ -39,6 +39,10 @@ from paper_search.recall_experiments.generation.deepseek import (
 from paper_search.recall_experiments.generation.fixed import FixedActionGenerator
 from paper_search.recall_experiments.generation.manual import ManualActionGenerator
 from paper_search.recall_experiments.recipes import load_recall_recipe
+from paper_search.recall_experiments.validation import (
+    ActionValidationFailure,
+    ActionValidationIssue,
+)
 
 
 def _context(query_id: str) -> RecallGenerationContext:
@@ -306,6 +310,35 @@ def test_rendered_recall_prompt_is_deterministic_and_locks_deepseek_settings() -
     assert "supplied seed_canonical_id" in message
 
 
+def test_rendered_prompt_declares_exact_action_payload_contracts() -> None:
+    message = render_recall_prompt(_prompt())
+
+    assert "action_id must be a unique non-empty JSON string" in message
+    assert "actions must be a JSON array of action objects" in message
+    assert (
+        "action_type must be a JSON string exactly equal to one supplied "
+        "allowed_action_types value" in message
+    )
+    assert "strategy must be a non-empty JSON string" in message
+    assert (
+        'text_search payload keys: exactly ["query_text"]; query_text must be a '
+        "non-empty JSON string of at most 300 characters" in message
+    )
+    assert (
+        'title_search payload keys: exactly ["title_text"]; title_text must be a '
+        "non-empty JSON string of at most 300 characters" in message
+    )
+    assert (
+        'citation_expand payload keys: exactly '
+        '["seed_canonical_id", "direction", "limit"]' in message
+    )
+    assert "seed_canonical_id must copy a supplied seed verbatim" in message
+    assert 'direction must be exactly "references", "citations", or "both"' in message
+    assert "limit must be a positive JSON integer, never a boolean" in message
+    assert "Do not add any unlisted keys to an action or payload" in message
+    assert "Do not add limit to text_search or title_search payloads" in message
+
+
 @pytest.mark.parametrize(
     ("invalid", "expected_code", "context"),
     [
@@ -338,7 +371,13 @@ def test_structured_validation_failure_triggers_one_repair(
     repair_request = backend.calls[1][1]
     repair_payload = getattr(repair_request, "payload")
     assert repair_payload["validation_errors"][0]["code"] == expected_code
+    assert repair_payload["validation_errors"][0]["message"]
+    assert repair_payload["validation_errors"][0]["repair_instruction"]
     assert repair_payload["allowed_change_scope"] == ["actions"]
+    assert repair_payload["repair_instruction"] == (
+        "Correct every listed validation error; preserve only valid action content; "
+        "return the complete corrected RecallActionBatch JSON object."
+    )
 
 
 def test_analyzer_invalid_json_triggers_one_repair_with_previous_output() -> None:
@@ -355,8 +394,88 @@ def test_analyzer_invalid_json_triggers_one_repair_with_previous_output() -> Non
     assert len({receipt.provenance["backend_call_id"] for receipt in result.call_receipts}) == 2
     assert [kind for kind, _ in backend.calls] == ["initial", "repair"]
     repair_payload = getattr(backend.calls[1][1], "payload")
-    assert repair_payload["validation_errors"] == [{"code": "invalid_json", "field_path": ""}]
+    assert repair_payload["validation_errors"] == [
+        {
+            "code": "invalid_json",
+            "field_path": "",
+            "message": "invalid JSON",
+            "repair_instruction": "Return one valid JSON object with only the top-level actions key.",
+        }
+    ]
     assert repair_payload["previous_output"] == {}
+
+
+def test_repair_feedback_explains_action_id_type_and_forbidden_payload_fields() -> None:
+    invalid = {
+        "actions": [
+            {
+                "action_id": 1,
+                "action_type": "text_search",
+                "strategy": "synthetic",
+                "payload": {"query_text": "dataset distillation", "limit": 10},
+            }
+        ]
+    }
+    backend = _RecordingLLMBackend([_backend_result(invalid), _backend_result(_actions())])
+    generator = DeepSeekPromptGenerator(
+        backend=backend,
+        prompt=_prompt(),
+        visibility="blind",
+        allowed_actions={"text_search"},
+        max_actions=1,
+    )
+
+    asyncio.run(generator.generate(_context("query-1")))
+
+    repair_payload = getattr(backend.calls[1][1], "payload")
+    errors = repair_payload["validation_errors"]
+    assert any(
+        item["field_path"].endswith("action_id")
+        and "valid string" in item["message"]
+        and "non-empty JSON string" in item["repair_instruction"]
+        for item in errors
+    )
+    assert any(
+        item["field_path"].endswith("payload.limit")
+        and "Extra inputs" in item["message"]
+        and "Remove this unlisted field" in item["repair_instruction"]
+        for item in errors
+    )
+
+
+@pytest.mark.parametrize(
+    ("invalid_payload", "instruction_fragment"),
+    [
+        ({"query_text": ""}, "non-empty JSON string"),
+        ({"query_text": "x" * 301}, "300 characters or fewer"),
+    ],
+)
+def test_repair_feedback_gives_field_specific_text_correction(
+    invalid_payload: dict[str, object], instruction_fragment: str
+) -> None:
+    invalid = {
+        "actions": [
+            {
+                "action_id": "a-1",
+                "action_type": "text_search",
+                "strategy": "synthetic",
+                "payload": invalid_payload,
+            }
+        ]
+    }
+    backend = _RecordingLLMBackend([_backend_result(invalid), _backend_result(_actions())])
+    generator = DeepSeekPromptGenerator(
+        backend=backend,
+        prompt=_prompt(),
+        visibility="blind",
+        allowed_actions={"text_search"},
+        max_actions=1,
+    )
+
+    asyncio.run(generator.generate(_context("query-1")))
+
+    errors = getattr(backend.calls[1][1], "payload")["validation_errors"]
+    assert instruction_fragment in errors[0]["repair_instruction"]
 
 
 def test_initial_and_repair_requests_carry_the_same_rendered_prompt_and_exact_source_identity() -> None:
@@ -556,7 +675,7 @@ def test_infrastructure_failures_never_consume_a_semantic_repair(code: str) -> N
     assert [kind for kind, _ in backend.calls] == ["initial"]
 
 
-def test_repair_payload_is_limited_to_validation_diagnostics() -> None:
+def test_repair_payload_is_limited_to_local_validation_diagnostics() -> None:
     from paper_search.recall_experiments.validation import ActionValidationFailure, ActionValidationIssue
 
     payload = build_repair_payload(
@@ -568,9 +687,96 @@ def test_repair_payload_is_limited_to_validation_diagnostics() -> None:
 
     assert payload == {
         "previous_output": {"actions": "bad"},
-        "validation_errors": [{"code": "invalid_json", "field_path": "actions"}],
+        "validation_errors": [
+            {
+                "code": "invalid_json",
+                "field_path": "actions",
+                "message": "bad",
+                "repair_instruction": "Replace actions with a JSON array of valid action objects.",
+            }
+        ],
         "allowed_change_scope": ["actions"],
+        "repair_instruction": (
+            "Correct every listed validation error; preserve only valid action content; "
+            "return the complete corrected RecallActionBatch JSON object."
+        ),
     }
+
+
+def test_repair_payload_maps_multiple_citation_errors_to_their_own_fields() -> None:
+    from paper_search.recall_experiments.validation import (
+        ActionValidationFailure,
+        ActionValidationIssue,
+    )
+
+    payload = build_repair_payload(
+        ActionValidationFailure(
+            [
+                ActionValidationIssue(
+                    code="invalid_json",
+                    field_path="actions.0.0.citation_expand.payload.direction",
+                    message="Input should be 'references', 'citations' or 'both'",
+                ),
+                ActionValidationIssue(
+                    code="invalid_json",
+                    field_path="actions.0.0.citation_expand.payload.limit",
+                    message="Input should be a valid integer",
+                ),
+            ],
+            previous_output={"actions": []},
+        )
+    )
+
+    errors = payload["validation_errors"]
+    assert errors[0]["field_path"].endswith("payload.direction")
+    assert '"references", "citations", or "both"' in errors[0]["repair_instruction"]
+    assert errors[1]["field_path"].endswith("payload.limit")
+    assert "positive JSON integer" in errors[1]["repair_instruction"]
+
+
+@pytest.mark.parametrize(
+    ("issue", "expected_instruction"),
+    [
+        (
+            ActionValidationIssue(
+                code="disallowed_action_type",
+                field_path="actions.0.action_type",
+                message="action type is not allowed",
+            ),
+            "Delete the entire action containing this disallowed action_type.",
+        ),
+        (
+            ActionValidationIssue(
+                code="unknown_seed_candidate",
+                field_path="actions.0.payload.seed_canonical_id",
+                message="citation seed must be present in context seed_candidates",
+            ),
+            "Delete the entire citation_expand action containing this unknown seed.",
+        ),
+        (
+            ActionValidationIssue(
+                code="year_conflict",
+                field_path="actions.0.payload.query_text",
+                message="search text conflicts with query year constraints",
+            ),
+            "Remove every explicit year from this search text.",
+        ),
+    ],
+)
+def test_repair_instructions_are_executable_without_initial_request_context(
+    issue: ActionValidationIssue, expected_instruction: str
+) -> None:
+    payload = build_repair_payload(
+        ActionValidationFailure([issue], previous_output={"actions": []})
+    )
+
+    assert set(payload) == {
+        "previous_output",
+        "validation_errors",
+        "allowed_change_scope",
+        "repair_instruction",
+    }
+    assert payload["validation_errors"][0]["repair_instruction"] == expected_instruction
 
 
 @pytest.mark.parametrize("mode", ["oracle", "blind"])

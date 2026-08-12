@@ -284,6 +284,8 @@ def compare_historical_replays(
                 "query_ids_available": method.query_ids_available,
                 "evidence_level": method.evidence_level,
                 "candidate_pool_policy_version": method.candidate_pool_policy_version,
+                "exact_actions_available": method.exact_actions_available,
+                "exact_provider_responses_available": method.exact_provider_responses_available,
                 "fixed_actions_replayed": method.fixed_actions is not None,
                 "candidate_pool_ids_by_query": method.candidate_pool_ids_by_query,
                 "gold_hit_ids_by_query": method.gold_hit_ids_by_query,
@@ -520,7 +522,10 @@ def _load_catalog(
     frozen = sample.frozen_inputs
     if frozen is None:
         raise RecallTerminalError("config_mismatch")
-    gold_records = getattr(getattr(dataset, "evaluation_materials"), "gold_records")
+    materials = getattr(dataset, "evaluation_materials", None)
+    if materials is None:
+        raise RecallTerminalError("config_mismatch")
+    gold_records = getattr(materials, "gold_records")
     catalog = GoldDocumentCatalogSource(workspace_root).load(
         sample.gold_document_catalog,
         manifest_binding=sample.gold_document_catalog_manifest,

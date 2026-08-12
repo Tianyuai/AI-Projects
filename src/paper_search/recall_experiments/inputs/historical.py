@@ -23,7 +23,6 @@ from paper_search.recall_experiments.contracts import RetrievalActionResult
 from paper_search.recall_experiments.inputs.base import (
     FrozenRecallDataset,
     HistoricalRecallBaseline,
-    OpaqueEvaluationMaterials,
 )
 
 
@@ -49,6 +48,8 @@ class HistoricalMethodReplay(DomainModel):
     query_ids_available: list[str]
     evidence_level: Literal["exact", "aggregate_only", "insufficient", "not_comparable"]
     candidate_pool_policy_version: str
+    exact_actions_available: bool
+    exact_provider_responses_available: bool
     fixed_actions: dict[str, dict[str, object]] | None = None
     frozen_dataset: FrozenRecallDataset | None = None
     historical_baseline: HistoricalRecallBaseline | None = None
@@ -77,10 +78,6 @@ _METHOD_IDS = frozenset(
         "citation-expansion",
     }
 )
-_EMPTY_IDENTIFIER_MAP = b"{}"
-_EMPTY_IDENTIFIER_MAP_SHA256 = "sha256:" + hashlib.sha256(_EMPTY_IDENTIFIER_MAP).hexdigest()
-
-
 def load_historical_replays(
     *, inventory_path: Path, config_root: Path, workspace_root: Path | None = None
 ) -> HistoricalReplaySet:
@@ -91,6 +88,9 @@ def load_historical_replays(
     bindings = _load_bindings(config_root, root)
     if set(inventory_methods) != _METHOD_IDS or set(bindings) != _METHOD_IDS:
         raise HistoricalReplayError("historical inventory must bind exactly the five candidate methods")
+    association_path, association_sha256 = _verified_denominator_binding(
+        inventory, bindings.values(), root
+    )
 
     normalized: dict[str, HistoricalMethodReplay] = {}
     for method_id in sorted(_METHOD_IDS):
@@ -98,14 +98,21 @@ def load_historical_replays(
         binding = bindings[method_id]
         sources = _verified_sources(record, binding, root)
         query_ids = _string_list(record.get("query_ids"), "inventory query_ids")
-        dataset = _frozen_dataset(query_ids, sources, binding, root)
+        dataset = _frozen_dataset(
+            query_ids,
+            sources,
+            association_path=association_path,
+            association_sha256=association_sha256,
+        )
         evidence_level = _evidence_level(record)
+        metric_report = _metric_report(record, sources)
         if method_id == "query-evolution":
             normalized[method_id] = _query_evolution_replay(
                 record=record,
                 sources=sources,
                 dataset=dataset,
                 evidence_level=evidence_level,
+                metric_report=metric_report,
             )
         else:
             normalized[method_id] = _aggregate_replay(
@@ -114,6 +121,7 @@ def load_historical_replays(
                 sources=sources,
                 dataset=dataset,
                 evidence_level=evidence_level,
+                metric_report=metric_report,
             )
     return HistoricalReplaySet(
         methods=normalized,
@@ -187,23 +195,48 @@ def _verified_sources(
     return result
 
 
+def _verified_denominator_binding(
+    inventory: Mapping[str, object],
+    bindings: Iterable[Mapping[str, object]],
+    root: Path,
+) -> tuple[Path, str]:
+    catalog = _mapping(inventory.get("gold_catalog"), "Task 0 gold catalog")
+    inventory_association = _association_binding(
+        catalog.get("association_source"), "Task 0 Gold association binding"
+    )
+    for binding in bindings:
+        bound_catalog = _mapping(binding.get("gold_catalog"), "historical binding gold catalog")
+        bound_association = _association_binding(
+            bound_catalog.get("association_source"), "historical binding Gold association")
+        if bound_association != inventory_association:
+            raise HistoricalReplayError(
+                "Task 0 Gold association binding differs from the current denominator binding"
+            )
+    path_value, sha256 = inventory_association
+    path = _workspace_path(root, path_value)
+    if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != sha256:
+        raise HistoricalReplayError("Task 0 Gold association binding hash mismatch")
+    return path, sha256
+
+
+def _association_binding(value: object, label: str) -> tuple[str, str]:
+    association = _mapping(value, label)
+    path = association.get("path")
+    sha256 = association.get("sha256")
+    if not isinstance(path, str) or not isinstance(sha256, str):
+        raise HistoricalReplayError(f"{label} is malformed")
+    return path, _hash_value(sha256)
+
+
 def _frozen_dataset(
     query_ids: list[str],
     sources: Mapping[str, Path],
-    binding: Mapping[str, object],
-    root: Path,
+    *,
+    association_path: Path,
+    association_sha256: str,
 ) -> FrozenRecallDataset:
-    catalog = binding.get("gold_catalog")
-    if not isinstance(catalog, Mapping) or not isinstance(catalog.get("association_source"), Mapping):
-        raise HistoricalReplayError("historical binding lacks a Gold association source")
-    association = catalog["association_source"]
-    path_value = association.get("path")
-    hash_value = association.get("sha256")
-    if not isinstance(path_value, str) or not isinstance(hash_value, str):
-        raise HistoricalReplayError("historical Gold association source is malformed")
-    association_path = _workspace_path(root, path_value)
     association_bytes = association_path.read_bytes()
-    if hashlib.sha256(association_bytes).hexdigest() != _hash_value(hash_value):
+    if hashlib.sha256(association_bytes).hexdigest() != association_sha256:
         raise HistoricalReplayError("historical Gold association hash mismatch")
     all_queries = read_jsonl(association_path, EvaluationQuery)
     by_id = {query.query_id: query for query in all_queries}
@@ -220,11 +253,7 @@ def _frozen_dataset(
     return FrozenRecallDataset(
         queries=selected,
         source_hashes=source_hashes,
-        evaluation_materials=OpaqueEvaluationMaterials(
-            gold_records=selected,
-            identifier_map_bytes=_EMPTY_IDENTIFIER_MAP,
-            identifier_map_sha256=_EMPTY_IDENTIFIER_MAP_SHA256,
-        ),
+        evaluation_materials=None,
         seed_candidates=[],
     )
 
@@ -235,6 +264,7 @@ def _query_evolution_replay(
     sources: Mapping[str, Path],
     dataset: FrozenRecallDataset,
     evidence_level: Literal["exact", "aggregate_only", "insufficient", "not_comparable"],
+    metric_report: Mapping[str, object],
 ) -> HistoricalMethodReplay:
     outcomes_path = _source_with_name(sources, "outcomes.jsonl")
     outcomes = [_mapping(json.loads(line), "query-evolution outcome") for line in outcomes_path.read_text(encoding="utf-8").splitlines() if line]
@@ -288,18 +318,21 @@ def _query_evolution_replay(
         query_ids_available=query_ids,
         evidence_level=evidence_level,
         candidate_pool_policy_version="canonical-id-first-v1",
+        exact_actions_available=True,
+        exact_provider_responses_available=True,
         fixed_actions=actions,
         frozen_dataset=dataset,
         candidate_pool_ids_by_query=pools,
-        aggregate_metrics=_query_evolution_metrics(_load_json(_source_with_name(sources, "result.json"))),
+        aggregate_metrics=_query_evolution_metrics(metric_report),
         terminal_state="not_comparable",
-        per_query_equality="not_comparable",
+        per_query_equality="not_provable",
         semantic_mismatch=(
             "The bound source lacks an identifier-map artifact and per-query Gold-hit records, "
             "so canonical response IDs cannot be compared with Gold associations."
         ),
         unprovable_fields=[
             "per_query_gold_hits",
+            "independent_per_query_candidate_ids",
             "total_gold_associations",
             "macro_candidate_recall",
         ],
@@ -313,6 +346,7 @@ def _aggregate_replay(
     sources: Mapping[str, Path],
     dataset: FrozenRecallDataset,
     evidence_level: Literal["exact", "aggregate_only", "insufficient", "not_comparable"],
+    metric_report: Mapping[str, object],
 ) -> HistoricalMethodReplay:
     report = _load_json(next(iter(sources.values())))
     terminal: HistoricalTerminalState = (
@@ -334,8 +368,10 @@ def _aggregate_replay(
         query_ids_available=[query.query_id for query in dataset.queries],
         evidence_level=evidence_level,
         candidate_pool_policy_version=_required_string(record, "candidate_pool_policy_version"),
+        exact_actions_available=False,
+        exact_provider_responses_available=False,
         frozen_dataset=dataset,
-        aggregate_metrics=_aggregate_metrics(report),
+        aggregate_metrics=_aggregate_metrics(metric_report),
         terminal_state=terminal,
         per_query_equality="not_provable",
         unprovable_fields=unavailable,
@@ -357,6 +393,18 @@ def _query_evolution_metrics(report: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(public_report, Mapping):
         raise HistoricalReplayError("query-evolution result lacks a public report")
     return {"public_report": dict(public_report)}
+
+
+def _metric_report(
+    record: Mapping[str, object], sources: Mapping[str, Path]
+) -> Mapping[str, object]:
+    evidence = _mapping(record.get("metric_evidence"), "Task 0 metric evidence")
+    path = evidence.get("path")
+    if evidence.get("available") is not True or not isinstance(path, str):
+        raise HistoricalReplayError("Task 0 metric evidence is unavailable")
+    if path not in sources:
+        raise HistoricalReplayError("Task 0 metric evidence path is not a bound historical source")
+    return _load_json(sources[path])
 
 
 def _scheme_b_terminal_state(methods: Iterable[HistoricalMethodReplay]) -> HistoricalTerminalState:

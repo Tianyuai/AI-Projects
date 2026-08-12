@@ -28,7 +28,7 @@ class FrozenRecallDataset(DomainModel):
 
     queries: list[EvaluationQuery]
     source_hashes: dict[str, Sha256]
-    evaluation_materials: OpaqueEvaluationMaterials
+    evaluation_materials: OpaqueEvaluationMaterials | None
     seed_candidates: list[SeedCandidate]
 
 

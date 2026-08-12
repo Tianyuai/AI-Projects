@@ -1,7 +1,7 @@
 # Scheme B Live Provider Identity Design
 
-**Date:** 2026-08-12  
-**Status:** Approved in conversation; pending written-spec review  
+**Date:** 2026-08-12
+**Status:** Approved in conversation; pending written-spec review
 **Scope:** Make the modular candidate-recall harness capable of constructing a verifiable live runtime. This design does not authorize or execute DeepSeek, OpenAlex, or Semantic Scholar calls.
 
 ## 1. Goal
@@ -209,4 +209,3 @@ Completion authorizes no network or fee-bearing action. The next separately appr
 - seal exact requests/responses and usage;
 - replay the new snapshot offline;
 - report candidate recall only, without a general performance or compatibility claim.
-

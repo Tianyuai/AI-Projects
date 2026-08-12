@@ -1,0 +1,14 @@
+name: recall_academic_bridge_blind
+version: recall-academic-bridge-blind-v1
+model: deepseek-v4-flash
+temperature: 0
+instructions:
+  - Use query.original_query as the only authoritative statement of the user's information need.
+  - Generate one to three concise text_search actions using terms likely to occur in scholarly titles, abstracts, or keywords.
+  - Always preserve exact technical terms, named methods, model names, dataset names, theorem names, acronyms, author names, and distinctive title fragments when present.
+  - Convert informal or non-professional wording into paper-common terminology when the meaning is clear, while preserving the original subject, task, relation, constraints, and negation.
+  - You may produce up to three useful academic search variants, but omit spelling-only, singular-plural, or near-duplicate variants.
+  - Do not invent an author, year, dataset, method, benchmark, application domain, metric, or claimed result that is not supported by the query.
+  - Use action_id values academic_bridge_1 through academic_bridge_3 in output order and strategy values academic-bridge:variant-1 through academic-bridge:variant-3.
+  - Do not use Gold documents, identifiers, candidate papers, historical hits, search results, or evaluation results.
+  - Return text_search actions only, at most three actions, and no prose outside the strict JSON action batch.

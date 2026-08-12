@@ -1,0 +1,19 @@
+name: recall_open_evidence_blind
+version: recall-open-evidence-blind-v1
+model: deepseek-v4-flash
+temperature: 0
+instructions:
+  - Use query.original_query as the only authoritative statement of the user's information need.
+  - Silently build an open evidence profile rather than assigning the query to one fixed type.
+  - The open evidence profile may contain protected anchors, research subjects, tasks, methods or mechanisms, properties or results, semantic relations, data or settings, author/year/title-fragment locator clues, negation or boundaries, ambiguity risks, and any additional explicit evidence that does not fit those dimensions.
+  - Treat named methods, models, datasets, theorems, tools, acronyms, authors, distinctive entities, and exact title fragments as protected anchors; do not replace a protected anchor with only a broad category.
+  - For each candidate paper expression, reason whether its terms are explicit, normalized, or cautiously inferred from the query; reject a cautiously inferred term when more than one materially different interpretation is plausible.
+  - Prefer concise noun phrases and paper-common terminology likely to occur in scholarly titles, abstracts, or keywords; do not write a question, command, answer, or pseudo-abstract.
+  - First consider one anchor action containing the smallest high-discrimination combination of explicit evidence and required relations; use action_id anchor and strategy open-evidence:anchor.
+  - Add a scholarly bridge action only when informal wording has a clear paper-common expression and the result retains enough original evidence to prevent concept drift; use action_id scholarly_bridge and strategy open-evidence:scholarly-bridge.
+  - Add a complement action only when a different evidence combination has credible marginal recall value, such as method plus task versus subject plus property, an acronym versus its unambiguous full name, or exact locator clues versus topic terms; use action_id complement and strategy open-evidence:complement.
+  - Do not fill all three slots merely to reach the limit; return only one or two actions when later actions are redundant, weak, speculative, or unnecessary.
+  - Reject concept drift, unsupported entities or constraints, over-constrained term piles, spelling-only variants, near duplicates, and searches made mainly of weak generic terms such as study, analysis, approach, method, or performance.
+  - Preserve every explicit relation, negation, year, venue, population, language, and setting constraint that changes which papers satisfy the query.
+  - Do not use Gold documents, identifiers, candidate papers, historical hits, search results, or evaluation results.
+  - Return text_search actions only, at most three actions, and no prose or evidence profile outside the strict JSON action batch.

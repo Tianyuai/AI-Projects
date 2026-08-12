@@ -1,0 +1,19 @@
+method_id: open-evidence-blind
+generator:
+  type: deepseek_prompt
+  prompt: configs/prompts/recall/open-evidence-blind.yaml
+  model: deepseek-v4-flash
+  temperature: 0
+  gold_visibility: blind
+  max_generated_actions: 3
+  repair_attempts: 1
+retrieval:
+  allowed_actions: [text_search]
+  backend: live_provider
+  max_results_per_action: 50
+  max_total_actions: 3
+candidate_pool:
+  policy_version: production-dedup-v1
+evaluation:
+  repeat_count: 1
+  max_repeat_attempts: 1

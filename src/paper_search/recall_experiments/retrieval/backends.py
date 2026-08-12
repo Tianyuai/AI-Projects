@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import httpx
 from decimal import Decimal
 from typing import Literal, Protocol
 
@@ -47,6 +48,7 @@ from paper_search.recall_experiments.identity import (
 )
 from paper_search.retrieval.base import SearchProvider
 from paper_search.retrieval.snapshot_adapters import LiveCaptureSearchProvider
+from paper_search.storage.dependency_snapshot import DependencyCaptureStore
 
 
 _INFRASTRUCTURE_ERROR_CODES = frozenset(
@@ -311,6 +313,13 @@ class BudgetedSearchBackend(_BudgetedProviderCall):
             infrastructure_failure=_infrastructure_failure(result.errors),
         )
 
+    def owns_live_resources(self, *, client: object, capture_store: object) -> bool:
+        return isinstance(client, httpx.AsyncClient) and isinstance(
+            capture_store, DependencyCaptureStore
+        ) and isinstance(self._provider, LiveCaptureSearchProvider) and self._provider.owns_live_resources(
+            client=client, capture_store=capture_store
+        )
+
 
 class BudgetedCitationBackend(_BudgetedProviderCall):
     """Adapt Semantic Scholar citation calls without constructing provider clients."""
@@ -335,6 +344,13 @@ class BudgetedCitationBackend(_BudgetedProviderCall):
         if seed.semantic_scholar_id is None:
             return None
         return ProviderPaperId(provider="semantic_scholar", value=seed.semantic_scholar_id)
+
+    def owns_live_resources(self, *, client: object, capture_store: object) -> bool:
+        return isinstance(client, httpx.AsyncClient) and isinstance(
+            capture_store, DependencyCaptureStore
+        ) and isinstance(self._provider, LiveCaptureSearchProvider) and self._provider.owns_live_resources(
+            client=client, capture_store=capture_store
+        )
 
     async def _one_direction(
         self,

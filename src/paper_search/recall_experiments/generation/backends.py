@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import httpx
 from collections.abc import Mapping
 from typing import Any, Literal, Protocol
 
@@ -30,6 +31,7 @@ from paper_search.domain.models import (
 )
 from paper_search.live_identity import LiveDependencyEvidence
 from paper_search.llm.snapshot_adapters import LiveCaptureLLMAnalyzer
+from paper_search.storage.dependency_snapshot import DependencyCaptureStore
 from paper_search.recall_experiments.identity import (
     LiveDependencyIdentity,
     dependency_identity_from_evidence,
@@ -189,6 +191,13 @@ class BudgetedLLMBackend:
         if self._dependency_identity is None:
             raise ValueError("live identity unavailable")
         return self._controller
+
+    def owns_live_resources(self, *, client: object, capture_store: object) -> bool:
+        return isinstance(client, httpx.AsyncClient) and isinstance(
+            capture_store, DependencyCaptureStore
+        ) and isinstance(self._analyzer, LiveCaptureLLMAnalyzer) and self._analyzer.owns_live_resources(
+            client=client, capture_store=capture_store
+        )
 
     def _settle_or_verify(
         self,

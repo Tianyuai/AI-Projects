@@ -58,6 +58,13 @@ def _valid_execution_identity() -> dict[str, object]:
     }
 
 
+def test_canary_command_requires_live_authorization_before_output(tmp_path: Path) -> None:
+    output = tmp_path / "canary"
+
+    assert main(["recall", "canary", "--query", "test query", "--out", str(output)]) == 2
+    assert not output.exists()
+
+
 def _live_runtime_identity(*, model: str = "deepseek-v4-flash") -> dict[str, object]:
     pricing_hash = "sha256:" + "e" * 64
     controller_hash = "sha256:" + "f" * 64

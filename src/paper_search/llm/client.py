@@ -372,6 +372,9 @@ class OpenAICompatibleLLMClient:
     def prompt_version(self) -> str:
         return self._prompt_version
 
+    def owns_http_client(self, client: httpx.AsyncClient) -> bool:
+        return self._client is client
+
     def canonical_request(
         self,
         *,

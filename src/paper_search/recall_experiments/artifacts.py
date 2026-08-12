@@ -136,6 +136,12 @@ class RecallArtifactWriter:
         self._publish(path, _canonical_json(_sanitize(report)))
         return path
 
+    def write_canary_report(self, report: Mapping[str, object]) -> Path:
+        """Atomically publish the stable public canary report after capture sealing."""
+        path = self.run_path / "canary-report.json"
+        self._publish(path, _canonical_json(_sanitize_canary_report(report)))
+        return path
+
     def _write_attempt_json(
         self,
         category: str,
@@ -213,6 +219,31 @@ def _sanitize(value: object) -> object:
         _AUTHORIZATION_VALUE.search(value) or _SENSITIVE_VALUE.search(value)
     ):
         return "[REDACTED]"
+    return value
+
+
+def _sanitize_canary_report(value: object, *, path: tuple[str, ...] = ()) -> object:
+    """Sanitize strings without corrupting typed usage counters or canonical paper IDs."""
+    identifier_paths = {
+        "candidate_pool_ids",
+        "gold_hit_ids",
+        "added_gold_hit_ids",
+        "lost_gold_hit_ids",
+        "snapshot_manifest_sha256",
+        "snapshot_set_id",
+    }
+    if isinstance(value, Mapping):
+        return {
+            str(key): _sanitize_canary_report(item, path=(*path, str(key)))
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_canary_report(item, path=path) for item in value]
+    if isinstance(value, str):
+        if path and path[-1] in identifier_paths:
+            return value
+        if _AUTHORIZATION_VALUE.search(value) or _SENSITIVE_VALUE.search(value):
+            return "[REDACTED]"
     return value
 
 

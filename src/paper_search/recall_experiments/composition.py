@@ -744,6 +744,13 @@ def _validate_live_recipe_runtime_model(
         raise RecallTerminalError("config_mismatch")
 
 
+def validate_live_runtime(runtime: RecallRuntime, recipe: RecallMethodRecipe) -> None:
+    """Fail closed unless the exact runtime capability is admitted for this recipe."""
+    if not _valid_live_runtime_identity(runtime):
+        raise RecallTerminalError("config_mismatch")
+    _validate_live_recipe_runtime_model(recipe, runtime)
+
+
 def _live_runtime_identity(
     *,
     search_backend: BudgetedSearchBackend,

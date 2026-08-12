@@ -134,6 +134,31 @@ def build_parser() -> argparse.ArgumentParser:
     run_recall.add_argument("--snapshot-manifest", type=Path)
     run_recall.add_argument("--allow-live", action="store_true")
     run_recall.add_argument("--out", type=Path, required=True)
+    canary = recall_commands.add_parser(
+        "canary", help="run the fixed Scheme-B canary interface"
+    )
+    canary_input = canary.add_mutually_exclusive_group(required=True)
+    canary_input.add_argument("--query")
+    canary_input.add_argument("--input-jsonl", type=Path)
+    canary_input.add_argument("--sample", type=Path)
+    canary.add_argument("--query-id")
+    canary.add_argument("--id-map", type=Path)
+    canary.add_argument(
+        "--recipe",
+        type=Path,
+        default=_PROJECT_CONFIG_ROOT / "recall_experiments" / "methods" / "scheme-b-blind-live.yaml",
+    )
+    canary.add_argument(
+        "--runtime-profile",
+        type=Path,
+        default=_PROJECT_CONFIG_ROOT / "recall_experiments" / "runtime" / "default-live.yaml",
+    )
+    canary.add_argument("--env-file", type=Path)
+    canary.add_argument("--pricing-policy", type=Path)
+    canary.add_argument("--budget", type=Path)
+    canary.add_argument("--baseline", type=Path)
+    canary.add_argument("--allow-live", action="store_true")
+    canary.add_argument("--out", type=Path, required=True)
     compare_recall = recall_commands.add_parser("compare", help="compare recall artifacts or bound historical evidence")
     compare_recall.add_argument("--current", type=Path)
     compare_recall.add_argument("--historical", type=Path)
@@ -426,6 +451,8 @@ def _run_recall_command(
                     live_runtime_factory=recall_runtime_factory,
                 )
             )
+        elif args.recall_command == "canary":
+            path = asyncio.run(_run_canary(args, output))
         elif args.recall_command == "compare":
             if args.config_root is not None:
                 if args.current is not None or args.historical is not None:
@@ -457,6 +484,15 @@ def _run_recall_command(
             path = output
         else:
             raise RecallTerminalError("config_mismatch")
+    except PermissionError:
+        print(
+            json.dumps(
+                {"error_code": "live_not_authorized", "path": str(output), "status": "failed"},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
     except RecallTerminalError as error:
         print(
             json.dumps(
@@ -479,6 +515,73 @@ def _run_recall_command(
         summary = {"path": str(path), "status": "complete"}
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     return 0
+
+
+async def _run_canary(args: argparse.Namespace, output: Path) -> Path:
+    """Own the fixed input, runtime and lifecycle boundaries for one canary."""
+    from paper_search.recall_experiments.canary_inputs import load_canary_input
+    from paper_search.recall_experiments.canary_runtime import (
+        build_live_runtime_bundle,
+        load_runtime_profile,
+        resolve_runtime_secrets,
+    )
+    from paper_search.recall_experiments.canary_service import RecallCanaryService
+    from paper_search.recall_experiments.recipes import load_recall_recipe
+
+    if not bool(args.allow_live):
+        raise PermissionError("live canary requires explicit authorization")
+    if args.query is not None:
+        loaded_input = load_canary_input(
+            input_kind="single",
+            query=args.query,
+            query_id=args.query_id,
+            source_path=None,
+            identifier_map_path=None,
+            workspace_root=Path.cwd(),
+        )
+    elif args.input_jsonl is not None:
+        loaded_input = load_canary_input(
+            input_kind="jsonl",
+            query=None,
+            query_id=None,
+            source_path=args.input_jsonl,
+            identifier_map_path=args.id_map,
+            workspace_root=Path.cwd(),
+        )
+    else:
+        loaded_input = load_canary_input(
+            input_kind="frozen",
+            query=None,
+            query_id=None,
+            source_path=args.sample,
+            identifier_map_path=None,
+            workspace_root=Path.cwd(),
+        )
+    profile = load_runtime_profile(
+        args.runtime_profile,
+        env_file=args.env_file,
+        pricing_policy=args.pricing_policy,
+        budget=args.budget,
+    )
+    secrets = resolve_runtime_secrets(profile)
+    recipe = load_recall_recipe(args.recipe)
+    bundle = await build_live_runtime_bundle(
+        profile=profile,
+        secrets=secrets,
+        loaded_recipe=recipe,
+        capture_root=output.parent / f"{output.name}-capture",
+    )
+    try:
+        await RecallCanaryService(workspace_root=Path.cwd()).run(
+            loaded_recipe=recipe,
+            loaded_input=loaded_input,
+            runtime_bundle=bundle,
+            output_path=output,
+            baseline_report_path=args.baseline,
+        )
+    finally:
+        await bundle.aclose()
+    return output
 
 
 if __name__ == "__main__":

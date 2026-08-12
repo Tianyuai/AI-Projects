@@ -151,3 +151,22 @@ def test_writer_rejects_non_finite_json_numbers(tmp_path, invalid_number: float)
             attempt_status="failed",
             valid_repeat_ordinal=None,
         )
+
+
+def test_canary_report_sanitizes_action_secrets_without_corrupting_usage(tmp_path) -> None:
+    writer = RecallArtifactWriter(tmp_path)
+    writer.start_run("run", recipe_lock={}, sample_manifest={})
+    writer.write_canary_report(
+        {
+            "actions_by_query": {
+                "q": [{"payload": {"query_text": "Authorization: Bearer private"}}]
+            },
+            "usage": {"input_tokens": 7, "output_tokens": 3},
+            "result": {"candidate_pool_ids": ["doi:10.1234/example"]},
+        }
+    )
+
+    payload = json.loads((tmp_path / "run" / "canary-report.json").read_bytes())
+    assert payload["actions_by_query"]["q"][0]["payload"]["query_text"] == "[REDACTED]"
+    assert payload["usage"] == {"input_tokens": 7, "output_tokens": 3}
+    assert payload["result"]["candidate_pool_ids"] == ["doi:10.1234/example"]

@@ -483,6 +483,12 @@ class LiveCaptureSearchProvider:
     def live_controller(self) -> ProviderSettlementController:
         return self._controller
 
+    def owns_live_resources(
+        self, *, client: httpx.AsyncClient, capture_store: DependencyCaptureStore
+    ) -> bool:
+        """Prove that identity, dispatch, capture, and lifecycle share exact objects."""
+        return self._client is client and self._capture_store is capture_store
+
     async def _run_live(
         self,
         reservation: BudgetReservation,

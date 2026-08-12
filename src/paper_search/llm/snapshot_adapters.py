@@ -303,6 +303,11 @@ class LiveCaptureLLMAnalyzer:
     def live_controller(self) -> RequestSettlementController:
         return self._controller
 
+    def owns_live_resources(
+        self, *, client: httpx.AsyncClient, capture_store: DependencyCaptureStore
+    ) -> bool:
+        return self._client.owns_http_client(client) and self._capture_store is capture_store
+
     async def generate_json(
         self,
         *,

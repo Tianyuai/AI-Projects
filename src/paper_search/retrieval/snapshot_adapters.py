@@ -11,7 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypedDict, TypeVar
 from urllib.parse import quote
 
 import httpx
@@ -29,6 +29,7 @@ from paper_search.domain.models import (
     UsageActual,
 )
 from paper_search.errors import ProtectedExecutionError
+from paper_search.live_identity import LiveDependencyEvidence, LiveProviderDescriptor
 from paper_search.retrieval.openalex import (
     OPENALEX_SELECT_FIELDS,
     _filter_expression,
@@ -67,6 +68,37 @@ _ADAPTERS = {
 }
 
 
+class _LiveDescriptorSurface(TypedDict):
+    provider: str
+    version: str
+    model: str | None
+    endpoints: tuple[str, ...]
+    operations: tuple[str, ...]
+
+
+_LIVE_DESCRIPTOR_SURFACES: dict[ProviderName, _LiveDescriptorSurface] = {
+    "openalex": {
+        "provider": "openalex",
+        "version": "live-capture-search-v1",
+        "model": None,
+        "endpoints": ("https://api.openalex.org/works",),
+        "operations": ("search",),
+    },
+    "semantic_scholar": {
+        "provider": "semantic_scholar",
+        "version": "live-capture-search-v1",
+        "model": None,
+        "endpoints": (
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            "https://api.semanticscholar.org/graph/v1/paper/batch",
+            "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/references",
+            "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/citations",
+        ),
+        "operations": ("search", "batch", "references", "citations"),
+    },
+}
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -92,6 +124,12 @@ def _snapshot_provenance(refs: list[SnapshotRef]) -> str:
 
 
 class ProviderSettlementController(Protocol):
+    @property
+    def policy_fingerprint(self) -> str: ...
+
+    @property
+    def formal_live(self) -> bool: ...
+
     def mark_dispatched(self, reservation: BudgetReservation) -> None: ...
 
     def settle(self, reservation: BudgetReservation, actual: UsageActual) -> None: ...
@@ -350,6 +388,8 @@ class LiveCaptureSearchProvider:
         sleep: Sleep | None = None,
         jitter: Jitter = random.random,
     ) -> None:
+        if controller.formal_live is not True:
+            raise ValueError("live capture requires formal-live budget enforcement")
         self._dependency = dependency
         self._client = client
         self._capture_store = capture_store
@@ -366,9 +406,39 @@ class LiveCaptureSearchProvider:
         self._api_key = api_key
         self._mailto = mailto
         self._adapter = adapter_version or _ADAPTERS[dependency]
+        surface = _LIVE_DESCRIPTOR_SURFACES[dependency]
+        descriptor = LiveProviderDescriptor(
+            identity_schema_version="live-provider-descriptor-v1",
+            provider=surface["provider"],
+            dependency=dependency,
+            adapter=self._adapter,
+            version=surface["version"],
+            model=surface["model"],
+            endpoints=surface["endpoints"],
+            operations=surface["operations"],
+        )
+        self._live_identity_evidence = LiveDependencyEvidence(
+            identity_schema_version="live-dependency-evidence-v1",
+            provider=descriptor,
+            pricing_policy_sha256=pricer.policy_sha256,
+            controller_policy_sha256=controller.policy_fingerprint,
+            formal_live=True,
+        )
         self._clock = clock
         self._sleep = sleep or asyncio.sleep
         self._jitter = jitter
+
+    @property
+    def live_identity_evidence(self) -> LiveDependencyEvidence:
+        return self._live_identity_evidence
+
+    @property
+    def live_pricer(self) -> ActualCostPricer:
+        return self._pricer
+
+    @property
+    def live_controller(self) -> ProviderSettlementController:
+        return self._controller
 
     async def _run_live(
         self,

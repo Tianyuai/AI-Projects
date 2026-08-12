@@ -45,6 +45,14 @@ class SettlementSpy:
         self.settled: list[tuple[BudgetReservation, UsageActual]] = []
         self.dispatched: list[str] = []
 
+    @property
+    def policy_fingerprint(self) -> str:
+        return "sha256:" + "c" * 64
+
+    @property
+    def formal_live(self) -> bool:
+        return True
+
     def mark_dispatched(self, reservation: BudgetReservation) -> None:
         self.dispatched.append(reservation.reservation_id)
 
@@ -126,6 +134,210 @@ def _real_controller_reservation(
         ),
     )
     return controller, reservation
+
+
+def _formal_controller(
+    *,
+    reservation_ttl_seconds: int = 60,
+    max_search_api_calls: int = 4,
+) -> HardBudgetController:
+    return HardBudgetController(
+        SearchBudget(
+            max_search_api_calls=max_search_api_calls,
+            target_search_api_calls=1,
+            max_llm_calls=1,
+            target_llm_calls=0,
+            max_total_tokens=1,
+            max_cost_cny=1.0,
+            max_elapsed_seconds=120,
+            soft_deadline_seconds=100,
+        ),
+        formal_live=True,
+        reservation_ttl_seconds=reservation_ttl_seconds,
+        clock=lambda: CAPTURED_AT,
+    )
+
+
+def test_openalex_live_capture_identity_is_derived_and_credential_free(
+    tmp_path: Path,
+) -> None:
+    requests = 0
+
+    def no_request(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        raise AssertionError(request)
+
+    async def run() -> None:
+        store = DependencyCaptureStore(tmp_path / "private-capture-root")
+        pricer = _pricer()
+        controller = _formal_controller()
+        async with (
+            httpx.AsyncClient(transport=httpx.MockTransport(no_request)) as first_client,
+            httpx.AsyncClient(transport=httpx.MockTransport(no_request)) as second_client,
+        ):
+            first = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=first_client,
+                capture_store=store,
+                pricer=pricer,
+                controller=controller,
+                api_key="secret-one",
+                mailto="private@example.invalid",
+            )
+            second = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=second_client,
+                capture_store=store,
+                pricer=pricer,
+                controller=controller,
+                api_key="secret-two",
+                mailto="other@example.invalid",
+            )
+            assert first.live_identity_evidence == second.live_identity_evidence
+            payload = first.live_identity_evidence.model_dump_json()
+            assert "secret" not in payload
+            assert "example.invalid" not in payload
+            assert "private-capture-root" not in payload
+            assert first.live_pricer is pricer
+            assert first.live_controller is controller
+
+    asyncio.run(run())
+    assert requests == 0
+
+
+def test_search_provider_descriptor_changes_with_dependency_or_adapter_version(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = DependencyCaptureStore(tmp_path / "snapshot")
+        pricer = _pricer()
+        controller = _formal_controller()
+        transport = httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        async with httpx.AsyncClient(transport=transport) as client:
+            openalex = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=store,
+                pricer=pricer,
+                controller=controller,
+            )
+            semantic = LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=store,
+                pricer=pricer,
+                controller=controller,
+            )
+            changed = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=store,
+                pricer=pricer,
+                controller=controller,
+                adapter_version="openalex-works-v2",
+            )
+            assert openalex.live_identity_evidence.provider != (
+                semantic.live_identity_evidence.provider
+            )
+            assert openalex.live_identity_evidence.provider != (
+                changed.live_identity_evidence.provider
+            )
+            assert semantic.live_identity_evidence.provider.operations == (
+                "search",
+                "batch",
+                "references",
+                "citations",
+            )
+
+    asyncio.run(run())
+
+
+def test_search_provider_evidence_changes_with_pricing_budget_or_ttl(
+    tmp_path: Path,
+) -> None:
+    async def run() -> None:
+        store = DependencyCaptureStore(tmp_path / "snapshot")
+        policy = load_pricing_policy(PRICING)
+        changed_policy = policy.model_copy(
+            update={"source_identity": "operator-verified-changed-policy"}
+        )
+        pricers = (
+            ActualCostPricer(policy, valued_at=CAPTURED_AT),
+            ActualCostPricer(changed_policy, valued_at=CAPTURED_AT),
+        )
+        controllers = (
+            _formal_controller(),
+            _formal_controller(max_search_api_calls=5),
+            _formal_controller(reservation_ttl_seconds=61),
+        )
+        transport = httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        async with httpx.AsyncClient(transport=transport) as client:
+            baseline = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=store,
+                pricer=pricers[0],
+                controller=controllers[0],
+            ).live_identity_evidence
+            changed_pricing = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=store,
+                pricer=pricers[1],
+                controller=controllers[0],
+            ).live_identity_evidence
+            changed_budget = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=store,
+                pricer=pricers[0],
+                controller=controllers[1],
+            ).live_identity_evidence
+            changed_ttl = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=store,
+                pricer=pricers[0],
+                controller=controllers[2],
+            ).live_identity_evidence
+            assert baseline.pricing_policy_sha256 != changed_pricing.pricing_policy_sha256
+            assert baseline.controller_policy_sha256 != (
+                changed_budget.controller_policy_sha256
+            )
+            assert baseline.controller_policy_sha256 != changed_ttl.controller_policy_sha256
+
+    asyncio.run(run())
+
+
+def test_search_provider_rejects_nonformal_controller_before_dispatch(
+    tmp_path: Path,
+) -> None:
+    requests = 0
+
+    def no_request(request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        raise AssertionError(request)
+
+    controller = _formal_controller()
+    controller.formal_live = False
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(no_request)
+        ) as client:
+            with pytest.raises(ValueError, match="formal-live"):
+                LiveCaptureSearchProvider(
+                    dependency="openalex",
+                    client=client,
+                    capture_store=DependencyCaptureStore(tmp_path / "snapshot"),
+                    pricer=_pricer(),
+                    controller=controller,
+                )
+
+    asyncio.run(run())
+    assert requests == 0
 
 
 async def _capture(

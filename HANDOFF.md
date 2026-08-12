@@ -1,6 +1,6 @@
 # paper-search 项目交接
 
-更新于 2026-08-11。权威工作区：`D:\AI Projects\.worktrees\week3`。
+更新于 2026-08-12。权威工作区：`D:\AI Projects\.worktrees\week3`。
 
 ## 1. 项目目标
 
@@ -140,7 +140,7 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - 新基线的首要判据必须针对检索覆盖，而非先调排序：在相同 verified identifier 语义和 143 个 Gold 关联分母下，首先证明 `not_retrieved` 明显低于 101，再评估 Top-50 是否达到或超过外部基准 30。未降低 `not_retrieved` 时立即停止查询工程，转向数据源覆盖、标识符映射或 Gold/reference 输入诊断。
 - 相关实现、证据与验证器已经合并并推送到 `main`，实现与证据链截至 `2a538fc3643a1309ee8bf247039ac6639173ddc8`；本节的 HANDOFF/路线图封存提交位于其后。最终离线验证在含完整 sealed 材料的 week3 工作区为 `2233 passed, 35 skipped, 1 online deselected`，Ruff 与 mypy 均通过。
 - 主工作区缺少 Git 忽略的 sealed run、Gold 和 identifier-map 本地材料，因此在那里运行全量测试会有 58 个环境性失败；同一提交已在 week3 工作区通过完整离线测试。主工作区不依赖这些私有材料的相关测试为 `102 passed`。
-- 当前 week3 仍保留未提交的 `HANDOFF.md`、`docs/retrieval-roadmap.md`、`data/budget_ledger.sqlite3`、`deliverables/` 和 `docs/evidence/identifier-map-semantic-audit-2026-08-10.json`；除本次明确更新的两份文档外，其余文件不得清理、覆盖或误提交。
+- `HANDOFF.md` 与 `docs/retrieval-roadmap.md` 已由 `cabf67c` 提交；当前 week3 只剩三项用户未跟踪路径：`data/budget_ledger.sqlite3`、`deliverables/` 和 `docs/evidence/identifier-map-semantic-audit-2026-08-10.json`，均不得清理、覆盖或误提交。
 
 ## 14. Scheme B 模块化候选召回离线验收（2026-08-12）
 

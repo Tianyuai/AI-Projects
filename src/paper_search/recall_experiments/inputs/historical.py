@@ -20,10 +20,8 @@ from paper_search.evaluation.dataset import EvaluationQuery, read_jsonl
 from paper_search.evaluation.query_evolution_probe import offline_provider_result
 from paper_search.recall_experiments.candidate_pool import CandidatePoolBuilder
 from paper_search.recall_experiments.contracts import RetrievalActionResult
-from paper_search.recall_experiments.inputs.base import (
-    FrozenRecallDataset,
-    HistoricalRecallBaseline,
-)
+from paper_search.recall_experiments.inputs.base import HistoricalRecallBaseline
+from paper_search.recall_experiments.inventory import InventoryError, frozen_request_identities
 
 
 HistoricalTerminalState = Literal[
@@ -39,6 +37,16 @@ class HistoricalReplayError(ValueError):
     """Raised when a historical binding or its Task 0 inventory has drifted."""
 
 
+class HistoricalNormalizedSource(DomainModel):
+    """Identifier-safe historical inputs, including an explicit scoring boundary."""
+
+    queries: list[EvaluationQuery]
+    source_hashes: dict[str, str]
+    identifier_map_bound: bool
+    scoring_status: Literal["scorable", "unscorable"]
+    unscorable_reason: str | None = None
+
+
 class HistoricalMethodReplay(DomainModel):
     """One normalized historical method with only its proven evidence exposed."""
 
@@ -47,11 +55,12 @@ class HistoricalMethodReplay(DomainModel):
     source_hashes: dict[str, str]
     query_ids_available: list[str]
     evidence_level: Literal["exact", "aggregate_only", "insufficient", "not_comparable"]
+    action_family: str
     candidate_pool_policy_version: str
     exact_actions_available: bool
     exact_provider_responses_available: bool
     fixed_actions: dict[str, dict[str, object]] | None = None
-    frozen_dataset: FrozenRecallDataset | None = None
+    normalized_source: HistoricalNormalizedSource
     historical_baseline: HistoricalRecallBaseline | None = None
     candidate_pool_ids_by_query: dict[str, tuple[str, ...]] = {}
     gold_hit_ids_by_query: dict[str, tuple[str, ...]] | None = None
@@ -98,34 +107,40 @@ def load_historical_replays(
         binding = bindings[method_id]
         sources = _verified_sources(record, binding, root)
         query_ids = _string_list(record.get("query_ids"), "inventory query_ids")
-        dataset = _frozen_dataset(
+        normalized_source = _normalized_source(
             query_ids,
             sources,
             association_path=association_path,
             association_sha256=association_sha256,
         )
         evidence_level = _evidence_level(record)
+        candidate_pool_policy = _verified_candidate_pool_policy(record, binding)
+        provider_responses_available = _verified_provider_response_evidence(record, sources, root)
         metric_report = _metric_report(record, sources)
         if method_id == "query-evolution":
             normalized[method_id] = _query_evolution_replay(
                 record=record,
                 sources=sources,
-                dataset=dataset,
+                normalized_source=normalized_source,
                 evidence_level=evidence_level,
                 metric_report=metric_report,
+                candidate_pool_policy=candidate_pool_policy,
+                provider_responses_available=provider_responses_available,
             )
         else:
             normalized[method_id] = _aggregate_replay(
                 method_id=method_id,
                 record=record,
                 sources=sources,
-                dataset=dataset,
+                normalized_source=normalized_source,
                 evidence_level=evidence_level,
                 metric_report=metric_report,
+                candidate_pool_policy=candidate_pool_policy,
+                provider_responses_available=provider_responses_available,
             )
     return HistoricalReplaySet(
         methods=normalized,
-        scheme_b_terminal_state=_scheme_b_terminal_state(normalized.values()),
+        scheme_b_terminal_state=overall_compatibility_terminal_state(normalized.values()),
     )
 
 
@@ -228,13 +243,13 @@ def _association_binding(value: object, label: str) -> tuple[str, str]:
     return path, _hash_value(sha256)
 
 
-def _frozen_dataset(
+def _normalized_source(
     query_ids: list[str],
     sources: Mapping[str, Path],
     *,
     association_path: Path,
     association_sha256: str,
-) -> FrozenRecallDataset:
+) -> HistoricalNormalizedSource:
     association_bytes = association_path.read_bytes()
     if hashlib.sha256(association_bytes).hexdigest() != association_sha256:
         raise HistoricalReplayError("historical Gold association hash mismatch")
@@ -250,11 +265,12 @@ def _frozen_dataset(
         },
         "gold_associations": "sha256:" + hashlib.sha256(association_bytes).hexdigest(),
     }
-    return FrozenRecallDataset(
+    return HistoricalNormalizedSource(
         queries=selected,
         source_hashes=source_hashes,
-        evaluation_materials=None,
-        seed_candidates=[],
+        identifier_map_bound=False,
+        scoring_status="unscorable",
+        unscorable_reason="identifier-map bytes are not bound by the historical source",
     )
 
 
@@ -262,14 +278,16 @@ def _query_evolution_replay(
     *,
     record: Mapping[str, object],
     sources: Mapping[str, Path],
-    dataset: FrozenRecallDataset,
+    normalized_source: HistoricalNormalizedSource,
     evidence_level: Literal["exact", "aggregate_only", "insufficient", "not_comparable"],
     metric_report: Mapping[str, object],
+    candidate_pool_policy: str,
+    provider_responses_available: bool,
 ) -> HistoricalMethodReplay:
     outcomes_path = _source_with_name(sources, "outcomes.jsonl")
     outcomes = [_mapping(json.loads(line), "query-evolution outcome") for line in outcomes_path.read_text(encoding="utf-8").splitlines() if line]
     outcome_by_id = {_required_string(item, "query_id"): item for item in outcomes}
-    query_ids = [query.query_id for query in dataset.queries]
+    query_ids = [query.query_id for query in normalized_source.queries]
     if set(outcome_by_id) != set(query_ids):
         raise HistoricalReplayError("query-evolution outcomes do not match the normalized query slice")
     actions: dict[str, dict[str, object]] = {}
@@ -308,7 +326,7 @@ def _query_evolution_replay(
                 )
             )
         actions[query_id] = {"actions": action_rows}
-        pool = CandidatePoolBuilder("canonical-id-first-v1").build(query_id, results)
+        pool = CandidatePoolBuilder(candidate_pool_policy).build(query_id, results)
         pools[query_id] = tuple(entry.paper.canonical_id for entry in pool.entries)
     lock = _load_json(_source_with_name(sources, "probe.lock.json"))
     return HistoricalMethodReplay(
@@ -317,11 +335,12 @@ def _query_evolution_replay(
         source_hashes=_source_hashes(sources),
         query_ids_available=query_ids,
         evidence_level=evidence_level,
-        candidate_pool_policy_version="canonical-id-first-v1",
+        action_family=_required_string(record, "action_family"),
+        candidate_pool_policy_version=candidate_pool_policy,
         exact_actions_available=True,
-        exact_provider_responses_available=True,
+        exact_provider_responses_available=provider_responses_available,
         fixed_actions=actions,
-        frozen_dataset=dataset,
+        normalized_source=normalized_source,
         candidate_pool_ids_by_query=pools,
         aggregate_metrics=_query_evolution_metrics(metric_report),
         terminal_state="not_comparable",
@@ -344,9 +363,11 @@ def _aggregate_replay(
     method_id: str,
     record: Mapping[str, object],
     sources: Mapping[str, Path],
-    dataset: FrozenRecallDataset,
+    normalized_source: HistoricalNormalizedSource,
     evidence_level: Literal["exact", "aggregate_only", "insufficient", "not_comparable"],
     metric_report: Mapping[str, object],
+    candidate_pool_policy: str,
+    provider_responses_available: bool,
 ) -> HistoricalMethodReplay:
     report = _load_json(next(iter(sources.values())))
     terminal: HistoricalTerminalState = (
@@ -365,12 +386,13 @@ def _aggregate_replay(
         method_id=method_id,
         source_run_id=_required_string(report, "run_id"),
         source_hashes=_source_hashes(sources),
-        query_ids_available=[query.query_id for query in dataset.queries],
+        query_ids_available=[query.query_id for query in normalized_source.queries],
         evidence_level=evidence_level,
-        candidate_pool_policy_version=_required_string(record, "candidate_pool_policy_version"),
-        exact_actions_available=False,
-        exact_provider_responses_available=False,
-        frozen_dataset=dataset,
+        action_family=_required_string(record, "action_family"),
+        candidate_pool_policy_version=candidate_pool_policy,
+        exact_actions_available=_evidence_available(record, "actions_evidence"),
+        exact_provider_responses_available=provider_responses_available,
+        normalized_source=normalized_source,
         aggregate_metrics=_aggregate_metrics(metric_report),
         terminal_state=terminal,
         per_query_equality="not_provable",
@@ -407,12 +429,49 @@ def _metric_report(
     return _load_json(sources[path])
 
 
-def _scheme_b_terminal_state(methods: Iterable[HistoricalMethodReplay]) -> HistoricalTerminalState:
-    exact = [method for method in methods if isinstance(method, HistoricalMethodReplay) and method.terminal_state == "exact_replay_passed"]
-    families = {method.method_id for method in exact}
-    if len(exact) >= 2 and "query-evolution" in families and any(
-        method.method_id in {"title-candidates", "citation-expansion"} for method in exact
-    ):
+def _verified_candidate_pool_policy(
+    record: Mapping[str, object], binding: Mapping[str, object]
+) -> str:
+    inventory_policy = _required_string(record, "candidate_pool_policy_version")
+    binding_policy = _required_string(binding, "candidate_pool_policy_version")
+    if inventory_policy != binding_policy:
+        raise HistoricalReplayError(
+            "Task 0 candidate-pool policy differs from the current historical binding"
+        )
+    return binding_policy
+
+
+def _verified_provider_response_evidence(
+    record: Mapping[str, object], sources: Mapping[str, Path], root: Path
+) -> bool:
+    evidence = _mapping(record.get("provider_response_evidence"), "provider response evidence")
+    if evidence.get("available") is False:
+        return False
+    path = evidence.get("path")
+    if evidence.get("available") is not True or not isinstance(path, str):
+        raise HistoricalReplayError("provider response evidence is malformed")
+    if path not in sources:
+        raise HistoricalReplayError("provider response evidence path is not a bound historical source")
+    try:
+        frozen_request_identities(sources[path], workspace_root=root)
+    except InventoryError as error:
+        raise HistoricalReplayError(str(error)) from error
+    return True
+
+
+def _evidence_available(record: Mapping[str, object], key: str) -> bool:
+    evidence = _mapping(record.get(key), key)
+    return evidence.get("available") is True
+
+
+def overall_compatibility_terminal_state(
+    methods: Iterable[HistoricalMethodReplay],
+) -> HistoricalTerminalState:
+    """Require independently exact text and non-text retrieval evidence."""
+    exact = [method for method in methods if method.terminal_state == "exact_replay_passed"]
+    has_text_search = any(method.action_family == "text_search" for method in exact)
+    has_non_text_search = any(method.action_family != "text_search" for method in exact)
+    if len(exact) >= 2 and has_text_search and has_non_text_search:
         return "exact_replay_passed"
     return "insufficient_historical_evidence"
 
@@ -486,9 +545,11 @@ def _list_of_mappings(value: object, label: str) -> list[Mapping[str, object]]:
 
 __all__ = [
     "HistoricalMethodReplay",
+    "HistoricalNormalizedSource",
     "HistoricalReplayError",
     "HistoricalReplaySet",
     "HistoricalTerminalState",
     "PerQueryEquality",
     "load_historical_replays",
+    "overall_compatibility_terminal_state",
 ]

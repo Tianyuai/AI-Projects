@@ -156,12 +156,9 @@ class CandidateRecallEvaluator:
 
     def preflight(self, dataset: FrozenRecallDataset) -> PreparedEvaluationContext:
         """Resolve aliases once and prove all evaluator-only frozen invariants."""
-        materials = dataset.evaluation_materials
-        if materials is None:
-            raise ValueError("evaluation materials are unavailable for this frozen dataset")
-        identifier_map = IdentifierMap.from_bytes(materials.identifier_map_bytes)
+        identifier_map = IdentifierMap.from_bytes(dataset.evaluation_materials.identifier_map_bytes)
         resolver = IdentifierResolver(identifier_map)
-        material_queries = materials.gold_records
+        material_queries = dataset.evaluation_materials.gold_records
         dataset_ids = [query.query_id for query in dataset.queries]
         material_ids = [query.query_id for query in material_queries]
         if dataset_ids != material_ids:

@@ -141,3 +141,13 @@ Citation Expansion、Topic Retrieval、Embedding Reranking、普通 Query Rewrit
 - 相关实现、证据与验证器已经合并并推送到 `main`，实现与证据链截至 `2a538fc3643a1309ee8bf247039ac6639173ddc8`；本节的 HANDOFF/路线图封存提交位于其后。最终离线验证在含完整 sealed 材料的 week3 工作区为 `2233 passed, 35 skipped, 1 online deselected`，Ruff 与 mypy 均通过。
 - 主工作区缺少 Git 忽略的 sealed run、Gold 和 identifier-map 本地材料，因此在那里运行全量测试会有 58 个环境性失败；同一提交已在 week3 工作区通过完整离线测试。主工作区不依赖这些私有材料的相关测试为 `102 passed`。
 - 当前 week3 仍保留未提交的 `HANDOFF.md`、`docs/retrieval-roadmap.md`、`data/budget_ledger.sqlite3`、`deliverables/` 和 `docs/evidence/identifier-map-semantic-audit-2026-08-10.json`；除本次明确更新的两份文档外，其余文件不得清理、覆盖或误提交。
+
+## 14. Scheme B 模块化候选召回离线验收（2026-08-12）
+
+- 离线验收已在 `D:\AI Projects\.worktrees\week3` 完成：四个模块组分别为 `70`、`42`、`23`、`68` passed；`tests/recall_experiments` 为 `217 passed`；全仓库 `pytest -m "not online" -q` 为 `2452 passed, 35 skipped, 1 deselected`。跳过项仅是 Windows 平台不支持 symlink 或 POSIX inode 语义的已标注测试。
+- 质量门结果：对 `248` 个 tracked Python 文件的 Ruff 为 `All checks passed!`；`mypy src scripts` 为 `135 source files`、`0` errors；`git diff --check` exit `0`。
+- 模块化能力已验证：文本、标题和引用扩展三个检索 handler 可独立注册/替换且相互不导入；候选池是版本化、保留 provenance、Gold-independent 的完整去重投影；runner 仅编排注入接口，不含方法 ID、action-type 分支、provider 构造器、历史常量或排序指标；Phase-1 报告模型不含 Precision/F1/MRR/NDCG/Top-K 字段。
+- 离线安全边界已验证：novel action 在 snapshot replay 中以 `snapshot_unavailable` fail-closed，不会回退到 live；LLM `initial`/`repair` 均有独立预算 reservation 和终态处理；本次没有读取 `.env`、联网、构造 live provider、写 ledger 或执行 live Scheme B repeat。
+- 历史证据仍为精确受限结论：Query Rewrite、LLM Query Variants 与 Title Candidates 是 `aggregate_only`；Query Evolution 的 action/provider snapshot bytes 可验，但缺少独立绑定的 identifier-map/per-query Gold 命中，故为 `not_comparable`；Citation Expansion 为 `insufficient_historical_evidence`。Scheme B 总结仍为 `insufficient_historical_evidence`，不能给出 overall `passed`。
+- 5 个 historical bindings 的 9 个 source hashes 加 1 个 Gold association hash（共 `10/10`）与当前 bytes、Task 0 inventory 及 Task 0 review binding 完全一致；其中 1 个路径 tracked、9 个由 `.gitignore` 覆盖。Oracle Gold-document catalog 仍为 `oracle_catalog_blocked`，未授权前不得执行 Oracle/DeepSeek 或任何 live comparison。
+- 用户路径保持本轮开始时的未跟踪状态且未写入：`data/budget_ledger.sqlite3` SHA-256 `56f7f6871a6c642223786900462e81c8a877824a94bd952dfd2b395268956750`、`docs/evidence/identifier-map-semantic-audit-2026-08-10.json` SHA-256 `79e0c02ab59f8e61d243d8f5d73a2d713c6cd1d846aff61c6f2a3aa90ea03c8c`、`deliverables/`（2059 files）tree SHA-256 `6aa105b4bda3482fe8bb64a7097b6fc73d92531c3be29010ddc1a3ef2ae8a6b1`。

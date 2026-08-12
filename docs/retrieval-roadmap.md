@@ -148,3 +148,11 @@ DOI exact-endpoint acceptance contract 已完成离线固化：请求使用规�
 - 禁止事项：当前阶段不修改生产代码、不重建锁、不刷新 readiness、不运行 live capture/replay/compare、不读取 `.env` 或 ledger，也不自动采用参考文献中的方法。
 
 Phase 11 的推荐顺序只有三步：先写正式设计；再做矛盾、遗漏、冗余自审并确定指标/门槛/停止条件；用户批准后再撰写精简实施计划。未经批准不执行实验。
+
+## Phase 12：Scheme B 候选召回 harness 离线验收（已完成，未进入 live）
+
+- 模块化 harness 已通过离线验收：inventory/contracts/recipes/inputs 为 `70 passed`；LLM、registry、text/title/citation handlers 为 `42 passed`；candidate-pool/evaluator 为 `23 passed`；generation/artifacts/runner/CLI 为 `68 passed`。聚合 `tests/recall_experiments` 为 `217 passed`，全仓 `not online` 为 `2452 passed, 35 skipped, 1 deselected`。
+- 静态门完整通过：Ruff 检查 `248` 个 tracked Python 文件无问题，`mypy src scripts` 对 `135` 个 source files 为 0 errors，`git diff --check` exit 0。架构 AST/search 复核确认 retrieval handlers 互不导入；candidate pool 不依赖 evaluator、Gold 或 `IdentifierMap`；runner 不含 method/action/provider/metric/history 特例；Phase-1 回报仅表达 candidate recall。
+- Snapshot replay 只支持 hash-bound exact request：novel action 明确终止为 `snapshot_unavailable`，没有隐式 live fallback。每次 LLM initial/repair 调用各自占用并终结预算 receipt。此阶段未读 `.env`、未联网、未动 ledger、未创建或运行 live Scheme B 尝试。
+- 历史回放覆盖是证据边界，不是 regenerated compatibility：Query Rewrite、LLM Query Variants、Title Candidates 为 `aggregate_only`；Query Evolution 只验证已封存 actions/provider responses，因未绑定 identifier-map 和独立 per-query Gold-hit 而为 `not_comparable`；Citation Expansion 缺 seed actions/provider responses，为 `insufficient_historical_evidence`。因此 Scheme B 仍为 `insufficient_historical_evidence`，不满足两种跨 action family 的 exact replay 条件。
+- Task 0 绑定、保存 inventory 与当前文件的 10 个历史源/Gold hash 全部一致。Oracle catalog 仍被 `oracle_catalog_blocked` 阻断；在完整、hash-bound Gold-document catalog 和明确 live 授权之前，不得进行 Oracle 生成、DeepSeek、provider 调用或 Scheme B regenerated repeat。

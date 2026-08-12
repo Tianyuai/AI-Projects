@@ -35,6 +35,7 @@ from paper_search.recall_experiments.generation.deepseek import DeepSeekPromptGe
 from paper_search.recall_experiments.generation.fixed import FixedActionGenerator
 from paper_search.recall_experiments.generation.manual import ManualActionGenerator
 from paper_search.recall_experiments.inputs.formal_run import FormalRunInputSource
+from paper_search.recall_experiments.inputs.historical import load_historical_replays
 from paper_search.recall_experiments.inputs.gold_catalog import (
     GoldDocumentCatalogSource,
     SealedGoldDocumentCatalog,
@@ -256,6 +257,53 @@ def compare_recall_artifacts(
         }
         output_path.mkdir(parents=True, exist_ok=False)
         _write_new_json(output_path / "recall-comparison.json", payload)
+        return payload
+    except (OSError, TypeError, ValueError, KeyError) as error:
+        raise RecallTerminalError("config_mismatch") from error
+
+
+def compare_historical_replays(
+    *,
+    inventory_path: Path,
+    config_root: Path,
+    output_path: Path,
+    workspace_root: Path,
+) -> dict[str, object]:
+    """Write all historical replay terminal states without manufacturing evidence."""
+    try:
+        replay = load_historical_replays(
+            inventory_path=inventory_path,
+            config_root=config_root,
+            workspace_root=workspace_root,
+        )
+        methods = [
+            {
+                "method_id": method.method_id,
+                "source_run_id": method.source_run_id,
+                "source_hashes": method.source_hashes,
+                "query_ids_available": method.query_ids_available,
+                "evidence_level": method.evidence_level,
+                "candidate_pool_policy_version": method.candidate_pool_policy_version,
+                "fixed_actions_replayed": method.fixed_actions is not None,
+                "candidate_pool_ids_by_query": method.candidate_pool_ids_by_query,
+                "gold_hit_ids_by_query": method.gold_hit_ids_by_query,
+                "aggregate_metrics": method.aggregate_metrics,
+                "terminal_state": method.terminal_state,
+                "per_query_equality": method.per_query_equality,
+                "semantic_mismatch": method.semantic_mismatch,
+                "unprovable_fields": method.unprovable_fields,
+            }
+            for method in replay.methods.values()
+        ]
+        payload: dict[str, object] = {
+            "schema_version": "candidate-recall-historical-replay-v1",
+            "methods": methods,
+            "scheme_b_terminal_state": replay.scheme_b_terminal_state,
+            "status": "complete",
+            "path": str(output_path),
+        }
+        output_path.mkdir(parents=True, exist_ok=False)
+        _write_new_json(output_path / "historical-replay-comparison.json", payload)
         return payload
     except (OSError, TypeError, ValueError, KeyError) as error:
         raise RecallTerminalError("config_mismatch") from error
@@ -584,6 +632,7 @@ __all__ = [
     "build_replay_runtime",
     "build_text_handler",
     "compare_recall_artifacts",
+    "compare_historical_replays",
     "build_title_handler",
     "generator_factories",
     "prepare_recall_run",

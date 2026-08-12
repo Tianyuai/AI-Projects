@@ -134,9 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
     run_recall.add_argument("--snapshot-manifest", type=Path)
     run_recall.add_argument("--allow-live", action="store_true")
     run_recall.add_argument("--out", type=Path, required=True)
-    compare_recall = recall_commands.add_parser("compare", help="compare explicit recall artifacts")
-    compare_recall.add_argument("--current", type=Path, required=True)
+    compare_recall = recall_commands.add_parser("compare", help="compare recall artifacts or bound historical evidence")
+    compare_recall.add_argument("--current", type=Path)
     compare_recall.add_argument("--historical", type=Path)
+    compare_recall.add_argument("--config-root", type=Path)
     compare_recall.add_argument("--out", type=Path, required=True)
     inventory = recall_commands.add_parser(
         "inventory-history", help="verify frozen historical recall evidence"
@@ -391,6 +392,7 @@ def _run_recall_command(
     """Dispatch recall composition without opening runtime state for offline paths."""
     from paper_search.recall_experiments.composition import (
         RecallTerminalError,
+        compare_historical_replays,
         compare_recall_artifacts,
         prepare_recall_run,
         run_recall_experiment,
@@ -425,11 +427,23 @@ def _run_recall_command(
                 )
             )
         elif args.recall_command == "compare":
-            comparison = compare_recall_artifacts(
-                current_run=args.current,
-                historical_run=args.historical,
-                output_path=output,
-            )
+            if args.config_root is not None:
+                if args.current is not None or args.historical is not None:
+                    raise RecallTerminalError("config_mismatch")
+                comparison = compare_historical_replays(
+                    inventory_path=Path.cwd() / "runs" / "_recall_history_inventory" / "source-inventory.json",
+                    config_root=args.config_root,
+                    output_path=output,
+                    workspace_root=Path.cwd(),
+                )
+            elif args.current is not None:
+                comparison = compare_recall_artifacts(
+                    current_run=args.current,
+                    historical_run=args.historical,
+                    output_path=output,
+                )
+            else:
+                raise RecallTerminalError("config_mismatch")
             path = output
             summary = {"path": str(path), "status": "complete", **comparison}
         elif args.recall_command == "inventory-history":

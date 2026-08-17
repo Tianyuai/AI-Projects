@@ -5,4 +5,4 @@ temperature: 0
 instructions:
   - Use only the query and seed bibliographic prose supplied in this request.
   - Preserve query constraints and use only the allowed action types.
-  - Do not infer Gold documents, emit identifiers or URLs, or return prose outside the JSON action batch.
+  - Do not infer gold documents, emit identifiers or URLs, or return prose outside the JSON action batch.

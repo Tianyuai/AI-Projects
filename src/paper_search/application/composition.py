@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, NoReturn, Protocol
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 import httpx
@@ -16,13 +16,9 @@ from pydantic import SecretStr
 
 from paper_search.application.artifacts import ArtifactFactory
 from paper_search.application.experiments import (
-    ExperimentComponents,
-    ExperimentDependencyFactory,
     ExperimentDefinition,
     ExperimentFlags,
     ExperimentName,
-    build_experiment_components,
-    load_experiment_definition,
 )
 from paper_search.application.contracts import (
     ReadyHealthResponse,
@@ -46,9 +42,7 @@ from paper_search.application.readiness import (
 from paper_search.application.service import SearchApplicationService, SearchOrchestrator
 from paper_search.api.routing import SearchServiceRouter
 from paper_search.config import (
-    ExperimentConfigEvidence,
     RuntimeConfig,
-    experiment_config_hash,
     parse_budget_bytes,
     validate_mode_authorization,
 )
@@ -72,7 +66,6 @@ from paper_search.llm.snapshot_adapters import (
     ReplayLLMAnalyzer,
 )
 from paper_search.pipeline.orchestrator import (
-    EvolutionSearchOrchestrator,
     MockSearchOrchestrator,
     OrchestratorResult,
 )
@@ -80,7 +73,6 @@ from paper_search.retrieval.snapshot_adapters import (
     LiveCaptureSearchProvider,
     ReplaySearchProvider,
 )
-from paper_search.retrieval.base import SearchProvider
 from paper_search.storage.dependency_snapshot import (
     DependencyCaptureStore,
     DependencySnapshotManifestV2,
@@ -93,30 +85,6 @@ _DEPENDENCIES: tuple[DependencyName, ...] = (
     "llm",
     "openalex",
     "semantic_scholar",
-)
-
-
-class _BaselineDependencyTrap:
-    def build_embedding_ranker(self) -> NoReturn:
-        raise AssertionError("main baseline cannot construct embedding")
-
-    def build_citation_expander(self) -> NoReturn:
-        raise AssertionError("main baseline cannot construct citation expansion")
-
-    def build_constraint_reranker(self) -> NoReturn:
-        raise AssertionError("main baseline cannot construct LLM reranking")
-
-    def build_title_candidate_stage(self) -> NoReturn:
-        raise AssertionError("main baseline cannot construct title candidates")
-
-
-_MAIN_BASELINE_COMPONENTS: ExperimentComponents = build_experiment_components(
-    ExperimentDefinition(
-        name="main-baseline",
-        flags=ExperimentFlags(),
-        strategy="fixed-one-round",
-    ),
-    dependencies=_BaselineDependencyTrap(),
 )
 
 
@@ -137,10 +105,7 @@ def _read_confined_source_capture_file(source_root: Path, name: str) -> tuple[Pa
         candidate = root / name
         resolved_before = candidate.resolve(strict=True)
         before = os.lstat(candidate)
-        if (
-            resolved_before.parent != root
-            or not stat.S_ISREG(before.st_mode)
-        ):
+        if resolved_before.parent != root or not stat.S_ISREG(before.st_mode):
             raise ValueError(unavailable)
 
         flags = os.O_RDONLY
@@ -214,116 +179,6 @@ class _AnalyzerBridge:
 
 
 @dataclass(frozen=True)
-class _RequestExperimentDependencies:
-    analyzer: _AnalyzerAdapter
-    providers: Mapping[str, SearchProvider]
-    analysis_estimate: UsageEstimate
-    provider_estimates: Mapping[str, UsageEstimate]
-    runtime_config: RuntimeConfig
-
-    def build_embedding_ranker(self) -> Any:
-        from paper_search.ranking.embedding import EmbeddingRanker
-        from paper_search.ranking.sentence_transformer import (
-            sentence_transformer_factory,
-        )
-
-        config = self.runtime_config.embedding
-        return EmbeddingRanker(
-            encoder_factory=sentence_transformer_factory(config.model_id),
-            model_id=config.model_id,
-            preferred_device=config.device,
-            batch_size=config.batch_size,
-            fallback_to_cpu=config.fallback_to_cpu,
-        )
-
-    def build_citation_expander(self) -> Any:
-        from paper_search.graph.provider_stage import ProviderCitationExpansionStage
-
-        provider = self.providers.get("semantic_scholar")
-        if provider is None:
-            raise ValueError("citation expansion requires semantic_scholar")
-        return ProviderCitationExpansionStage(
-            provider=provider,
-            call_estimate=self.provider_estimates["semantic_scholar"],
-        )
-
-    def build_constraint_reranker(self) -> Any:
-        from paper_search.ranking.llm_stage import LLMConstraintRerankingStage
-
-        return LLMConstraintRerankingStage(
-            analyzer=self.analyzer,
-            call_estimate=self.analysis_estimate,
-        )
-
-    def build_title_candidate_stage(self) -> Any:
-        from paper_search.retrieval.title_candidates import LLMTitleCandidateStage
-
-        provider = self.providers.get("openalex")
-        if provider is None:
-            raise ValueError("title candidates require openalex")
-        return LLMTitleCandidateStage(
-            analyzer=self.analyzer,
-            provider=provider,
-            max_titles=20,
-            llm_estimate=self.analysis_estimate.model_copy(
-                update={
-                    "llm_calls": 1,
-                    "input_tokens": 2000,
-                    "output_tokens": 1500,
-                    "elapsed_ms": 30000,
-                }
-            ),
-            search_estimate=self.provider_estimates["openalex"].model_copy(
-                update={"search_api_calls": 1, "elapsed_ms": 25000}
-            ),
-        )
-
-
-def _request_components(
-    *,
-    definition: ExperimentDefinition,
-    dependencies: ExperimentDependencyFactory | None,
-    analyzer: _AnalyzerAdapter,
-    providers: Mapping[str, SearchProvider],
-    analysis_estimate: UsageEstimate,
-    provider_estimates: Mapping[str, UsageEstimate],
-    runtime_config: RuntimeConfig | None,
-) -> ExperimentComponents:
-    if definition.name == "main-baseline":
-        return _MAIN_BASELINE_COMPONENTS
-    resolved_dependencies = dependencies
-    if resolved_dependencies is None:
-        if runtime_config is None:
-            raise ValueError("optional experiments require validated runtime config")
-        resolved_dependencies = _RequestExperimentDependencies(
-            analyzer=analyzer,
-            providers=providers,
-            analysis_estimate=analysis_estimate,
-            provider_estimates=provider_estimates,
-            runtime_config=runtime_config,
-        )
-    return build_experiment_components(
-        definition,
-        dependencies=resolved_dependencies,
-    )
-
-
-def _with_evolution(
-    *,
-    orchestrator: MockSearchOrchestrator,
-    controller: HardBudgetController,
-    components: ExperimentComponents,
-) -> SearchOrchestrator:
-    if components.evolution_strategy == "fixed_one_round":
-        return orchestrator
-    return EvolutionSearchOrchestrator(
-        single_round=orchestrator,
-        controller=controller,
-        strategy=components.evolution_strategy,
-    )
-
-
-@dataclass(frozen=True)
 class ApplicationBundle:
     service: SearchApplicationService
     readiness_probe: Callable[[], ReadyHealthResponse]
@@ -331,7 +186,7 @@ class ApplicationBundle:
     artifact_factory: ArtifactFactory
     experiment_id: ExperimentName
     optional_modules: dict[str, bool]
-    experiment_config: ExperimentConfigEvidence | None
+    experiment_config: None
     source_git_sha: str
     prompt_version: Literal["query-analyze-v1"]
     mode_binding: ModeBinding
@@ -396,11 +251,7 @@ class _RequestLiveCaptureService:
                 }
             )
             execution = execution.model_copy(
-                update={
-                    "outcome": execution.outcome.model_copy(
-                        update={"response": response}
-                    )
-                }
+                update={"outcome": execution.outcome.model_copy(update={"response": response})}
             )
             session.publish()
             return execution
@@ -564,9 +415,6 @@ def _replay_factory(
     lock: ReplayLock,
     pricer: ActualCostPricer,
     config_hash: Sha256,
-    experiment_definition: ExperimentDefinition,
-    experiment_dependencies: ExperimentDependencyFactory | None,
-    runtime_config: RuntimeConfig | None,
 ) -> Callable[[HardBudgetController, str], SearchOrchestrator]:
     def create(
         controller: HardBudgetController,
@@ -591,15 +439,6 @@ def _replay_factory(
                 reader=reader,
             ),
         }
-        components = _request_components(
-            definition=experiment_definition,
-            dependencies=experiment_dependencies,
-            analyzer=analyzer,
-            providers=providers,
-            analysis_estimate=analysis_estimate,
-            provider_estimates=provider_estimates,
-            runtime_config=runtime_config,
-        )
         orchestrator = MockSearchOrchestrator(
             controller=controller,
             analyzer=_AnalyzerBridge(analyzer),
@@ -615,17 +454,9 @@ def _replay_factory(
                 lock.baseline.retrieval.semantic_scholar_calls_max,
             ),
             execution_mode="replay",
-            embedding_ranker=components.embedding_ranker,
-            citation_expander=components.citation_expander,
-            constraint_reranker=components.constraint_reranker,
-            title_candidate_stage=components.title_candidate_stage,
             max_output_papers=lock.baseline.retrieval.max_output_papers,
         )
-        return _with_evolution(
-            orchestrator=orchestrator,
-            controller=controller,
-            components=components,
-        )
+        return orchestrator
 
     return create
 
@@ -711,9 +542,6 @@ class _LiveOrchestratorFactory:
         pricer: ActualCostPricer,
         credentials: _LiveCredentials,
         artifact_factory: ArtifactFactory,
-        experiment_definition: ExperimentDefinition,
-        experiment_dependencies: ExperimentDependencyFactory | None,
-        runtime_config: RuntimeConfig | None,
         prompt_instructions: str | None = None,
     ) -> None:
         self._lock = lock
@@ -721,9 +549,6 @@ class _LiveOrchestratorFactory:
         self._pricer = pricer
         self._credentials = credentials
         self._artifact_factory = artifact_factory
-        self._experiment_definition = experiment_definition
-        self._experiment_dependencies = experiment_dependencies
-        self._runtime_config = runtime_config
         self._prompt_instructions = prompt_instructions
 
     def __repr__(self) -> str:
@@ -735,9 +560,7 @@ class _LiveOrchestratorFactory:
         run_id: str,
     ) -> _LiveRunOrchestrator:
         lock = self._lock
-        seal_on_completion = not self._artifact_factory.has_capture_session(
-            run_id=run_id
-        )
+        seal_on_completion = not self._artifact_factory.has_capture_session(run_id=run_id)
         capture_store = self._artifact_factory.start_dependency_capture(run_id=run_id)
         timeout = httpx.Timeout(
             connect=lock.baseline.timeout.connect_seconds,
@@ -764,9 +587,7 @@ class _LiveOrchestratorFactory:
             capture_store=capture_store,
             pricer=self._pricer,
             controller=controller,
-            prompt_artifact_sha256=(
-                lock.baseline.planner.prompt_config.sha256
-            ),
+            prompt_artifact_sha256=(lock.baseline.planner.prompt_config.sha256),
             prompt_instructions=self._prompt_instructions,
         )
         providers = {
@@ -801,15 +622,6 @@ class _LiveOrchestratorFactory:
                 ),
             ),
         }
-        components = _request_components(
-            definition=self._experiment_definition,
-            dependencies=self._experiment_dependencies,
-            analyzer=analyzer,
-            providers=providers,
-            analysis_estimate=analysis_estimate,
-            provider_estimates=provider_estimates,
-            runtime_config=self._runtime_config,
-        )
         orchestrator = MockSearchOrchestrator(
             controller=controller,
             analyzer=_AnalyzerBridge(analyzer),
@@ -830,18 +642,10 @@ class _LiveOrchestratorFactory:
                 lock.baseline.retrieval.semantic_scholar_calls_max,
             ),
             execution_mode="live",
-            embedding_ranker=components.embedding_ranker,
-            citation_expander=components.citation_expander,
-            constraint_reranker=components.constraint_reranker,
-            title_candidate_stage=components.title_candidate_stage,
             max_output_papers=lock.baseline.retrieval.max_output_papers,
         )
         return _LiveRunOrchestrator(
-            orchestrator=_with_evolution(
-                orchestrator=orchestrator,
-                controller=controller,
-                components=components,
-            ),
+            orchestrator=orchestrator,
             capture_store=capture_store,
             client=client,
             artifact_factory=self._artifact_factory,
@@ -863,8 +667,8 @@ class CompositionRoot:
         live_authorized: bool,
         environ: Mapping[str, str] | None = None,
         runtime_config: RuntimeConfig | None = None,
-        ablation_config: Path = Path("configs/ablations.yaml"),
-        experiment_dependencies: ExperimentDependencyFactory | None = None,
+        ablation_config: Path | None = None,
+        experiment_dependencies: object | None = None,
     ) -> ServerApplicationBundle:
         """Bind one replay service and optionally authorize isolated live captures."""
         try:
@@ -886,7 +690,10 @@ class CompositionRoot:
         if live_authorized:
             capture_root = capture_output_root.resolve()
             source_id_path = Path(replay_lock.source_capture_run_id)
-            if source_id_path.name != replay_lock.source_capture_run_id or source_id_path.parent != Path("."):
+            if (
+                source_id_path.name != replay_lock.source_capture_run_id
+                or source_id_path.parent != Path(".")
+            ):
                 raise ValueError("source capture run id escapes capture output root")
             try:
                 source_root = (capture_root / replay_lock.source_capture_run_id).resolve(
@@ -894,7 +701,10 @@ class CompositionRoot:
                 )
             except OSError as error:
                 raise ValueError("source live capture lock is unavailable") from error
-            if source_root.parent != capture_root or source_root.name != replay_lock.source_capture_run_id:
+            if (
+                source_root.parent != capture_root
+                or source_root.name != replay_lock.source_capture_run_id
+            ):
                 raise ValueError("source capture run id escapes capture output root")
             source_lock_path, source_lock_bytes = _read_confined_source_capture_file(
                 source_root, "config.lock.yaml"
@@ -922,9 +732,7 @@ class CompositionRoot:
                 "capture_policy",
                 "project_ledger",
             ):
-                if getattr(source_verified.lock, field_name) != getattr(
-                    replay_lock, field_name
-                ):
+                if getattr(source_verified.lock, field_name) != getattr(replay_lock, field_name):
                     raise ValueError("source capture lock does not match replay lineage")
 
         replay = cls.compose(
@@ -1029,8 +837,8 @@ class CompositionRoot:
         lock_bytes: bytes | None = None,
         artifact_factory: ArtifactFactory | None = None,
         runtime_config: RuntimeConfig | None = None,
-        ablation_config: Path = Path("configs/ablations.yaml"),
-        experiment_dependencies: ExperimentDependencyFactory | None = None,
+        ablation_config: Path | None = None,
+        experiment_dependencies: object | None = None,
     ) -> ApplicationBundle:
         verified = (
             load_verified_input_lock(lock_path, artifact_root=artifact_root)
@@ -1041,54 +849,31 @@ class CompositionRoot:
             )
         )
         lock = verified.lock
-        experiment_definition = (
-            ExperimentDefinition(
-                name="main-baseline",
-                flags=ExperimentFlags(),
-                strategy="fixed-one-round",
-            )
-            if runtime_config is None
-            else load_experiment_definition(
-                runtime_config.experiment,
-                ablation_config=ablation_config,
-            )
+        del ablation_config, experiment_dependencies
+        experiment_definition = ExperimentDefinition(
+            name="main-baseline",
+            flags=ExperimentFlags(),
+            strategy="fixed-one-round",
         )
+        if runtime_config is not None and runtime_config.experiment != "main-baseline":
+            raise ValueError("unknown experiment name")
         validate_mode_authorization(
             mode=mode,
             runtime_allow_live=lock.runtime_allow_live,
             network_authorized=network_authorized,
         )
         locked_config_hash = lock_sha256(lock)
-        experiment_config = (
-            None
-            if experiment_definition.name == "main-baseline"
-            else ExperimentConfigEvidence(
-                experiment=experiment_definition,
-                embedding=(
-                    runtime_config.embedding
-                    if runtime_config is not None
-                    and experiment_definition.flags.embedding
-                    else None
-                ),
-            )
-        )
-        config_hash = experiment_config_hash(
-            input_lock_sha256=locked_config_hash,
-            evidence=experiment_config,
-        )
+        experiment_config = None
+        config_hash = locked_config_hash
         budget_profile = _locked_budget_profile(lock.budget_config.path)
         budgets: dict[str, SearchBudget] = {
-            budget_profile: parse_budget_bytes(
-                verified.artifact_bytes[lock.budget_config.path]
-            ),
+            budget_profile: parse_budget_bytes(verified.artifact_bytes[lock.budget_config.path]),
         }
         resolved_artifact_factory = artifact_factory or ArtifactFactory(
             output_root=output_root.resolve()
         )
         binding: ModeBinding
-        orchestrator_factory: Callable[
-            [HardBudgetController, str], SearchOrchestrator
-        ]
+        orchestrator_factory: Callable[[HardBudgetController, str], SearchOrchestrator]
         snapshot_captured_at: datetime | None = None
 
         if mode == "replay":
@@ -1115,14 +900,9 @@ class CompositionRoot:
                 reader=reader,
                 lock=lock,
                 pricer=ActualCostPricer(
-                    parse_pricing_policy_bytes(
-                        verified.artifact_bytes[lock.pricing_policy.path]
-                    )
+                    parse_pricing_policy_bytes(verified.artifact_bytes[lock.pricing_policy.path])
                 ),
                 config_hash=config_hash,
-                experiment_definition=experiment_definition,
-                experiment_dependencies=experiment_dependencies,
-                runtime_config=runtime_config,
             )
             readiness_probe = _replay_readiness(binding)
             snapshot_captured_at = _snapshot_manifest_time(manifest_path)
@@ -1151,9 +931,6 @@ class CompositionRoot:
                 pricer=pricer,
                 credentials=credentials,
                 artifact_factory=resolved_artifact_factory,
-                experiment_definition=experiment_definition,
-                experiment_dependencies=experiment_dependencies,
-                runtime_config=runtime_config,
                 prompt_instructions=_prompt_system_message(
                     verified.artifact_bytes[lock.baseline.planner.prompt_config.path]
                 ),

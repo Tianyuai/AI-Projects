@@ -1,45 +1,27 @@
-"""Exact default-off experiment identities and injected component selection."""
+"""Stable production identity for the canonical end-to-end system."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import Any, Literal, Protocol
 
-import yaml
 from pydantic import StrictBool, model_validator
 
 from paper_search.domain.models import DomainModel
-from paper_search.evolution import EvolutionStrategy
-
-if TYPE_CHECKING:
-    from paper_search.graph.provider_stage import AsyncCitationExpansionStage
-    from paper_search.ranking.embedding import EmbeddingRankingStage
-    from paper_search.ranking.llm_stage import AsyncConstraintRerankingStage
-    from paper_search.retrieval.title_candidates import AsyncTitleCandidateStage
 
 
-ExperimentName = Literal[
-    "main-baseline",
-    "embedding",
-    "citation-expansion",
-    "llm-rerank",
-    "title-candidates",
-    "fixed-two-round",
-    "adaptive-evolution",
-]
-ExperimentStrategy = Literal[
-    "fixed-one-round",
-    "fixed-two-round",
-    "adaptive-evolution",
-]
+ExperimentName = Literal["main-baseline"]
+ExperimentStrategy = Literal["fixed-one-round"]
 
 
 class OptionalStageUnavailableError(RuntimeError):
-    """An optional stage reported an expected, evidence-bearing outage."""
+    """Compatibility error used by shared provider adapters."""
 
 
 class ExperimentFlags(DomainModel):
+    """Read-only legacy evidence fields; production requires every flag off."""
+
     embedding: StrictBool = False
     citation_expansion: StrictBool = False
     constraint_reranking: StrictBool = False
@@ -48,37 +30,10 @@ class ExperimentFlags(DomainModel):
     adaptive_evolution: StrictBool = False
 
 
-_DEFINITIONS: dict[ExperimentName, tuple[ExperimentFlags, ExperimentStrategy]] = {
-    "main-baseline": (ExperimentFlags(), "fixed-one-round"),
-    "embedding": (ExperimentFlags(embedding=True), "fixed-one-round"),
-    "citation-expansion": (
-        ExperimentFlags(citation_expansion=True),
-        "fixed-one-round",
-    ),
-    "llm-rerank": (
-        ExperimentFlags(constraint_reranking=True),
-        "fixed-one-round",
-    ),
-    "title-candidates": (
-        ExperimentFlags(title_candidates=True),
-        "fixed-one-round",
-    ),
-    "fixed-two-round": (
-        ExperimentFlags(fixed_two_round=True),
-        "fixed-two-round",
-    ),
-    "adaptive-evolution": (
-        ExperimentFlags(adaptive_evolution=True),
-        "adaptive-evolution",
-    ),
-}
-
-
 def expected_experiment_flags(name: str) -> ExperimentFlags:
-    definition = _DEFINITIONS.get(cast(ExperimentName, name))
-    if definition is None:
+    if name != "main-baseline":
         raise ValueError("unknown experiment name")
-    return definition[0]
+    return ExperimentFlags()
 
 
 class ExperimentDefinition(DomainModel):
@@ -88,102 +43,46 @@ class ExperimentDefinition(DomainModel):
 
     @model_validator(mode="after")
     def validate_exact_definition(self) -> ExperimentDefinition:
-        expected_flags, expected_strategy = _DEFINITIONS[self.name]
-        if self.flags != expected_flags or self.strategy != expected_strategy:
+        if self.flags != ExperimentFlags() or self.strategy != "fixed-one-round":
             raise ValueError("exact experiment definition is required")
         return self
 
 
 @dataclass(frozen=True)
 class ExperimentComponents:
-    embedding_ranker: EmbeddingRankingStage | None
-    citation_expander: AsyncCitationExpansionStage | None
-    constraint_reranker: AsyncConstraintRerankingStage | None
-    title_candidate_stage: AsyncTitleCandidateStage | None
-    evolution_strategy: EvolutionStrategy
+    embedding_ranker: None = None
+    citation_expander: None = None
+    constraint_reranker: None = None
+    title_candidate_stage: None = None
+    evolution_strategy: Literal["fixed_one_round"] = "fixed_one_round"
 
 
 class ExperimentDependencyFactory(Protocol):
-    def build_embedding_ranker(self) -> EmbeddingRankingStage: ...
-
-    def build_citation_expander(self) -> AsyncCitationExpansionStage: ...
-
-    def build_constraint_reranker(self) -> AsyncConstraintRerankingStage: ...
-
-    def build_title_candidate_stage(self) -> AsyncTitleCandidateStage: ...
-
-
-def _optional_flags(raw: object) -> ExperimentFlags:
-    if not isinstance(raw, dict):
-        raise ValueError("ablation case must contain a mapping")
-    public = {
-        "embedding": raw.get("embedding"),
-        "citation_expansion": raw.get("citation_expansion"),
-        "constraint_reranking": raw.get("llm_rerank"),
-        "title_candidates": raw.get("title_candidates"),
-        "fixed_two_round": raw.get("fixed_two_round"),
-        "adaptive_evolution": raw.get("adaptive_evolution"),
-    }
-    if any(not isinstance(value, bool) for value in public.values()):
-        raise ValueError("experiment flags must be explicit booleans")
-    return ExperimentFlags.model_validate(public)
+    """Compatibility marker for composition callers; no optional builders remain."""
 
 
 def load_experiment_definition(
-    name: ExperimentName,
+    name: str,
     *,
-    ablation_config: Path,
+    ablation_config: Path | None = None,
 ) -> ExperimentDefinition:
-    if name not in _DEFINITIONS:
-        raise ValueError("unknown experiment name")
-    try:
-        raw = yaml.safe_load(ablation_config.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as error:
-        raise ValueError("invalid ablation registry") from error
-    if not isinstance(raw, dict):
-        raise ValueError("ablation registry must contain a mapping")
-    case_name = "baseline" if name == "main-baseline" else name
-    flags = _optional_flags(raw.get(case_name))
-    expected_flags, strategy = _DEFINITIONS[name]
-    if flags != expected_flags:
-        raise ValueError("ablation registry does not match exact experiment definition")
-    return ExperimentDefinition(name=name, flags=flags, strategy=strategy)
+    del ablation_config
+    expected_experiment_flags(name)
+    return ExperimentDefinition(
+        name="main-baseline",
+        flags=ExperimentFlags(),
+        strategy="fixed-one-round",
+    )
 
 
 def build_experiment_components(
     definition: ExperimentDefinition,
     *,
-    dependencies: ExperimentDependencyFactory,
+    dependencies: ExperimentDependencyFactory | Any,
 ) -> ExperimentComponents:
-    definition = ExperimentDefinition.model_validate(definition)
-    strategy_map: dict[ExperimentStrategy, EvolutionStrategy] = {
-        "fixed-one-round": "fixed_one_round",
-        "fixed-two-round": "fixed_two_round",
-        "adaptive-evolution": "adaptive",
-    }
-    return ExperimentComponents(
-        embedding_ranker=(
-            dependencies.build_embedding_ranker()
-            if definition.flags.embedding
-            else None
-        ),
-        citation_expander=(
-            dependencies.build_citation_expander()
-            if definition.flags.citation_expansion
-            else None
-        ),
-        constraint_reranker=(
-            dependencies.build_constraint_reranker()
-            if definition.flags.constraint_reranking
-            else None
-        ),
-        title_candidate_stage=(
-            dependencies.build_title_candidate_stage()
-            if definition.flags.title_candidates
-            else None
-        ),
-        evolution_strategy=strategy_map[definition.strategy],
-    )
+    del dependencies
+    ExperimentDefinition.model_validate(definition)
+    return ExperimentComponents()
 
 
 __all__ = [

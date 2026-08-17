@@ -1,6 +1,6 @@
 schema_version: recall-runtime-profile-v1
-env_file: ../../../../../Projects/.env
-pricing_policy: ../../../data/annotation_work/pricing_v1.yaml
+env_file: ../../../.env
+pricing_policy: ../../../configs/pricing_v1.yaml
 budget: ../../../configs/budget_low.yaml
 capture_responses: true
 llm_model: deepseek-v4-flash

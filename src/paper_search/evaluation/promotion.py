@@ -9,7 +9,6 @@ from typing import Literal, Self
 
 from pydantic import model_validator
 
-from paper_search.application.experiments import ExperimentName
 from paper_search.control.pricing import AUTHORITATIVE_QUALITY_CATALOG
 from paper_search.domain.models import DomainModel, NonEmptyStr, Sha256
 from paper_search.evaluation.statistics import MacroF1Comparison
@@ -55,7 +54,7 @@ def _meets_threshold(value: Decimal, rule_id: str) -> bool:
 class PromotionEvidence(DomainModel):
     """One complete, policy-bound optional-module promotion evidence bundle."""
 
-    experiment: ExperimentName
+    experiment: NonEmptyStr
     dev_run_ids: tuple[NonEmptyStr, NonEmptyStr, NonEmptyStr]
     median_macro_f1_delta: Decimal
     bootstrap_samples: Literal[1000] = 1000
@@ -102,7 +101,7 @@ class PromotionEvidence(DomainModel):
 
 def evaluate_promotion_evidence(
     *,
-    experiment: ExperimentName,
+    experiment: NonEmptyStr,
     dev_run_ids: Sequence[str],
     dev_comparisons: Sequence[MacroF1Comparison],
     validation_comparison: MacroF1Comparison,

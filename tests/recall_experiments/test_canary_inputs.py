@@ -9,7 +9,6 @@ from paper_search.recall_experiments.canary_inputs import (
     LoadedCanaryInput,
     RecallCase,
     load_canary_input,
-    load_frozen_cases,
     load_jsonl_cases,
     load_single_case,
 )
@@ -69,20 +68,6 @@ def test_jsonl_rejects_mixed_gold_coverage(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="all cases must consistently include Gold"):
         load_jsonl_cases(path)
-
-
-def test_frozen_sample_uses_the_same_recall_case_contract() -> None:
-    cases = load_frozen_cases(
-        Path("configs/recall_experiments/samples/dev-smoke-3.yaml"),
-        workspace_root=Path.cwd(),
-    )
-
-    assert [case.query_id for case in cases] == [
-        "AutoScholarQuery_dev_14",
-        "AutoScholarQuery_dev_247",
-        "AutoScholarQuery_dev_399",
-    ]
-    assert [len(case.gold_paper_ids or ()) for case in cases] == [1, 5, 2]
 
 
 def test_cases_reject_duplicate_query_ids(tmp_path: Path) -> None:

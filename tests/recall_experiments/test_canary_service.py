@@ -88,7 +88,7 @@ async def _run_canary(
     profile = RecallRuntimeProfile(
         schema_version="recall-runtime-profile-v1",
         env_file=tmp_path / "unused.env",
-        pricing_policy=Path("data/annotation_work/pricing_v1.yaml").resolve(),
+        pricing_policy=Path("configs/pricing_v1.yaml").resolve(),
         budget=Path("configs/budget_low.yaml").resolve(),
         capture_responses=True,
         llm_model="deepseek-v4-flash",
@@ -243,7 +243,7 @@ def test_service_rejects_unverified_runtime_before_dispatch(tmp_path: Path) -> N
     loaded_recipe = load_recall_recipe(_recipe(tmp_path))
     profile = RecallRuntimeProfile(
         schema_version="recall-runtime-profile-v1", env_file=tmp_path / "none",
-        pricing_policy=Path("data/annotation_work/pricing_v1.yaml").resolve(),
+        pricing_policy=Path("configs/pricing_v1.yaml").resolve(),
         budget=Path("configs/budget_low.yaml").resolve(), capture_responses=True,
         llm_model="deepseek-v4-flash", llm_reservation_input_tokens=2500,
         llm_reservation_output_tokens=1000,

@@ -1,12 +1,5 @@
 experiment: main-baseline
 
-embedding:
-  enabled: false
-  model_id: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-  device: cpu
-  batch_size: 16
-  fallback_to_cpu: true
-
 runtime:
   allow_live: false
   artifact_root: artifacts

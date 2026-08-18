@@ -24,10 +24,13 @@ class TextSearchHandler:
     ) -> RetrievalActionResult:
         if not isinstance(action, TextSearchAction):
             raise TypeError("text search handler requires a text-search action")
+        filters = dict(context.provider_filters)
+        if action.payload.search_mode == "semantic":
+            filters["_search_mode"] = "semantic"
         result = await self._backend.search(
             action_id=action.action_id,
             query=action.payload.query_text,
-            filters=dict(context.provider_filters),
+            filters=filters,
             limit=context.max_results_per_action,
         )
         return RetrievalActionResult(

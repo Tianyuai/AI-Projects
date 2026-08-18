@@ -17,6 +17,7 @@ from paper_search.application.locks import (
     ValidationLock,
     canonical_lock_bytes,
     load_input_lock,
+    load_verified_input_lock,
     lock_sha256,
 )
 
@@ -64,6 +65,60 @@ def test_candidate_lock_accepts_openalex_only_routing() -> None:
     lock = CandidateLock.model_validate(raw)
 
     assert lock.baseline.retrieval.semantic_scholar_calls_max == 0
+
+
+def test_legacy_lock_canonical_identity_omits_absent_document_ranker() -> None:
+    lock = CandidateLock.model_validate(fixture_data("candidate.lock.yaml"))
+
+    canonical = canonical_lock_bytes(lock)
+
+    assert b"document_ranker" not in canonical
+
+
+def test_enabled_document_ranker_is_verified_as_part_of_input_lock(
+    tmp_path: Path,
+) -> None:
+    lock_path, raw = write_lock(tmp_path, "candidate.lock.yaml")
+    root = tmp_path / "artifacts"
+    manifest_path = "models/document-ranker.json"
+    weights_path = "models/document-ranker.f64"
+    manifest_bytes = b'{"schema_version":"fixture-ranker-v1"}\n'
+    weights_bytes = b"locked-ranker-weights"
+    (root / "models").mkdir()
+    (root / manifest_path).write_bytes(manifest_bytes)
+    (root / weights_path).write_bytes(weights_bytes)
+    raw["baseline"]["document_ranker"] = {
+        "enabled": True,
+        "manifest": {"path": manifest_path, "sha256": sha256(manifest_bytes)},
+        "weights": {"path": weights_path, "sha256": sha256(weights_bytes)},
+    }
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    verified = load_verified_input_lock(lock_path, artifact_root=root)
+
+    binding = verified.lock.baseline.document_ranker
+    assert binding is not None
+    assert verified.artifact_bytes[binding.manifest.path] == manifest_bytes
+    assert verified.artifact_bytes[binding.weights.path] == weights_bytes
+
+
+def test_enabled_document_ranker_rejects_weight_hash_mismatch(tmp_path: Path) -> None:
+    lock_path, raw = write_lock(tmp_path, "candidate.lock.yaml")
+    root = tmp_path / "artifacts"
+    manifest_path = "models/document-ranker.json"
+    weights_path = "models/document-ranker.f64"
+    (root / "models").mkdir()
+    (root / manifest_path).write_bytes(b"manifest")
+    (root / weights_path).write_bytes(b"weights")
+    raw["baseline"]["document_ranker"] = {
+        "enabled": True,
+        "manifest": {"path": manifest_path, "sha256": sha256(b"manifest")},
+        "weights": {"path": weights_path, "sha256": ZERO_SHA256},
+    }
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        load_verified_input_lock(lock_path, artifact_root=root)
 
 
 def write_artifact_root(root: Path) -> dict[str, bytes]:

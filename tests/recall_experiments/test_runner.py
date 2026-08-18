@@ -183,6 +183,243 @@ def test_runner_follows_the_gold_safe_branch_free_event_order() -> None:
     ]
 
 
+def test_runner_refines_only_after_anchor_results_and_executes_the_combined_batch() -> None:
+    events: list[str] = []
+    executed_queries: list[str] = []
+    refinement_titles: list[str] = []
+
+    class EvidenceSteeredGenerator(_Generator):
+        async def refine(
+            self,
+            context: RecallGenerationContext,
+            anchor_generation: GenerationResult,
+            first_round_results: list[RetrievalActionResult],
+        ) -> GenerationResult:
+            assert executed_queries == ["graph retrieval"]
+            assert [action.action_id for action in anchor_generation.action_batch.actions] == [
+                "search-1"
+            ]
+            refinement_titles.extend(
+                paper.title for result in first_round_results for paper in result.hits
+            )
+            batch = RecallActionBatch.model_validate(
+                {
+                    "actions": [
+                        anchor_generation.action_batch.actions[0].model_dump(mode="json"),
+                        {
+                            "action_id": "search-2",
+                            "action_type": "text_search",
+                            "strategy": "first-round-evidence",
+                            "payload": {"query_text": "dense graph retrieval"},
+                        },
+                    ]
+                }
+            )
+            return GenerationResult(
+                query_id=context.query_id,
+                action_batch=batch,
+                artifact_bytes=batch.model_dump_json().encode("utf-8"),
+            )
+
+    class RecordingHandler:
+        async def execute(self, action: object, context: object) -> RetrievalActionResult:
+            del context
+            query_text = str(getattr(getattr(action, "payload"), "query_text"))
+            executed_queries.append(query_text)
+            hits = (
+                [
+                    Paper(
+                        canonical_id="doi:10.1000/anchor-hit",
+                        title="Dense retrieval for graphs",
+                        sources=["openalex"],
+                    )
+                ]
+                if len(executed_queries) == 1
+                else []
+            )
+            return RetrievalActionResult(
+                action_id=str(getattr(action, "action_id")),
+                action_type="text_search",
+                hits=hits,
+            )
+
+    request = RecallExperimentRequest(
+        **{**_request().__dict__, "max_actions": 3}
+    )
+    runner = RecallExperimentRunner(
+        input_source=_InputSource(events),
+        generator=EvidenceSteeredGenerator(events),
+        registry=_Registry(events, RecordingHandler()),
+        pool_builder=_PoolBuilder(events),
+        stages=_Stages(events),
+        evaluator=_Evaluator(events, _context()),
+        writer=_Writer(events),
+    )
+
+    asyncio.run(runner.run(request))
+
+    assert refinement_titles == ["Dense retrieval for graphs"]
+    assert executed_queries == ["graph retrieval", "dense graph retrieval"]
+
+
+def test_runner_exposes_first_round_hits_as_gold_free_refinement_seeds() -> None:
+    events: list[str] = []
+    seed = Paper(
+        canonical_id="openalex:W1234567890",
+        title="Dense retrieval for graphs",
+        openalex_id="W1234567890",
+        sources=["openalex"],
+    )
+
+    class GraphGenerator(_Generator):
+        async def refine(
+            self,
+            context: RecallGenerationContext,
+            anchor_generation: GenerationResult,
+            first_round_results: list[RetrievalActionResult],
+        ) -> GenerationResult:
+            del first_round_results
+            assert [item.paper for item in context.seed_candidates] == [seed]
+            batch = RecallActionBatch.model_validate(
+                {
+                    "actions": [
+                        anchor_generation.action_batch.actions[0].model_dump(mode="json"),
+                        {
+                            "action_id": "graph-1",
+                            "action_type": "citation_expand",
+                            "strategy": "structured-graph:references",
+                            "payload": {
+                                "seed_canonical_id": seed.canonical_id,
+                                "direction": "references",
+                                "limit": 5,
+                            },
+                        },
+                    ]
+                }
+            )
+            return GenerationResult(
+                query_id=context.query_id,
+                action_batch=batch,
+                artifact_bytes=batch.model_dump_json().encode("utf-8"),
+            )
+
+    class GraphHandler:
+        async def execute(
+            self, action: object, context: object
+        ) -> RetrievalActionResult:
+            action_id = str(getattr(action, "action_id"))
+            action_type = str(getattr(action, "action_type"))
+            if action_type == "text_search":
+                return RetrievalActionResult(
+                    action_id=action_id,
+                    action_type="text_search",
+                    hits=[seed],
+                )
+            assert [item.paper for item in getattr(context, "seed_candidates")] == [
+                seed
+            ]
+            return RetrievalActionResult(
+                action_id=action_id,
+                action_type="citation_expand",
+            )
+
+    request = RecallExperimentRequest(
+        **{
+            **_request().__dict__,
+            "allowed_actions": {"text_search", "citation_expand"},
+            "max_actions": 2,
+        }
+    )
+    runner = RecallExperimentRunner(
+        input_source=_InputSource(events),
+        generator=GraphGenerator(events),
+        registry=_Registry(events, GraphHandler()),
+        pool_builder=_PoolBuilder(events),
+        stages=_Stages(events),
+        evaluator=_Evaluator(events, _context()),
+        writer=_Writer(events),
+    )
+
+    result = asyncio.run(runner.run(request))
+
+    assert result.attempts[0].attempt_status == "succeeded"
+
+
+def test_runner_keeps_anchor_when_optional_refinement_fails() -> None:
+    events: list[str] = []
+    executed_queries: list[str] = []
+
+    class FailingRefinementGenerator(_Generator):
+        async def refine(
+            self,
+            context: RecallGenerationContext,
+            anchor_generation: GenerationResult,
+            first_round_results: list[RetrievalActionResult],
+        ) -> GenerationResult:
+            del context, anchor_generation, first_round_results
+            raise RecallGenerationFailure("generation_failure", [])
+
+    class RecordingHandler:
+        async def execute(self, action: object, context: object) -> RetrievalActionResult:
+            del context
+            query_text = str(getattr(getattr(action, "payload"), "query_text"))
+            executed_queries.append(query_text)
+            return RetrievalActionResult(
+                action_id=str(getattr(action, "action_id")),
+                action_type="text_search",
+                hits=[
+                    Paper(
+                        canonical_id="doi:10.1000/anchor-hit",
+                        title="Anchor hit",
+                        sources=["openalex"],
+                    )
+                ],
+            )
+
+    runner = RecallExperimentRunner(
+        input_source=_InputSource(events),
+        generator=FailingRefinementGenerator(events),
+        registry=_Registry(events, RecordingHandler()),
+        pool_builder=_PoolBuilder(events),
+        stages=_Stages(events),
+        evaluator=_Evaluator(events, _context()),
+        writer=_Writer(events),
+    )
+
+    result = asyncio.run(runner.run(_request()))
+
+    assert result.attempts[0].attempt_status == "succeeded"
+    assert executed_queries == ["graph retrieval"]
+    provenance = result.attempts[0].generation_provenance[0]
+    assert provenance["refinement_fallback"] == "generation_failure"
+
+
+def test_runner_rejects_retrieval_result_mislabeled_for_executed_action() -> None:
+    events: list[str] = []
+
+    class MislabeledHandler:
+        async def execute(self, action: object, context: object) -> RetrievalActionResult:
+            del action, context
+            return RetrievalActionResult(
+                action_id="different-action",
+                action_type="text_search",
+                hits=[],
+            )
+
+    runner = RecallExperimentRunner(
+        input_source=_InputSource(events),
+        generator=_Generator(events),
+        registry=_Registry(events, MislabeledHandler()),
+        pool_builder=_PoolBuilder(events),
+        stages=_Stages(events),
+        evaluator=_Evaluator(events, _context()),
+        writer=_Writer(events),
+    )
+
+    with pytest.raises(ValueError, match="retrieval result does not match executed action"):
+        asyncio.run(runner.run(_request()))
+
+
 def test_unknown_handler_fails_before_a_retrieval_artifact_is_written() -> None:
     events: list[str] = []
     writer = _Writer(events)

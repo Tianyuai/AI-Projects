@@ -79,6 +79,10 @@ class ActionBase(DomainModel):
 
 class TextSearchPayload(DomainModel):
     query_text: NonEmptyStr
+    search_mode: Literal["lexical", "semantic"] = Field(
+        default="lexical",
+        exclude_if=lambda value: value == "lexical",
+    )
 
 
 class TitleSearchPayload(DomainModel):

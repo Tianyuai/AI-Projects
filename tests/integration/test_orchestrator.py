@@ -21,6 +21,7 @@ from paper_search.domain.models import (
     CitationEdge,
     CitationExpansion,
     ErrorDetail,
+    FusedPaper,
     Paper,
     ProviderPaperId,
     ProviderResult,
@@ -43,6 +44,10 @@ from paper_search.ranking.rerank import (
 )
 from paper_search.ranking.llm_stage import LLMConstraintRerankingStage
 from paper_search.retrieval.title_candidates import TitleCandidateRecallResult
+from paper_search.retrieval.routing import (
+    FixedBudgetOpenAlexPolicy,
+    FixedHybridOpenAlexPolicy,
+)
 from paper_search.retrieval.snapshot_adapters import ProviderAdapterError
 
 
@@ -125,6 +130,40 @@ class FakeAnalyzer:
                 },
             },
             UsageActual(llm_calls=1, cost_cny=0.1, elapsed_ms=self.elapsed_ms),
+        )
+
+
+class SingleEitherAnalyzer:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    async def __call__(
+        self, query: str, _: object
+    ) -> ProviderResult[dict[str, object]]:
+        self.events.append("analyze")
+        return _result(
+            "llm",
+            {
+                "query_spec": {
+                    "original_query": query,
+                    "research_goal": "find papers",
+                },
+                "search_plan": {
+                    "subqueries": [
+                        {
+                            "query_id": "either-1",
+                            "text": query,
+                            "query_type": "exact",
+                            "target_constraints": ["papers"],
+                            "priority": 1,
+                            "provider_hint": "either",
+                        }
+                    ],
+                    "inherited_hard_filters": {},
+                    "rationale": "fixture",
+                },
+            },
+            UsageActual(llm_calls=1, cost_cny=0.1),
         )
 
 
@@ -445,6 +484,23 @@ class FakeEmbeddingRanker:
             fallback_used=False,
             warnings=["encoder_unavailable"] if self.degraded else [],
         )
+
+
+class FakeDocumentRanker:
+    model_id = "fixture-document-ranker-v1"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def rank(
+        self,
+        query: str,
+        candidates: Sequence[FusedPaper],
+    ) -> list[FusedPaper]:
+        self.calls.append(
+            (query, [item.paper.canonical_id for item in candidates])
+        )
+        return list(reversed(candidates))
 
 
 class MaliciousEmbeddingRanker:
@@ -904,6 +960,9 @@ def test_max_output_papers_truncates_final_papers_but_not_pool() -> None:
     )
 
     assert [paper.canonical_id for paper in result.papers] == ["openalex:W0"]
+    assert [
+        paper.canonical_id for paper in result.pre_truncation_candidates
+    ] == ["openalex:W0", "openalex:W1", "openalex:W2"]
     assert len(result.retrieved_paper_ids) == 3
     assert len(result.post_filter_paper_ids) == 3
 
@@ -1658,7 +1717,252 @@ def test_locked_baseline_router_prevents_unconditional_either_fanout() -> None:
     asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
     assert events.count("openalex") == 3
-    assert events.count("semantic_scholar") <= 2
+    assert events.count("semantic_scholar") == 1
+
+
+@pytest.mark.parametrize(
+    ("openalex_empty", "openalex_failed", "expected_s2_calls"),
+    [(False, False, 0), (True, False, 1), (False, True, 1)],
+)
+def test_semantic_scholar_supplement_is_an_openalex_fallback(
+    openalex_empty: bool,
+    openalex_failed: bool,
+    expected_s2_calls: int,
+) -> None:
+    events: list[str] = []
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget(max_search_api_calls=6)),
+        analyzer=SingleEitherAnalyzer(events),
+        providers={
+            "openalex": FakeProvider(
+                "openalex",
+                events,
+                empty=openalex_empty,
+                failed=openalex_failed,
+            ),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "6" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        routing_limits=(1, 1, 1),
+    )
+
+    result = asyncio.run(
+        orchestrator.run("graph retrieval", max_provider_results=5)
+    )
+
+    assert events.count("openalex") == 1
+    assert events.count("semantic_scholar") == expected_s2_calls
+    assert set(result.provider_results) == (
+        {"openalex", "semantic_scholar"}
+        if expected_s2_calls
+        else {"openalex"}
+    )
+    if expected_s2_calls == 0:
+        assert any(item.get("step") == "skip_optional_provider" for item in result.trace)
+
+
+def test_fixed_hybrid_policy_executes_both_modes_and_skips_healthy_s2() -> None:
+    events: list[tuple[str, str]] = []
+
+    class RecordingProvider(FakeProvider):
+        async def search(
+            self,
+            query: str,
+            filters: dict[str, object],
+            limit: int,
+            reservation: object,
+        ) -> ProviderResult[list[Paper]]:
+            mode = str(filters.pop("_search_mode", "lexical"))
+            events.append((self.name, mode))
+            return await super().search(query, filters, limit, reservation)
+
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget(max_search_api_calls=8)),
+        analyzer=FakeAnalyzer([]),
+        providers={
+            "openalex": RecordingProvider("openalex", []),
+            "semantic_scholar": RecordingProvider("semantic_scholar", []),
+        },
+        config_hash="sha256:" + "6" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        retrieval_policy=FixedHybridOpenAlexPolicy(
+            min_openalex_calls=3,
+            max_openalex_calls=6,
+            max_semantic_scholar_calls=2,
+        ),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert events == [
+        ("openalex", "lexical"),
+        ("openalex", "semantic"),
+        ("openalex", "lexical"),
+        ("openalex", "semantic"),
+        ("openalex", "lexical"),
+        ("openalex", "semantic"),
+    ]
+    assert set(result.provider_results) == {"openalex"}
+    assert result.citation_edges == []
+    assert [
+        item["search_mode"]
+        for item in result.trace
+        if item.get("step") == "retrieve"
+    ] == ["lexical", "semantic", "lexical", "semantic", "lexical", "semantic"]
+
+
+def test_fixed_budget_policy_executes_original_semantic_once_and_preserves_identity() -> None:
+    events: list[tuple[str, str, str]] = []
+
+    class RecordingProvider(FakeProvider):
+        async def search(
+            self,
+            query: str,
+            filters: dict[str, object],
+            limit: int,
+            reservation: object,
+        ) -> ProviderResult[list[Paper]]:
+            mode = str(filters.pop("_search_mode", "lexical"))
+            events.append((self.name, mode, query))
+            return await super().search(query, filters, limit, reservation)
+
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget(max_search_api_calls=7)),
+        analyzer=FakeAnalyzer([]),
+        providers={
+            "openalex": RecordingProvider("openalex", []),
+            "semantic_scholar": RecordingProvider("semantic_scholar", []),
+        },
+        config_hash="sha256:" + "6" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        retrieval_policy=FixedBudgetOpenAlexPolicy(max_openalex_calls=6),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    openalex = [event for event in events if event[0] == "openalex"]
+    assert 2 <= len(openalex) <= 6
+    assert openalex[0] == ("openalex", "lexical", "graph retrieval")
+    assert openalex[1] == ("openalex", "semantic", "graph retrieval")
+    assert sum(mode == "semantic" for _, mode, _ in openalex) == 1
+    retrieval_trace = [
+        item for item in result.trace if item.get("step") == "retrieve"
+    ]
+    assert all(item["action_type"] in {"text_search", "title_search"} for item in retrieval_trace)
+    assert all(item["method"] in {"lexical_original", "semantic_original", "structured"} for item in retrieval_trace)
+
+
+def test_fixed_hybrid_policy_fuses_each_search_action_independently() -> None:
+    class ActionAwareProvider:
+        async def search(
+            self,
+            query: str,
+            filters: dict[str, object],
+            limit: int,
+            reservation: object,
+        ) -> ProviderResult[list[Paper]]:
+            del reservation
+            mode = str(filters.pop("_search_mode", "lexical"))
+            route_number = (
+                1 if query.endswith("openalex") else 2 if query.endswith("semantic") else 3
+            )
+            filler = [
+                Paper(
+                    canonical_id=f"openalex:W{route_number}{0 if mode == 'lexical' else 1}{index:03d}",
+                    title=f"{mode} route {route_number} paper {index}",
+                    openalex_id=f"W{route_number}{0 if mode == 'lexical' else 1}{index:03d}",
+                    sources=["openalex"],
+                )
+                for index in range(limit)
+            ]
+            if mode == "semantic":
+                filler[0] = Paper(
+                    canonical_id="openalex:W999999",
+                    title="Gold paper",
+                    openalex_id="W999999",
+                    arxiv_id="2401.00001",
+                    sources=["openalex"],
+                )
+            return _result(
+                "openalex",
+                filler,
+                UsageActual(search_api_calls=1),
+            )
+
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget(max_search_api_calls=6)),
+        analyzer=FakeAnalyzer([]),
+        providers={"openalex": ActionAwareProvider()},
+        config_hash="sha256:" + "6" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        retrieval_policy=FixedHybridOpenAlexPolicy(
+            min_openalex_calls=3,
+            max_openalex_calls=6,
+            max_semantic_scholar_calls=0,
+        ),
+        max_output_papers=1,
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=50))
+
+    assert [paper.canonical_id for paper in result.papers] == ["openalex:W999999"]
+    assert len(result.fused_papers[0].source_ranks) == 3
+
+
+def test_fixed_hybrid_policy_calls_s2_only_for_failed_lexical_fallbacks() -> None:
+    events: list[tuple[str, str]] = []
+
+    class RecordingProvider(FakeProvider):
+        async def search(
+            self,
+            query: str,
+            filters: dict[str, object],
+            limit: int,
+            reservation: object,
+        ) -> ProviderResult[list[Paper]]:
+            mode = str(filters.pop("_search_mode", "lexical"))
+            events.append((self.name, mode))
+            return await super().search(query, filters, limit, reservation)
+
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget(max_search_api_calls=10)),
+        analyzer=FakeAnalyzer([]),
+        providers={
+            "openalex": RecordingProvider("openalex", [], empty=True),
+            "semantic_scholar": RecordingProvider("semantic_scholar", []),
+        },
+        config_hash="sha256:" + "6" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        retrieval_policy=FixedHybridOpenAlexPolicy(
+            min_openalex_calls=3,
+            max_openalex_calls=6,
+            max_semantic_scholar_calls=2,
+        ),
+    )
+
+    asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert events == [
+        ("openalex", "lexical"),
+        ("semantic_scholar", "lexical"),
+        ("openalex", "semantic"),
+        ("openalex", "lexical"),
+        ("semantic_scholar", "lexical"),
+        ("openalex", "semantic"),
+        ("openalex", "lexical"),
+        ("openalex", "semantic"),
+    ]
 
 
 def test_replay_integrity_failure_records_zero_external_spend() -> None:
@@ -1760,14 +2064,14 @@ def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
 
     result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
-    assert events == ["analyze", "openalex", "semantic_scholar", "openalex", "semantic_scholar"]
+    assert events == ["analyze", "openalex", "semantic_scholar", "openalex"]
     assert [paper.canonical_id for paper in result.papers] == ["openalex:W1", "s2:S1"]
     assert [item["step"] for item in result.trace] == [
         "analyze",
         "retrieve",
         "retrieve",
         "retrieve",
-        "retrieve",
+        "skip_optional_provider",
         "deduplicate",
         "filter",
         "fuse",
@@ -1775,7 +2079,10 @@ def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
     assert set(result.provider_results) == {"openalex", "semantic_scholar"}
     assert result.fused_papers[0].paper.canonical_id == "openalex:W1"
     assert result.fused_papers[0].score > 0
-    assert result.fused_papers[0].source_ranks == {"openalex": 1}
+    assert result.fused_papers[0].source_ranks == {
+        "openalex:sq-1:lexical": 1,
+        "openalex:sq-3:lexical": 1,
+    }
     assert result.config_hash == "sha256:" + "b" * 64
     assert result.prompt_version == "query-analyze-v1"
     assert result.stop_reason == "completed"
@@ -1984,6 +2291,40 @@ def test_orchestrator_retains_valid_sibling_result_when_one_provider_fails() -> 
     assert result.stop_reason == "completed"
     assert result.is_partial is True
     assert "openalex: provider returned errors" in result.warnings
+
+
+def test_orchestrator_applies_injected_document_ranker_after_fusion() -> None:
+    events: list[str] = []
+    document_ranker = FakeDocumentRanker()
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "openalex": FakeProvider("openalex", events),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "3" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        document_ranker=document_ranker,
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert document_ranker.calls == [
+        ("graph retrieval", ["openalex:W1", "s2:S1"])
+    ]
+    assert [paper.canonical_id for paper in result.papers] == [
+        "s2:S1",
+        "openalex:W1",
+    ]
+    assert result.trace[-1] == {
+        "step": "document_rank",
+        "status": "applied",
+        "model_id": "fixture-document-ranker-v1",
+        "count": 2,
+    }
 
 
 def test_orchestrator_applies_injected_embedding_after_fusion() -> None:

@@ -61,6 +61,7 @@ from paper_search.domain.models import (
     ProviderResult,
     SearchMode,
     SearchBudget,
+    SafeRelativePath,
     Sha256,
     UsageActual,
     UsageEstimate,
@@ -86,6 +87,16 @@ from paper_search.storage.dependency_snapshot import (
     DependencySnapshotManifestV2,
     DependencySnapshotReader,
 )
+from paper_search.ranking.cpu_document import (
+    DocumentRankingStage,
+    load_cpu_document_ranking_stage_bytes,
+)
+
+
+QueryAnalyzer = Callable[
+    [str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]
+]
+AnalyzerDecorator = Callable[[QueryAnalyzer], QueryAnalyzer]
 
 
 _LLM_BASE_URL = "https://api.deepseek.com/v1"
@@ -497,6 +508,19 @@ def _prompt_system_message(prompt_bytes: bytes) -> str:
     return render_prompt_system_message(prompt_bytes)
 
 
+def _locked_document_ranker(
+    lock: InputLock,
+    artifact_bytes: Mapping[SafeRelativePath, bytes],
+) -> DocumentRankingStage | None:
+    binding = lock.baseline.document_ranker
+    if binding is None:
+        return None
+    return load_cpu_document_ranking_stage_bytes(
+        artifact_bytes[binding.manifest.path],
+        artifact_bytes[binding.weights.path],
+    )
+
+
 def _replay_readiness(binding: ModeBinding) -> Callable[[], ReadyHealthResponse]:
     response = ReadyHealthResponse(
         status="ready",
@@ -567,6 +591,8 @@ def _replay_factory(
     experiment_definition: ExperimentDefinition,
     experiment_dependencies: ExperimentDependencyFactory | None,
     runtime_config: RuntimeConfig | None,
+    analyzer_decorator: AnalyzerDecorator | None,
+    document_ranker: DocumentRankingStage | None,
 ) -> Callable[[HardBudgetController, str], SearchOrchestrator]:
     def create(
         controller: HardBudgetController,
@@ -600,9 +626,15 @@ def _replay_factory(
             provider_estimates=provider_estimates,
             runtime_config=runtime_config,
         )
+        baseline_analyzer: QueryAnalyzer = _AnalyzerBridge(analyzer)
+        selected_analyzer = (
+            analyzer_decorator(baseline_analyzer)
+            if analyzer_decorator is not None
+            else baseline_analyzer
+        )
         orchestrator = MockSearchOrchestrator(
             controller=controller,
-            analyzer=_AnalyzerBridge(analyzer),
+            analyzer=selected_analyzer,
             providers=providers,
             config_hash=config_hash,
             prompt_version=lock.baseline.prompt_version,
@@ -615,6 +647,7 @@ def _replay_factory(
                 lock.baseline.retrieval.semantic_scholar_calls_max,
             ),
             execution_mode="replay",
+            document_ranker=document_ranker,
             embedding_ranker=components.embedding_ranker,
             citation_expander=components.citation_expander,
             constraint_reranker=components.constraint_reranker,
@@ -715,6 +748,8 @@ class _LiveOrchestratorFactory:
         experiment_dependencies: ExperimentDependencyFactory | None,
         runtime_config: RuntimeConfig | None,
         prompt_instructions: str | None = None,
+        analyzer_decorator: AnalyzerDecorator | None = None,
+        document_ranker: DocumentRankingStage | None = None,
     ) -> None:
         self._lock = lock
         self._config_hash = config_hash
@@ -725,6 +760,8 @@ class _LiveOrchestratorFactory:
         self._experiment_dependencies = experiment_dependencies
         self._runtime_config = runtime_config
         self._prompt_instructions = prompt_instructions
+        self._analyzer_decorator = analyzer_decorator
+        self._document_ranker = document_ranker
 
     def __repr__(self) -> str:
         return "_LiveOrchestratorFactory(credentials=**********)"
@@ -810,9 +847,15 @@ class _LiveOrchestratorFactory:
             provider_estimates=provider_estimates,
             runtime_config=self._runtime_config,
         )
+        baseline_analyzer: QueryAnalyzer = _AnalyzerBridge(analyzer)
+        selected_analyzer = (
+            self._analyzer_decorator(baseline_analyzer)
+            if self._analyzer_decorator is not None
+            else baseline_analyzer
+        )
         orchestrator = MockSearchOrchestrator(
             controller=controller,
-            analyzer=_AnalyzerBridge(analyzer),
+            analyzer=selected_analyzer,
             providers=providers,
             config_hash=self._config_hash,
             prompt_version=lock.baseline.prompt_version,
@@ -830,6 +873,7 @@ class _LiveOrchestratorFactory:
                 lock.baseline.retrieval.semantic_scholar_calls_max,
             ),
             execution_mode="live",
+            document_ranker=self._document_ranker,
             embedding_ranker=components.embedding_ranker,
             citation_expander=components.citation_expander,
             constraint_reranker=components.constraint_reranker,
@@ -865,6 +909,7 @@ class CompositionRoot:
         runtime_config: RuntimeConfig | None = None,
         ablation_config: Path = Path("configs/ablations.yaml"),
         experiment_dependencies: ExperimentDependencyFactory | None = None,
+        analyzer_decorator: AnalyzerDecorator | None = None,
     ) -> ServerApplicationBundle:
         """Bind one replay service and optionally authorize isolated live captures."""
         try:
@@ -938,6 +983,7 @@ class CompositionRoot:
             runtime_config=runtime_config,
             ablation_config=ablation_config,
             experiment_dependencies=experiment_dependencies,
+            analyzer_decorator=analyzer_decorator,
         )
         capture_artifact_factory = ArtifactFactory(output_root=capture_output_root.resolve())
         active_live: dict[int, ApplicationBundle] = {}
@@ -967,6 +1013,7 @@ class CompositionRoot:
                     runtime_config=runtime_config,
                     ablation_config=ablation_config,
                     experiment_dependencies=experiment_dependencies,
+                    analyzer_decorator=analyzer_decorator,
                 )
                 active_live[id(bundle)] = bundle
                 return bundle
@@ -1031,6 +1078,7 @@ class CompositionRoot:
         runtime_config: RuntimeConfig | None = None,
         ablation_config: Path = Path("configs/ablations.yaml"),
         experiment_dependencies: ExperimentDependencyFactory | None = None,
+        analyzer_decorator: AnalyzerDecorator | None = None,
     ) -> ApplicationBundle:
         verified = (
             load_verified_input_lock(lock_path, artifact_root=artifact_root)
@@ -1076,6 +1124,7 @@ class CompositionRoot:
             input_lock_sha256=locked_config_hash,
             evidence=experiment_config,
         )
+        document_ranker = _locked_document_ranker(lock, verified.artifact_bytes)
         budget_profile = _locked_budget_profile(lock.budget_config.path)
         budgets: dict[str, SearchBudget] = {
             budget_profile: parse_budget_bytes(
@@ -1123,6 +1172,8 @@ class CompositionRoot:
                 experiment_definition=experiment_definition,
                 experiment_dependencies=experiment_dependencies,
                 runtime_config=runtime_config,
+                analyzer_decorator=analyzer_decorator,
+                document_ranker=document_ranker,
             )
             readiness_probe = _replay_readiness(binding)
             snapshot_captured_at = _snapshot_manifest_time(manifest_path)
@@ -1157,6 +1208,8 @@ class CompositionRoot:
                 prompt_instructions=_prompt_system_message(
                     verified.artifact_bytes[lock.baseline.planner.prompt_config.path]
                 ),
+                analyzer_decorator=analyzer_decorator,
+                document_ranker=document_ranker,
             )
 
             binding = ModeBinding(

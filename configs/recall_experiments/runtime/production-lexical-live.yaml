@@ -1,0 +1,9 @@
+schema_version: recall-runtime-profile-v1
+env_file: ../../../../../Projects/.env
+pricing_policy: ../../../data/annotation_work/pricing_v1.yaml
+budget: ../../../configs/budget_production_lexical_batch4.yaml
+capture_responses: true
+llm_model: deepseek-v4-flash
+llm_reservation_input_tokens: 1
+llm_reservation_output_tokens: 1
+openalex_minimum_request_interval_seconds: 1.0

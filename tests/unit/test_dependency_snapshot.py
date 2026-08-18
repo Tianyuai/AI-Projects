@@ -15,11 +15,35 @@ from paper_search.storage.dependency_snapshot import (
     DependencyRequestIdentity,
     DependencySnapshotManifestV2,
     DependencySnapshotReader,
+    _atomic_new_file,
 )
 
 
 CAPTURED_AT = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
 PROMPT_ARTIFACT_SHA256 = "sha256:" + "a" * 64
+
+
+def test_atomic_new_file_keeps_temporary_path_below_windows_legacy_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    desired_parent_length = 181
+    filler_length = desired_parent_length - len(str(tmp_path)) - 1
+    assert 0 < filler_length <= 255
+    destination = tmp_path / ("p" * filler_length) / (("a" * 64) + ".bin")
+    assert len(str(destination)) == 250
+
+    original_write_bytes = Path.write_bytes
+
+    def guarded_write_bytes(path: Path, content: bytes) -> int:
+        if len(str(path)) > 259:
+            raise FileNotFoundError(str(path))
+        return original_write_bytes(path, content)
+
+    monkeypatch.setattr(Path, "write_bytes", guarded_write_bytes)
+
+    _atomic_new_file(destination, b"snapshot")
+
+    assert destination.read_bytes() == b"snapshot"
 
 
 def _sha256(value: bytes) -> str:

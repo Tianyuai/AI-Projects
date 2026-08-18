@@ -1,0 +1,89 @@
+{
+  "asta_access_status": "excluded_by_scope",
+  "datasets_in_scope": [
+    "pasa"
+  ],
+  "excluded_development_count": 412,
+  "excluded_development_ids_sha256": "sha256:45bdfbb170fe32ca55b25e7e199e7d8163b5c4f0e1c9cb141e54f99d67c89574",
+  "excluded_training_count": 12103,
+  "excluded_training_ids_sha256": "sha256:730c7f15ce4654ba4885fefdf3efba559a383e9128d4f96eeef9a6c2437982b4",
+  "exclusion_policy": "role-priority-direct-cross-role-v2",
+  "final_cross_role_issue_count": 0,
+  "frozen_counts": {
+    "pasa/auto_dev": 588,
+    "pasa/auto_test": 1000,
+    "pasa/auto_train": 21448,
+    "pasa/real_test": 50
+  },
+  "isolation_issue_counts": {
+    "gold_paper_overlap": 64353
+  },
+  "isolation_report": {
+    "byte_count": 22020067,
+    "path": "isolation-report.json",
+    "row_count": 64353,
+    "sha256": "sha256:c0d4a00b65864b33fd0714f4138993dffa7992bb198a0ea7c9850a4d42256c6d"
+  },
+  "partition_files": {
+    "pasa/auto_dev": {
+      "byte_count": 204818,
+      "path": "partitions/pasa_auto_dev.jsonl",
+      "row_count": 588,
+      "sha256": "sha256:6d55c2c65d8456f92e697cd78c2591d4ec49896b08155cb9c8c2f832e09cbcf5"
+    },
+    "pasa/auto_test": {
+      "byte_count": 354032,
+      "path": "partitions/pasa_auto_test.jsonl",
+      "row_count": 1000,
+      "sha256": "sha256:1ede25b7477974cf145eb325f02a867a72f395bfbb86cc8f619e2c41733e744a"
+    },
+    "pasa/auto_train": {
+      "byte_count": 7497914,
+      "path": "partitions/pasa_auto_train.jsonl",
+      "row_count": 21448,
+      "sha256": "sha256:7dbcdb2bcb1f193bc76e294024bbeaf850ee546787606e45c0a0b77b553439b1"
+    },
+    "pasa/real_test": {
+      "byte_count": 30150,
+      "path": "partitions/pasa_real_test.jsonl",
+      "row_count": 50,
+      "sha256": "sha256:db31be25e2b15c7e2b7e7b13ee89568effc7ba00048a2539ce29bd632c039ea8"
+    }
+  },
+  "pasa_revision": "232428b0c867268c3b8ded90db4d98c1b30501d6",
+  "schema_version": "query-policy-training-freeze-v1",
+  "source_counts": {
+    "pasa/auto_dev": 1000,
+    "pasa/auto_test": 1000,
+    "pasa/auto_train": 33551,
+    "pasa/real_test": 50
+  },
+  "source_files": {
+    "AutoScholarQuery/dev.jsonl": {
+      "byte_count": 450875,
+      "path": "AutoScholarQuery/dev.jsonl",
+      "row_count": 1000,
+      "sha256": "sha256:d211a33f8171bd847331a34b0b4ea98e3ce06f2b1d64ff3f35b633407cb1d082"
+    },
+    "AutoScholarQuery/test.jsonl": {
+      "byte_count": 438997,
+      "path": "AutoScholarQuery/test.jsonl",
+      "row_count": 1000,
+      "sha256": "sha256:7d8c7f59b289a54912c38cf204d16dbfec14ca35de850b9978b4051ad43a8b36"
+    },
+    "AutoScholarQuery/train.jsonl": {
+      "byte_count": 15272018,
+      "path": "AutoScholarQuery/train.jsonl",
+      "row_count": 33551,
+      "sha256": "sha256:fe5a776c3fea0fa4189a3df83e9fb6508b2edc31180d0c902c71293a27d57821"
+    },
+    "RealScholarQuery/test.jsonl": {
+      "byte_count": 84709,
+      "path": "RealScholarQuery/test.jsonl",
+      "row_count": 50,
+      "sha256": "sha256:b3b570411ce2399ce4ea145ba9b2d3d0048b248030edeeb44ba95a7e9dc575c2"
+    }
+  },
+  "training_isolation_verified": true,
+  "transitive_component_warning_count": 13893
+}

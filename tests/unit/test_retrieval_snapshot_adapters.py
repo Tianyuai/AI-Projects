@@ -393,6 +393,7 @@ async def _capture(
     sleep: Callable[[float], Awaitable[None]] | None = None,
     mailto: str | None = None,
     additional_api_keys: Sequence[str] = (),
+    minimum_request_interval_seconds: float = 0.0,
 ) -> tuple[LiveCaptureSearchProvider, DependencyCaptureStore, SettlementSpy, httpx.AsyncClient]:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
@@ -409,8 +410,91 @@ async def _capture(
         clock=lambda: CAPTURED_AT,
         sleep=sleep,
         jitter=lambda: 0.0,
+        minimum_request_interval_seconds=minimum_request_interval_seconds,
     )
     return provider, store, controller, client
+
+
+def test_semantic_scholar_live_requests_are_paced_after_each_attempt(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        events.append("request")
+        return httpx.Response(
+            200,
+            content=(S2 / "search.json").read_bytes(),
+            request=request,
+        )
+
+    async def paced_sleep(delay: float) -> None:
+        events.append(f"sleep:{delay}")
+
+    async def run() -> None:
+        provider, _, _, client = await _capture(
+            tmp_path,
+            dependency="semantic_scholar",
+            handler=handler,
+            sleep=paced_sleep,
+            minimum_request_interval_seconds=1.1,
+        )
+        async with client:
+            await provider.search("graph retrieval", {}, 2, _reservation())
+            await provider.search("citation retrieval", {}, 2, _reservation())
+
+    asyncio.run(run())
+
+    assert events == [
+        "request",
+        "sleep:1.1",
+        "request",
+        "sleep:1.1",
+    ]
+
+
+def test_request_pacing_serializes_concurrent_provider_attempts(tmp_path: Path) -> None:
+    requests: list[str] = []
+    first_sleep_started = asyncio.Event()
+    release_first_sleep = asyncio.Event()
+    sleep_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def paced_sleep(_: float) -> None:
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            first_sleep_started.set()
+            await release_first_sleep.wait()
+
+    async def run() -> None:
+        provider, _, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+            sleep=paced_sleep,
+            minimum_request_interval_seconds=0.2,
+        )
+        async with client:
+            tasks = [
+                asyncio.create_task(provider.search(query, {}, 1, _reservation()))
+                for query in ("graph retrieval", "citation retrieval")
+            ]
+            await first_sleep_started.wait()
+            await asyncio.sleep(0)
+            assert len(requests) == 1
+            release_first_sleep.set()
+            await asyncio.gather(*tasks)
+
+    asyncio.run(run())
+    assert len(requests) == 2
 
 
 def test_openalex_live_and_replay_are_identical_and_refs_are_page_ordered(tmp_path: Path) -> None:
@@ -449,6 +533,56 @@ def test_openalex_live_and_replay_are_identical_and_refs_are_page_ordered(tmp_pa
         for name in ("works_page_1.json", "works_page_2.json")
     ]
     assert [ref["response_sha256"] for ref in refs] == expected_hashes
+
+
+def test_openalex_semantic_live_capture_and_replay_share_search_mode_identity(
+    tmp_path: Path,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> tuple[object, object]:
+        live, store, _, client = await _capture(
+            tmp_path, dependency="openalex", handler=handler
+        )
+        filters = {"_search_mode": "semantic", "year_from": 2020}
+        async with client:
+            captured = await live.search(
+                "predicting toxicity from molecular structure",
+                filters,
+                2,
+                _reservation(),
+            )
+        manifest = store.seal()
+        replay = ReplaySearchProvider(
+            dependency="openalex",
+            reader=_reader(store, snapshot_set_id=manifest.snapshot_set_id),
+            clock=lambda: CAPTURED_AT,
+        )
+        replayed = await replay.search(
+            "predicting toxicity from molecular structure",
+            filters,
+            2,
+            _reservation(),
+        )
+        return captured, replayed
+
+    captured, replayed = asyncio.run(run())
+
+    assert "search" not in seen[0].url.params
+    assert seen[0].url.params["search.semantic"] == (
+        "predicting toxicity from molecular structure"
+    )
+    assert "cursor" not in seen[0].url.params
+    assert seen[0].url.params["page"] == "1"
+    assert captured.data == replayed.data
 
 
 def test_replay_reports_captured_usage_instead_of_zero(tmp_path: Path) -> None:
@@ -597,6 +731,84 @@ def test_openalex_rotates_to_next_key_when_quota_is_exhausted(
         entry.request.canonical_request_sha256 for entry in manifest.entries
     }
     assert _openalex_identity().canonical_request_sha256 in captured_hashes
+
+
+def test_openalex_rotates_key_when_zero_budget_is_reported_only_in_json(
+    tmp_path: Path,
+) -> None:
+    seen_keys: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        api_key = request.url.params["api_key"]
+        seen_keys.append(api_key)
+        if api_key == "synthetic-key":
+            return httpx.Response(
+                429,
+                json={
+                    "error": "Rate limit exceeded",
+                    "message": "Insufficient budget.",
+                    "dailyRemainingUsd": 0,
+                    "creditsRemaining": 0,
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> object:
+        live, _, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+            additional_api_keys=["fallback-key"],
+        )
+        async with client:
+            return await live.search("RAG", {}, 1, _reservation())
+
+    result = asyncio.run(run())
+
+    assert seen_keys == ["synthetic-key", "fallback-key"]
+    assert result.errors == []
+
+
+def test_openalex_can_rotate_past_three_exhausted_keys(tmp_path: Path) -> None:
+    seen_keys: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        api_key = request.url.params["api_key"]
+        seen_keys.append(api_key)
+        if api_key != "funded-key":
+            return httpx.Response(
+                429,
+                json={
+                    "message": "Insufficient budget.",
+                    "dailyRemainingUsd": 0,
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> object:
+        live, _, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+            additional_api_keys=["empty-2", "empty-3", "funded-key"],
+        )
+        async with client:
+            return await live.search("RAG", {}, 1, _reservation(4))
+
+    result = asyncio.run(run())
+
+    assert seen_keys == ["synthetic-key", "empty-2", "empty-3", "funded-key"]
+    assert result.errors == []
 
 
 @pytest.mark.parametrize(
@@ -878,6 +1090,30 @@ def test_failed_response_is_captured_as_error_and_retries_are_accounted(
     )
 
 
+def test_semantic_scholar_rate_limit_uses_extended_backoff(tmp_path: Path) -> None:
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, content=b"rate limited", request=request)
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def run() -> None:
+        live, _, _, client = await _capture(
+            tmp_path,
+            dependency="semantic_scholar",
+            handler=handler,
+            sleep=fake_sleep,
+        )
+        async with client:
+            await live.search("graph", {}, 2, _reservation())
+
+    asyncio.run(run())
+
+    assert sleeps == [10.0, 20.0]
+
+
 def test_replay_miss_is_structured_and_has_no_network_dependency(tmp_path: Path) -> None:
     store = DependencyCaptureStore(tmp_path / "empty", clock=lambda: CAPTURED_AT)
     manifest = store.seal()
@@ -917,6 +1153,108 @@ def test_replay_references_uses_snapshot_only(tmp_path: Path) -> None:
     captured, replayed = asyncio.run(run())
     assert replayed.data == captured.data
     assert replayed.cache_hit is True
+
+
+def test_openalex_references_fetches_seed_edges_then_batches_works(
+    tmp_path: Path,
+) -> None:
+    paper_id = ProviderPaperId(provider="openalex", value="W1000000001")
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/works/W1000000001":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "https://openalex.org/W1000000001",
+                    "referenced_works": [
+                        "https://openalex.org/W2000000002",
+                        "https://openalex.org/W3000000003",
+                    ],
+                },
+                request=request,
+            )
+        return httpx.Response(
+            200,
+            json={
+                "meta": {"next_cursor": None},
+                "results": [
+                    {
+                        "id": "https://openalex.org/W2000000002",
+                        "title": "First cited work",
+                    },
+                    {
+                        "id": "https://openalex.org/W3000000003",
+                        "title": "Second cited work",
+                    },
+                ],
+            },
+            request=request,
+        )
+
+    async def run() -> object:
+        live, _, _, client = await _capture(
+            tmp_path, dependency="openalex", handler=handler
+        )
+        async with client:
+            return await live.references(paper_id, 2, _reservation(2))
+
+    result = asyncio.run(run())
+
+    assert paths == ["/works/W1000000001", "/works"]
+    assert [paper.openalex_id for paper in result.data.papers] == [
+        "W2000000002",
+        "W3000000003",
+    ]
+    assert {
+        (edge.citing_provider_id.value, edge.cited_provider_id.value)
+        for edge in result.data.raw_edges
+    } == {
+        ("W1000000001", "W2000000002"),
+        ("W1000000001", "W3000000003"),
+    }
+    assert result.usage.search_api_calls == 2
+
+
+def test_openalex_citations_filters_for_works_that_cite_the_seed(
+    tmp_path: Path,
+) -> None:
+    paper_id = ProviderPaperId(provider="openalex", value="W1000000001")
+    filters: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        filters.append(request.url.params.get("filter"))
+        return httpx.Response(
+            200,
+            json={
+                "meta": {"next_cursor": None},
+                "results": [
+                    {
+                        "id": "https://openalex.org/W4000000004",
+                        "title": "A citing work",
+                    }
+                ],
+            },
+            request=request,
+        )
+
+    async def run() -> object:
+        live, _, _, client = await _capture(
+            tmp_path, dependency="openalex", handler=handler
+        )
+        async with client:
+            return await live.citations(paper_id, 1, _reservation(1))
+
+    result = asyncio.run(run())
+
+    assert filters == ["cites:W1000000001"]
+    assert [paper.openalex_id for paper in result.data.papers] == ["W4000000004"]
+    assert [
+        (edge.citing_provider_id.value, edge.cited_provider_id.value)
+        for edge in result.data.raw_edges
+    ] == [("W4000000004", "W1000000001")]
+    assert result.usage.search_api_calls == 1
 
 
 def test_expired_deadline_prevents_dispatch_and_accounts_zero_calls(tmp_path: Path) -> None:

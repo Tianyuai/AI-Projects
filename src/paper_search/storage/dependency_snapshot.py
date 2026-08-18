@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
@@ -63,11 +64,19 @@ _CANONICAL_REQUEST_FIELDS: dict[tuple[str, str], frozenset[str]] = {
             "filters",
             "limit",
             "mailto",
+            "page",
             "per_page",
             "query",
             "search",
+            "search_mode",
             "select",
         }
+    ),
+    ("openalex", "citations"): frozenset(
+        {"filter", "limit", "paper_id", "per_page", "select"}
+    ),
+    ("openalex", "references"): frozenset(
+        {"filter", "limit", "paper_id", "per_page", "select"}
     ),
     ("semantic_scholar", "search"): frozenset(
         {"fields", "filters", "limit", "offset", "query", "venue", "year"}
@@ -150,6 +159,13 @@ class DependencyRequestIdentity(DomainModel):
                 and self.method == "GET"
                 and self.endpoint == "/works"
             )
+            if self.operation == "citations":
+                valid_binding = self.method == "GET" and self.endpoint == "/works"
+            if self.operation == "references":
+                valid_binding = self.method == "GET" and (
+                    self.endpoint == "/works"
+                    or re.fullmatch(r"/works/W\d+", self.endpoint) is not None
+                )
         elif self.dependency == "semantic_scholar":
             valid_binding = (
                 self.operation == "search"
@@ -289,9 +305,13 @@ def _sanitize_headers(headers: Mapping[str, str]) -> dict[str, str]:
 
 def _atomic_new_file(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".tmp-", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
     try:
-        temporary.write_bytes(content)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
         if path.exists():
             raise FileExistsError(f"refusing to overwrite sealed snapshot file: {path}")
         os.replace(temporary, path)

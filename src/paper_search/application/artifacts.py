@@ -573,7 +573,7 @@ def _parse_lock(payload: bytes) -> CandidateLock | ValidationLock | ReplayLock:
 
 def _replay_lock_bytes(lock: ReplayLock) -> bytes:
     return yaml.safe_dump(
-        lock.model_dump(mode="python"),
+        lock.model_dump(mode="python", exclude_none=True),
         sort_keys=False,
         allow_unicode=True,
     ).encode("utf-8")

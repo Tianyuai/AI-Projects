@@ -354,6 +354,45 @@ evaluation:
     assert generator_factories[loaded.recipe.generator.type](loaded.recipe) == "ordinary-search-terms"
 
 
+def test_deepseek_recipe_can_enable_evidence_steered_generation_without_a_new_scheme(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _write(
+        tmp_path / "prompt.yaml",
+        "name: adaptive\nversion: adaptive-v1\nmodel: deepseek-v4-flash\n"
+        "temperature: 0\ninstructions:\n  - Use the supplied generation phase.\n",
+    )
+    loaded = load_recall_recipe(
+        _write(
+            tmp_path / "adaptive.yaml",
+            """method_id: evidence-steered
+generator:
+  type: deepseek_prompt
+  prompt: prompt.yaml
+  model: deepseek-v4-flash
+  temperature: 0
+  gold_visibility: blind
+  max_generated_actions: 3
+  repair_attempts: 1
+  evidence_steered: true
+retrieval:
+  allowed_actions: [text_search]
+  backend: live_provider
+  max_results_per_action: 50
+  max_total_actions: 3
+candidate_pool: {}
+evaluation:
+  repeat_count: 1
+  max_repeat_attempts: 1
+""",
+        )
+    )
+
+    assert loaded.recipe.generator.type == "deepseek_prompt"
+    assert loaded.recipe.generator.evidence_steered is True
+
+
 def test_load_sample_binding_binds_exact_bytes(tmp_path: Path) -> None:
     binding_path = _write(
         tmp_path / "sample.yaml",

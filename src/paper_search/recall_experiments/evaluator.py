@@ -25,6 +25,7 @@ from paper_search.recall_experiments.contracts import (
 )
 from paper_search.recall_experiments.inputs.base import FrozenRecallDataset
 from paper_search.recall_experiments.inputs.gold_catalog import SealedGoldDocumentCatalog
+from paper_search.recall_experiments.paper_identity import EvidenceDrivenIdentifierResolver
 from paper_search.recall_experiments.recipes import RecallMethodRecipe, SampleBinding
 
 
@@ -38,16 +39,6 @@ TerminalConclusion = Literal[
 _ATTEMPT_ID = re.compile(r"attempt-(0[1-5])$")
 
 
-class IdentifierResolver:
-    """The evaluator-local adapter for the frozen identifier resolution contract."""
-
-    def __init__(self, identifier_map: IdentifierMap) -> None:
-        self._identifier_map = identifier_map
-
-    def resolve(self, value: str) -> str:
-        return self._identifier_map.resolve(value)
-
-
 @dataclass(frozen=True)
 class _PrivateScoringData:
     gold_by_query: Mapping[str, frozenset[str]]
@@ -59,7 +50,7 @@ class PreparedEvaluationContext:
 
     generation_contexts: tuple[RecallGenerationContext, ...]
     _scoring: _PrivateScoringData
-    _resolver: IdentifierResolver
+    _resolver: EvidenceDrivenIdentifierResolver
 
 
 class PerQueryCandidateRecall(DomainModel):
@@ -157,7 +148,7 @@ class CandidateRecallEvaluator:
     def preflight(self, dataset: FrozenRecallDataset) -> PreparedEvaluationContext:
         """Resolve aliases once and prove all evaluator-only frozen invariants."""
         identifier_map = IdentifierMap.from_bytes(dataset.evaluation_materials.identifier_map_bytes)
-        resolver = IdentifierResolver(identifier_map)
+        resolver = EvidenceDrivenIdentifierResolver(identifier_map)
         material_queries = dataset.evaluation_materials.gold_records
         dataset_ids = [query.query_id for query in dataset.queries]
         material_ids = [query.query_id for query in material_queries]
@@ -188,7 +179,7 @@ class CandidateRecallEvaluator:
 
         all_gold = frozenset().union(*gold_by_query.values())
         for seed in dataset.seed_candidates:
-            if resolver.resolve(seed.paper.canonical_id) in all_gold:
+            if resolver.paper_identities(seed.paper).intersection(all_gold):
                 raise ValueError("seed candidate resolves to a Gold ID")
 
         documents_by_query = self._validated_oracle_documents(gold_by_query, resolver)
@@ -232,10 +223,13 @@ class CandidateRecallEvaluator:
         for query_id in expected_ids:
             pool = pools_by_query[query_id]
             candidate_ids = frozenset(
-                prepared._resolver.resolve(entry.paper.canonical_id) for entry in pool.entries
+                prepared._resolver.primary_paper_id(entry.paper) for entry in pool.entries
+            )
+            candidate_identities = frozenset().union(
+                *(prepared._resolver.paper_identities(entry.paper) for entry in pool.entries)
             )
             gold = prepared._scoring.gold_by_query[query_id]
-            hits = candidate_ids.intersection(gold)
+            hits = candidate_identities.intersection(gold)
             per_query.append(
                 PerQueryCandidateRecall(
                     query_id=query_id,
@@ -257,7 +251,9 @@ class CandidateRecallEvaluator:
         )
 
     def _validated_oracle_documents(
-        self, gold_by_query: Mapping[str, frozenset[str]], resolver: IdentifierResolver
+        self,
+        gold_by_query: Mapping[str, frozenset[str]],
+        resolver: EvidenceDrivenIdentifierResolver,
     ) -> dict[str, list[GoldDocument]]:
         if self._recipe is None or self._recipe.generator.gold_visibility != "oracle":
             return {}
@@ -426,9 +422,9 @@ def _comparison(
 
 __all__ = [
     "CandidateRecallEvaluator",
+    "EvidenceDrivenIdentifierResolver",
     "HistoricalReplayComparison",
     "HistoricalReplayEvidence",
-    "IdentifierResolver",
     "PerQueryCandidateRecall",
     "PreparedEvaluationContext",
     "RecallAttempt",

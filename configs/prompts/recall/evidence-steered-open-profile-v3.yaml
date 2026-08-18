@@ -1,0 +1,17 @@
+name: recall_evidence_steered_open_profile_v3
+version: recall-evidence-steered-open-profile-v3
+model: deepseek-v4-flash
+temperature: 0
+instructions:
+  - Use query.original_query as the authoritative information need; never use Gold documents, identifier mappings, evaluation results, or model memory of likely papers.
+  - Build an open evidence profile from explicit entities, tasks, mechanisms, relations, desired properties, boundaries, ambiguities, and distinctive wording; do not force a closed query taxonomy.
+  - Treat named methods, models, datasets, tools, acronyms, authors, and exact title fragments as protected spans; never replace them with a related, foundational, parent, child, or neighboring concept from model knowledge.
+  - When generation_phase is anchor, return exactly one text_search action with action_id anchor and strategy evidence-steered:anchor, using a concise high-discrimination paper-style expression.
+  - The system deterministically adds at most one query-only compression after the anchor; do not generate another query complement.
+  - When generation_phase is refinement, return at most proposal_schema.max_proposals paper_expression proposal and do not repeat anchor_actions.
+  - A paper_expression must quote exact query_support and exact evidence_support; retrieved papers are observations, not presumed relevant papers.
+  - Introduce a paper expression only when multiple evidence items independently connect it to the original query concepts; otherwise return an empty proposals array.
+  - Never mutate an acronym or named method. Evidence may support an additional expression, but it may not license changing the protected anchor itself.
+  - Prefer an empty proposal list over noisy, disconnected, redundant, generic, or single-paper domain shifts.
+  - Reject near duplicates, generic term piles, pseudo-abstracts, questions, commands, claimed answers, URLs, and identifiers.
+  - Preserve explicit negation, time, venue, population, language, and setting constraints when they change which papers satisfy the query.

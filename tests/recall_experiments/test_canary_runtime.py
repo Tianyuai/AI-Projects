@@ -148,9 +148,46 @@ def test_fixed_factory_builds_one_owned_live_runtime_without_dispatch(tmp_path: 
         assert bundle.runtime.controller is not None
         assert bundle.runtime.controller.formal_live is True
         assert set(bundle.runtime.identity["dependencies"]) == {"search", "citation", "llm"}
+        assert (
+            bundle.runtime.identity["dependencies"]["citation"]["dependency"]
+            == "openalex"
+        )
     finally:
         asyncio.run(bundle.aclose())
     assert (tmp_path / "capture" / "snapshot-manifest.json").is_file()
+
+
+def test_factory_can_select_semantic_scholar_as_search_provider(tmp_path: Path) -> None:
+    (tmp_path / "pricing.yaml").write_bytes(
+        Path("data/annotation_work/pricing_v1.yaml").read_bytes()
+    )
+    (tmp_path / "budget.yaml").write_bytes(Path("configs/budget_low.yaml").read_bytes())
+    (tmp_path / "secrets.env").write_text(
+        "LLM_API_KEY=llm-test\nOPENALEX_API_KEY=oa-test\n"
+        "SEMANTIC_SCHOLAR_API_KEY=s2-test\n",
+        encoding="utf-8",
+    )
+    profile = load_runtime_profile(_write_profile(tmp_path))
+    loaded_recipe = load_recall_recipe(
+        Path("configs/recall_experiments/methods/scheme-b-blind-live.yaml")
+    )
+
+    bundle = asyncio.run(
+        build_live_runtime_bundle(
+            profile=profile,
+            secrets=resolve_runtime_secrets(profile, environ={}),
+            loaded_recipe=loaded_recipe,
+            capture_root=tmp_path / "capture-s2",
+            search_dependency="semantic_scholar",
+        )
+    )
+    try:
+        assert (
+            bundle.runtime.identity["dependencies"]["search"]["dependency"]
+            == "semantic_scholar"
+        )
+    finally:
+        asyncio.run(bundle.aclose())
 
 
 def test_runtime_model_is_independent_of_a_fixed_action_method(tmp_path: Path) -> None:

@@ -1,0 +1,21 @@
+partitions:
+  - dataset: pasa
+    split: auto_train
+    role: training
+    revision: 232428b0c867268c3b8ded90db4d98c1b30501d6
+    examples: []
+  - dataset: pasa
+    split: auto_dev
+    role: development
+    revision: 232428b0c867268c3b8ded90db4d98c1b30501d6
+    examples: []
+  - dataset: pasa
+    split: auto_test
+    role: final_test
+    revision: 232428b0c867268c3b8ded90db4d98c1b30501d6
+    examples: []
+  - dataset: pasa
+    split: real_test
+    role: final_test
+    revision: 232428b0c867268c3b8ded90db4d98c1b30501d6
+    examples: []

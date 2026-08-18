@@ -20,6 +20,7 @@ from paper_search.application.contracts import SnapshotRef
 from paper_search.control.pricing import ActualCostPricer
 from paper_search.domain.models import (
     BudgetReservation,
+    CitationEdge,
     CitationExpansion,
     ErrorDetail,
     Paper,
@@ -82,7 +83,7 @@ _LIVE_DESCRIPTOR_SURFACES: dict[ProviderName, _LiveDescriptorSurface] = {
         "version": "live-capture-search-v1",
         "model": None,
         "endpoints": ("https://api.openalex.org/works",),
-        "operations": ("search",),
+        "operations": ("search", "references", "citations"),
     },
     "semantic_scholar": {
         "provider": "semantic_scholar",
@@ -319,12 +320,30 @@ def _key_quota_exhausted(response: httpx.Response) -> bool:
     (positive) balance, so ``<= 0`` alone would never trigger rotation.
     """
     remaining = response.headers.get("x-ratelimit-remaining")
-    if remaining is None:
-        return False
+    if remaining is not None:
+        try:
+            return int(remaining) < 10
+        except (TypeError, ValueError):
+            pass
     try:
-        return int(remaining) < 10
-    except (TypeError, ValueError):
+        payload = response.json()
+    except ValueError:
         return False
+    if not isinstance(payload, dict):
+        return False
+    message = payload.get("message")
+    if not isinstance(message, str) or "insufficient budget" not in message.casefold():
+        return False
+    balances = (
+        payload.get("dailyRemainingUsd"),
+        payload.get("creditsRemaining"),
+    )
+    return any(
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and value <= 0
+        for value in balances
+    )
 
 
 def _attempt_timeout(remaining_seconds: float, read_timeout: float | None) -> float:
@@ -407,9 +426,12 @@ class LiveCaptureSearchProvider:
         clock: Clock = _utc_now,
         sleep: Sleep | None = None,
         jitter: Jitter = random.random,
+        minimum_request_interval_seconds: float = 0.0,
     ) -> None:
         if controller.formal_live is not True:
             raise ValueError("live capture requires formal-live budget enforcement")
+        if minimum_request_interval_seconds < 0:
+            raise ValueError("minimum request interval must not be negative")
         self._client = client
         self._capture_store = capture_store
         self._pricer = pricer
@@ -455,6 +477,8 @@ class LiveCaptureSearchProvider:
         self._clock = clock
         self._sleep = sleep or asyncio.sleep
         self._jitter = jitter
+        self._minimum_request_interval_seconds = minimum_request_interval_seconds
+        self._request_pacing_lock = asyncio.Lock()
 
     @property
     def live_identity_evidence(self) -> LiveDependencyEvidence:
@@ -517,7 +541,10 @@ class LiveCaptureSearchProvider:
         remaining_calls: int,
     ) -> _RequestOutcome:
         captured_at = self._clock()
-        attempts_allowed = min(3, max(0, remaining_calls))
+        retry_capacity = (
+            max(3, len(self._api_keys)) if self._dependency == "openalex" else 3
+        )
+        attempts_allowed = min(retry_capacity, max(0, remaining_calls))
         if attempts_allowed == 0:
             return _RequestOutcome(
                 content=None,
@@ -567,15 +594,19 @@ class LiveCaptureSearchProvider:
             )
             try:
                 async with asyncio.timeout(attempt_timeout):
-                    response = await self._client.request(
-                        method,
-                        f"{self._validated_transport_config().base_url}{endpoint}",
-                        params=request_params,
-                        json=body,
-                        headers=headers,
-                        follow_redirects=False,
-                        timeout=attempt_timeout,
-                    )
+                    async with self._request_pacing_lock:
+                        try:
+                            response = await self._client.request(
+                                method,
+                                f"{self._validated_transport_config().base_url}{endpoint}",
+                                params=request_params,
+                                json=body,
+                                headers=headers,
+                                follow_redirects=False,
+                                timeout=attempt_timeout,
+                            )
+                        finally:
+                            await self._pace_after_attempt()
             except (TimeoutError, httpx.TimeoutException):
                 operation.finish_attempt()
                 last_error = _error(
@@ -637,7 +668,13 @@ class LiveCaptureSearchProvider:
             ):
                 request_params["api_key"] = self._api_keys[self._key_cursor]
                 continue
-            delay_seconds = min(8, 2**retry_index) + self._jitter()
+            if (
+                self._dependency == "semantic_scholar"
+                and last_error.code == "rate_limited"
+            ):
+                delay_seconds = min(30, 10 * 2**retry_index) + self._jitter()
+            else:
+                delay_seconds = min(8, 2**retry_index) + self._jitter()
             remaining_seconds = operation.remaining_seconds()
             if delay_seconds >= remaining_seconds:
                 last_error = _error(
@@ -660,6 +697,10 @@ class LiveCaptureSearchProvider:
             safe_headers={},
             error_response_bytes=error_response_bytes,
         )
+
+    async def _pace_after_attempt(self) -> None:
+        if self._minimum_request_interval_seconds > 0:
+            await self._sleep(self._minimum_request_interval_seconds)
 
     def _rotate_key(self) -> bool:
         if self._key_cursor + 1 >= len(self._api_keys):
@@ -735,10 +776,16 @@ class LiveCaptureSearchProvider:
             raise ValueError("query must not be empty")
         if type(limit) is not int or not 1 <= limit <= 300:
             raise ValueError("limit must be an integer between 1 and 300")
-        filter_value = _filter_expression(filters)
+        provider_filters = dict(filters)
+        search_mode = provider_filters.pop("_search_mode", "lexical")
+        if search_mode not in {"lexical", "semantic"}:
+            raise ValueError("OpenAlex search mode must be lexical or semantic")
+        if search_mode == "semantic" and limit > 50:
+            raise ValueError("OpenAlex semantic search limit cannot exceed 50")
+        filter_value = _filter_expression(provider_filters)
         started = time.perf_counter()
         requested_at = self._clock()
-        cursor = "*"
+        cursor: str | None = None if search_mode == "semantic" else "*"
         seen_cursors: set[str] = set()
         raw_seen = 0
         calls = 0
@@ -747,7 +794,7 @@ class LiveCaptureSearchProvider:
         refs: list[SnapshotRef] = []
         hashes: list[str] = []
         while raw_seen < limit:
-            if cursor in seen_cursors:
+            if cursor is not None and cursor in seen_cursors:
                 errors.append(
                     _error(
                         "openalex",
@@ -757,16 +804,21 @@ class LiveCaptureSearchProvider:
                     )
                 )
                 break
-            seen_cursors.add(cursor)
+            if cursor is not None:
+                seen_cursors.add(cursor)
             remaining = limit - raw_seen
             canonical: dict[str, object] = {
                 "query": normalized_query,
-                "filters": filters,
+                "filters": provider_filters,
                 "limit": limit,
-                "cursor": cursor,
                 "per_page": min(50, remaining),
                 "select": OPENALEX_SELECT_FIELDS,
             }
+            if search_mode == "semantic":
+                canonical["search_mode"] = search_mode
+                canonical["page"] = 1
+            else:
+                canonical["cursor"] = cursor or "*"
             if filter_value is not None:
                 canonical["filter"] = filter_value
             identity = _identity(
@@ -778,11 +830,16 @@ class LiveCaptureSearchProvider:
                 canonical_request=canonical,
             )
             params: dict[str, QueryValue] = {
-                "search": normalized_query,
-                "cursor": cursor,
                 "per_page": min(50, remaining),
                 "select": OPENALEX_SELECT_FIELDS,
             }
+            if search_mode == "semantic":
+                params["page"] = 1
+            else:
+                params["cursor"] = cursor or "*"
+            params[
+                "search.semantic" if search_mode == "semantic" else "search"
+            ] = normalized_query
             if filter_value is not None:
                 params["filter"] = filter_value
             outcome = await self._request(
@@ -816,7 +873,11 @@ class LiveCaptureSearchProvider:
             papers.extend(decoded.papers)
             errors.extend(decoded.errors)
             raw_seen += decoded.raw_count
-            if decoded.raw_count == 0 or decoded.next_cursor is None:
+            if (
+                search_mode == "semantic"
+                or decoded.raw_count == 0
+                or decoded.next_cursor is None
+            ):
                 break
             cursor = decoded.next_cursor
         elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
@@ -991,8 +1052,15 @@ class LiveCaptureSearchProvider:
         limit: int,
         operation: _LiveOperation,
     ) -> ProviderResult[CitationExpansion]:
-        if self._dependency != "semantic_scholar":
-            raise ValueError("citation expansion requires Semantic Scholar")
+        if self._dependency == "openalex":
+            return await self._openalex_expansion(
+                direction=direction,
+                paper_id=paper_id,
+                limit=limit,
+                operation=operation,
+            )
+        if self._dependency != "semantic_scholar":  # pragma: no cover - closed provider union
+            raise ValueError("unsupported citation expansion provider")
         if paper_id.provider != "semantic_scholar":
             raise ValueError("citation expansion requires a Semantic Scholar paper ID")
         if type(limit) is not int or not 1 <= limit <= 100:
@@ -1056,6 +1124,206 @@ class LiveCaptureSearchProvider:
             provenance={
                 "provider": "semantic_scholar",
                 "endpoint": endpoint,
+                "model_id": self._adapter,
+                "requested_at": requested_at.isoformat(),
+                "response_hash": _aggregate_hash(hashes),
+                "snapshot_refs": _snapshot_provenance(refs),
+            },
+            cache_hit=False,
+            latency_ms=elapsed_ms,
+            errors=errors,
+        )
+
+    async def _openalex_expansion(
+        self,
+        *,
+        direction: Literal["references", "citations"],
+        paper_id: ProviderPaperId,
+        limit: int,
+        operation: _LiveOperation,
+    ) -> ProviderResult[CitationExpansion]:
+        if paper_id.provider != "openalex":
+            raise ValueError("OpenAlex expansion requires an OpenAlex paper ID")
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("OpenAlex expansion limit must be between 1 and 100")
+        started = time.perf_counter()
+        requested_at = self._clock()
+        refs: list[SnapshotRef] = []
+        hashes: list[str] = []
+        errors: list[ErrorDetail] = []
+        papers: list[Paper] = []
+        calls = 0
+
+        async def fetch(
+            *,
+            request_operation: Operation,
+            endpoint: str,
+            params: Mapping[str, QueryValue],
+            canonical: Mapping[str, object],
+        ) -> bytes | None:
+            nonlocal calls
+            identity = _identity(
+                dependency="openalex",
+                operation=request_operation,
+                method="GET",
+                endpoint=endpoint,
+                adapter=self._adapter,
+                canonical_request=canonical,
+            )
+            outcome = await self._request(
+                method="GET",
+                endpoint=endpoint,
+                params=params,
+                operation=operation,
+                remaining_calls=(
+                    operation.reservation.reserved.search_api_calls - calls
+                ),
+            )
+            calls += outcome.calls
+            if outcome.error is not None:
+                errors.append(outcome.error)
+                refs.append(self._capture_error(identity, outcome))
+                return None
+            if outcome.content is None:
+                return None
+            refs.append(self._capture(identity, outcome))
+            hashes.append(_sha256(outcome.content))
+            return outcome.content
+
+        if direction == "references":
+            endpoint = f"/works/{quote(paper_id.value, safe='')}"
+            seed_bytes = await fetch(
+                request_operation="references",
+                endpoint=endpoint,
+                params={"select": "id,referenced_works"},
+                canonical={
+                    "paper_id": paper_id.value,
+                    "select": "id,referenced_works",
+                },
+            )
+            reference_ids: list[str] = []
+            if seed_bytes is not None:
+                try:
+                    seed_payload = json.loads(seed_bytes)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    seed_payload = None
+                raw_ids = (
+                    seed_payload.get("referenced_works")
+                    if isinstance(seed_payload, dict)
+                    else None
+                )
+                if not isinstance(raw_ids, list):
+                    errors.append(
+                        _error(
+                            "openalex",
+                            "invalid_response",
+                            "OpenAlex work lacks referenced_works",
+                            retryable=False,
+                        )
+                    )
+                else:
+                    reference_ids = [
+                        item.rsplit("/", 1)[-1]
+                        for item in raw_ids
+                        if isinstance(item, str) and item.rsplit("/", 1)[-1]
+                    ][:limit]
+            if reference_ids and not errors:
+                filter_value = "openalex:" + "|".join(reference_ids)
+                page_bytes = await fetch(
+                    request_operation="references",
+                    endpoint="/works",
+                    params={
+                        "filter": filter_value,
+                        "per_page": len(reference_ids),
+                        "select": OPENALEX_SELECT_FIELDS,
+                    },
+                    canonical={
+                        "paper_id": paper_id.value,
+                        "filter": filter_value,
+                        "limit": limit,
+                        "per_page": len(reference_ids),
+                        "select": OPENALEX_SELECT_FIELDS,
+                    },
+                )
+                if page_bytes is not None:
+                    try:
+                        decoded = decode_openalex_page(page_bytes, limit=limit)
+                    except ValueError:
+                        errors.append(
+                            _error(
+                                "openalex",
+                                "invalid_response",
+                                "OpenAlex returned invalid reference works",
+                                retryable=False,
+                            )
+                        )
+                    else:
+                        papers.extend(decoded.papers)
+                        errors.extend(decoded.errors)
+        else:
+            filter_value = f"cites:{paper_id.value}"
+            page_bytes = await fetch(
+                request_operation="citations",
+                endpoint="/works",
+                params={
+                    "filter": filter_value,
+                    "per_page": limit,
+                    "select": OPENALEX_SELECT_FIELDS,
+                },
+                canonical={
+                    "paper_id": paper_id.value,
+                    "filter": filter_value,
+                    "limit": limit,
+                    "per_page": limit,
+                    "select": OPENALEX_SELECT_FIELDS,
+                },
+            )
+            if page_bytes is not None:
+                try:
+                    decoded = decode_openalex_page(page_bytes, limit=limit)
+                except ValueError:
+                    errors.append(
+                        _error(
+                            "openalex",
+                            "invalid_response",
+                            "OpenAlex returned invalid citing works",
+                            retryable=False,
+                        )
+                    )
+                else:
+                    papers.extend(decoded.papers)
+                    errors.extend(decoded.errors)
+
+        edges = [
+            CitationEdge(
+                provider="openalex",
+                citing_provider_id=(
+                    paper_id
+                    if direction == "references"
+                    else ProviderPaperId(provider="openalex", value=paper.openalex_id or "")
+                ),
+                cited_provider_id=(
+                    ProviderPaperId(provider="openalex", value=paper.openalex_id or "")
+                    if direction == "references"
+                    else paper_id
+                ),
+            )
+            for paper in papers
+            if paper.openalex_id is not None
+        ]
+        elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
+        if refs:
+            self._capture_store.annotate_usage(
+                refs[0].entry_id,
+                _terminal_usage(operation),
+            )
+        usage = self._settle(operation)
+        return ProviderResult[CitationExpansion](
+            data=CitationExpansion(papers=papers, raw_edges=edges),
+            usage=usage,
+            provenance={
+                "provider": "openalex",
+                "endpoint": "/works",
                 "model_id": self._adapter,
                 "requested_at": requested_at.isoformat(),
                 "response_hash": _aggregate_hash(hashes),
@@ -1202,9 +1470,15 @@ class ReplaySearchProvider:
             raise ValueError("query must not be empty")
         if type(limit) is not int or not 1 <= limit <= 300:
             raise ValueError("limit must be an integer between 1 and 300")
-        filter_value = _filter_expression(filters)
+        provider_filters = dict(filters)
+        search_mode = provider_filters.pop("_search_mode", "lexical")
+        if search_mode not in {"lexical", "semantic"}:
+            raise ValueError("OpenAlex search mode must be lexical or semantic")
+        if search_mode == "semantic" and limit > 50:
+            raise ValueError("OpenAlex semantic search limit cannot exceed 50")
+        filter_value = _filter_expression(provider_filters)
         requested_at = self._clock()
-        cursor = "*"
+        cursor: str | None = None if search_mode == "semantic" else "*"
         seen: set[str] = set()
         raw_seen = 0
         papers: list[Paper] = []
@@ -1213,7 +1487,7 @@ class ReplaySearchProvider:
         hashes: list[str] = []
         usages: list[UsageActual] = []
         while raw_seen < limit:
-            if cursor in seen:
+            if cursor is not None and cursor in seen:
                 errors.append(
                     _error(
                         "openalex",
@@ -1223,16 +1497,21 @@ class ReplaySearchProvider:
                     )
                 )
                 break
-            seen.add(cursor)
+            if cursor is not None:
+                seen.add(cursor)
             remaining = limit - raw_seen
             canonical: dict[str, object] = {
                 "query": normalized_query,
-                "filters": filters,
+                "filters": provider_filters,
                 "limit": limit,
-                "cursor": cursor,
                 "per_page": min(50, remaining),
                 "select": OPENALEX_SELECT_FIELDS,
             }
+            if search_mode == "semantic":
+                canonical["search_mode"] = search_mode
+                canonical["page"] = 1
+            else:
+                canonical["cursor"] = cursor or "*"
             if filter_value is not None:
                 canonical["filter"] = filter_value
             identity = _identity(
@@ -1273,7 +1552,11 @@ class ReplaySearchProvider:
             papers.extend(decoded.papers)
             errors.extend(decoded.errors)
             raw_seen += decoded.raw_count
-            if decoded.raw_count == 0 or decoded.next_cursor is None:
+            if (
+                search_mode == "semantic"
+                or decoded.raw_count == 0
+                or decoded.next_cursor is None
+            ):
                 break
             cursor = decoded.next_cursor
         return self._result(

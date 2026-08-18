@@ -36,6 +36,9 @@ from paper_search.storage.dependency_snapshot import DependencyCaptureStore
 from paper_search.domain.models import Sha256
 
 
+_SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL_SECONDS = 1.1
+
+
 class RecallRuntimeProfile(DomainModel):
     schema_version: Literal["recall-runtime-profile-v1"]
     env_file: Path
@@ -45,6 +48,7 @@ class RecallRuntimeProfile(DomainModel):
     llm_model: str = Field(min_length=1)
     llm_reservation_input_tokens: int = Field(strict=True, gt=0)
     llm_reservation_output_tokens: int = Field(strict=True, gt=0)
+    openalex_minimum_request_interval_seconds: float = Field(default=0.0, ge=0)
 
 
 class RecallRuntimeSecrets(DomainModel):
@@ -55,6 +59,18 @@ class RecallRuntimeSecrets(DomainModel):
 
 
 _BUNDLE_CAPABILITY = object()
+
+
+def _search_reservation_calls(
+    dependency: Literal["openalex", "semantic_scholar"],
+    *,
+    configured_key_count: int,
+) -> int:
+    if configured_key_count <= 0:
+        raise ValueError("configured key count must be positive")
+    if dependency == "openalex":
+        return max(3, configured_key_count)
+    return 3
 
 
 @dataclass(frozen=True, init=False)
@@ -182,6 +198,7 @@ async def build_live_runtime_bundle(
     loaded_recipe: LoadedRecallRecipe,
     capture_root: Path,
     client: httpx.AsyncClient | None = None,
+    search_dependency: Literal["openalex", "semantic_scholar"] = "openalex",
 ) -> RecallLiveRuntimeBundle:
     """Build the only approved live runtime from verified, secret-free profile inputs."""
     if profile.capture_responses is not True:
@@ -202,24 +219,32 @@ async def build_live_runtime_bundle(
     capture = DependencyCaptureStore(capture_root)
     try:
         search_provider = LiveCaptureSearchProvider(
-            dependency="openalex",
+            dependency=search_dependency,
             client=owned_client,
             capture_store=capture,
             pricer=pricer,
             controller=controller,
-            api_key=secrets.openalex_api_key.get_secret_value(),
-            additional_api_keys=tuple(
-                key.get_secret_value() for key in secrets.additional_openalex_api_keys
+            api_key=(
+                secrets.openalex_api_key.get_secret_value()
+                if search_dependency == "openalex"
+                else secrets.semantic_scholar_api_key.get_secret_value()
+            ),
+            additional_api_keys=(
+                tuple(
+                    key.get_secret_value()
+                    for key in secrets.additional_openalex_api_keys
+                )
+                if search_dependency == "openalex"
+                else ()
+            ),
+            minimum_request_interval_seconds=(
+                _SEMANTIC_SCHOLAR_MIN_REQUEST_INTERVAL_SECONDS
+                if search_dependency == "semantic_scholar"
+                else profile.openalex_minimum_request_interval_seconds
             ),
         )
-        citation_provider = LiveCaptureSearchProvider(
-            dependency="semantic_scholar",
-            client=owned_client,
-            capture_store=capture,
-            pricer=pricer,
-            controller=controller,
-            api_key=secrets.semantic_scholar_api_key.get_secret_value(),
-        )
+        citation_dependency = search_dependency
+        citation_provider = search_provider
         llm_client = OpenAICompatibleLLMClient(
             client=owned_client,
             base_url="https://api.deepseek.com/v1",
@@ -241,15 +266,34 @@ async def build_live_runtime_bundle(
         llm_cost = pricer.value_actual(
             dependency="llm", model_or_adapter=profile.llm_model, usage=llm_usage
         ).cost_cny
+        search_reservation_calls = _search_reservation_calls(
+            search_dependency,
+            configured_key_count=(
+                1 + len(secrets.additional_openalex_api_keys)
+                if search_dependency == "openalex"
+                else 1
+            ),
+        )
         search_cost = pricer.value_actual(
-            dependency="openalex",
-            model_or_adapter="openalex-works-v1",
-            usage=UsageActual(search_api_calls=1),
+            dependency=search_dependency,
+            model_or_adapter=(
+                "openalex-works-v1"
+                if search_dependency == "openalex"
+                else "semantic-graph-v1"
+            ),
+            usage=UsageActual(search_api_calls=search_reservation_calls),
         ).cost_cny
+        citation_reservation_calls = search_reservation_calls * (
+            2 if citation_dependency == "openalex" else 1
+        )
         citation_cost = pricer.value_actual(
-            dependency="semantic_scholar",
-            model_or_adapter="semantic-graph-v1",
-            usage=UsageActual(search_api_calls=1),
+            dependency=citation_dependency,
+            model_or_adapter=(
+                "openalex-works-v1"
+                if citation_dependency == "openalex"
+                else "semantic-graph-v1"
+            ),
+            usage=UsageActual(search_api_calls=citation_reservation_calls),
         ).cost_cny
         llm_estimate = UsageEstimate(
             llm_calls=1,
@@ -261,12 +305,20 @@ async def build_live_runtime_bundle(
             search_backend=BudgetedSearchBackend(
                 provider=search_provider,
                 controller=controller,
-                call_estimate=UsageEstimate(search_api_calls=1, cost_cny=search_cost),
+                call_estimate=UsageEstimate(
+                    search_api_calls=search_reservation_calls,
+                    cost_cny=search_cost,
+                ),
+                dependency=search_dependency,
             ),
             citation_backend=BudgetedCitationBackend(
                 provider=citation_provider,
                 controller=controller,
-                call_estimate=UsageEstimate(search_api_calls=1, cost_cny=citation_cost),
+                call_estimate=UsageEstimate(
+                    search_api_calls=citation_reservation_calls,
+                    cost_cny=citation_cost,
+                ),
+                dependency=citation_dependency,
             ),
             llm_backend=BudgetedLLMBackend(
                 analyzer=analyzer,

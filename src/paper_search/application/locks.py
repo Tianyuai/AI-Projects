@@ -118,6 +118,12 @@ class BaselineOptionalModules(_LockModel):
     adaptive_evolution: Literal[False]
 
 
+class DocumentRankerBinding(_LockModel):
+    enabled: Literal[True]
+    manifest: ArtifactBinding
+    weights: ArtifactBinding
+
+
 class BaselineBinding(_LockModel):
     primary_model: Literal["deepseek-v4-flash"]
     fallback_model: Literal["deepseek-v4-flash"]
@@ -128,6 +134,7 @@ class BaselineBinding(_LockModel):
     timeout: TimeoutBinding
     retry: RetryBinding
     optional_modules: BaselineOptionalModules
+    document_ranker: DocumentRankerBinding | None = None
 
 
 class _LiveInputLockBase(_LockModel):
@@ -205,13 +212,20 @@ _INPUT_LOCK_ADAPTER: TypeAdapter[CandidateLock | ValidationLock | ReplayLock] = 
 
 
 def _artifact_bindings(lock: InputLock) -> tuple[ArtifactBinding, ...]:
-    return (
+    bindings = (
         lock.frozen_data.manifest,
         lock.frozen_data.identifier_map,
         lock.baseline.planner.prompt_config,
         lock.budget_config,
         lock.pricing_policy,
         lock.quality_gates,
+    )
+    if lock.baseline.document_ranker is None:
+        return bindings
+    return (
+        *bindings,
+        lock.baseline.document_ranker.manifest,
+        lock.baseline.document_ranker.weights,
     )
 
 
@@ -428,7 +442,7 @@ def canonical_lock_bytes(lock: InputLock) -> bytes:
     """Return sorted, compact JSON bytes for a lock's immutable identity."""
 
     return json.dumps(
-        lock.model_dump(mode="json"),
+        lock.model_dump(mode="json", exclude_none=True),
         sort_keys=True,
         ensure_ascii=False,
         separators=(",", ":"),

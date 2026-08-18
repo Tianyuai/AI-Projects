@@ -90,6 +90,35 @@ def _extract_location(value: object, fallback_url: str) -> tuple[str | None, str
     return venue, url
 
 
+def _extract_arxiv_id(raw_work: Mapping[str, object]) -> str | None:
+    locations: list[object] = []
+    primary = raw_work.get("primary_location")
+    if primary is not None:
+        locations.append(primary)
+    raw_locations = raw_work.get("locations")
+    if raw_locations is not None:
+        if not isinstance(raw_locations, list):
+            raise ValueError("locations must be a list or null")
+        locations.extend(raw_locations)
+
+    identifiers: set[str] = set()
+    for location in locations:
+        if not isinstance(location, Mapping):
+            continue
+        for field in ("landing_page_url", "pdf_url"):
+            value = location.get(field)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            try:
+                normalized = normalize_paper_id(value, kind="arxiv")
+            except ValueError:
+                continue
+            identifiers.add(normalized.removeprefix("arxiv:"))
+    if len(identifiers) > 1:
+        raise ValueError("OpenAlex work contains conflicting arXiv IDs")
+    return next(iter(identifiers), None)
+
+
 def normalize_openalex_work(raw_work: Mapping[str, object]) -> Paper:
     """Convert one OpenAlex Work object to the project's canonical Paper model."""
     title_value = raw_work.get("title") or raw_work.get("display_name")
@@ -114,6 +143,12 @@ def normalize_openalex_work(raw_work: Mapping[str, object]) -> Paper:
             doi = None
 
     canonical_id = f"doi:{doi}" if doi is not None else openalex_canonical
+    arxiv_id = _extract_arxiv_id(raw_work)
+    arxiv_doi_prefix = "10.48550/arxiv."
+    if doi is not None and doi.casefold().startswith(arxiv_doi_prefix):
+        arxiv_id = normalize_paper_id(
+            doi[len(arxiv_doi_prefix) :], kind="arxiv"
+        ).removeprefix("arxiv:")
     venue, url = _extract_location(raw_work.get("primary_location"), openalex_value)
 
     return Paper(
@@ -124,6 +159,7 @@ def normalize_openalex_work(raw_work: Mapping[str, object]) -> Paper:
         publication_year=_optional_publication_year(raw_work.get("publication_year")),
         venue=venue,
         doi=doi,
+        arxiv_id=arxiv_id,
         openalex_id=openalex_id,
         url=url,
         citation_count=_optional_int(raw_work.get("cited_by_count"), "cited_by_count"),

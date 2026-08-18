@@ -16,8 +16,8 @@ frozen_inputs:
     path: data/dev/gold.jsonl
     sha256: sha256:24009cf03ad069131793b9a190024e239082277bd0e48149a1efbbbb7978e215
   identifier_map:
-    path: data/identifier-map.json
-    sha256: sha256:6ea6dbcd20a3f572d9f0dd0a0eef938ff01773db792401adf7fde1e489396e82
+    path: data/annotation_work/identifier_semantics/dev-identifier-map.semantic-v2.json
+    sha256: sha256:3ce299d699ab401283d761b95334d1ed4bf1ba798ff0d0548b5c135e13033359
   bound_paper_sources:
     - path: runs/_diag_query_evolution_query-evolution-prompt-v2-full-20260810/outcomes.jsonl
       sha256: sha256:10457964f12886891860f0e6bf01570b8505d8b29178c69635b3d169c04e4fbf

@@ -33,6 +33,9 @@ from paper_search.recall_experiments.generation.backends import (
 )
 from paper_search.recall_experiments.generation.base import QueryGenerator
 from paper_search.recall_experiments.generation.deepseek import DeepSeekPromptGenerator, RecallPromptArtifact
+from paper_search.recall_experiments.generation.evidence_steered import (
+    EvidenceSteeredDeepSeekGenerator,
+)
 from paper_search.recall_experiments.generation.fixed import FixedActionGenerator
 from paper_search.recall_experiments.generation.manual import ManualActionGenerator
 from paper_search.recall_experiments.inputs.formal_run import FormalRunInputSource
@@ -395,11 +398,21 @@ def build_deepseek_generator(
     prompt_bytes: bytes,
     allowed_actions: Sequence[str],
     backend: LLMBackend | None = None,
-) -> DeepSeekPromptGenerator:
+) -> QueryGenerator:
     del contexts
+    prompt = RecallPromptArtifact.from_yaml_bytes(prompt_bytes)
+    resolved_backend = backend or _SnapshotUnavailableLLMBackend()
+    if recipe.evidence_steered:
+        return EvidenceSteeredDeepSeekGenerator(
+            backend=resolved_backend,
+            prompt=prompt,
+            visibility=recipe.gold_visibility,
+            allowed_actions=allowed_actions,
+            max_actions=recipe.max_generated_actions,
+        )
     return DeepSeekPromptGenerator(
-        backend=backend or _SnapshotUnavailableLLMBackend(),
-        prompt=RecallPromptArtifact.from_yaml_bytes(prompt_bytes),
+        backend=resolved_backend,
+        prompt=prompt,
         visibility=recipe.gold_visibility,
         allowed_actions=allowed_actions,
         max_actions=recipe.max_generated_actions,
@@ -789,9 +802,9 @@ def _live_runtime_identity(
     pricer = pricers[0]
     if controller.formal_live is not True:
         raise RecallTerminalError("config_mismatch")
-    if dependencies["search"].dependency != "openalex":
+    if dependencies["search"].dependency not in {"openalex", "semantic_scholar"}:
         raise RecallTerminalError("config_mismatch")
-    if dependencies["citation"].dependency != "semantic_scholar":
+    if dependencies["citation"].dependency not in {"openalex", "semantic_scholar"}:
         raise RecallTerminalError("config_mismatch")
     if (
         dependencies["llm"].dependency != "llm"

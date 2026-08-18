@@ -215,6 +215,40 @@ def test_live_retrieval_backends_bind_provider_owned_identity_and_exact_objects(
     asyncio.run(run())
 
 
+def test_live_search_backend_can_explicitly_bind_semantic_scholar(
+    tmp_path: Path,
+) -> None:
+    controller = HardBudgetController(_budget(), formal_live=True)
+    pricer = ActualCostPricer(
+        load_pricing_policy(Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")),
+        valued_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+
+    async def run() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda request: pytest.fail(str(request)))
+        ) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="semantic_scholar",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot-s2-search"),
+                pricer=pricer,
+                controller=controller,
+            )
+            backend = BudgetedSearchBackend(
+                provider=provider,
+                controller=controller,
+                call_estimate=UsageEstimate(
+                    search_api_calls=1, cost_cny=Decimal("0.01")
+                ),
+                dependency="semantic_scholar",
+            )
+
+            assert backend.dependency_identity.dependency == "semantic_scholar"
+
+    asyncio.run(run())
+
+
 def test_live_retrieval_backends_reject_wrong_role_or_controller(
     tmp_path: Path,
 ) -> None:

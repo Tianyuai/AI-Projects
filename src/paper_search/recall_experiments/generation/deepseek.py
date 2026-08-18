@@ -273,6 +273,13 @@ class DeepSeekPromptGenerator:
             allowed_actions=self._allowed_actions,
             max_actions=self._max_actions,
         )
+        return await self.generate_with_payload(context, payload)
+
+    async def generate_with_payload(
+        self, context: RecallGenerationContext, payload: dict[str, object]
+    ) -> GenerationResult:
+        """Generate from a caller-built Gold-safe payload using the same validation path."""
+        assert_no_forbidden_identifier_keys_or_patterns(payload)
         initial = await self._backend.generate(
             self._request(payload), "initial"
         )

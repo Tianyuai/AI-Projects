@@ -1,0 +1,14 @@
+max_search_api_calls: 336
+target_search_api_calls: 336
+max_llm_calls: 1
+target_llm_calls: 1
+max_iterations: 2
+max_subqueries: 12
+max_rerank_candidates: 12
+max_output_papers: 50
+max_citation_seeds: 1
+target_citation_seeds: 1
+max_elapsed_seconds: 180
+soft_deadline_seconds: 170
+max_total_tokens: 2
+max_cost_cny: 0.10

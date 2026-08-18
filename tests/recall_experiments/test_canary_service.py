@@ -16,6 +16,8 @@ from paper_search.recall_experiments.canary_runtime import (
     build_live_runtime_bundle,
 )
 from paper_search.recall_experiments.canary_service import RecallCanaryService
+from paper_search.recall_experiments.contracts import RecallActionBatch, TextSearchAction
+from paper_search.recall_experiments.generation.base import GenerationResult
 from paper_search.recall_experiments.composition import RecallRuntime
 from paper_search.recall_experiments.recipes import load_recall_recipe
 from paper_search.recall_experiments.retrieval.backends import (
@@ -82,6 +84,8 @@ async def _run_canary(
     loaded_input: object,
     output_name: str,
     baseline: Path | None = None,
+    transport: object = _transport,
+    generator_override: object | None = None,
 ) -> object:
     recipe_path = _recipe(tmp_path)
     loaded_recipe = load_recall_recipe(recipe_path)
@@ -100,7 +104,7 @@ async def _run_canary(
         openalex_api_key=SecretStr("test"),
         semantic_scholar_api_key=SecretStr("test"),
     )
-    client = httpx.AsyncClient(transport=httpx.MockTransport(_transport))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(transport))  # type: ignore[arg-type]
     bundle = await build_live_runtime_bundle(
         profile=profile,
         secrets=secrets,
@@ -115,6 +119,7 @@ async def _run_canary(
             runtime_bundle=bundle,
             output_path=tmp_path / output_name,
             baseline_report_path=baseline,
+            generator_override=generator_override,  # type: ignore[arg-type]
         )
     finally:
         await bundle.aclose()
@@ -184,6 +189,62 @@ def test_service_runs_unscored_query_and_writes_fixed_report(tmp_path: Path) -> 
     assert saved["input"]["evaluation_status"] == "not_available"
 
 
+def test_service_accepts_an_explicit_verified_generator_override(tmp_path: Path) -> None:
+    class LocalGenerator:
+        model_id = "local-test-v1"
+        generator_type = "local_cpu"
+        source_sha256 = "sha256:" + "1" * 64
+
+        async def generate(self, context: object) -> GenerationResult:
+            query_id = getattr(context, "query_id")
+            return GenerationResult(
+                query_id=query_id,
+                action_batch=RecallActionBatch(
+                    actions=[
+                        TextSearchAction(
+                            action_id="local-1",
+                            action_type="text_search",
+                            strategy="local_cpu",
+                            payload={"query_text": "graph retrieval"},
+                        )
+                    ]
+                ),
+                    artifact_bytes=json.dumps(
+                        {
+                            "actions": [
+                                {
+                                    "action_id": "local-1",
+                                    "action_type": "text_search",
+                                    "strategy": "local_cpu",
+                                    "payload": {"query_text": "graph retrieval"},
+                                }
+                            ],
+                        }
+                    ).encode("utf-8"),
+                provenance={"generator": self.model_id},
+            )
+
+    loaded_input = load_canary_input(
+        input_kind="single",
+        query="graph retrieval",
+        query_id="q-1",
+        source_path=None,
+        identifier_map_path=None,
+        workspace_root=tmp_path,
+    )
+
+    report = asyncio.run(
+        _run_canary(
+            tmp_path,
+            loaded_input=loaded_input,
+            output_name="override",
+            generator_override=LocalGenerator(),
+        )
+    )
+
+    assert report.actions_by_query["q-1"][0].strategy == "local_cpu"
+
+
 def test_service_scores_gold_and_embeds_a_baseline_comparison(tmp_path: Path) -> None:
     identifier_map = tmp_path / "id-map.json"
     identifier_map.write_text("{}", encoding="utf-8")
@@ -219,6 +280,61 @@ def test_service_scores_gold_and_embeds_a_baseline_comparison(tmp_path: Path) ->
     assert current.comparison is not None
     assert current.comparison.evidence_level == "strict"
     assert current.comparison.per_query[0].jaccard == 1
+
+
+def test_service_scores_unseen_arxiv_without_a_dataset_specific_alias(
+    tmp_path: Path,
+) -> None:
+    identifier_map = tmp_path / "id-map.json"
+    identifier_map.write_text("{}", encoding="utf-8")
+    input_jsonl = tmp_path / "queries.jsonl"
+    input_jsonl.write_text(
+        '{"query_id":"q-1","query":"graph retrieval",'
+        '"gold_paper_ids":["arxiv:2501.10120"]}\n',
+        encoding="utf-8",
+    )
+    loaded_input = load_canary_input(
+        input_kind="jsonl",
+        query=None,
+        query_id=None,
+        source_path=input_jsonl,
+        identifier_map_path=identifier_map,
+        workspace_root=tmp_path,
+    )
+
+    def same_arxiv_transport(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "meta": {"count": 1, "per_page": 5, "next_cursor": None},
+                "results": [
+                    {
+                        "id": "https://openalex.org/W1",
+                        "doi": "https://doi.org/10.48550/arxiv.2501.10120",
+                        "title": "Candidate",
+                        "display_name": "Candidate",
+                        "authorships": [],
+                        "publication_year": 2026,
+                        "primary_location": None,
+                        "cited_by_count": 0,
+                        "is_retracted": False,
+                    }
+                ],
+            },
+            request=request,
+        )
+
+    report = asyncio.run(
+        _run_canary(
+            tmp_path,
+            loaded_input=loaded_input,
+            output_name="unseen-arxiv",
+            transport=same_arxiv_transport,
+        )
+    )
+
+    assert report.result.gold_hit_count == 1
+    assert report.result.macro_candidate_recall == 1.0
 
 
 def test_service_rejects_unverified_runtime_before_dispatch(tmp_path: Path) -> None:

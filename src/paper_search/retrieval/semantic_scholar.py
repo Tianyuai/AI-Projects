@@ -33,7 +33,7 @@ _SEARCH_ENDPOINT = "/paper/search"
 _BATCH_ENDPOINT = "/paper/batch"
 _FIELDS = (
     "paperId,title,abstract,authors,year,venue,externalIds,url,citationCount,"
-    "isRetracted,references.paperId,citations.paperId"
+    "references.paperId,citations.paperId"
 )
 
 
@@ -79,10 +79,19 @@ def _normalize_record(record: Mapping[str, object]) -> Paper:
         raise ValueError("Semantic Scholar record requires paperId and title")
     external_ids = record.get("externalIds")
     doi: str | None = None
+    arxiv_id: str | None = None
     if isinstance(external_ids, Mapping):
         raw_doi = _optional_string(external_ids.get("DOI"))
         if raw_doi is not None:
             doi = normalize_paper_id(raw_doi, kind="doi").removeprefix("doi:")
+        raw_arxiv = _optional_string(external_ids.get("ArXiv"))
+        if raw_arxiv is not None:
+            try:
+                arxiv_id = normalize_paper_id(raw_arxiv, kind="arxiv").removeprefix(
+                    "arxiv:"
+                )
+            except ValueError:
+                arxiv_id = None
     authors: list[str] = []
     raw_authors = record.get("authors")
     if isinstance(raw_authors, list):
@@ -102,6 +111,7 @@ def _normalize_record(record: Mapping[str, object]) -> Paper:
         publication_year=year if isinstance(year, int) and not isinstance(year, bool) else None,
         venue=_optional_string(record.get("venue")),
         doi=doi,
+        arxiv_id=arxiv_id,
         semantic_scholar_id=paper_id,
         url=_optional_string(record.get("url"))
         or f"https://www.semanticscholar.org/paper/{paper_id}",
@@ -163,6 +173,12 @@ def decode_semantic_scholar_search(
     records = payload.get("data") if isinstance(payload, Mapping) else None
     errors: list[ErrorDetail] = []
     papers: list[Paper] = []
+    if (
+        isinstance(payload, Mapping)
+        and payload.get("total") == 0
+        and records is None
+    ):
+        records = []
     if not isinstance(records, list):
         errors.append(
             _error(

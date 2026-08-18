@@ -8,7 +8,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import Field, model_validator
 
@@ -59,10 +59,11 @@ from paper_search.ranking.embedding import (
 from paper_search.ranking.fusion import FusedPaper, fuse_provider_results
 from paper_search.ranking.rerank import ConstraintScoredPaper
 from paper_search.retrieval.base import SearchProvider
-from paper_search.retrieval.routing import route_baseline_subqueries
+from paper_search.retrieval.routing import RetrievalPolicy, route_baseline_subqueries
 
 if TYPE_CHECKING:
     from paper_search.graph.provider_stage import AsyncCitationExpansionStage
+    from paper_search.ranking.cpu_document import DocumentRankingStage
     from paper_search.ranking.llm_stage import AsyncConstraintRerankingStage
     from paper_search.retrieval.title_candidates import AsyncTitleCandidateStage
 
@@ -106,6 +107,7 @@ class OrchestratorResult(DomainModel):
     provider_results: dict[DependencyName, ProviderResult[list[Paper]]]
     retrieved_paper_ids: list[NonEmptyStr] = Field(default_factory=list)
     post_filter_paper_ids: list[NonEmptyStr] = Field(default_factory=list)
+    pre_truncation_candidates: list[Paper] = Field(default_factory=list)
     diagnostics: list[DependencyDiagnostic]
     planner_status: PlannerStatus
     trace: list[dict[str, object]]
@@ -389,7 +391,9 @@ class MockSearchOrchestrator:
         provider_estimate: UsageEstimate,
         provider_estimates: Mapping[str, UsageEstimate] | None = None,
         routing_limits: tuple[int, int, int] | None = None,
+        retrieval_policy: RetrievalPolicy | None = None,
         execution_mode: SearchMode = "live",
+        document_ranker: DocumentRankingStage | None = None,
         embedding_ranker: EmbeddingRankingStage | None = None,
         citation_expander: AsyncCitationExpansionStage | None = None,
         constraint_reranker: AsyncConstraintRerankingStage | None = None,
@@ -413,7 +417,9 @@ class MockSearchOrchestrator:
         self._provider_estimate = provider_estimate
         self._provider_estimates = dict(provider_estimates or {})
         self._routing_limits = routing_limits
+        self._retrieval_policy = retrieval_policy
         self._execution_mode = execution_mode
+        self._document_ranker = document_ranker
         self._embedding_ranker = embedding_ranker
         self._citation_expander = citation_expander
         self._constraint_reranker = constraint_reranker
@@ -740,25 +746,73 @@ class MockSearchOrchestrator:
         trace.append({"step": "analyze", "prompt_version": self._prompt_version})
 
         collected: dict[DependencyName, list[ProviderResult[list[Paper]]]] = {}
+        action_results: dict[str, ProviderResult[list[Paper]]] = {}
         stopped = False
-        if self._routing_limits is None:
+        routes: list[
+            tuple[
+                str,
+                str,
+                Literal["text_search", "title_search"],
+                Literal["lexical", "semantic"],
+                list[DependencyName],
+                str | None,
+                str | None,
+            ]
+        ]
+        if self._retrieval_policy is not None:
+            routes = [
+                (
+                    item.route_id,
+                    item.text,
+                    item.action_type,
+                    item.search_mode,
+                    cast(list[DependencyName], list(item.providers)),
+                    item.routing_reason,
+                    item.method,
+                )
+                for item in self._retrieval_policy.route(
+                    analysis.search_plan,
+                    original_query=analysis.query_spec.original_query,
+                )
+            ]
+        elif self._routing_limits is None:
             routes = [
                 (
                     subquery.query_id,
                     subquery.text,
+                    subquery.action_type,
+                    subquery.search_mode,
                     [
                         name
                         for name in sorted(self._providers)
                         if subquery.provider_hint == "either"
                         or subquery.provider_hint == name
                     ],
+                    None,
+                    None,
                 )
                 for subquery in analysis.search_plan.subqueries
             ]
         else:
             minimum, openalex_maximum, semantic_maximum = self._routing_limits
             routes = [
-                (item.subquery_id, item.text, list(item.providers))
+                (
+                    item.subquery_id,
+                    item.text,
+                    next(
+                        subquery.action_type
+                        for subquery in analysis.search_plan.subqueries
+                        if subquery.query_id == item.subquery_id
+                    ),
+                    next(
+                        subquery.search_mode
+                        for subquery in analysis.search_plan.subqueries
+                        if subquery.query_id == item.subquery_id
+                    ),
+                    cast(list[DependencyName], list(item.providers)),
+                    item.routing_reason,
+                    None,
+                )
                 for item in route_baseline_subqueries(
                     analysis.search_plan,
                     min_openalex_calls=minimum,
@@ -766,8 +820,33 @@ class MockSearchOrchestrator:
                     max_semantic_scholar_calls=semantic_maximum,
                 )
             ]
-        for subquery_id, subquery_text, names in routes:
+        for (
+            subquery_id,
+            subquery_text,
+            action_type,
+            search_mode,
+            names,
+            routing_reason,
+            method,
+        ) in routes:
+            primary_result: ProviderResult[list[Paper]] | None = None
             for name in names:
+                if (
+                    name == "semantic_scholar"
+                    and routing_reason not in {"high_priority_supplement"}
+                    and primary_result is not None
+                    and primary_result.data
+                    and not primary_result.errors
+                ):
+                    trace.append(
+                        {
+                            "step": "skip_optional_provider",
+                            "provider": name,
+                            "subquery_id": subquery_id,
+                            "reason": "openalex_sufficient",
+                        }
+                    )
+                    continue
                 status = self._controller.stop_status()
                 if status != "continue":
                     warnings.append(f"{name}: budget unavailable")
@@ -783,9 +862,14 @@ class MockSearchOrchestrator:
                     stopped = True
                     break
                 try:
+                    provider_filters = dict(
+                        analysis.search_plan.inherited_hard_filters
+                    )
+                    if name == "openalex" and search_mode == "semantic":
+                        provider_filters["_search_mode"] = search_mode
                     result = await self._providers[name].search(
                         subquery_text,
-                        analysis.search_plan.inherited_hard_filters,
+                        provider_filters,
                         max_provider_results,
                         reservation,
                     )
@@ -840,8 +924,20 @@ class MockSearchOrchestrator:
                         diagnostics.append(self._failure_diagnostic(name))
                     continue
                 collected.setdefault(name, []).append(result)
+                action_results[
+                    f"{name}:{subquery_id}:{search_mode}"
+                ] = result
+                if name == "openalex":
+                    primary_result = result
                 trace.append(
-                    {"step": "retrieve", "provider": name, "subquery_id": subquery_id}
+                    {
+                        "step": "retrieve",
+                        "provider": name,
+                        "subquery_id": subquery_id,
+                        "action_type": action_type,
+                        "search_mode": search_mode,
+                        "method": method,
+                    }
                 )
                 if result.errors:
                     warnings.append(f"{name}: provider returned errors")
@@ -855,9 +951,7 @@ class MockSearchOrchestrator:
             for name, result in sorted(provider_results.items())
         )
 
-        fusion_input: dict[str, ProviderResult[list[Paper]]] = {
-            name: result for name, result in provider_results.items()
-        }
+        fusion_input = dict(action_results)
         if self._title_candidate_stage is not None:
             try:
                 title_recall = await self._title_candidate_stage.recall(
@@ -926,6 +1020,27 @@ class MockSearchOrchestrator:
         fused_by_id = {item.paper.canonical_id: item for item in fused}
         selected_fused = [fused_by_id[paper.canonical_id] for paper in papers]
         trace.append({"step": "fuse", "count": len(papers)})
+        if self._document_ranker is not None and selected_fused:
+            prior_ids = [item.paper.canonical_id for item in selected_fused]
+            ranked_fused = self._document_ranker.rank(
+                analysis.query_spec.original_query,
+                selected_fused,
+            )
+            ranked_ids = [item.paper.canonical_id for item in ranked_fused]
+            if len(ranked_ids) != len(prior_ids) or set(ranked_ids) != set(prior_ids):
+                raise ValueError("document ranker changed candidate identity")
+            selected_fused = ranked_fused
+            papers = [item.paper for item in selected_fused]
+            trace.append(
+                {
+                    "step": "document_rank",
+                    "status": "applied",
+                    "model_id": sanitize_embedding_model_id(
+                        self._document_ranker.model_id
+                    ),
+                    "count": len(papers),
+                }
+            )
         if self._embedding_ranker is not None and papers:
             embedding = self._embedding_ranker.rank(
                 analysis.query_spec.original_query,
@@ -1057,6 +1172,7 @@ class MockSearchOrchestrator:
                         "truncated": rerank.truncated,
                     }
                 )
+        pre_truncation_candidates = list(papers)
         if self._max_output_papers is not None and len(papers) > self._max_output_papers:
             papers = papers[: self._max_output_papers]
             selected_fused = [
@@ -1094,6 +1210,7 @@ class MockSearchOrchestrator:
             post_filter_paper_ids=[
                 item.paper.canonical_id for item in filtered.accepted
             ],
+            pre_truncation_candidates=pre_truncation_candidates,
         )
 
     def _result(
@@ -1114,6 +1231,7 @@ class MockSearchOrchestrator:
         planner_status: PlannerStatus = "primary",
         retrieved_paper_ids: list[str] | None = None,
         post_filter_paper_ids: list[str] | None = None,
+        pre_truncation_candidates: list[Paper] | None = None,
     ) -> OrchestratorResult:
         del papers
         return OrchestratorResult(
@@ -1125,6 +1243,7 @@ class MockSearchOrchestrator:
             provider_results=provider_results,
             retrieved_paper_ids=retrieved_paper_ids or [],
             post_filter_paper_ids=post_filter_paper_ids or [],
+            pre_truncation_candidates=pre_truncation_candidates or [],
             diagnostics=diagnostics or [],
             planner_status=planner_status,
             trace=trace,

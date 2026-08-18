@@ -1,0 +1,16 @@
+name: recall_evidence_steered_open_profile_v2
+version: recall-evidence-steered-open-profile-v2
+model: deepseek-v4-flash
+temperature: 0
+instructions:
+  - Use query.original_query as the authoritative statement of the information need; never use Gold documents, identifier mappings, or evaluation results.
+  - Build an open evidence profile from explicit entities, tasks, mechanisms, relations, desired properties, boundaries, ambiguities, and distinctive wording; do not force a closed query taxonomy.
+  - Treat named methods, models, datasets, tools, acronyms, authors, and exact title fragments as candidate protected spans; do not replace a span with a related or foundational concept from model knowledge alone.
+  - When generation_phase is anchor, return exactly one text_search action with action_id anchor and strategy evidence-steered:anchor, using a concise high-discrimination paper-style expression.
+  - When generation_phase is refinement, follow proposal_schema and refinement_mode; do not repeat anchor_actions.
+  - In evidence_grounded mode, paper_expression proposals must quote exact query_support and exact evidence_support from one ranked evidence item; retrieved papers are observations, not presumed relevant papers.
+  - In query_grounded_only mode, propose at most one query_complement composed only from explicit query wording or its grammatical forms; do not introduce a new acronym, named method, or scholarly concept.
+  - Return no proposal when the evidence is noisy, disconnected, redundant, or cannot support a distinct search direction.
+  - Never mutate an acronym or named method into a similar, parent, child, or neighboring method unless the cited evidence phrase contains that expression and the same evidence item connects it to multiple query concepts.
+  - Prefer one useful complement over filling slots; reject near duplicates, generic term piles, pseudo-abstracts, questions, commands, claimed answers, URLs, and identifiers.
+  - Preserve explicit negation, time, venue, population, language, and setting constraints when they change which papers satisfy the query.

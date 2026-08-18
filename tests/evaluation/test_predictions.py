@@ -6,6 +6,8 @@ import pytest
 
 from paper_search.domain.models import (
     DependencyStatus,
+    FusedPaper,
+    Paper,
     QueryAnalysisResult,
     QuerySpec,
     SearchPlan,
@@ -19,6 +21,7 @@ from paper_search.evaluation.official_adapter import (
     adapt_prediction_record,
 )
 from paper_search.evaluation.predictions import (
+    prediction_from_response,
     write_prediction_records,
     write_response_predictions,
 )
@@ -181,3 +184,36 @@ def test_write_response_predictions_rejects_duplicate_query_before_write(
         )
 
     assert output.read_bytes() == b"sentinel\n"
+
+
+def test_official_prediction_prefers_arxiv_identity_for_selected_openalex_paper() -> None:
+    response = _response("q1", ["openalex:W1", "openalex:W2"]).model_copy(
+        update={
+            "fused_papers": [
+                FusedPaper(
+                    paper=Paper(
+                        canonical_id="openalex:W1",
+                        title="ArXiv-backed paper",
+                        arxiv_id="2210.05663",
+                        openalex_id="W1",
+                    ),
+                    score=1.0,
+                    source_ranks={"openalex": 1},
+                ),
+                FusedPaper(
+                    paper=Paper(
+                        canonical_id="openalex:W2",
+                        title="OpenAlex-only paper",
+                        openalex_id="W2",
+                    ),
+                    score=0.5,
+                    source_ranks={"openalex": 2},
+                ),
+            ]
+        }
+    )
+
+    assert prediction_from_response(response) == InternalPredictionRecord(
+        query_id="q1",
+        selected_paper_ids=["arxiv:2210.05663", "openalex:W2"],
+    )

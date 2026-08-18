@@ -46,6 +46,31 @@ class InternalPredictionRecord(DomainModel):
     selected_paper_ids: list[NonEmptyStr] = Field(default_factory=list)
 
 
+class AstaPaperFindingQuery(DomainModel):
+    query_id: NonEmptyStr
+    query: NonEmptyStr
+
+
+class AstaPaperFindingRecord(DomainModel):
+    """Agent-facing PaperFindingBench input; scorer criteria stay external."""
+
+    input: AstaPaperFindingQuery
+
+
+class AstaPaperFindingResult(DomainModel):
+    paper_id: NonEmptyStr
+    markdown_evidence: NonEmptyStr
+
+
+class AstaPaperFindingOutputPayload(DomainModel):
+    query_id: NonEmptyStr
+    results: list[AstaPaperFindingResult] = Field(default_factory=list)
+
+
+class AstaPaperFindingOutput(DomainModel):
+    output: AstaPaperFindingOutputPayload
+
+
 def adapt_pasa_record(
     record: PaSaRecord,
     *,
@@ -93,4 +118,52 @@ def adapt_prediction_record(record: InternalPredictionRecord) -> PredictionRecor
     return PredictionRecord(
         query_id=record.query_id,
         predicted_paper_ids=record.selected_paper_ids,
+    )
+
+
+def adapt_asta_paper_finding_record(
+    record: AstaPaperFindingRecord,
+    *,
+    source: str,
+    split: str,
+    revision: str,
+) -> EvaluationQuery:
+    """Adapt public agent input without inventing an exhaustive semantic Gold set."""
+    record = AstaPaperFindingRecord.model_validate(record)
+    return EvaluationQuery(
+        query_id=record.input.query_id,
+        query=record.input.query,
+        relevant_paper_ids=[],
+        metadata={
+            "dataset_revision": revision,
+            "source": source,
+            "split": split,
+            "gold_semantics": "official_scorer_only",
+        },
+    )
+
+
+def adapt_internal_to_asta_paper_finding(
+    record: InternalPredictionRecord,
+    *,
+    markdown_evidence: dict[str, str],
+) -> AstaPaperFindingOutput:
+    """Map ranked internal IDs to Asta's evidence-bearing completion contract."""
+    record = InternalPredictionRecord.model_validate(record)
+    results: list[AstaPaperFindingResult] = []
+    for paper_id in record.selected_paper_ids:
+        evidence = markdown_evidence.get(paper_id)
+        if evidence is None or not evidence.strip():
+            raise ValueError(f"missing markdown evidence for selected paper: {paper_id}")
+        results.append(
+            AstaPaperFindingResult(
+                paper_id=paper_id,
+                markdown_evidence=evidence,
+            )
+        )
+    return AstaPaperFindingOutput(
+        output=AstaPaperFindingOutputPayload(
+            query_id=record.query_id,
+            results=results,
+        )
     )

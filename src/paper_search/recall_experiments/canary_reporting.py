@@ -85,7 +85,13 @@ class CanaryExecutionIdentity(DomainModel):
     recipe_sha256: Sha256
     input_sha256: Sha256
     identifier_map_sha256: Sha256 | None
-    generator_type: Literal["manual_actions", "fixed_actions", "deepseek_prompt"]
+    generator_type: Literal[
+        "manual_actions",
+        "fixed_actions",
+        "deepseek_prompt",
+        "local_cpu",
+        "local_cpu_fallback",
+    ]
     generator_model: NonEmptyStr | None
     prompt_sha256: Sha256 | None
     actions_sha256: Sha256 | None
@@ -108,6 +114,12 @@ class CanaryExecutionIdentity(DomainModel):
                 raise ValueError("DeepSeek canary identity requires model/prompt and no action source")
             if self.generator_model != self.runtime.dependencies["llm"].model:
                 raise ValueError("canary generator and runtime models do not match")
+        elif self.generator_type == "local_cpu":
+            if self.generator_model is None or self.prompt_sha256 is not None or not self.actions_sha256:
+                raise ValueError("local CPU canary identity requires model and weight source")
+        elif self.generator_type == "local_cpu_fallback":
+            if self.generator_model is None or self.prompt_sha256 is None or not self.actions_sha256:
+                raise ValueError("hybrid CPU canary identity requires model, prompt, and weights")
         elif self.generator_model is not None or self.prompt_sha256 is not None or not self.actions_sha256:
             raise ValueError("fixed/manual canary identity requires only an action source")
         return self

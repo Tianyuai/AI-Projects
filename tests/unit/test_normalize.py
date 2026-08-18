@@ -24,11 +24,20 @@ def complete_work() -> dict[str, Any]:
 
 
 def test_normalize_openalex_work_maps_complete_record() -> None:
-    paper = normalize_openalex_work(complete_work())
+    raw = complete_work()
+    raw["locations"] = [
+        {
+            "landing_page_url": "https://arxiv.org/abs/2501.10120v2",
+            "pdf_url": "https://arxiv.org/pdf/2501.10120",
+        }
+    ]
+
+    paper = normalize_openalex_work(raw)
 
     assert paper.canonical_id == "doi:10.1000/example"
     assert paper.openalex_id == "W123"
     assert paper.doi == "10.1000/example"
+    assert paper.arxiv_id == "2501.10120"
     assert paper.abstract == "retrieval augmented generation"
     assert paper.authors == ["Ada Lovelace", "Grace Hopper"]
     assert paper.publication_year == 2023
@@ -47,6 +56,19 @@ def test_missing_abstract_is_valid_and_openalex_id_is_fallback() -> None:
     assert paper.abstract is None
     assert paper.canonical_id == "openalex:W125"
     assert paper.url == "https://openalex.org/W125"
+
+
+def test_arxiv_datacite_doi_overrides_conflicting_location_identifier() -> None:
+    raw = complete_work()
+    raw["doi"] = "https://doi.org/10.48550/arxiv.2309.17453"
+    raw["locations"] = [
+        {"landing_page_url": "https://arxiv.org/abs/2602.06317"}
+    ]
+
+    paper = normalize_openalex_work(raw)
+
+    assert paper.canonical_id == "doi:10.48550/arxiv.2309.17453"
+    assert paper.arxiv_id == "2309.17453"
 
 
 def test_reconstruct_abstract_orders_all_positions() -> None:

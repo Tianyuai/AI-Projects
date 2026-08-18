@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -20,6 +21,8 @@ from paper_search.domain.models import (
     UsageEstimate,
 )
 from paper_search.pipeline.orchestrator import MockSearchOrchestrator
+from paper_search.ranking.fusion import FusedPaper
+from paper_search.retrieval.routing import FixedBudgetOpenAlexPolicy
 
 
 def _budget(**updates: object) -> SearchBudget:
@@ -236,6 +239,23 @@ class FakeProvider:
         )
 
 
+class FakeDocumentRanker:
+    model_id = "fixture-document-ranker-v1"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def rank(
+        self,
+        query: str,
+        candidates: Sequence[FusedPaper],
+    ) -> list[FusedPaper]:
+        self.calls.append(
+            (query, [item.paper.canonical_id for item in candidates])
+        )
+        return list(reversed(candidates))
+
+
 class SettlingAnalyzer(FakeAnalyzer):
     def __init__(
         self,
@@ -390,6 +410,91 @@ def test_max_output_papers_truncates_final_papers_but_not_pool() -> None:
     assert [paper.canonical_id for paper in result.papers] == ["openalex:W0"]
     assert len(result.retrieved_paper_ids) == 3
     assert len(result.post_filter_paper_ids) == 3
+    assert len(result.pre_truncation_candidates) == 3
+
+
+def test_fixed_budget_policy_executes_original_semantic_once_and_preserves_identity() -> None:
+    events: list[tuple[str, str, str]] = []
+
+    class RecordingProvider(FakeProvider):
+        async def search(
+            self,
+            query: str,
+            filters: dict[str, object],
+            limit: int,
+            reservation: object,
+        ) -> ProviderResult[list[Paper]]:
+            mode = str(filters.pop("_search_mode", "lexical"))
+            events.append((self.name, mode, query))
+            return await super().search(query, filters, limit, reservation)
+
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget(max_search_api_calls=7)),
+        analyzer=FakeAnalyzer([]),
+        providers={
+            "openalex": RecordingProvider("openalex", []),
+            "semantic_scholar": RecordingProvider("semantic_scholar", []),
+        },
+        config_hash="sha256:" + "6" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        retrieval_policy=FixedBudgetOpenAlexPolicy(max_openalex_calls=6),
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    openalex = [event for event in events if event[0] == "openalex"]
+    assert 2 <= len(openalex) <= 6
+    assert openalex[0] == ("openalex", "lexical", "graph retrieval")
+    assert openalex[1] == ("openalex", "semantic", "graph retrieval")
+    assert sum(mode == "semantic" for _, mode, _ in openalex) == 1
+    assert all(provider != "semantic_scholar" for provider, _, _ in events)
+    retrieval_trace = [
+        item for item in result.trace if item.get("step") == "retrieve"
+    ]
+    assert all(
+        item["action_type"] in {"text_search", "title_search"}
+        for item in retrieval_trace
+    )
+    assert all(
+        item["method"] in {"lexical_original", "semantic_original", "structured"}
+        for item in retrieval_trace
+    )
+
+
+def test_orchestrator_applies_injected_document_ranker_after_fusion() -> None:
+    events: list[str] = []
+    document_ranker = FakeDocumentRanker()
+    orchestrator = MockSearchOrchestrator(
+        controller=HardBudgetController(_budget()),
+        analyzer=FakeAnalyzer(events),
+        providers={
+            "openalex": FakeProvider("openalex", events),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
+        config_hash="sha256:" + "3" * 64,
+        prompt_version="query-analyze-v1",
+        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
+        provider_estimate=UsageEstimate(search_api_calls=1),
+        document_ranker=document_ranker,
+    )
+
+    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
+
+    assert document_ranker.calls == [
+        ("graph retrieval", ["openalex:W1", "s2:S1"])
+    ]
+    assert [paper.canonical_id for paper in result.papers] == [
+        "s2:S1",
+        "openalex:W1",
+    ]
+    assert result.trace[-1] == {
+        "step": "document_rank",
+        "status": "applied",
+        "model_id": "fixture-document-ranker-v1",
+        "count": 2,
+    }
 
 
 
@@ -523,14 +628,15 @@ def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
 
     result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
-    assert events == ["analyze", "openalex", "semantic_scholar", "openalex", "semantic_scholar"]
+    assert events == ["analyze", "openalex", "semantic_scholar", "openalex"]
+    assert any(item.get("step") == "skip_optional_provider" for item in result.trace)
     assert [paper.canonical_id for paper in result.papers] == ["openalex:W1", "s2:S1"]
     assert [item["step"] for item in result.trace] == [
         "analyze",
         "retrieve",
         "retrieve",
         "retrieve",
-        "retrieve",
+        "skip_optional_provider",
         "deduplicate",
         "filter",
         "fuse",
@@ -538,7 +644,10 @@ def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
     assert set(result.provider_results) == {"openalex", "semantic_scholar"}
     assert result.fused_papers[0].paper.canonical_id == "openalex:W1"
     assert result.fused_papers[0].score > 0
-    assert result.fused_papers[0].source_ranks == {"openalex": 1}
+    assert result.fused_papers[0].source_ranks == {
+        "openalex:sq-1:lexical": 1,
+        "openalex:sq-3:lexical": 1,
+    }
     assert result.config_hash == "sha256:" + "b" * 64
     assert result.prompt_version == "query-analyze-v1"
     assert result.stop_reason == "completed"

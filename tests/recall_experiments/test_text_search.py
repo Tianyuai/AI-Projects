@@ -72,6 +72,36 @@ def test_text_search_passes_validated_query_filters_and_limit_without_changing_r
     assert observed.provenance == {"provider": "offline-search"}
 
 
+def test_semantic_text_search_marks_the_provider_search_mode() -> None:
+    backend = FakeSearchBackend(BackendSearchResult())
+    handler = TextSearchHandler(backend=backend)
+    action = TextSearchAction(
+        action_id="semantic-1",
+        strategy="controlled-semantic",
+        action_type="text_search",
+        payload=TextSearchPayload(
+            query_text="long natural-language research question",
+            search_mode="semantic",
+        ),
+    )
+    context = RetrievalExecutionContext(
+        query_id="query-1",
+        provider_filters={"year_from": 2020},
+        max_results_per_action=50,
+    )
+
+    asyncio.run(handler.execute(action, context))
+
+    assert backend.calls == [
+        (
+            "semantic-1",
+            "long natural-language research question",
+            {"year_from": 2020, "_search_mode": "semantic"},
+            50,
+        )
+    ]
+
+
 def test_text_search_module_has_no_recall_filtering_or_handler_dependencies() -> None:
     import paper_search.recall_experiments.retrieval.text_search as module
 

@@ -46,7 +46,7 @@ include = [
 
 [tool.pytest.ini_options]
 addopts = "-ra -p no:cacheprovider --import-mode=importlib"
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 markers = [
     "online: requires explicit external provider credentials and network",

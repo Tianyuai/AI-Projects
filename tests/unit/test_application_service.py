@@ -285,6 +285,35 @@ def test_service_one_provider_degradation_is_partial_success() -> None:
     assert execution.outcome.response.is_partial is True
 
 
+def test_service_exposes_pre_truncation_candidates_only_on_execution_result() -> None:
+    selected = Paper(
+        canonical_id="openalex:W1",
+        title="Selected",
+        openalex_id="W1",
+        sources=["openalex"],
+    )
+    truncated = Paper(
+        canonical_id="openalex:W2",
+        title="Truncated",
+        openalex_id="W2",
+        sources=["openalex"],
+    )
+    result = _result(papers=[selected]).model_copy(
+        update={"pre_truncation_candidates": [selected, truncated]}
+    )
+
+    execution = asyncio.run(_service(result).execute(_request()))
+
+    assert isinstance(execution.outcome, SearchSuccess)
+    assert execution.outcome.response.selected_paper_ids == ["openalex:W1"]
+    assert [
+        paper.canonical_id for paper in execution.pre_truncation_candidates
+    ] == ["openalex:W1", "openalex:W2"]
+    assert "pre_truncation_candidates" not in type(
+        execution.outcome.response
+    ).model_fields
+
+
 def test_service_both_provider_failures_are_hard_failure() -> None:
     provider_errors = [
         ErrorDetail(

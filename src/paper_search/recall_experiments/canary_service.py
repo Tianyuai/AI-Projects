@@ -30,6 +30,7 @@ from paper_search.recall_experiments.composition import (
 )
 from paper_search.recall_experiments.contracts import CandidatePool, RecallGenerationContext
 from paper_search.recall_experiments.generation.base import QueryGenerator
+from paper_search.recall_experiments.paper_identity import EvidenceDrivenIdentifierResolver
 from paper_search.recall_experiments.recipes import (
     DeepSeekPromptGeneratorRecipe,
     FixedActionsGeneratorRecipe,
@@ -82,7 +83,7 @@ class _Evaluator:
         pool_by_query = {pool.query_id: pool for pool in pools}
         if set(pool_by_query) != {case.query_id for case in prepared.loaded_input.cases}:
             raise ValueError("candidate pools do not cover the canary query set")
-        identifier_map = self._identifier_map(prepared.loaded_input)
+        resolver = self._identifier_resolver(prepared.loaded_input)
         rows: list[CanaryPerQueryResult] = []
         for case in prepared.loaded_input.cases:
             pool = pool_by_query[case.query_id]
@@ -98,9 +99,11 @@ class _Evaluator:
                     )
                 )
                 continue
-            assert identifier_map is not None
-            resolved_candidates = {identifier_map.resolve(item) for item in candidate_ids}
-            resolved_gold = [identifier_map.resolve(item) for item in case.gold_paper_ids]
+            assert resolver is not None
+            resolved_candidates = frozenset().union(
+                *(resolver.paper_identities(entry.paper) for entry in pool.entries)
+            )
+            resolved_gold = [resolver.resolve(item) for item in case.gold_paper_ids]
             hits = sorted(set(resolved_gold).intersection(resolved_candidates))
             rows.append(
                 CanaryPerQueryResult(
@@ -132,12 +135,17 @@ class _Evaluator:
         )
 
     @staticmethod
-    def _identifier_map(loaded: LoadedCanaryInput) -> IdentifierMap | None:
+    def _identifier_resolver(
+        loaded: LoadedCanaryInput,
+    ) -> EvidenceDrivenIdentifierResolver | None:
         if loaded.evaluation_status == "not_available":
             return None
         if loaded.identifier_map_bytes is None:
             raise ValueError("scored canary input lacks verified identifier-map bytes")
-        return IdentifierMap.from_bytes(loaded.identifier_map_bytes, source="canary identifier map")
+        identifier_map = IdentifierMap.from_bytes(
+            loaded.identifier_map_bytes, source="canary identifier map"
+        )
+        return EvidenceDrivenIdentifierResolver(identifier_map)
 
 
 class RecallCanaryService:
@@ -154,6 +162,7 @@ class RecallCanaryService:
         runtime_bundle: RecallLiveRuntimeBundle,
         output_path: Path,
         baseline_report_path: Path | None = None,
+        generator_override: QueryGenerator | None = None,
     ) -> CanaryReport:
         recipe = loaded_recipe.recipe
         runtime_bundle.validate_capability()
@@ -174,8 +183,11 @@ class RecallCanaryService:
             for case in loaded_input.cases
         )
         generator_recipe = recipe.generator
-        if isinstance(generator_recipe, FixedActionsGeneratorRecipe):
-            generator: QueryGenerator = build_fixed_generator(
+        generator: QueryGenerator
+        if generator_override is not None:
+            generator = generator_override
+        elif isinstance(generator_recipe, FixedActionsGeneratorRecipe):
+            generator = build_fixed_generator(
                 self._workspace_root / generator_recipe.actions,
                 contexts=contexts,
                 recipe=recipe,
@@ -243,15 +255,25 @@ class RecallCanaryService:
         result = succeeded[-1].result
         actions_by_query = _load_actions(output_path, succeeded[-1].attempt_id)
         snapshot_manifest_sha256, snapshot_set_id = await runtime_bundle.seal()
+        override_type = getattr(generator, "generator_type", None)
+        generator_type = override_type or recipe.generator.type
         execution_identity = CanaryExecutionIdentity(
             identity_schema_version="recall-canary-execution-identity-v1",
             method_id=recipe.method_id,
             recipe_sha256=loaded_recipe.recipe_sha256,
             input_sha256=loaded_input.input_sha256,
             identifier_map_sha256=loaded_input.identifier_map_sha256,
-            generator_type=recipe.generator.type,
-            generator_model=getattr(recipe.generator, "model", None),
-            prompt_sha256=loaded_recipe.prompt_sha256,
+            generator_type=generator_type,
+            generator_model=(
+                getattr(generator, "model_id", None)
+                if override_type is not None
+                else getattr(recipe.generator, "model", None)
+            ),
+            prompt_sha256=(
+                loaded_recipe.prompt_sha256
+                if generator_type in {"deepseek_prompt", "local_cpu_fallback"}
+                else None
+            ),
             actions_sha256=actions_sha256,
             allowed_actions=tuple(recipe.retrieval.allowed_actions),
             max_total_actions=recipe.retrieval.max_total_actions,

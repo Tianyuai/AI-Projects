@@ -86,7 +86,7 @@ def validate_action_batch(
     issues: list[ActionValidationIssue] = []
     actions: list[RecallSearchAction] = []
     seen_ids: set[str] = set()
-    seen_search_text: set[str] = set()
+    seen_search_text: set[tuple[str, str, str]] = set()
     seed_ids = {candidate.paper.canonical_id for candidate in context.seed_candidates}
 
     for index, candidate in enumerate(raw_actions):
@@ -153,7 +153,7 @@ def _normalize_action(
     field_prefix: str,
     context: RecallGenerationContext,
     seed_ids: set[str],
-    seen_search_text: set[str],
+    seen_search_text: set[tuple[str, str, str]],
     issues: list[ActionValidationIssue],
 ) -> RecallSearchAction | None:
     if isinstance(action, (TextSearchAction, TitleSearchAction)):
@@ -177,17 +177,30 @@ def _normalize_action(
                 )
             )
             return None
-        if text.casefold() in seen_search_text:
+        search_mode = (
+            action.payload.search_mode
+            if isinstance(action, TextSearchAction)
+            else "lexical"
+        )
+        search_key = (action.action_type, search_mode, text.casefold())
+        if search_key in seen_search_text:
             issues.append(_issue("duplicate_action", field_path, "search text is duplicated"))
             return None
-        seen_search_text.add(text.casefold())
+        seen_search_text.add(search_key)
         if _has_year_conflict(text, context):
             issues.append(
                 _issue("year_conflict", field_path, "search text conflicts with query year constraints")
             )
             return None
         if isinstance(action, TextSearchAction):
-            return action.model_copy(update={"payload": TextSearchPayload(query_text=text)})
+            return action.model_copy(
+                update={
+                    "payload": TextSearchPayload(
+                        query_text=text,
+                        search_mode=action.payload.search_mode,
+                    )
+                }
+            )
         return action.model_copy(update={"payload": TitleSearchPayload(title_text=text)})
 
     if action.payload.seed_canonical_id not in seed_ids:

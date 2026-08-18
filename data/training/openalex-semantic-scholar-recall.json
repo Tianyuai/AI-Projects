@@ -1,0 +1,45 @@
+{
+  "actions_identical_across_providers": true,
+  "dataset": "pasa_auto_dev",
+  "development_partition_count": 588,
+  "evaluation_scope": "deterministic_even_stride_sample",
+  "gold_association_count": 79,
+  "max_actions_per_query": 3,
+  "max_results_per_action": 50,
+  "provider_overlap": {
+    "intersection_gold_hits": 1,
+    "openalex_only_gold_hits": 2,
+    "semantic_scholar_only_gold_hits": 3,
+    "union_gold_hits": 6
+  },
+  "providers": [
+    {
+      "cost_cny": "0",
+      "gold_hit_count": 3,
+      "macro_candidate_recall": 0.08333333333333333,
+      "mean_candidate_count": 104.93333333333334,
+      "micro_candidate_recall": 0.0379746835443038,
+      "provider": "openalex",
+      "search_api_calls": 89
+    },
+    {
+      "cost_cny": "0",
+      "gold_hit_count": 4,
+      "macro_candidate_recall": 0.10196078431372549,
+      "mean_candidate_count": 90.26666666666667,
+      "micro_candidate_recall": 0.05063291139240506,
+      "provider": "semantic_scholar",
+      "search_api_calls": 129
+    }
+  ],
+  "query_count": 30,
+  "schema_version": "provider-recall-comparison-public-v1",
+  "source_summary": {
+    "path": "data/training_private/online_recall/oa-s2-dev-stratified-30-20260813/summary.json",
+    "sha256": "sha256:c4732f34d037c70ed874f317b9a12d65b232ed0feccd7fd775920149714083f3"
+  },
+  "successful_batch_errors": {
+    "openalex_invalid_work_records_skipped": 12,
+    "semantic_scholar_errors": 0
+  }
+}

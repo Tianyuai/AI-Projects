@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import socket
 from collections.abc import Iterator
 from pathlib import Path
@@ -28,6 +29,8 @@ from paper_search.domain.models import (
     UsageActual,
 )
 from paper_search.llm.snapshot_adapters import ReplayLLMAnalyzer
+from paper_search.learning.adapters import QueryPolicyAnalyzerAdapter
+from paper_search.learning.deployment import build_cpu_action_analyzer_decorator
 from paper_search.retrieval.snapshot_adapters import ReplaySearchProvider
 from paper_search.pipeline.orchestrator import OrchestratorResult
 from paper_search.storage.dependency_snapshot import DependencyCaptureStore
@@ -76,6 +79,21 @@ instructions:
 def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir()
+    ranker_weights = bytes(64 * 8)
+    ranker_manifest = json.dumps(
+        {
+            "schema_version": "cpu-pairwise-document-ranker-manifest-v1",
+            "model_id": "cpu-pairwise-document-ranker-v1",
+            "model_sha256": _sha256(ranker_weights),
+            "dimension": 64,
+            "epochs": 3,
+            "learning_rate": 0.04,
+            "l2": 0.00001,
+            "learned_weight": 0.5,
+            "hard_negative_limit": 11,
+            "seed": 17,
+        }
+    ).encode("utf-8")
     payloads = {
         "data/manifest.json": b"{}",
         "data/identifier-map.json": b"{}",
@@ -86,6 +104,8 @@ def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
         "configs/budget_low.yaml": Path("configs/budget_low.yaml").read_bytes(),
         "configs/pricing_v1.yaml": _pricing_policy(),
         "configs/quality_gates_v1.yaml": b"{}",
+        "models/document-ranker.json": ranker_manifest,
+        "models/document-ranker.f64": ranker_weights,
     }
     hashes = {
         relative: _write_artifact(artifact_root, relative, payload)
@@ -101,6 +121,7 @@ def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
         *,
         runtime_allow_live: bool = True,
         budget_profile: str = "balanced",
+        document_ranker: bool = False,
     ) -> Path:
         fixture_path = Path(f"tests/fixtures/application/{kind}.lock.yaml")
         raw = yaml.safe_load(fixture_path.read_bytes())
@@ -113,6 +134,18 @@ def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
         raw["baseline"]["planner"]["prompt_config"]["sha256"] = hashes[
             "configs/prompts/query_analyze.yaml"
         ]
+        if document_ranker:
+            raw["baseline"]["document_ranker"] = {
+                "enabled": True,
+                "manifest": {
+                    "path": "models/document-ranker.json",
+                    "sha256": hashes["models/document-ranker.json"],
+                },
+                "weights": {
+                    "path": "models/document-ranker.f64",
+                    "sha256": hashes["models/document-ranker.f64"],
+                },
+            }
         for key, relative in (
             ("budget_config", f"configs/budget_{budget_profile}.yaml"),
             ("pricing_policy", "configs/pricing_v1.yaml"),
@@ -132,8 +165,10 @@ def composition_fixture(tmp_path: Path) -> Iterator[dict[str, Path]]:
         "output_root": tmp_path / "output",
         "manifest_path": manifest_path,
         "replay_lock": write_lock("replay"),
+        "replay_ranked_lock": write_lock("replay", document_ranker=True),
         "replay_no_live_lock": write_lock("replay", runtime_allow_live=False),
         "candidate_lock": write_lock("candidate"),
+        "candidate_ranked_lock": write_lock("candidate", document_ranker=True),
         "candidate_low_lock": write_lock("candidate", budget_profile="low"),
     }
 
@@ -147,6 +182,136 @@ def _compose_replay(fixture: dict[str, Path]) -> ApplicationBundle:
         snapshot_manifest_path=fixture["manifest_path"],
         environ={},
     )
+
+
+def test_replay_composition_exposes_one_analyzer_decorator_hook(
+    composition_fixture: dict[str, Path],
+) -> None:
+    decorated: list[object] = []
+
+    def decorate(analyzer: object) -> object:
+        decorated.append(analyzer)
+        return analyzer
+
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["replay_lock"],
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+        analyzer_decorator=decorate,  # type: ignore[arg-type]
+    )
+
+    asyncio.run(
+        bundle.service.execute(
+            SearchRequest(query_id="q1", query="offline fixture", mode="replay")
+        )
+    )
+
+    assert len(decorated) == 1
+
+
+def test_replay_composition_explicitly_enables_locked_document_ranker(
+    composition_fixture: dict[str, Path],
+) -> None:
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["replay_ranked_lock"],
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load(
+            (
+                composition_fixture["artifact_root"]
+                / "configs/budget_balanced.yaml"
+            ).read_bytes()
+        )
+    )
+
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        "locked-document-ranker",
+    )
+
+    assert orchestrator._document_ranker is not None  # noqa: SLF001
+    assert (  # noqa: SLF001
+        orchestrator._document_ranker.model_id
+        == "cpu-pairwise-document-ranker-v1"
+    )
+
+
+def test_live_composition_explicitly_enables_locked_document_ranker(
+    composition_fixture: dict[str, Path],
+) -> None:
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["candidate_ranked_lock"],
+        mode="live",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        network_authorized=True,
+        environ={"LLM_API_KEY": "fixture-secret"},
+    )
+
+    factory = bundle.service._orchestrator_factory  # noqa: SLF001
+
+    assert factory._document_ranker is not None  # type: ignore[attr-defined]  # noqa: SLF001
+    assert (  # type: ignore[attr-defined]  # noqa: SLF001
+        factory._document_ranker.model_id
+        == "cpu-pairwise-document-ranker-v1"
+    )
+
+
+def test_composition_root_accepts_verified_cpu_action_analyzer(
+    composition_fixture: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    weights = bytes(256 * 8)
+    model_path = tmp_path / "cpu-action.f64"
+    model_path.write_bytes(weights)
+    result_path = tmp_path / "cpu-action.json"
+    result_path.write_text(
+        json.dumps(
+            {
+                "model_id": "cpu-action-ranker-v1",
+                "dimension": 256,
+                "learned": {"threshold": 0.4},
+                "model_sha256": _sha256(weights),
+            }
+        ),
+        encoding="utf-8",
+    )
+    bundle = CompositionRoot.compose(
+        lock_path=composition_fixture["replay_lock"],
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+        analyzer_decorator=build_cpu_action_analyzer_decorator(
+            model_path=model_path,
+            result_path=result_path,
+            max_actions=5,
+        ),
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load(
+            (
+                composition_fixture["artifact_root"]
+                / "configs/budget_balanced.yaml"
+            ).read_bytes()
+        )
+    )
+
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        "cpu-action-composition",
+    )
+
+    assert isinstance(orchestrator._analyzer, QueryPolicyAnalyzerAdapter)  # noqa: SLF001
 
 
 def test_prompt_system_message_keeps_query_analyze_output_stable() -> None:
@@ -413,6 +578,7 @@ def test_replay_orchestrator_uses_only_replay_adapters_and_baseline_modules(
         for provider in orchestrator._providers.values()  # noqa: SLF001
     )
     assert orchestrator._routing_limits == (3, 6, 2)  # noqa: SLF001
+    assert orchestrator._retrieval_policy is None  # noqa: SLF001
 
 
 def test_explicit_main_baseline_uses_lock_identity(
@@ -624,6 +790,7 @@ def test_live_requests_use_priced_estimates_and_isolated_sealed_resources(
         assert estimates["semantic_scholar"].cost_cny is not None
         assert estimates["openalex"].cost_cny != estimates["semantic_scholar"].cost_cny
         assert kwargs["routing_limits"] == (3, 6, 2)
+        assert kwargs.get("retrieval_policy") is None
 
 
 def test_snapshot_binding_is_immutable_after_composition(

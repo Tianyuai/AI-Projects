@@ -259,10 +259,11 @@ class BudgetedSearchBackend(_BudgetedProviderCall):
         provider: SearchProvider,
         controller: HardBudgetController,
         call_estimate: UsageEstimate,
+        dependency: Literal["openalex", "semantic_scholar"] = "openalex",
     ) -> None:
         super().__init__(controller=controller, call_estimate=call_estimate)
         self._provider = provider
-        self._bind_live_provider(provider, dependency="openalex", role="search")
+        self._bind_live_provider(provider, dependency=dependency, role="search")
 
     async def search(
         self,
@@ -322,7 +323,7 @@ class BudgetedSearchBackend(_BudgetedProviderCall):
 
 
 class BudgetedCitationBackend(_BudgetedProviderCall):
-    """Adapt Semantic Scholar citation calls without constructing provider clients."""
+    """Adapt provider citation calls without constructing provider clients."""
 
     def __init__(
         self,
@@ -330,20 +331,26 @@ class BudgetedCitationBackend(_BudgetedProviderCall):
         provider: SearchProvider,
         controller: HardBudgetController,
         call_estimate: UsageEstimate,
+        dependency: Literal["openalex", "semantic_scholar"] = "semantic_scholar",
     ) -> None:
         super().__init__(controller=controller, call_estimate=call_estimate)
         self._provider = provider
+        self._dependency = dependency
         self._bind_live_provider(
             provider,
-            dependency="semantic_scholar",
+            dependency=dependency,
             role="citation",
         )
 
-    @staticmethod
-    def _seed_id(seed: Paper) -> ProviderPaperId | None:
-        if seed.semantic_scholar_id is None:
+    def _seed_id(self, seed: Paper) -> ProviderPaperId | None:
+        value = (
+            seed.openalex_id
+            if self._dependency == "openalex"
+            else seed.semantic_scholar_id
+        )
+        if value is None:
             return None
-        return ProviderPaperId(provider="semantic_scholar", value=seed.semantic_scholar_id)
+        return ProviderPaperId(provider=self._dependency, value=value)
 
     def owns_live_resources(self, *, client: object, capture_store: object) -> bool:
         return isinstance(client, httpx.AsyncClient) and isinstance(
@@ -366,13 +373,13 @@ class BudgetedCitationBackend(_BudgetedProviderCall):
         except BudgetExceededError as error:
             return BackendCitationResult(
                 direction=direction,
-                errors=[_backend_error(code="budget_exhausted", message=str(error), provider="semantic_scholar")],
+                errors=[_backend_error(code="budget_exhausted", message=str(error), provider=self._dependency)],
                 infrastructure_failure=True,
             )
         except ReservationError as error:
             return BackendCitationResult(
                 direction=direction,
-                errors=[_backend_error(code="accounting_failure", message=str(error), provider="semantic_scholar")],
+                errors=[_backend_error(code="accounting_failure", message=str(error), provider=self._dependency)],
                 infrastructure_failure=True,
             )
         try:
@@ -392,14 +399,14 @@ class BudgetedCitationBackend(_BudgetedProviderCall):
                 self._fail_accounting(reservation, result.usage)
             return BackendCitationResult(
                 direction=direction,
-                errors=[_backend_error(code="accounting_failure", message=str(error), provider="semantic_scholar")],
+                errors=[_backend_error(code="accounting_failure", message=str(error), provider=self._dependency)],
                 infrastructure_failure=True,
             )
         except Exception as error:
             self._finalize_exception(reservation)
             return BackendCitationResult(
                 direction=direction,
-                errors=[_backend_error(code="provider_error", message=str(error), provider="semantic_scholar")],
+                errors=[_backend_error(code="provider_error", message=str(error), provider=self._dependency)],
                 infrastructure_failure=True,
             )
 
@@ -417,12 +424,53 @@ class BudgetedCitationBackend(_BudgetedProviderCall):
                 errors=[
                     _backend_error(
                         code="seed_unavailable",
-                        message="citation expansion requires a Semantic Scholar seed ID",
-                        provider="semantic_scholar",
+                        message=f"citation expansion requires a {self._dependency} seed ID",
+                        provider=self._dependency,
                     )
                 ],
             )
         if direction == "both":
+            if self._dependency == "openalex":
+                parts = [
+                    await self._one_direction(
+                        action_id=action_id,
+                        seed_id=seed_id,
+                        direction=item,
+                        limit=limit,
+                    )
+                    for item in ("references", "citations")
+                ]
+                provider_results = [
+                    item for item in parts if not isinstance(item, BackendCitationResult)
+                ]
+                backend_results = [
+                    item for item in parts if isinstance(item, BackendCitationResult)
+                ]
+                errors = [
+                    error
+                    for item in parts
+                    for error in item.errors
+                ]
+                hits: list[Paper] = []
+                seen: set[str] = set()
+                for item in provider_results:
+                    for paper in item.data.papers:
+                        if paper.canonical_id not in seen:
+                            seen.add(paper.canonical_id)
+                            hits.append(paper)
+                for item in backend_results:
+                    for paper in item.hits:
+                        if paper.canonical_id not in seen:
+                            seen.add(paper.canonical_id)
+                            hits.append(paper)
+                return BackendCitationResult(
+                    direction=direction,
+                    hits=hits,
+                    usage=_aggregate_usage([item.usage for item in parts]),
+                    provenance={"provider": "openalex", "stage": "provider_citation_expand"},
+                    errors=errors,
+                    infrastructure_failure=_infrastructure_failure(errors),
+                )
             # The established stage owns its two provider reservations and
             # resolves graph edges.  We only adapt its normalized papers here.
             stage = ProviderCitationExpansionStage(
@@ -507,14 +555,18 @@ class SearchActionHandler:
     ) -> RetrievalActionResult:
         if isinstance(action, TextSearchAction):
             query = action.payload.query_text
+            filters = dict(context.provider_filters)
+            if action.payload.search_mode == "semantic":
+                filters["_search_mode"] = "semantic"
         elif isinstance(action, TitleSearchAction):
             query = action.payload.title_text
+            filters = dict(context.provider_filters)
         else:
             raise TypeError("search action handler does not support citation actions")
         result = await self._backend.search(
             action.action_id,
             query,
-            dict(context.provider_filters),
+            filters,
             context.max_results_per_action,
         )
         return RetrievalActionResult(

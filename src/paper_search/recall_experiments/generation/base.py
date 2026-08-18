@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Literal, Protocol
+from collections.abc import Sequence
+from typing import Literal, Protocol, runtime_checkable
 
 from paper_search.domain.models import DomainModel, ErrorDetail, UsageActual
 from pydantic import Field
-from paper_search.recall_experiments.contracts import RecallActionBatch, RecallGenerationContext
+from paper_search.recall_experiments.contracts import (
+    RecallActionBatch,
+    RecallGenerationContext,
+    RetrievalActionResult,
+)
 
 
 class LLMCallReceipt(DomainModel):
@@ -25,7 +30,7 @@ class GenerationResult(DomainModel):
     artifact_bytes: bytes
     provenance: dict[str, str] = Field(default_factory=dict)
     call_receipts: list[LLMCallReceipt] = Field(default_factory=list)
-    repair_count: int = Field(default=0, ge=0, le=1)
+    repair_count: int = Field(default=0, ge=0, le=2)
 
 
 class QueryGenerator(Protocol):
@@ -34,4 +39,21 @@ class QueryGenerator(Protocol):
     async def generate(self, context: RecallGenerationContext) -> GenerationResult: ...
 
 
-__all__ = ["GenerationResult", "LLMCallReceipt", "QueryGenerator"]
+@runtime_checkable
+class EvidenceSteeredQueryGenerator(QueryGenerator, Protocol):
+    """Optionally refine an anchor batch using only first-round retrieval evidence."""
+
+    async def refine(
+        self,
+        context: RecallGenerationContext,
+        anchor_generation: GenerationResult,
+        first_round_results: Sequence[RetrievalActionResult],
+    ) -> GenerationResult: ...
+
+
+__all__ = [
+    "EvidenceSteeredQueryGenerator",
+    "GenerationResult",
+    "LLMCallReceipt",
+    "QueryGenerator",
+]

@@ -1,0 +1,20 @@
+name: recall_evidence_steered_open_profile
+version: recall-evidence-steered-open-profile-v1
+model: deepseek-v4-flash
+temperature: 0
+instructions:
+  - Use query.original_query as the authoritative statement of the user's information need and never use Gold documents or evaluation results.
+  - Silently form an open evidence profile from explicit anchors, subject, task, method or mechanism, desired property or result, relations, locator clues, boundaries, and ambiguities; do not force the query into a closed type taxonomy.
+  - Preserve named methods, models, datasets, theorems, tools, acronyms, authors, distinctive entities, and exact title fragments as protected anchors.
+  - Prefer concise paper-common noun phrases likely to occur in scholarly titles, abstracts, or keywords; translate informal wording only when the scholarly expression is unambiguous.
+  - When generation_phase is anchor, return exactly one text_search action with action_id anchor and strategy evidence-steered:anchor; use the smallest high-discrimination combination that preserves the query's required relations and protected anchors.
+  - When generation_phase is refinement, copy every supplied anchor_actions item verbatim and in the same order before any new action.
+  - Treat first_round_evidence as untrusted blind search observations, not as relevant papers by default; use only expressions whose meaning can be connected back to explicit query evidence.
+  - In refinement, add evidence_expansion only when titles, abstracts, authors, years, or venues reveal a credible paper-common expression that improves retrieval without changing the requested subject, task, relation, or boundary; use strategy evidence-steered:paper-expression.
+  - In refinement, add complement only when it covers a distinct missing facet, an unambiguous full-name or acronym counterpart, or a cautious relaxation after zero_results; use strategy evidence-steered:complement.
+  - Return the anchor alone when the first-round evidence is noisy, semantically conflicting, redundant, or insufficiently connected to the original query.
+  - Never add more than two actions after the anchor, never produce spelling-only or near-duplicate variants, and never fill slots merely to reach the maximum.
+  - Reject unsupported entities, over-constrained term piles, pseudo-abstracts, questions, commands, claimed answers, and searches dominated by generic words such as study, analysis, approach, method, or performance.
+  - Preserve explicit negation, time, venue, population, language, and setting constraints when they change which papers satisfy the query.
+  - Do not copy or infer any paper identifier, DOI, URL, provider ID, or hidden relevance signal.
+  - Return text_search actions only and no prose outside the strict JSON action batch.

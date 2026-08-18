@@ -21,13 +21,16 @@ from paper_search.domain.models import (
 )
 from paper_search.recall_experiments.contracts import (
     GoldDocument,
+    RecallActionBatch,
     RecallGenerationContext,
+    RetrievalActionResult,
     SeedCandidate,
 )
 from paper_search.recall_experiments.generation.backends import (
     BudgetedLLMBackend,
     LLMBackendResult,
 )
+from paper_search.recall_experiments.generation.base import GenerationResult
 from paper_search.recall_experiments.generation.deepseek import (
     DeepSeekPromptGenerator,
     RecallGenerationFailure,
@@ -35,6 +38,12 @@ from paper_search.recall_experiments.generation.deepseek import (
     build_generation_payload,
     build_repair_payload,
     render_recall_prompt,
+)
+from paper_search.recall_experiments.generation.evidence_steered import (
+    EvidenceSteeredDeepSeekGenerator,
+    build_refinement_payload,
+    build_safe_query_complement,
+    validate_refinement_proposals,
 )
 from paper_search.recall_experiments.generation.fixed import FixedActionGenerator
 from paper_search.recall_experiments.generation.manual import ManualActionGenerator
@@ -213,6 +222,18 @@ def _prompt() -> RecallPromptArtifact:
     )
 
 
+def _evidence_prompt_v3() -> RecallPromptArtifact:
+    return RecallPromptArtifact.from_yaml_bytes(
+        b"# source bytes are identity-sensitive\nname: recall_evidence_v3\nversion: recall-evidence-steered-open-profile-v3\nmodel: deepseek-v4-flash\ntemperature: 0\ninstructions:\n  - Generate only permitted retrieval actions.\n"
+    )
+
+
+def _evidence_prompt_v4() -> RecallPromptArtifact:
+    return RecallPromptArtifact.from_yaml_bytes(
+        b"# source bytes are identity-sensitive\nname: recall_evidence_v4\nversion: recall-evidence-steered-open-profile-v4\nmodel: deepseek-v4-flash\ntemperature: 0\ninstructions:\n  - Generate only permitted retrieval actions.\n"
+    )
+
+
 def _oracle_context(*, year_from: int | None = None) -> RecallGenerationContext:
     return RecallGenerationContext(
         query_id="query-1",
@@ -240,6 +261,1229 @@ def _oracle_context(*, year_from: int | None = None) -> RecallGenerationContext:
 
 def _backend_result(data: dict[str, object]) -> LLMBackendResult:
     return LLMBackendResult(data=data)
+
+
+def test_evidence_steered_generation_uses_sanitized_first_round_paper_evidence() -> None:
+    anchor = {
+        "actions": [
+            {
+                "action_id": "anchor",
+                "action_type": "text_search",
+                "strategy": "evidence-steered:anchor",
+                "payload": {"query_text": "graph retrieval"},
+            }
+        ]
+    }
+    refined = {
+        "proposals": [
+            {
+                "action_id": "evidence_expansion",
+                "query_text": "dense graph retrieval",
+                "expansion_kind": "paper_expression",
+                "query_support": ["graph retrieval"],
+                "evidence_support": [
+                    {
+                        "rank": 1,
+                        "exact_phrase": "Dense retrieval for attributed graphs",
+                    }
+                ],
+            }
+        ]
+    }
+    backend = _RecordingLLMBackend(
+        [_backend_result(anchor), _backend_result(refined)]
+    )
+    generator = EvidenceSteeredDeepSeekGenerator(
+        backend=backend,
+        prompt=_prompt(),
+        visibility="blind",
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+    context = _context("query-1")
+
+    anchor_result = asyncio.run(generator.generate(context))
+    result = asyncio.run(
+        generator.refine(
+            context,
+            anchor_result,
+            [
+                RetrievalActionResult(
+                    action_id="anchor",
+                    action_type="text_search",
+                    hits=[
+                        Paper(
+                            canonical_id="doi:10.1000/private-id",
+                            title="Dense retrieval for attributed graphs",
+                            abstract=(
+                                "Graph retrieval is a paper-common expression from the first-round abstract. "
+                                "Repository https://example.test/private"
+                            ),
+                            authors=["A. Researcher"],
+                            publication_year=2024,
+                            venue="IR Journal",
+                            doi="10.1000/private-id",
+                            openalex_id="W123456789",
+                            url="https://example.test/private",
+                            sources=["openalex"],
+                        )
+                    ],
+                )
+            ],
+        )
+    )
+
+    assert [kind for kind, _ in backend.calls] == ["initial", "initial"]
+    anchor_payload = getattr(backend.calls[0][1], "payload")
+    refinement_payload = getattr(backend.calls[1][1], "payload")
+    assert anchor_payload["generation_phase"] == "anchor"
+    assert anchor_payload["allowed_action_schema"]["max_actions"] == 1
+    assert refinement_payload["generation_phase"] == "refinement"
+    assert refinement_payload["anchor_actions"] == anchor["actions"]
+    assert refinement_payload["first_round_evidence"] == [
+        {
+            "rank": 1,
+            "title": "Dense retrieval for attributed graphs",
+            "snippets": [
+                "Graph retrieval is a paper-common expression from the first-round abstract. Repository"
+            ],
+            "authors": ["A. Researcher"],
+            "publication_year": 2024,
+            "venue": "IR Journal",
+        }
+    ]
+    serialized = json.dumps(refinement_payload)
+    assert "10.1000/private-id" not in serialized
+    assert "W123456789" not in serialized
+    assert "https://example.test/private" not in serialized
+    assert [action.action_id for action in result.action_batch.actions] == [
+        "anchor",
+        "evidence_expansion",
+    ]
+    assert len(result.call_receipts) == 2
+    assert result.repair_count == 0
+
+
+def test_refinement_evidence_strips_embedded_arxiv_and_pmid_identifiers() -> None:
+    context = _context("query-identifiers")
+    batch = RecallActionBatch.model_validate(_actions())
+    anchor = GenerationResult(
+        query_id=context.query_id,
+        action_batch=batch,
+        artifact_bytes=batch.model_dump_json().encode("utf-8"),
+    )
+
+    payload = build_refinement_payload(
+        context,
+        anchor,
+        [
+            RetrievalActionResult(
+                action_id="search-1",
+                action_type="text_search",
+                hits=[
+                    Paper(
+                        canonical_id="openalex:W1000000",
+                        title=(
+                            "Graph retrieval arXiv:2107.03374 PMID: 12345678 "
+                            "PubMed: 87654321"
+                        ),
+                        abstract=(
+                            "Graph retrieval appears in arXiv 2203.07814 and "
+                            "arXiv:hep-th/9901001 with S2 "
+                            "0123456789abcdef0123456789abcdef01234567."
+                        ),
+                        sources=["openalex"],
+                    )
+                ],
+            )
+        ],
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+
+    serialized = json.dumps(payload["first_round_evidence"])
+    assert "2107.03374" not in serialized
+    assert "2203.07814" not in serialized
+    assert "PMID" not in serialized
+    assert "PubMed" not in serialized
+    assert "hep-th/9901001" not in serialized
+    assert "0123456789abcdef0123456789abcdef01234567" not in serialized
+
+
+def test_refinement_evidence_is_bounded_for_the_existing_scheme_b_token_reservation() -> None:
+    context = _context("query-1")
+    batch = RecallActionBatch.model_validate(_actions())
+    anchor = GenerationResult(
+        query_id=context.query_id,
+        action_batch=batch,
+        artifact_bytes=batch.model_dump_json().encode("utf-8"),
+    )
+    distinct_terms = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+    hits = [
+        Paper(
+            canonical_id=f"openalex:W{index + 1000000}",
+            title=f"Graph retrieval evidence {distinct_terms[index]}",
+            abstract="graph retrieval " + ("x" * 900),
+            sources=["openalex"],
+        )
+        for index in range(8)
+    ]
+
+    payload = build_refinement_payload(
+        context,
+        anchor,
+        [
+            RetrievalActionResult(
+                action_id="search-1", action_type="text_search", hits=hits
+            )
+        ],
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+
+    evidence = payload["first_round_evidence"]
+    assert isinstance(evidence, list)
+    assert len(evidence) == 5
+    assert all(
+        len(str(snippet)) <= 400
+        for item in evidence
+        for snippet in item["snippets"]
+    )
+
+
+def test_refinement_selects_query_relevant_late_hit_and_uses_focused_snippets() -> None:
+    context = RecallGenerationContext(
+        query_id="query-swag",
+        original_query="SWAG Gaussian posterior uncertainty calibration",
+        query_spec=QuerySpec(
+            original_query="SWAG Gaussian posterior uncertainty calibration",
+            research_goal="SWAG Gaussian posterior uncertainty calibration",
+        ),
+    )
+    batch = RecallActionBatch.model_validate(_actions("SWAG Gaussian posterior"))
+    anchor = GenerationResult(
+        query_id=context.query_id,
+        action_batch=batch,
+        artifact_bytes=batch.model_dump_json().encode("utf-8"),
+    )
+    noisy = [
+        Paper(
+            canonical_id=f"openalex:W{index + 1000000}",
+            title=f"Unrelated optimization study {index}",
+            abstract="Generic neural network training results without the requested concepts.",
+            sources=["openalex"],
+        )
+        for index in range(22)
+    ]
+    relevant = Paper(
+        canonical_id="openalex:W9999999",
+        title="Gaussian Stochastic Weight Averaging for Bayesian Deep Learning",
+        abstract=(
+            "Background text. SWAG approximates a Gaussian posterior from SGD iterates "
+            "for uncertainty calibration. Closing text."
+        ),
+        sources=["openalex"],
+    )
+
+    payload = build_refinement_payload(
+        context,
+        anchor,
+        [
+            RetrievalActionResult(
+                action_id="search-1",
+                action_type="text_search",
+                hits=[*noisy, relevant],
+            )
+        ],
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+
+    evidence = payload["first_round_evidence"]
+    assert isinstance(evidence, list)
+    assert evidence[0]["rank"] == 23
+    assert evidence[0]["title"] == relevant.title
+    assert evidence[0]["snippets"] == [relevant.abstract]
+    assert all(item["title"] != noisy[0].title for item in evidence)
+    assert payload["refinement_mode"] == "evidence_grounded"
+
+
+def test_refinement_rejects_unsupported_near_anchor_mutation_without_repair_call() -> None:
+    anchor_output = {
+        "actions": [
+            {
+                "action_id": "anchor",
+                "action_type": "text_search",
+                "strategy": "evidence-steered:anchor",
+                "payload": {"query_text": "SWAG Gaussian posterior uncertainty"},
+            }
+        ]
+    }
+    proposal_output = {
+        "proposals": [
+            {
+                "action_id": "evidence-expansion",
+                "query_text": "SWA Gaussian posterior SGD uncertainty",
+                "expansion_kind": "paper_expression",
+                "query_support": ["Gaussian posterior", "uncertainty"],
+                "evidence_support": [],
+            }
+        ]
+    }
+    backend = _RecordingLLMBackend(
+        [_backend_result(anchor_output), _backend_result(proposal_output)]
+    )
+    generator = EvidenceSteeredDeepSeekGenerator(
+        backend=backend,
+        prompt=_prompt(),
+        visibility="blind",
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+    context = RecallGenerationContext(
+        query_id="query-swag",
+        original_query="SWAG Gaussian posterior uncertainty",
+        query_spec=QuerySpec(
+            original_query="SWAG Gaussian posterior uncertainty",
+            research_goal="SWAG Gaussian posterior uncertainty",
+        ),
+    )
+
+    anchor = asyncio.run(generator.generate(context))
+    result = asyncio.run(
+        generator.refine(
+            context,
+            anchor,
+            [
+                RetrievalActionResult(
+                    action_id="anchor",
+                    action_type="text_search",
+                    hits=[
+                        Paper(
+                            canonical_id="openalex:W1000000",
+                            title="Uncertainty estimation for neural networks",
+                            abstract="Gaussian posterior calibration for uncertainty estimation.",
+                            sources=["openalex"],
+                        )
+                    ],
+                )
+            ],
+        )
+    )
+
+    assert [action.payload.query_text for action in result.action_batch.actions] == [
+        "SWAG Gaussian posterior uncertainty"
+    ]
+    assert [kind for kind, _ in backend.calls] == ["initial", "initial"]
+    audit = json.loads(result.provenance["proposal_audit_json"])
+    assert audit[0]["decision"] == "rejected"
+    assert audit[0]["reason"] == "near_anchor_mutation"
+
+
+def test_evidence_support_does_not_treat_swa_as_exact_span_inside_swag() -> None:
+    context = RecallGenerationContext(
+        query_id="query-swag-prefix",
+        original_query="SWAG Gaussian posterior uncertainty",
+        query_spec=QuerySpec(
+            original_query="SWAG Gaussian posterior uncertainty",
+            research_goal="SWAG Gaussian posterior uncertainty",
+        ),
+    )
+    anchor = RecallActionBatch.model_validate(
+        {
+            "actions": [
+                {
+                    "action_id": "anchor",
+                    "action_type": "text_search",
+                    "strategy": "evidence-steered:anchor",
+                    "payload": {"query_text": "SWAG Gaussian posterior uncertainty"},
+                }
+            ]
+        }
+    )
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {
+            "proposals": [
+                {
+                    "action_id": "prefix-bypass",
+                    "query_text": "SWA Gaussian posterior uncertainty",
+                    "expansion_kind": "paper_expression",
+                    "query_support": "Gaussian posterior uncertainty",
+                    "evidence_support": [{"rank": 1, "exact_phrase": "SWA"}],
+                }
+            ]
+        },
+        [
+            {
+                "rank": 1,
+                "title": "SWAG Gaussian posterior uncertainty",
+                "snippets": [],
+                "authors": [],
+                "publication_year": 2019,
+                "venue": None,
+            }
+        ],
+        max_actions=3,
+    )
+
+    assert batch == anchor
+    assert audit[0]["decision"] == "rejected"
+    assert audit[0]["reason"] == "missing_evidence_support"
+
+
+def test_evidence_steered_anchor_payload_omits_text_search_seed_identifiers() -> None:
+    backend = _RecordingLLMBackend(
+        [
+            _backend_result(
+                {
+                    "actions": [
+                        {
+                            "action_id": "anchor",
+                            "action_type": "text_search",
+                            "strategy": "evidence-steered:anchor",
+                            "payload": {"query_text": "graph retrieval"},
+                        }
+                    ]
+                }
+            )
+        ]
+    )
+    generator = EvidenceSteeredDeepSeekGenerator(
+        backend=backend,
+        prompt=_prompt(),
+        visibility="blind",
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+    context = RecallGenerationContext(
+        query_id="query-seed",
+        original_query="graph retrieval",
+        query_spec=QuerySpec(
+            original_query="graph retrieval", research_goal="graph retrieval"
+        ),
+        seed_candidates=[
+            SeedCandidate(
+                paper=Paper(
+                    canonical_id="doi:10.1000/private-seed",
+                    title="Private seed title",
+                    sources=["openalex"],
+                )
+            )
+        ],
+    )
+
+    asyncio.run(generator.generate(context))
+
+    payload = getattr(backend.calls[0][1], "payload")
+    assert "seed_candidates" not in payload
+    assert "10.1000/private-seed" not in json.dumps(payload)
+
+
+def test_evidence_steered_rejects_empty_anchor_batch() -> None:
+    backend = _RecordingLLMBackend([_backend_result({"actions": []})])
+    generator = EvidenceSteeredDeepSeekGenerator(
+        backend=backend,
+        prompt=_prompt(),
+        visibility="blind",
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+
+    with pytest.raises(RecallGenerationFailure, match="generation_failure"):
+        asyncio.run(generator.generate(_context("query-empty-anchor")))
+
+
+def test_query_grounded_complement_is_allowed_when_first_round_has_no_evidence() -> None:
+    anchor_output = {
+        "actions": [
+            {
+                "action_id": "anchor",
+                "action_type": "text_search",
+                "strategy": "evidence-steered:anchor",
+                "payload": {"query_text": "robust graph retrieval"},
+            }
+        ]
+    }
+    proposal_output = {
+        "proposals": [
+            {
+                "action_id": "query-complement",
+                "query_text": "graph retrieval robustness benchmark",
+                "expansion_kind": "query_complement",
+                "query_support": ["graph retrieval", "robustness benchmark"],
+                "evidence_support": [],
+            }
+        ]
+    }
+    backend = _RecordingLLMBackend(
+        [_backend_result(anchor_output), _backend_result(proposal_output)]
+    )
+    generator = EvidenceSteeredDeepSeekGenerator(
+        backend=backend,
+        prompt=_prompt(),
+        visibility="blind",
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+    context = RecallGenerationContext(
+        query_id="query-robust",
+        original_query="robust graph retrieval robustness benchmark",
+        query_spec=QuerySpec(
+            original_query="robust graph retrieval robustness benchmark",
+            research_goal="robust graph retrieval robustness benchmark",
+        ),
+    )
+
+    anchor = asyncio.run(generator.generate(context))
+    result = asyncio.run(
+        generator.refine(
+            context,
+            anchor,
+            [
+                RetrievalActionResult(
+                    action_id="anchor", action_type="text_search", hits=[]
+                )
+            ],
+        )
+    )
+
+    assert [action.payload.query_text for action in result.action_batch.actions] == [
+        "robust graph retrieval",
+        "graph retrieval robustness benchmark",
+    ]
+    refinement_payload = getattr(backend.calls[1][1], "payload")
+    assert refinement_payload["refinement_mode"] == "query_grounded_only"
+
+
+def test_near_anchor_expression_is_allowed_only_with_linked_exact_evidence() -> None:
+    context = RecallGenerationContext(
+        query_id="query-swag",
+        original_query="SWAG Gaussian posterior uncertainty",
+        query_spec=QuerySpec(
+            original_query="SWAG Gaussian posterior uncertainty",
+            research_goal="SWAG Gaussian posterior uncertainty",
+        ),
+    )
+    anchor = RecallActionBatch.model_validate(
+        {
+            "actions": [
+                {
+                    "action_id": "anchor",
+                    "action_type": "text_search",
+                    "strategy": "evidence-steered:anchor",
+                    "payload": {"query_text": "SWAG Gaussian posterior uncertainty"},
+                }
+            ]
+        }
+    )
+    evidence = [
+        {
+            "rank": 23,
+            "title": "SWA for Bayesian deep learning",
+            "snippets": [
+                "SWA estimates a Gaussian posterior for uncertainty calibration."
+            ],
+            "authors": [],
+            "publication_year": 2020,
+            "venue": None,
+        }
+    ]
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {
+            "proposals": [
+                {
+                    "action_id": "evidence-expansion",
+                    "query_text": "SWA Gaussian posterior uncertainty",
+                    "expansion_kind": "paper_expression",
+                    "query_support": "Gaussian posterior uncertainty",
+                    "evidence_support": [
+                        {
+                            "rank": 23,
+                            "exact_phrase": "SWA estimates a Gaussian posterior",
+                        }
+                    ],
+                }
+            ]
+        },
+        evidence,
+        max_actions=3,
+    )
+
+    assert [action.payload.query_text for action in batch.actions] == [
+        "SWAG Gaussian posterior uncertainty",
+        "SWA Gaussian posterior uncertainty",
+    ]
+    assert audit[0]["decision"] == "accepted"
+
+
+def test_malformed_proposal_does_not_discard_valid_sibling() -> None:
+    context = _context("query-mixed-proposals")
+    anchor = RecallActionBatch.model_validate(_actions("graph retrieval"))
+    evidence = [
+        {
+            "rank": 4,
+            "title": "Dense graph retrieval",
+            "snippets": ["Dense graph retrieval for attributed networks."],
+            "authors": [],
+            "publication_year": 2024,
+            "venue": None,
+        }
+    ]
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {
+            "proposals": [
+                {
+                    "action_id": "valid",
+                    "query_text": "dense graph retrieval",
+                    "expansion_kind": "paper_expression",
+                    "query_support": "graph retrieval",
+                    "evidence_support": [
+                        {"rank": 4, "exact_phrase": "Dense graph retrieval"}
+                    ],
+                },
+                {"action_id": "malformed", "query_text": 123},
+            ]
+        },
+        evidence,
+        max_actions=3,
+    )
+
+    assert [action.action_id for action in batch.actions] == ["search-1", "valid"]
+    assert sorted(item["decision"] for item in audit) == ["accepted", "rejected"]
+    assert any(item["reason"] == "invalid_proposal" for item in audit)
+
+
+def test_proposal_must_declare_every_query_concept_it_reuses() -> None:
+    context = _context("query-incomplete-source")
+    anchor = RecallActionBatch.model_validate(_actions("graph retrieval"))
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {
+            "proposals": [
+                {
+                    "action_id": "incomplete",
+                    "query_text": "dense graph retrieval",
+                    "expansion_kind": "paper_expression",
+                    "query_support": "graph",
+                    "evidence_support": [
+                        {"rank": 1, "exact_phrase": "dense retrieval"}
+                    ],
+                }
+            ]
+        },
+        [
+            {
+                "rank": 1,
+                "title": "Dense retrieval",
+                "snippets": [],
+                "authors": [],
+                "publication_year": 2024,
+                "venue": None,
+            }
+        ],
+        max_actions=3,
+    )
+
+    assert batch == anchor
+    assert audit[0]["reason"] == "missing_query_support"
+
+
+def test_query_complement_cannot_add_unsupported_year() -> None:
+    context = _context("query-year-bypass")
+    anchor = RecallActionBatch.model_validate(_actions("graph retrieval"))
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {
+            "proposals": [
+                {
+                    "action_id": "year-bypass",
+                    "query_text": "graph retrieval 2020",
+                    "expansion_kind": "query_complement",
+                    "query_support": "graph retrieval",
+                    "evidence_support": [],
+                }
+            ]
+        },
+        [],
+        max_actions=3,
+    )
+
+    assert batch == anchor
+    assert audit[0]["reason"] == "unsupported_query_expansion"
+
+
+def test_query_complement_cannot_mutate_single_digit_version() -> None:
+    context = RecallGenerationContext(
+        query_id="query-version",
+        original_query="graph retrieval version 3",
+        query_spec=QuerySpec(
+            original_query="graph retrieval version 3",
+            research_goal="graph retrieval version 3",
+        ),
+    )
+    anchor = RecallActionBatch.model_validate(_actions("graph retrieval version 3"))
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {
+            "proposals": [
+                {
+                    "action_id": "version-bypass",
+                    "query_text": "graph retrieval version 4",
+                    "expansion_kind": "query_complement",
+                    "query_support": "graph retrieval version 3",
+                    "evidence_support": [],
+                }
+            ]
+        },
+        [],
+        max_actions=3,
+    )
+
+    assert batch == anchor
+    assert audit[0]["reason"] == "unsupported_query_expansion"
+
+
+def test_refinement_considers_at_most_two_proposals() -> None:
+    context = _context("query-proposal-limit")
+    anchor = RecallActionBatch.model_validate(_actions("graph retrieval"))
+    proposals = [
+        {"action_id": "bad-1", "query_text": 1},
+        {"action_id": "bad-2", "query_text": 2},
+        {
+            "action_id": "third-valid",
+            "query_text": "dense graph retrieval",
+            "expansion_kind": "paper_expression",
+            "query_support": "graph retrieval",
+            "evidence_support": [
+                {"rank": 1, "exact_phrase": "dense graph retrieval"}
+            ],
+        },
+    ]
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {"proposals": proposals},
+        [
+            {
+                "rank": 1,
+                "title": "Dense graph retrieval",
+                "snippets": [],
+                "authors": [],
+                "publication_year": 2024,
+                "venue": None,
+            }
+        ],
+        max_actions=3,
+    )
+
+    assert batch == anchor
+    assert any(item["reason"] == "proposal_limit_exceeded" for item in audit)
+
+
+def test_safe_query_complement_compresses_td_ode_query_without_new_terms() -> None:
+    original = (
+        "Which study approaches the problem of convergence rates of classic TD "
+        "from the perspective of Ordinary Differential Equations (ODE) analysis?"
+    )
+
+    complement = build_safe_query_complement(
+        original,
+        "convergence rates temporal difference learning ordinary differential "
+        "equations ODE analysis",
+    )
+
+    assert complement == "convergence rates TD ODE analysis"
+
+
+def test_safe_query_complement_facets_long_parallel_method_list() -> None:
+    original = (
+        "What papers utilize VAEs, normalizing flows, reinforcement learning, "
+        "optimal transport and diffusion models for the task of predicting the "
+        "3D structure of molecules given a molecular graph?"
+    )
+
+    complement = build_safe_query_complement(
+        original,
+        "molecular graph 3D structure prediction variational autoencoder "
+        "normalizing flow reinforcement learning optimal transport diffusion model",
+    )
+
+    assert complement == (
+        "optimal transport diffusion models predicting 3D structure molecules "
+        "molecular graph"
+    )
+
+
+def test_safe_query_complement_removes_narrative_shell_but_keeps_relation_constraints() -> None:
+    complement = build_safe_query_complement(
+        "What studies have presented connections between RNNs and early versions of GNNs?",
+        "connections between recurrent neural networks and early graph neural networks",
+        remove_narrative_shell=True,
+    )
+
+    assert complement == "connections between RNNs early versions GNNs"
+
+
+def test_safe_query_complement_removes_retrieval_request_verbs() -> None:
+    complement = build_safe_query_complement(
+        "Which works used image generation models to create synthetic images for classification tasks?",
+        "generative image synthesis models synthetic visual data image classification",
+        remove_narrative_shell=True,
+    )
+
+    assert complement == "image generation models synthetic images classification tasks"
+
+
+def test_v3_safe_query_complement_preserves_historical_narrative_behavior() -> None:
+    complement = build_safe_query_complement(
+        "What studies have presented connections between RNNs and early versions of GNNs?",
+        "connections between recurrent neural networks and early graph neural networks",
+    )
+
+    assert complement == (
+        "studies have presented connections between RNNs early versions GNNs"
+    )
+
+
+def test_low_quality_first_round_skips_second_llm_and_keeps_safe_complement() -> None:
+    anchor_output = {
+        "actions": [
+            {
+                "action_id": "anchor",
+                "action_type": "text_search",
+                "strategy": "evidence-steered:anchor",
+                "payload": {
+                    "query_text": (
+                        "convergence rates temporal difference learning ordinary "
+                        "differential equations ODE analysis"
+                    )
+                },
+            }
+        ]
+    }
+    backend = _RecordingLLMBackend([_backend_result(anchor_output)])
+    generator = EvidenceSteeredDeepSeekGenerator(
+        backend=backend,
+        prompt=_evidence_prompt_v3(),
+        visibility="blind",
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+    original = (
+        "Which study approaches the problem of convergence rates of classic TD "
+        "from the perspective of Ordinary Differential Equations (ODE) analysis?"
+    )
+    context = RecallGenerationContext(
+        query_id="query-td-ode",
+        original_query=original,
+        query_spec=QuerySpec(original_query=original, research_goal=original),
+    )
+
+    anchor = asyncio.run(generator.generate(context))
+    result = asyncio.run(
+        generator.refine(
+            context,
+            anchor,
+            [
+                RetrievalActionResult(
+                    action_id="anchor",
+                    action_type="text_search",
+                    hits=[
+                        Paper(
+                            canonical_id="openalex:W1000000",
+                            title="A broad convergence survey",
+                            abstract="Convergence theory across optimization methods.",
+                            sources=["openalex"],
+                        )
+                    ],
+                )
+            ],
+        )
+    )
+
+    assert [action.payload.query_text for action in result.action_batch.actions] == [
+        anchor_output["actions"][0]["payload"]["query_text"],
+        "convergence rates TD ODE analysis",
+    ]
+    assert [kind for kind, _ in backend.calls] == ["initial"]
+    assert result.provenance["refinement_mode"] == "query_grounded_only"
+
+
+def test_high_quality_evidence_payload_is_capped_at_three_papers_and_one_proposal() -> None:
+    context = _context("query-quality-gate")
+    batch = RecallActionBatch.model_validate(_actions("graph retrieval"))
+    anchor = GenerationResult(
+        query_id=context.query_id,
+        action_batch=batch,
+        artifact_bytes=batch.model_dump_json().encode("utf-8"),
+    )
+    hits = [
+        Paper(
+            canonical_id=f"openalex:W{1000000 + index}",
+            title=f"Dense graph retrieval benchmark {index}",
+            abstract="Dense graph retrieval benchmark for attributed networks.",
+            sources=["openalex"],
+        )
+        for index in range(6)
+    ]
+
+    payload = build_refinement_payload(
+        context,
+        anchor,
+        [
+            RetrievalActionResult(
+                action_id="search-1", action_type="text_search", hits=hits
+            )
+        ],
+        allowed_actions={"text_search"},
+        max_actions=3,
+        generation_version="v3",
+    )
+
+    assert payload["refinement_mode"] == "evidence_grounded"
+    assert len(payload["first_round_evidence"]) == 3
+    assert payload["proposal_schema"]["max_proposals"] == 1
+    assert payload["proposal_schema"]["expansion_kinds"] == ["paper_expression"]
+
+
+def test_v4_evidence_gate_rejects_abstract_only_generic_overlap() -> None:
+    original = (
+        "Which research contains over thousands of single-choice questions "
+        "covering numerous different ability dimensions?"
+    )
+    context = RecallGenerationContext(
+        query_id="query-noisy-abstract-overlap",
+        original_query=original,
+        query_spec=QuerySpec(original_query=original, research_goal=original),
+    )
+    batch = RecallActionBatch.model_validate(
+        _actions("thousands of single-choice questions multiple ability dimensions")
+    )
+    anchor = GenerationResult(
+        query_id=context.query_id,
+        action_batch=batch,
+        artifact_bytes=batch.model_dump_json().encode("utf-8"),
+    )
+    hits = [
+        Paper(
+            canonical_id=f"openalex:W{1000000 + index}",
+            title=title,
+            abstract=(
+                "This benchmark contains thousands of questions and measures "
+                "multiple ability dimensions."
+            ),
+            sources=["openalex"],
+        )
+        for index, title in enumerate(
+            [
+                "Gradient-based document recognition",
+                "A flexible particle simulation tool",
+                "Implementation science in health services",
+            ]
+        )
+    ]
+
+    payload = build_refinement_payload(
+        context,
+        anchor,
+        [
+            RetrievalActionResult(
+                action_id="search-1", action_type="text_search", hits=hits
+            )
+        ],
+        allowed_actions={"text_search"},
+        max_actions=3,
+        generation_version="v4",
+    )
+
+    assert payload["refinement_mode"] != "evidence_grounded"
+
+
+def test_v4_evidence_gate_accepts_shared_title_level_paper_expression() -> None:
+    context = _context("query-title-expression")
+    batch = RecallActionBatch.model_validate(_actions("graph retrieval"))
+    anchor = GenerationResult(
+        query_id=context.query_id,
+        action_batch=batch,
+        artifact_bytes=batch.model_dump_json().encode("utf-8"),
+    )
+    hits = [
+        Paper(
+            canonical_id=f"openalex:W{1000000 + index}",
+            title=title,
+            abstract="Attributed networks and benchmark evaluation.",
+            sources=["openalex"],
+        )
+        for index, title in enumerate(
+            [
+                "Dense graph retrieval for attributed networks",
+                "Dense graph retrieval benchmark evaluation",
+                "Sparse graph retrieval methods",
+            ]
+        )
+    ]
+
+    payload = build_refinement_payload(
+        context,
+        anchor,
+        [
+            RetrievalActionResult(
+                action_id="search-1", action_type="text_search", hits=hits
+            )
+        ],
+        allowed_actions={"text_search"},
+        max_actions=3,
+        generation_version="v4",
+    )
+
+    assert payload["refinement_mode"] == "evidence_grounded"
+
+
+def test_evidence_steered_v3_live_recipe_locks_the_optimized_scheme_b_module() -> None:
+    loaded = load_recall_recipe(
+        Path(
+            "configs/recall_experiments/methods/"
+            "evidence-steered-open-profile-v3-live.yaml"
+        )
+    )
+
+    assert loaded.recipe.method_id == "evidence-steered-open-profile-v3"
+    assert loaded.recipe.generator.evidence_steered is True
+    assert loaded.recipe.generator.gold_visibility == "blind"
+    assert loaded.recipe.generator.max_generated_actions == 3
+    assert loaded.recipe.retrieval.max_total_actions == 3
+    assert loaded.prompt_bytes is not None
+    prompt = RecallPromptArtifact.from_yaml_bytes(loaded.prompt_bytes)
+    assert prompt.version == "recall-evidence-steered-open-profile-v3"
+    rendered = render_recall_prompt(prompt)
+    assert "deterministically adds at most one query-only compression" in rendered
+    assert "multiple evidence items independently connect" in rendered
+
+
+def test_evidence_steered_v4_live_recipe_locks_strict_title_consensus() -> None:
+    loaded = load_recall_recipe(
+        Path(
+            "configs/recall_experiments/methods/"
+            "evidence-steered-open-profile-v4-live.yaml"
+        )
+    )
+
+    assert loaded.recipe.method_id == "evidence-steered-open-profile-v4"
+    assert loaded.recipe.generator.evidence_steered is True
+    assert loaded.recipe.generator.gold_visibility == "blind"
+    assert loaded.recipe.generator.max_generated_actions == 3
+    assert loaded.prompt_bytes is not None
+    prompt = RecallPromptArtifact.from_yaml_bytes(loaded.prompt_bytes)
+    assert prompt.version == "recall-evidence-steered-open-profile-v4"
+    rendered = render_recall_prompt(prompt)
+    assert "shared non-query paper expression in their titles" in rendered
+
+
+def test_evidence_expansion_rejects_new_domain_term_without_cross_paper_support() -> None:
+    context = _context("query-domain-drift")
+    anchor = RecallActionBatch.model_validate(_actions("graph retrieval"))
+    evidence = [
+        {
+            "rank": 1,
+            "title": "Graph retrieval for fake news classification",
+            "snippets": ["Graph retrieval supports fake news classification."],
+            "authors": [],
+            "publication_year": 2024,
+            "venue": None,
+        },
+        {
+            "rank": 2,
+            "title": "Dense graph retrieval benchmark",
+            "snippets": ["Dense graph retrieval benchmark for attributed networks."],
+            "authors": [],
+            "publication_year": 2024,
+            "venue": None,
+        },
+    ]
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {
+            "proposals": [
+                {
+                    "action_id": "drift",
+                    "query_text": "graph retrieval fake news classification",
+                    "expansion_kind": "paper_expression",
+                    "query_support": "graph retrieval",
+                    "evidence_support": [
+                        {
+                            "rank": 1,
+                            "exact_phrase": "fake news classification",
+                        }
+                    ],
+                }
+            ]
+        },
+        evidence,
+        max_actions=3,
+        max_proposals=1,
+        require_cross_paper_support=True,
+    )
+
+    assert batch == anchor
+    assert audit[0]["reason"] == "unsupported_evidence_drift"
+
+
+def test_v4_proposal_rejects_term_shared_only_in_abstracts() -> None:
+    context = _context("query-v4-abstract-bypass")
+    anchor = RecallActionBatch.model_validate(_actions("graph retrieval"))
+    evidence = [
+        {
+            "rank": 1,
+            "title": "Graph retrieval for attributed networks",
+            "snippets": ["Dense representations improve graph retrieval."],
+            "authors": [],
+            "publication_year": 2024,
+            "venue": None,
+        },
+        {
+            "rank": 2,
+            "title": "Graph retrieval benchmark evaluation",
+            "snippets": ["Dense representations support graph retrieval."],
+            "authors": [],
+            "publication_year": 2023,
+            "venue": None,
+        },
+    ]
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {
+            "proposals": [
+                {
+                    "action_id": "abstract-bypass",
+                    "query_text": "dense graph retrieval",
+                    "expansion_kind": "paper_expression",
+                    "query_support": "graph retrieval",
+                    "evidence_support": [
+                        {"rank": 1, "exact_phrase": "Dense representations"},
+                        {"rank": 2, "exact_phrase": "Dense representations"},
+                    ],
+                }
+            ]
+        },
+        evidence,
+        max_actions=3,
+        max_proposals=1,
+        require_cross_paper_support=True,
+        require_cross_title_support=True,
+    )
+
+    assert batch == anchor
+    assert audit[0]["reason"] == "unsupported_title_expression"
+
+
+def test_short_query_without_evidence_skips_optional_second_llm_call() -> None:
+    anchor_output = {
+        "actions": [
+            {
+                "action_id": "anchor",
+                "action_type": "text_search",
+                "strategy": "evidence-steered:anchor",
+                "payload": {"query_text": "SWAG"},
+            }
+        ]
+    }
+    backend = _RecordingLLMBackend([_backend_result(anchor_output)])
+    generator = EvidenceSteeredDeepSeekGenerator(
+        backend=backend,
+        prompt=_prompt(),
+        visibility="blind",
+        allowed_actions={"text_search"},
+        max_actions=3,
+    )
+    context = RecallGenerationContext(
+        query_id="query-short",
+        original_query="SWAG",
+        query_spec=QuerySpec(original_query="SWAG", research_goal="SWAG"),
+    )
+
+    anchor = asyncio.run(generator.generate(context))
+    result = asyncio.run(
+        generator.refine(
+            context,
+            anchor,
+            [
+                RetrievalActionResult(
+                    action_id="anchor", action_type="text_search", hits=[]
+                )
+            ],
+        )
+    )
+
+    assert result.action_batch == anchor.action_batch
+    assert [kind for kind, _ in backend.calls] == ["initial"]
+    assert result.provenance["refinement_mode"] == "anchor_only"
+
+
+def test_query_complement_allows_hyphen_to_space_grammatical_variant() -> None:
+    context = RecallGenerationContext(
+        query_id="query-domain-shift",
+        original_query="post-hoc calibration in domain-shift scenarios",
+        query_spec=QuerySpec(
+            original_query="post-hoc calibration in domain-shift scenarios",
+            research_goal="post-hoc calibration in domain-shift scenarios",
+        ),
+    )
+    anchor = RecallActionBatch.model_validate(
+        {
+            "actions": [
+                {
+                    "action_id": "anchor",
+                    "action_type": "text_search",
+                    "strategy": "evidence-steered:anchor",
+                    "payload": {"query_text": "post-hoc calibration domain-shift"},
+                }
+            ]
+        }
+    )
+
+    batch, audit = validate_refinement_proposals(
+        context,
+        anchor,
+        {
+            "proposals": [
+                {
+                    "action_id": "complement",
+                    "query_text": "post hoc calibration domain shift",
+                    "expansion_kind": "query_complement",
+                    "query_support": "post-hoc calibration in domain-shift scenarios",
+                    "evidence_support": [],
+                }
+            ]
+        },
+        [],
+        max_actions=3,
+    )
+
+    assert [action.payload.query_text for action in batch.actions] == [
+        "post-hoc calibration domain-shift",
+        "post hoc calibration domain shift",
+    ]
+    assert audit[0]["decision"] == "accepted"
 
 
 def _error(code: str) -> LLMBackendResult:

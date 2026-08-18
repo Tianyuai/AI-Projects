@@ -104,9 +104,17 @@ class SubQuery(DomainModel):
     query_id: NonEmptyStr
     text: NonEmptyStr
     query_type: Literal["exact", "expanded", "decomposed"]
+    action_type: Literal["text_search", "title_search"] = Field(
+        default="text_search",
+        exclude_if=lambda value: value == "text_search",
+    )
     target_constraints: list[NonEmptyStr] = Field(default_factory=list)
     priority: Annotated[int, Field(strict=True, gt=0)]
     provider_hint: Literal["openalex", "semantic_scholar", "either"]
+    search_mode: Literal["lexical", "semantic"] = Field(
+        default="lexical",
+        exclude_if=lambda value: value == "lexical",
+    )
 
 
 class SearchPlan(DomainModel):
@@ -128,6 +136,7 @@ class Paper(DomainModel):
     publication_year: int | None = None
     venue: str | None = None
     doi: str | None = None
+    arxiv_id: str | None = None
     openalex_id: str | None = None
     semantic_scholar_id: str | None = None
     url: str | None = None

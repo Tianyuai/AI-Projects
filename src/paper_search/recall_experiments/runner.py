@@ -11,8 +11,13 @@ from paper_search.recall_experiments.contracts import (
     RecallGenerationContext,
     RetrievalActionResult,
     RetrievalExecutionContext,
+    SeedCandidate,
 )
-from paper_search.recall_experiments.generation.base import GenerationResult, QueryGenerator
+from paper_search.recall_experiments.generation.base import (
+    EvidenceSteeredQueryGenerator,
+    GenerationResult,
+    QueryGenerator,
+)
 from paper_search.recall_experiments.generation.deepseek import RecallGenerationFailure
 from paper_search.recall_experiments.validation import validate_action_batch
 
@@ -238,24 +243,21 @@ class RecallExperimentRunner:
                 return pools, failure.code, generation_provenance
             self._event("generate-and-validate")
             _validate_generation(generation, context, request)
-            generation_provenance.append(
-                {
-                    "query_id": context.query_id,
-                    **generation.provenance,
-                    "llm_call_receipts": [
-                        _payload(receipt) for receipt in generation.call_receipts
-                    ],
-                    "repair_count": generation.repair_count,
-                }
+            evidence_generator = (
+                self._generator
+                if isinstance(self._generator, EvidenceSteeredQueryGenerator)
+                else None
             )
-            self._event("write-generation")
-            self._writer.write_generation(
-                attempt_id,
-                context.query_id,
-                generation,
-                attempt_status="succeeded",
-                valid_repeat_ordinal=None,
-            )
+            if evidence_generator is None:
+                generation_provenance.append(_generation_provenance(generation))
+                self._event("write-generation")
+                self._writer.write_generation(
+                    attempt_id,
+                    context.query_id,
+                    generation,
+                    attempt_status="succeeded",
+                    valid_repeat_ordinal=None,
+                )
 
             self._event("build-gold-free-retrieval-context")
             retrieval_context = RetrievalExecutionContext(
@@ -265,13 +267,61 @@ class RecallExperimentRunner:
                 seed_candidates=list(context.seed_candidates),
             )
             self._event("resolve-and-execute-actions")
-            action_results: list[RetrievalActionResult] = []
-            for action in generation.action_batch.actions:
-                handler = self._registry.resolve(action.action_type)
-                if not hasattr(handler, "execute"):
-                    raise TypeError("registered retrieval handler lacks execute")
-                result = await _execute(handler, action, retrieval_context)
-                action_results.append(result)
+            action_results = await self._execute_actions(
+                generation.action_batch.actions, retrieval_context
+            )
+            if evidence_generator is not None and not any(
+                result.infrastructure_failure for result in action_results
+            ):
+                anchor_generation = generation
+                refinement_seeds = _evidence_seeds(
+                    context.seed_candidates, action_results
+                )
+                refinement_context = context.model_copy(
+                    update={"seed_candidates": refinement_seeds}
+                )
+                retrieval_context = retrieval_context.model_copy(
+                    update={"seed_candidates": refinement_seeds}
+                )
+                try:
+                    generation = await evidence_generator.refine(
+                        refinement_context, anchor_generation, action_results
+                    )
+                except RecallGenerationFailure as failure:
+                    self._event("refine-and-validate")
+                    receipts = [*anchor_generation.call_receipts, *failure.call_receipts]
+                    generation = anchor_generation.model_copy(
+                        update={
+                            "provenance": {
+                                **anchor_generation.provenance,
+                                "refinement_fallback": failure.code,
+                            },
+                            "call_receipts": receipts,
+                            "repair_count": sum(
+                                receipt.call_kind == "repair" for receipt in receipts
+                            ),
+                        }
+                    )
+                else:
+                    self._event("refine-and-validate")
+                    _validate_generation(generation, refinement_context, request)
+                    _validate_anchor_prefix(anchor_generation, generation)
+                    remaining_actions = generation.action_batch.actions[
+                        len(anchor_generation.action_batch.actions) :
+                    ]
+                    action_results.extend(
+                        await self._execute_actions(remaining_actions, retrieval_context)
+                    )
+            if evidence_generator is not None:
+                generation_provenance.append(_generation_provenance(generation))
+                self._event("write-generation")
+                self._writer.write_generation(
+                    attempt_id,
+                    context.query_id,
+                    generation,
+                    attempt_status="succeeded",
+                    valid_repeat_ordinal=None,
+                )
             infrastructure_failure = any(result.infrastructure_failure for result in action_results)
             self._event("write-retrieval")
             self._writer.write_retrieval(
@@ -301,6 +351,17 @@ class RecallExperimentRunner:
             pools.append(pool)
         return pools, None, generation_provenance
 
+    async def _execute_actions(
+        self, actions: Sequence[object], context: RetrievalExecutionContext
+    ) -> list[RetrievalActionResult]:
+        results: list[RetrievalActionResult] = []
+        for action in actions:
+            handler = self._registry.resolve(getattr(action, "action_type"))
+            if not hasattr(handler, "execute"):
+                raise TypeError("registered retrieval handler lacks execute")
+            results.append(await _execute(handler, action, context))
+        return results
+
     def _event(self, name: str) -> None:
         if self._event_sink is not None:
             self._event_sink(name)
@@ -309,7 +370,13 @@ class RecallExperimentRunner:
 async def _execute(
     handler: object, action: object, context: RetrievalExecutionContext
 ) -> RetrievalActionResult:
-    return await _handler(handler).execute(action, context)
+    result = await _handler(handler).execute(action, context)
+    if (
+        result.action_id != getattr(action, "action_id", None)
+        or result.action_type != getattr(action, "action_type", None)
+    ):
+        raise ValueError("retrieval result does not match executed action")
+    return result
 
 
 def _handler(value: object) -> _ActionHandler:
@@ -323,6 +390,21 @@ def _generation_contexts(prepared: object) -> Sequence[RecallGenerationContext]:
     if not isinstance(contexts, tuple) or not all(isinstance(item, RecallGenerationContext) for item in contexts):
         raise TypeError("evaluator preflight did not return generation-safe contexts")
     return contexts
+
+
+def _evidence_seeds(
+    configured: Sequence[SeedCandidate],
+    results: Sequence[RetrievalActionResult],
+) -> list[SeedCandidate]:
+    selected = list(configured)
+    seen = {item.paper.canonical_id for item in selected}
+    for result in results:
+        for paper in result.hits:
+            if paper.canonical_id in seen:
+                continue
+            seen.add(paper.canonical_id)
+            selected.append(SeedCandidate(paper=paper))
+    return selected
 
 
 def _validate_generation(
@@ -339,6 +421,26 @@ def _validate_generation(
     )
     if validated != generation.action_batch:
         raise ValueError("generation artifact bytes do not match the action batch")
+
+
+def _validate_anchor_prefix(
+    anchor: GenerationResult, refined: GenerationResult
+) -> None:
+    anchor_actions = anchor.action_batch.actions
+    refined_actions = refined.action_batch.actions
+    if len(refined_actions) < len(anchor_actions) or refined_actions[: len(anchor_actions)] != anchor_actions:
+        raise ValueError("refined generation must preserve the immutable anchor action prefix")
+
+
+def _generation_provenance(generation: GenerationResult) -> Mapping[str, object]:
+    return {
+        "query_id": generation.query_id,
+        **generation.provenance,
+        "llm_call_receipts": [
+            _payload(receipt) for receipt in generation.call_receipts
+        ],
+        "repair_count": generation.repair_count,
+    }
 
 
 def _sample_manifest(manifest: Mapping[str, object], dataset: object) -> dict[str, object]:

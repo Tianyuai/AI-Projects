@@ -78,30 +78,57 @@ def validate_scheme_b_dependency_identity(
 ) -> LiveDependencyIdentity:
     expected: dict[str, object]
     if role == "search":
-        expected = {
-            "provider": "openalex",
-            "dependency": "openalex",
-            "adapter": "openalex-works-v1",
-            "model": None,
-            "version": "live-capture-search-v1",
-            "endpoints": ("https://api.openalex.org/works",),
-            "operations": ("search",),
-        }
+        if identity.dependency == "openalex":
+            expected = {
+                "provider": "openalex",
+                "dependency": "openalex",
+                "adapter": "openalex-works-v1",
+                "model": None,
+                "version": "live-capture-search-v1",
+                "endpoints": ("https://api.openalex.org/works",),
+                "operations": ("search", "references", "citations"),
+            }
+        else:
+            expected = {
+                "provider": "semantic_scholar",
+                "dependency": "semantic_scholar",
+                "adapter": "semantic-graph-v1",
+                "model": None,
+                "version": "live-capture-search-v1",
+                "endpoints": (
+                    "https://api.semanticscholar.org/graph/v1/paper/search",
+                    "https://api.semanticscholar.org/graph/v1/paper/batch",
+                    "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/references",
+                    "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/citations",
+                ),
+                "operations": ("search", "batch", "references", "citations"),
+            }
     elif role == "citation":
-        expected = {
-            "provider": "semantic_scholar",
-            "dependency": "semantic_scholar",
-            "adapter": "semantic-graph-v1",
-            "model": None,
-            "version": "live-capture-search-v1",
-            "endpoints": (
-                "https://api.semanticscholar.org/graph/v1/paper/search",
-                "https://api.semanticscholar.org/graph/v1/paper/batch",
-                "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/references",
-                "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/citations",
-            ),
-            "operations": ("search", "batch", "references", "citations"),
-        }
+        if identity.dependency == "openalex":
+            expected = {
+                "provider": "openalex",
+                "dependency": "openalex",
+                "adapter": "openalex-works-v1",
+                "model": None,
+                "version": "live-capture-search-v1",
+                "endpoints": ("https://api.openalex.org/works",),
+                "operations": ("search", "references", "citations"),
+            }
+        else:
+            expected = {
+                "provider": "semantic_scholar",
+                "dependency": "semantic_scholar",
+                "adapter": "semantic-graph-v1",
+                "model": None,
+                "version": "live-capture-search-v1",
+                "endpoints": (
+                    "https://api.semanticscholar.org/graph/v1/paper/search",
+                    "https://api.semanticscholar.org/graph/v1/paper/batch",
+                    "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/references",
+                    "https://api.semanticscholar.org/graph/v1/paper/{paper_id}/citations",
+                ),
+                "operations": ("search", "batch", "references", "citations"),
+            }
     else:
         expected = {
             "provider": "deepseek",
@@ -142,7 +169,10 @@ class LiveRuntimeIdentity(DomainModel):
             raise ValueError("live dependency pricing policies do not match")
         if self.dependencies["llm"].dependency != "llm":
             raise ValueError("live LLM dependency identity is invalid")
-        if self.dependencies["citation"].dependency != "semantic_scholar":
+        if self.dependencies["citation"].dependency not in {
+            "openalex",
+            "semantic_scholar",
+        }:
             raise ValueError("live citation dependency identity is invalid")
         return self
 

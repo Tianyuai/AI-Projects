@@ -757,10 +757,6 @@ def _live_runtime_identity(
     pricer = pricers[0]
     if controller.formal_live is not True:
         raise RecallTerminalError("config_mismatch")
-    if dependencies["search"].dependency != "openalex":
-        raise RecallTerminalError("config_mismatch")
-    if dependencies["citation"].dependency != "semantic_scholar":
-        raise RecallTerminalError("config_mismatch")
     if dependencies["llm"].dependency != "llm" or dependencies["llm"].provider != "deepseek":
         raise RecallTerminalError("config_mismatch")
     for dependency in dependencies.values():

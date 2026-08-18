@@ -1,0 +1,44 @@
+{
+  "schema_version": "query-policy-label-bundle-v2",
+  "datasets_in_scope": [
+    "pasa"
+  ],
+  "gold_payload_serialized": false,
+  "final_test_labels_constructed": false,
+  "action_partitions": {
+    "pasa/auto_dev": {
+      "role": "development",
+      "query_count": 588,
+      "label_count": 2859,
+      "positive_count": 837,
+      "hard_negative_count": 2022,
+      "sha256": "sha256:905fbbc81991893be89295a5ef83c86b57baefd58e5162ec1f329399491ccf98"
+    },
+    "pasa/auto_train": {
+      "role": "training",
+      "query_count": 21448,
+      "label_count": 103462,
+      "positive_count": 31563,
+      "hard_negative_count": 71899,
+      "sha256": "sha256:bb5e5e86740b91802c3322e8a0a7c137fb7b2ea2d037f0661fd6073d53f8a8b7"
+    }
+  },
+  "term_partitions": {
+    "pasa/auto_dev": {
+      "role": "development",
+      "query_count": 588,
+      "label_count": 5239,
+      "positive_count": 1077,
+      "hard_negative_count": 4162,
+      "sha256": "sha256:4bd1837f1f3ffbe777d6678ea2f8cb91903d71be4ed63dd9016549dd5dfd0057"
+    },
+    "pasa/auto_train": {
+      "role": "training",
+      "query_count": 21448,
+      "label_count": 188348,
+      "positive_count": 41110,
+      "hard_negative_count": 147238,
+      "sha256": "sha256:b569ba737af3a3a2b66992bc93c1103c0e79622ac4bb6bd9b897694777c201ee"
+    }
+  }
+}

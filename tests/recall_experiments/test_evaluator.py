@@ -42,7 +42,8 @@ def _dataset(*, seed_ids: list[str] | None = None) -> FrozenRecallDataset:
         evaluation_materials=OpaqueEvaluationMaterials(
             gold_records=queries,
             identifier_map_bytes=(
-                b'{"arxiv:2401.00002":"doi:10.1000/other",'
+                b'{"arxiv:2401.00002":"doi:10.48550/arxiv.2401.00002",'
+                b'"doi:10.1000/other":"doi:10.48550/arxiv.2401.00002",'
                 b'"openalex:W2":"doi:10.1000/two"}'
             ),
             identifier_map_sha256="sha256:" + "0" * 64,
@@ -85,6 +86,119 @@ def test_evaluate_counts_unique_resolved_gold_associations_and_recall_only() -> 
     assert result.macro_candidate_recall == 1.0
     public_fields = set(type(result).model_fields)
     assert not {"precision", "top_k", "ranking", "f1", "mrr", "ndcg"}.intersection(public_fields)
+
+
+def test_evaluate_matches_unseen_arxiv_by_deterministic_and_provider_evidence() -> None:
+    queries = [
+        EvaluationQuery(
+            query_id="q-anchor",
+            query="same arxiv DOI",
+            relevant_paper_ids=["arxiv:2501.10120"],
+        ),
+        EvaluationQuery(
+            query_id="q-provider",
+            query="provider external ID",
+            relevant_paper_ids=["arxiv:2501.10121"],
+        ),
+    ]
+    dataset = FrozenRecallDataset(
+        queries=queries,
+        source_hashes={},
+        evaluation_materials=OpaqueEvaluationMaterials(
+            gold_records=queries,
+            identifier_map_bytes=b"{}",
+            identifier_map_sha256="sha256:" + "0" * 64,
+        ),
+        seed_candidates=[],
+    )
+    provider_pool = CandidatePoolBuilder("production-dedup-v1").build(
+        "q-provider",
+        [
+            RetrievalActionResult(
+                action_id="action-1",
+                action_type="text_search",
+                hits=[
+                    Paper(
+                        canonical_id="doi:10.1000/published",
+                        title="Published version",
+                        doi="10.1000/published",
+                        arxiv_id="2501.10121",
+                        sources=["semantic_scholar"],
+                    )
+                ],
+            )
+        ],
+    )
+
+    result = CandidateRecallEvaluator().evaluate(
+        dataset,
+        [
+            _pool("q-anchor", "doi:10.48550/arxiv.2501.10120"),
+            provider_pool,
+        ],
+    )
+
+    assert result.gold_hit_count == 2
+    assert [row.gold_hit_count for row in result.per_query] == [1, 1]
+    assert result.macro_candidate_recall == 1.0
+
+
+def test_preflight_rejects_map_whose_arxiv_target_is_a_different_work() -> None:
+    original = _dataset()
+    dataset = original.model_copy(
+        update={
+            "evaluation_materials": original.evaluation_materials.model_copy(
+                update={
+                    "identifier_map_bytes": (
+                        b'{"arxiv:2401.00002":"doi:10.48550/arxiv.2501.99999"}'
+                    )
+                }
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="non-equivalent arXiv relation"):
+        CandidateRecallEvaluator().preflight(dataset)
+
+
+def test_evaluate_rejects_conflicting_candidate_arxiv_evidence() -> None:
+    queries = [
+        EvaluationQuery(
+            query_id="q-one",
+            query="conflicting evidence",
+            relevant_paper_ids=["arxiv:2501.10120"],
+        )
+    ]
+    dataset = FrozenRecallDataset(
+        queries=queries,
+        source_hashes={},
+        evaluation_materials=OpaqueEvaluationMaterials(
+            gold_records=queries,
+            identifier_map_bytes=b"{}",
+            identifier_map_sha256="sha256:" + "0" * 64,
+        ),
+        seed_candidates=[],
+    )
+    pool = CandidatePoolBuilder("production-dedup-v1").build(
+        "q-one",
+        [
+            RetrievalActionResult(
+                action_id="action-1",
+                action_type="text_search",
+                hits=[
+                    Paper(
+                        canonical_id="doi:10.48550/arxiv.2501.10120",
+                        title="Conflicting candidate",
+                        arxiv_id="2501.10121",
+                        sources=["semantic_scholar"],
+                    )
+                ],
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="conflicting arXiv identity evidence"):
+        CandidateRecallEvaluator().evaluate(dataset, [pool])
 
 
 def test_preflight_rejects_resolved_duplicates_seed_gold_and_denominator_mismatch() -> None:

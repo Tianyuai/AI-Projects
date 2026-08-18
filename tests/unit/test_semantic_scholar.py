@@ -70,6 +70,7 @@ def test_search_maps_complete_and_missing_fields_and_preserves_identity(tmp_path
 
     assert [paper.semantic_scholar_id for paper in result.data] == ["S2-001", "S2-002"]
     assert result.data[0].canonical_id == "doi:10.9999/synthetic.001"
+    assert result.data[0].arxiv_id == "2401.00001"
     assert result.data[0].sources == ["semantic_scholar"]
     assert result.data[1].canonical_id == "s2:S2-002"
     assert result.data[1].abstract is None
@@ -229,3 +230,10 @@ def test_semantic_scholar_decoder_is_pure_and_deterministic() -> None:
 
     assert first == second
     assert [paper.semantic_scholar_id for paper in first.papers] == ["S2-001", "S2-002"]
+
+
+def test_semantic_scholar_decoder_accepts_zero_total_without_data() -> None:
+    result = decode_semantic_scholar_search(b'{"total":0,"offset":0}', limit=10)
+
+    assert result.papers == []
+    assert result.errors == []

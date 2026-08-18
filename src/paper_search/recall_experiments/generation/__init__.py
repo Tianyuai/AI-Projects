@@ -11,6 +11,9 @@ from paper_search.recall_experiments.generation.deepseek import (
     build_repair_payload,
     render_recall_prompt,
 )
+from paper_search.recall_experiments.generation.evidence_steered import (
+    EvidenceSteeredDeepSeekGenerator,
+)
 
 from paper_search.recall_experiments.generation.backends import (
     BudgetedLLMBackend,
@@ -22,6 +25,7 @@ from paper_search.recall_experiments.generation.backends import (
 __all__ = [
     "BudgetedLLMBackend",
     "DeepSeekPromptGenerator",
+    "EvidenceSteeredDeepSeekGenerator",
     "LLMBackend",
     "LLMBackendResult",
     "LLMGenerationRequest",

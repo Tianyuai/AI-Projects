@@ -20,6 +20,7 @@ def _paper(
     publication_year: int | None = None,
     venue: str | None = None,
     doi: str | None = None,
+    arxiv_id: str | None = None,
     openalex_id: str | None = None,
     semantic_scholar_id: str | None = None,
     url: str | None = None,
@@ -35,6 +36,7 @@ def _paper(
         publication_year=publication_year,
         venue=venue,
         doi=doi,
+        arxiv_id=arxiv_id,
         openalex_id=openalex_id,
         semantic_scholar_id=semantic_scholar_id,
         url=url,
@@ -87,6 +89,29 @@ def test_normalized_exact_title_merges() -> None:
     )
     assert result.decisions[0].match_rule == "exact_title"
     assert result.decisions[0].match_value == "graph based retrieval"
+
+
+def test_exact_title_merge_preserves_arxiv_identity_from_nonrepresentative() -> None:
+    result = deduplicate_papers(
+        [
+            _paper(
+                "doi:10.1093/biomet/asaa062",
+                title="Randomized numerical linear algebra",
+                doi="10.1093/biomet/asaa062",
+                abstract="richer published record",
+            ),
+            _paper(
+                "doi:10.48550/arxiv.1411.4357",
+                title="Randomized numerical linear algebra",
+                doi="10.48550/arxiv.1411.4357",
+                arxiv_id="1411.4357",
+            ),
+        ]
+    )
+
+    assert len(result.papers) == 1
+    assert result.papers[0].canonical_id == "doi:10.1093/biomet/asaa062"
+    assert result.papers[0].arxiv_id == "1411.4357"
 
 
 def test_fuzzy_title_requires_same_year_and_author_surname() -> None:

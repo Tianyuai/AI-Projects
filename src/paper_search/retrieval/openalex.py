@@ -35,7 +35,7 @@ Jitter = Callable[[], float]
 QueryValue = str | int | float | bool | None
 OPENALEX_SELECT_FIELDS = (
     "id,doi,title,display_name,abstract_inverted_index,authorships,publication_year,"
-    "primary_location,cited_by_count,is_retracted"
+    "primary_location,locations,cited_by_count,is_retracted"
 )
 _ENDPOINT = "/works"
 _REQUEST_URL = "https://api.openalex.org/works"
@@ -144,7 +144,9 @@ class OpenAlexPageDecode:
 
 
 def canonicalize_openalex_search_query(query: str) -> str:
-    return " ".join(query.replace("?", " ").replace("*", " ").split())
+    return " ".join(
+        query.replace("?", " ").replace("*", " ").replace("|", " ").split()
+    )
 
 
 def decode_openalex_page(
@@ -351,13 +353,19 @@ class OpenAlexProvider:
             raise ValueError("query must not be empty")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 300:
             raise ValueError("limit must be an integer between 1 and 300")
-        filter_value = _filter_expression(filters)
+        provider_filters = dict(filters)
+        search_mode = provider_filters.pop("_search_mode", "lexical")
+        if search_mode not in {"lexical", "semantic"}:
+            raise ValueError("OpenAlex search mode must be lexical or semantic")
+        if search_mode == "semantic" and limit > 50:
+            raise ValueError("OpenAlex semantic search limit cannot exceed 50")
+        filter_value = _filter_expression(provider_filters)
 
         started = time.perf_counter()
         requested_at = self._clock()
         remaining_calls = reservation.reserved.search_api_calls
         actual_calls = 0
-        cursor = "*"
+        cursor: str | None = None if search_mode == "semantic" else "*"
         papers: list[Paper] = []
         errors: list[ErrorDetail] = []
         cache_keys: list[str] = []
@@ -368,7 +376,7 @@ class OpenAlexProvider:
         raw_records_seen = 0
 
         while raw_records_seen < limit:
-            if cursor in seen_cursors:
+            if cursor is not None and cursor in seen_cursors:
                 errors.append(
                     _provider_error(
                         "pagination_cycle",
@@ -377,15 +385,21 @@ class OpenAlexProvider:
                     )
                 )
                 break
-            seen_cursors.add(cursor)
+            if cursor is not None:
+                seen_cursors.add(cursor)
             remaining = limit - raw_records_seen
             params: dict[str, QueryValue] = {
                 "api_key": self._api_key,
-                "cursor": cursor,
                 "per_page": min(50, remaining),
-                "search": normalized_query,
                 "select": OPENALEX_SELECT_FIELDS,
             }
+            if search_mode == "semantic":
+                params["page"] = 1
+            else:
+                params["cursor"] = cursor or "*"
+            params[
+                "search.semantic" if search_mode == "semantic" else "search"
+            ] = normalized_query
             if self._mailto:
                 params["mailto"] = self._mailto
             if filter_value is not None:
@@ -412,7 +426,12 @@ class OpenAlexProvider:
             raw_records_seen += decoded.raw_count
             papers.extend(decoded.papers)
             errors.extend(decoded.errors)
-            if decoded.raw_count == 0 or decoded.next_cursor is None or raw_records_seen >= limit:
+            if (
+                search_mode == "semantic"
+                or decoded.raw_count == 0
+                or decoded.next_cursor is None
+                or raw_records_seen >= limit
+            ):
                 break
             cursor = decoded.next_cursor
 
@@ -424,6 +443,7 @@ class OpenAlexProvider:
                 "provider": "openalex",
                 "endpoint": _ENDPOINT,
                 "model_id": "openalex-api",
+                "search_mode": str(search_mode),
                 "requested_at": requested_at.isoformat(),
                 "response_hash": _aggregate_hash(response_hashes),
                 "cache_keys": json.dumps(cache_keys, separators=(",", ":")),

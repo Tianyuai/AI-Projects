@@ -166,6 +166,7 @@ def _merge_cluster(
         "publication_year",
         "venue",
         "doi",
+        "arxiv_id",
         "openalex_id",
         "semantic_scholar_id",
         "url",

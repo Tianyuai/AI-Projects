@@ -156,7 +156,10 @@ def test_execution_identity_allows_manual_live_retrieval_without_generator_model
 
 def _write_synthetic_inputs(tmp_path: Path, *, backend: str = "snapshot_replay") -> tuple[Path, Path, Path]:
     gold = b'{"query_id":"q-one","query":"synthetic query","relevant_paper_ids":["arxiv:2401.00001"]}\n'
-    identifier_map = b'{"arxiv:2401.00001":"doi:10.1000/synthetic"}\n'
+    identifier_map = (
+        b'{"arxiv:2401.00001":"doi:10.48550/arxiv.2401.00001",'
+        b'"doi:10.1000/synthetic":"doi:10.48550/arxiv.2401.00001"}\n'
+    )
     (tmp_path / "gold.jsonl").write_bytes(gold)
     (tmp_path / "identifier-map.json").write_bytes(identifier_map)
     recipe = tmp_path / "recipe.yaml"
@@ -422,7 +425,10 @@ def test_manual_actions_prepare_and_validate_with_complete_synthetic_frozen_inpu
 ) -> None:
     monkeypatch.chdir(tmp_path)
     gold = b'{"query_id":"q-one","query":"synthetic query","relevant_paper_ids":["arxiv:2401.00001"]}\n'
-    identifier_map = b'{"arxiv:2401.00001":"doi:10.1000/synthetic"}\n'
+    identifier_map = (
+        b'{"arxiv:2401.00001":"doi:10.48550/arxiv.2401.00001",'
+        b'"doi:10.1000/synthetic":"doi:10.48550/arxiv.2401.00001"}\n'
+    )
     (tmp_path / "gold.jsonl").write_bytes(gold)
     (tmp_path / "identifier-map.json").write_bytes(identifier_map)
     recipe = tmp_path / "recipe.yaml"

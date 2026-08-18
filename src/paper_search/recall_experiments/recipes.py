@@ -46,6 +46,7 @@ class DeepSeekPromptGeneratorRecipe(_GeneratorRecipeBase):
     temperature: Annotated[int, Field(strict=True, ge=0, le=0)]
     max_generated_actions: Annotated[int, Field(strict=True, gt=0)]
     repair_attempts: Annotated[int, Field(strict=True, ge=1, le=1)]
+    evidence_steered: Annotated[bool, Field(strict=True)] = False
 
 
 GeneratorRecipe: TypeAlias = Annotated[
@@ -118,6 +119,13 @@ class RecallMethodRecipe(DomainModel):
         if isinstance(self.generator, DeepSeekPromptGeneratorRecipe):
             if self.generator.max_generated_actions > self.retrieval.max_total_actions:
                 raise ValueError("max_generated_actions must not exceed max_total_actions")
+            if self.generator.evidence_steered and (
+                self.generator.gold_visibility != "blind"
+                or set(self.retrieval.allowed_actions) != {"text_search"}
+            ):
+                raise ValueError(
+                    "evidence-steered generation requires blind text_search-only retrieval"
+                )
         if (
             self.candidate_pool.policy_version == "canonical-id-first-v1"
             and self.evaluation.compare_with is None

@@ -224,6 +224,9 @@ class SearchApplicationService:
             post_filter_paper_ids=(
                 result.post_filter_paper_ids if result is not None else []
             ),
+            pre_truncation_candidates=(
+                result.pre_truncation_candidates if result is not None else []
+            ),
             business_result_sha256=business_result_sha256(
                 hard_failure_business_result(
                     query_id=request.query_id,
@@ -347,6 +350,7 @@ class SearchApplicationService:
             diagnostics=result.diagnostics,
             retrieved_paper_ids=result.retrieved_paper_ids,
             post_filter_paper_ids=result.post_filter_paper_ids,
+            pre_truncation_candidates=result.pre_truncation_candidates,
             business_result_sha256=business_result_sha256(
                 business_result_from_response(response)
             ),

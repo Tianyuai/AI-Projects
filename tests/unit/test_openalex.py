@@ -96,6 +96,32 @@ def test_search_builds_safe_bounded_request_and_maps_results(tmp_path: Path) -> 
     assert API_KEY not in json.dumps(result.provenance)
 
 
+def test_semantic_search_uses_the_dedicated_openalex_parameter(tmp_path: Path) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=fixture_bytes("works_page_1.json"))
+
+    result = asyncio.run(
+        run_search(
+            SQLiteResponseCache(tmp_path / "cache.sqlite3"),
+            handler,
+            query="predicting toxicity from molecular structure",
+            filters={"_search_mode": "semantic", "year_from": 2020},
+            limit=2,
+        )
+    )
+
+    params = seen[0].url.params
+    assert "search" not in params
+    assert params["search.semantic"] == "predicting toxicity from molecular structure"
+    assert "cursor" not in params
+    assert params["page"] == "1"
+    assert params["filter"] == "from_publication_date:2020-01-01"
+    assert result.provenance["search_mode"] == "semantic"
+
+
 def test_search_removes_openalex_wildcards_and_collapses_whitespace(
     tmp_path: Path,
 ) -> None:
@@ -121,6 +147,7 @@ def test_public_canonicalizer_preserves_openalex_query_normalization() -> None:
         canonicalize_openalex_search_query("  graph?   retrieval* methods  ")
         == "graph retrieval methods"
     )
+    assert canonicalize_openalex_search_query("logc(|x|+1)") == "logc( x +1)"
 
 
 def test_search_includes_mailto_when_explicitly_configured(

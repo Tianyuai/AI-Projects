@@ -1,0 +1,21 @@
+{
+  "schema_version": "method-router-enablement-gates-v1",
+  "semantic": {
+    "minimum_evaluated_queries": 90,
+    "minimum_beneficial_queries": 15,
+    "minimum_availability_rate": 0.95,
+    "minimum_beneficial_recall": 0.90,
+    "minimum_call_reduction": 0.25,
+    "minimum_f1_lift": 0.05,
+    "minimum_marginal_gold_capture": 0.90
+  },
+  "graph": {
+    "minimum_evaluated_queries": 90,
+    "minimum_beneficial_queries": 10,
+    "minimum_availability_rate": 0.95,
+    "minimum_beneficial_recall": 0.80,
+    "minimum_call_reduction": 0.50,
+    "minimum_f1_lift": 0.10,
+    "minimum_marginal_gold_capture": 0.80
+  }
+}

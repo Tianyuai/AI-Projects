@@ -1,0 +1,21 @@
+{
+  "current_model_sha256": "sha256:0e208e6fbf9832f9bab4c52f5fdb7d4861586d37e883dfe0277289bed486d3ff",
+  "development_labels_used_for_training": false,
+  "dimension": 16384,
+  "epochs": 12,
+  "expansion_oof_sha256": "sha256:e5c661b93285a2c102ea38dd1161217e321d18c7614b62f686cbd32859baa71d",
+  "hard_negative_limit": 100,
+  "l2": 1e-06,
+  "learned_weight": 0.5,
+  "learning_rate": 0.05,
+  "model_id": "cpu-pairwise-document-ranker-v1",
+  "model_sha256": "sha256:cdfcb93e1355eb607bf4374223d26bd05a4bc86b8c93d6e6b3f3e4fec41d39c8",
+  "preference_pair_count": 123507,
+  "replacement_authorized": true,
+  "schema_version": "cpu-pairwise-document-ranker-manifest-v1",
+  "seed": 20260818,
+  "supplemental_training_query_count": 2000,
+  "target_training_query_count": 385,
+  "test_partition_touched": false,
+  "training_query_count": 2385
+}

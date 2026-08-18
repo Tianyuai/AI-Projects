@@ -111,10 +111,10 @@ class QueryPlanner:
             candidates.extend(_rule_subqueries(spec))
 
         selected: list[SubQuery] = []
-        seen_text: set[str] = set()
+        seen_text: set[tuple[str, str, str]] = set()
         for candidate in candidates:
             text = re.sub(r"\s+", " ", candidate.text).strip()
-            key = text.casefold()
+            key = (candidate.action_type, candidate.search_mode, text.casefold())
             if key in seen_text:
                 continue
             seen_text.add(key)

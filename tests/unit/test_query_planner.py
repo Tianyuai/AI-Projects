@@ -109,3 +109,46 @@ def test_finalize_clamps_caps_above_five() -> None:
     plan = QueryPlanner().finalize(_spec(), None, max_subqueries=99)
 
     assert len(plan.subqueries) == 3
+
+
+def test_finalize_preserves_action_type_and_search_mode_identity() -> None:
+    source = SearchPlan(
+        subqueries=[
+            SubQuery(
+                query_id="title",
+                text="Graph Retrieval",
+                query_type="decomposed",
+                action_type="title_search",
+                priority=1,
+                provider_hint="openalex",
+            ),
+            SubQuery(
+                query_id="semantic",
+                text="graph retrieval",
+                query_type="exact",
+                search_mode="semantic",
+                priority=2,
+                provider_hint="openalex",
+            ),
+            SubQuery(
+                query_id="lexical",
+                text="graph retrieval",
+                query_type="expanded",
+                priority=3,
+                provider_hint="openalex",
+            ),
+        ],
+        inherited_hard_filters={},
+        rationale="test",
+    )
+
+    plan = QueryPlanner().finalize(_spec(), source)
+
+    assert [
+        (item.action_type, item.search_mode, item.text)
+        for item in plan.subqueries[:3]
+    ] == [
+        ("title_search", "lexical", "Graph Retrieval"),
+        ("text_search", "semantic", "graph retrieval"),
+        ("text_search", "lexical", "graph retrieval"),
+    ]

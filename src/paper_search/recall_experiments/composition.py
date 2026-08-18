@@ -32,14 +32,13 @@ from paper_search.recall_experiments.generation.backends import (
     LLMBackendResult,
 )
 from paper_search.recall_experiments.generation.base import QueryGenerator
-from paper_search.recall_experiments.generation.deepseek import DeepSeekPromptGenerator, RecallPromptArtifact
-from paper_search.recall_experiments.generation.evidence_steered import (
-    EvidenceSteeredDeepSeekGenerator,
+from paper_search.recall_experiments.generation.deepseek import (
+    DeepSeekPromptGenerator,
+    RecallPromptArtifact,
 )
 from paper_search.recall_experiments.generation.fixed import FixedActionGenerator
 from paper_search.recall_experiments.generation.manual import ManualActionGenerator
 from paper_search.recall_experiments.inputs.formal_run import FormalRunInputSource
-from paper_search.recall_experiments.inputs.historical import load_historical_replays
 from paper_search.recall_experiments.inputs.gold_catalog import (
     GoldDocumentCatalogSource,
     SealedGoldDocumentCatalog,
@@ -127,7 +126,9 @@ class RecallRuntime:
 RecallRuntimeFactory = Callable[[LoadedRecallRecipe], RecallRuntime]
 
 
-def prepare_recall_run(recipe_path: Path, sample_path: Path, *, workspace_root: Path) -> PreparedRecallRun:
+def prepare_recall_run(
+    recipe_path: Path, sample_path: Path, *, workspace_root: Path
+) -> PreparedRecallRun:
     """Verify frozen inputs and construct generator-safe contexts offline."""
     try:
         loaded_recipe = load_recall_recipe(recipe_path)
@@ -140,7 +141,9 @@ def prepare_recall_run(recipe_path: Path, sample_path: Path, *, workspace_root: 
             sample=loaded_sample.binding,
             gold_catalog=catalog,
         )
-        return PreparedRecallRun(loaded_recipe, loaded_sample, evaluator.preflight(dataset), evaluator)
+        return PreparedRecallRun(
+            loaded_recipe, loaded_sample, evaluator.preflight(dataset), evaluator
+        )
     except RecallTerminalError:
         raise
     except ValueError as error:
@@ -156,7 +159,9 @@ def write_prepared_contexts(prepared: PreparedRecallRun, output_path: Path) -> P
     """Publish only sanitized, action-generation-visible contexts."""
     _start_output(output_path, prepared)
     for context in prepared.contexts:
-        _write_new_json(output_path / "contexts" / f"{context.query_id}.json", context.model_dump(mode="json"))
+        _write_new_json(
+            output_path / "contexts" / f"{context.query_id}.json", context.model_dump(mode="json")
+        )
     return output_path
 
 
@@ -270,7 +275,9 @@ async def run_recall_experiment(
     result = await runner.run(request)
     succeeded = sum(attempt.attempt_status == "succeeded" for attempt in result.attempts)
     if succeeded < recipe.evaluation.repeat_count:
-        failure_codes = [attempt.failure_code for attempt in result.attempts if attempt.failure_code]
+        failure_codes = [
+            attempt.failure_code for attempt in result.attempts if attempt.failure_code
+        ]
         code = failure_codes[-1] if failure_codes else "insufficient_valid_repeats"
         if code not in {
             "snapshot_unavailable",
@@ -288,7 +295,9 @@ def compare_recall_artifacts(
     """Compare explicit recall-report artifacts without inventing historical evidence."""
     try:
         current, current_identity, current_schema = _result_from_report(current_run)
-        historical_payload = _result_from_report(historical_run) if historical_run is not None else None
+        historical_payload = (
+            _result_from_report(historical_run) if historical_run is not None else None
+        )
         historical = historical_payload[0] if historical_payload is not None else None
         historical_identity = historical_payload[1] if historical_payload is not None else None
         historical_schema = historical_payload[2] if historical_payload is not None else None
@@ -306,59 +315,6 @@ def compare_recall_artifacts(
         }
         output_path.mkdir(parents=True, exist_ok=False)
         _write_new_json(output_path / "recall-comparison.json", payload)
-        return payload
-    except (OSError, TypeError, ValueError, KeyError) as error:
-        raise RecallTerminalError("config_mismatch") from error
-
-
-def compare_historical_replays(
-    *,
-    inventory_path: Path,
-    config_root: Path,
-    output_path: Path,
-    workspace_root: Path,
-) -> dict[str, object]:
-    """Write all historical replay terminal states without manufacturing evidence."""
-    try:
-        replay = load_historical_replays(
-            inventory_path=inventory_path,
-            config_root=config_root,
-            workspace_root=workspace_root,
-        )
-        methods = [
-            {
-                "method_id": method.method_id,
-                "source_run_id": method.source_run_id,
-                "source_hashes": method.source_hashes,
-                "query_ids_available": method.query_ids_available,
-                "evidence_level": method.evidence_level,
-                "action_family": method.action_family,
-                "candidate_pool_policy_version": method.candidate_pool_policy_version,
-                "exact_actions_available": method.exact_actions_available,
-                "exact_provider_responses_available": method.exact_provider_responses_available,
-                "fixed_actions_replayed": method.fixed_actions is not None,
-                "candidate_pool_ids_by_query": method.candidate_pool_ids_by_query,
-                "gold_hit_ids_by_query": method.gold_hit_ids_by_query,
-                "aggregate_metrics": method.aggregate_metrics,
-                "identifier_map_bound": method.normalized_source.identifier_map_bound,
-                "scoring_status": method.normalized_source.scoring_status,
-                "unscorable_reason": method.normalized_source.unscorable_reason,
-                "terminal_state": method.terminal_state,
-                "per_query_equality": method.per_query_equality,
-                "semantic_mismatch": method.semantic_mismatch,
-                "unprovable_fields": method.unprovable_fields,
-            }
-            for method in replay.methods.values()
-        ]
-        payload: dict[str, object] = {
-            "schema_version": "candidate-recall-historical-replay-v1",
-            "methods": methods,
-            "scheme_b_terminal_state": replay.scheme_b_terminal_state,
-            "status": "complete",
-            "path": str(output_path),
-        }
-        output_path.mkdir(parents=True, exist_ok=False)
-        _write_new_json(output_path / "historical-replay-comparison.json", payload)
         return payload
     except (OSError, TypeError, ValueError, KeyError) as error:
         raise RecallTerminalError("config_mismatch") from error
@@ -398,21 +354,11 @@ def build_deepseek_generator(
     prompt_bytes: bytes,
     allowed_actions: Sequence[str],
     backend: LLMBackend | None = None,
-) -> QueryGenerator:
+) -> DeepSeekPromptGenerator:
     del contexts
-    prompt = RecallPromptArtifact.from_yaml_bytes(prompt_bytes)
-    resolved_backend = backend or _SnapshotUnavailableLLMBackend()
-    if recipe.evidence_steered:
-        return EvidenceSteeredDeepSeekGenerator(
-            backend=resolved_backend,
-            prompt=prompt,
-            visibility=recipe.gold_visibility,
-            allowed_actions=allowed_actions,
-            max_actions=recipe.max_generated_actions,
-        )
     return DeepSeekPromptGenerator(
-        backend=resolved_backend,
-        prompt=prompt,
+        backend=backend or _SnapshotUnavailableLLMBackend(),
+        prompt=RecallPromptArtifact.from_yaml_bytes(prompt_bytes),
         visibility=recipe.gold_visibility,
         allowed_actions=allowed_actions,
         max_actions=recipe.max_generated_actions,
@@ -546,9 +492,7 @@ def build_live_runtime(
 class _SnapshotUnavailableLLMBackend(LLMBackend):
     async def generate(self, request: object, call_kind: object) -> LLMBackendResult:
         del request, call_kind
-        return LLMBackendResult(
-            errors=[_snapshot_error("llm")], infrastructure_failure=True
-        )
+        return LLMBackendResult(errors=[_snapshot_error("llm")], infrastructure_failure=True)
 
 
 class _SnapshotUnavailableRuntime(SearchBackend, CitationBackend):
@@ -559,7 +503,11 @@ class _SnapshotUnavailableRuntime(SearchBackend, CitationBackend):
         return BackendSearchResult(errors=[_snapshot_error("search")], infrastructure_failure=True)
 
     async def expand(
-        self, action_id: str, seed: Paper, direction: Literal["references", "citations", "both"], limit: int
+        self,
+        action_id: str,
+        seed: Paper,
+        direction: Literal["references", "citations", "both"],
+        limit: int,
     ) -> BackendCitationResult:
         del action_id, seed, limit
         return BackendCitationResult(
@@ -597,9 +545,13 @@ def _build_offline_generator(
 ) -> QueryGenerator:
     recipe = loaded.recipe
     if isinstance(recipe.generator, ManualActionsGeneratorRecipe):
-        return build_manual_generator(actions_path or Path(recipe.generator.actions), contexts=contexts, recipe=recipe)
+        return build_manual_generator(
+            actions_path or Path(recipe.generator.actions), contexts=contexts, recipe=recipe
+        )
     if isinstance(recipe.generator, FixedActionsGeneratorRecipe):
-        return build_fixed_generator(actions_path or Path(recipe.generator.actions), contexts=contexts, recipe=recipe)
+        return build_fixed_generator(
+            actions_path or Path(recipe.generator.actions), contexts=contexts, recipe=recipe
+        )
     assert isinstance(recipe.generator, DeepSeekPromptGeneratorRecipe)
     assert loaded.prompt_bytes is not None
     return build_deepseek_generator(
@@ -612,7 +564,10 @@ def _build_offline_generator(
 
 
 def _load_catalog(
-    recipe: RecallMethodRecipe, loaded_sample: LoadedSampleBinding, dataset: object, workspace_root: Path
+    recipe: RecallMethodRecipe,
+    loaded_sample: LoadedSampleBinding,
+    dataset: object,
+    workspace_root: Path,
 ) -> SealedGoldDocumentCatalog | None:
     if recipe.generator.gold_visibility != "oracle":
         return None
@@ -802,14 +757,7 @@ def _live_runtime_identity(
     pricer = pricers[0]
     if controller.formal_live is not True:
         raise RecallTerminalError("config_mismatch")
-    if dependencies["search"].dependency not in {"openalex", "semantic_scholar"}:
-        raise RecallTerminalError("config_mismatch")
-    if dependencies["citation"].dependency not in {"openalex", "semantic_scholar"}:
-        raise RecallTerminalError("config_mismatch")
-    if (
-        dependencies["llm"].dependency != "llm"
-        or dependencies["llm"].provider != "deepseek"
-    ):
+    if dependencies["llm"].dependency != "llm" or dependencies["llm"].provider != "deepseek":
         raise RecallTerminalError("config_mismatch")
     for dependency in dependencies.values():
         if (
@@ -850,7 +798,11 @@ def _result_from_report(
     attempts = report.get("attempts")
     if not isinstance(attempts, list):
         raise ValueError("recall report lacks attempts")
-    results = [attempt.get("result") for attempt in attempts if attempt.get("attempt_status") == "succeeded"]
+    results = [
+        attempt.get("result")
+        for attempt in attempts
+        if attempt.get("attempt_status") == "succeeded"
+    ]
     if len(results) != 1 or not isinstance(results[0], Mapping):
         raise ValueError("recall report lacks one successful repeat")
     identity = report.get("execution_identity")
@@ -962,7 +914,6 @@ __all__ = [
     "build_replay_runtime",
     "build_text_handler",
     "compare_recall_artifacts",
-    "compare_historical_replays",
     "build_title_handler",
     "generator_factories",
     "prepare_recall_run",

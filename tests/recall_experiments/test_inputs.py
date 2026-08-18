@@ -18,7 +18,6 @@ from paper_search.recall_experiments.recipes import (
     FormalRunInputBinding,
     HistoricalBaselineBinding,
     SampleBinding,
-    load_sample_binding,
 )
 
 
@@ -535,23 +534,3 @@ def test_catalog_generation_rejects_identifier_leakage_in_every_visible_text_fie
         catalog = _load_sealed_catalog(tmp_path, gold, [row])
         with pytest.raises(ValueError, match="forbidden"):
             catalog.to_generation_documents("q-one")
-
-
-def test_bound_smoke_catalog_is_association_complete_but_oracle_incomplete() -> None:
-    workspace = Path(__file__).parents[2]
-    sample = load_sample_binding(
-        workspace / "configs" / "recall_experiments" / "samples" / "dev-smoke-3.yaml"
-    ).binding
-    dataset = FormalRunInputSource(workspace).load_queries(sample)
-    assert sample.gold_document_catalog is not None
-    assert sample.gold_document_catalog_manifest is not None
-
-    catalog = GoldDocumentCatalogSource(workspace).load(
-        sample.gold_document_catalog,
-        manifest_binding=sample.gold_document_catalog_manifest,
-        bound_paper_sources=sample.frozen_inputs.bound_paper_sources,
-        gold_associations=dataset.evaluation_materials.gold_records,
-    )
-
-    assert catalog.status == "incomplete"
-    assert all(record.title is None for record in catalog.records)

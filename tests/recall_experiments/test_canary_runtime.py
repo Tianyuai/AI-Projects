@@ -122,7 +122,7 @@ def test_runtime_secrets_fail_closed_when_required_key_is_missing(tmp_path: Path
 
 def test_fixed_factory_builds_one_owned_live_runtime_without_dispatch(tmp_path: Path) -> None:
     (tmp_path / "pricing.yaml").write_bytes(
-        Path("data/annotation_work/pricing_v1.yaml").read_bytes()
+        Path("configs/pricing_v1.yaml").read_bytes()
     )
     (tmp_path / "budget.yaml").write_bytes(Path("configs/budget_low.yaml").read_bytes())
     (tmp_path / "secrets.env").write_text(
@@ -204,7 +204,7 @@ def test_runtime_model_is_independent_of_a_fixed_action_method(tmp_path: Path) -
         encoding="utf-8",
     )
     (tmp_path / "pricing.yaml").write_bytes(
-        Path("data/annotation_work/pricing_v1.yaml").read_bytes()
+        Path("configs/pricing_v1.yaml").read_bytes()
     )
     (tmp_path / "budget.yaml").write_bytes(Path("configs/budget_low.yaml").read_bytes())
     (tmp_path / "secrets.env").write_text(
@@ -229,10 +229,7 @@ def test_repository_default_profile_resolves_the_fixed_external_interfaces() -> 
         Path("configs/recall_experiments/runtime/default-live.yaml")
     )
 
-    assert profile.env_file == Path("D:/AI Projects/Projects/.env")
-    assert profile.pricing_policy == Path(
-        "D:/AI Projects/.worktrees/week3/data/annotation_work/pricing_v1.yaml"
-    )
-    assert profile.budget == Path(
-        "D:/AI Projects/.worktrees/week3/configs/budget_low.yaml"
-    )
+    root = Path.cwd().resolve()
+    assert profile.env_file == root / ".env"
+    assert profile.pricing_policy == root / "configs/pricing_v1.yaml"
+    assert profile.budget == root / "configs/budget_low.yaml"

@@ -11,16 +11,10 @@ from typing import Any, Literal, Mapping
 
 import yaml
 from dotenv import dotenv_values
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    SecretStr,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
-from paper_search.application.experiments import ExperimentDefinition, ExperimentName
-from paper_search.domain.models import SafeRelativePath, SearchBudget, SearchMode, Sha256
+from paper_search.application.experiments import ExperimentName
+from paper_search.domain.models import SafeRelativePath, SearchBudget, SearchMode
 
 
 BudgetConfig = SearchBudget
@@ -44,24 +38,6 @@ def validate_mode_authorization(
         raise ValueError("input lock does not allow live execution")
     if not network_authorized:
         raise ValueError("live execution requires explicit network authorization")
-
-
-class EmbeddingConfig(BaseModel):
-    """Public, reproducible settings for the optional local embedding stage."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    enabled: bool = False
-    model_id: str = Field(
-        default=(
-            "sentence-transformers/"
-            "paraphrase-multilingual-MiniLM-L12-v2"
-        ),
-        min_length=1,
-    )
-    device: Literal["cpu", "cuda"] = "cpu"
-    batch_size: int = Field(default=16, strict=True, ge=1, le=128)
-    fallback_to_cpu: bool = True
 
 
 class RuntimeSettings(BaseModel):
@@ -129,7 +105,6 @@ class RuntimeConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     experiment: ExperimentName = "main-baseline"
-    embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     runtime: RuntimeSettings = Field(
         default_factory=lambda: RuntimeSettings(artifact_root=Path("artifacts"))
     )
@@ -161,23 +136,6 @@ class RuntimeConfig(BaseModel):
         return canonical_config_hash(public_config)
 
 
-class ExperimentConfigEvidence(BaseModel):
-    """Canonical non-secret settings needed to reproduce an optional experiment."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    experiment: ExperimentDefinition
-    embedding: EmbeddingConfig | None = None
-
-    @model_validator(mode="after")
-    def validate_experiment_settings(self) -> ExperimentConfigEvidence:
-        if self.experiment.name == "main-baseline":
-            raise ValueError("main baseline does not require experiment evidence")
-        if self.experiment.flags.embedding != (self.embedding is not None):
-            raise ValueError("embedding settings must match the experiment definition")
-        return self
-
-
 def canonical_json_bytes(config: Mapping[str, Any]) -> bytes:
     """Serialize a config as sorted-key compact UTF-8 JSON."""
 
@@ -194,28 +152,6 @@ def canonical_config_hash(config: Mapping[str, Any]) -> str:
 
     digest = hashlib.sha256(canonical_json_bytes(config)).hexdigest()
     return f"sha256:{digest}"
-
-
-def experiment_config_hash(
-    *,
-    input_lock_sha256: Sha256,
-    evidence: ExperimentConfigEvidence | None,
-) -> Sha256:
-    """Bind optional experiment settings to one exact canonical input lock."""
-
-    if evidence is None:
-        return input_lock_sha256
-    return canonical_config_hash(
-        {
-            "input_lock_sha256": input_lock_sha256,
-            "experiment": evidence.experiment.model_dump(mode="json"),
-            "embedding": (
-                evidence.embedding.model_dump(mode="json")
-                if evidence.embedding is not None
-                else None
-            ),
-        }
-    )
 
 
 def validate_year_range(

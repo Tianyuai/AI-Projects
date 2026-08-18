@@ -29,7 +29,6 @@ from paper_search.application.locks import (
     lock_sha256,
 )
 from paper_search.control.ledger import LedgerReport
-from paper_search.config import ExperimentConfigEvidence, experiment_config_hash
 from paper_search.domain.models import (
     DependencyStatus,
     DomainModel,
@@ -148,7 +147,7 @@ class RunManifest(DomainModel):
     snapshot_manifest_sha256: Sha256
     experiment_name: NonEmptyStr
     optional_modules: dict[NonEmptyStr, bool]
-    experiment_config: ExperimentConfigEvidence | None = None
+    experiment_config: None = None
     started_at: datetime
     ended_at: datetime | None
     readiness_summary: list[DependencyStatus]
@@ -597,14 +596,10 @@ def experiment_manifest_matches_lock(
     expected_modules = expected_flags.model_dump(mode="python")
     if manifest.optional_modules != expected_modules:
         return False
-    if manifest.experiment_name == "main-baseline":
-        return manifest.experiment_config is None and manifest.config_hash == lock_hash
-    evidence = manifest.experiment_config
-    if evidence is None or evidence.experiment.name != manifest.experiment_name:
-        return False
-    return manifest.config_hash == experiment_config_hash(
-        input_lock_sha256=lock_hash,
-        evidence=evidence,
+    return (
+        manifest.experiment_name == "main-baseline"
+        and manifest.experiment_config is None
+        and manifest.config_hash == lock_hash
     )
 
 

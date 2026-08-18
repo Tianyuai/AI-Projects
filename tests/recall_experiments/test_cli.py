@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import socket
 from asyncio import run
 from hashlib import sha256
 from pathlib import Path
@@ -225,65 +224,6 @@ def test_recall_parser_exposes_split_workflow_commands(tmp_path: Path) -> None:
     assert args.command == "recall"
     assert args.recall_command == "prepare-context"
     assert args.out == tmp_path / "prepared"
-
-
-def test_prepare_context_reports_incomplete_oracle_catalog_without_network(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    attempts: list[str] = []
-
-    def tripwire(*_args: object, **_kwargs: object) -> object:
-        attempts.append("network")
-        raise AssertionError("offline command attempted network access")
-
-    monkeypatch.setattr(socket, "create_connection", tripwire)
-    monkeypatch.setattr(socket, "getaddrinfo", tripwire)
-
-    exit_code = main(
-        [
-            "recall",
-            "prepare-context",
-            "--recipe",
-            str(WORKSPACE_ROOT / "configs/recall_experiments/methods/manual-oracle-smoke.yaml"),
-            "--sample",
-            str(WORKSPACE_ROOT / "configs/recall_experiments/samples/dev-smoke-3.yaml"),
-            "--out",
-            str(tmp_path / "prepared"),
-        ]
-    )
-
-    payload = json.loads(capsys.readouterr().out)
-    assert exit_code == 2
-    assert payload == {
-        "error_code": "oracle_catalog_incomplete",
-        "path": str(tmp_path / "prepared"),
-        "status": "failed",
-    }
-    assert attempts == []
-
-
-def test_run_rejects_live_recipe_without_explicit_authorization(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    exit_code = main(
-        [
-            "recall",
-            "run",
-            "--recipe",
-            str(WORKSPACE_ROOT / "configs/recall_experiments/methods/manual-oracle-smoke.yaml"),
-            "--sample",
-            str(WORKSPACE_ROOT / "configs/recall_experiments/samples/dev-smoke-3.yaml"),
-            "--actions",
-            str(tmp_path / "actions.json"),
-            "--out",
-            str(tmp_path / "run"),
-        ]
-    )
-
-    payload = json.loads(capsys.readouterr().out)
-    assert exit_code == 2
-    assert payload["error_code"] == "live_not_authorized"
-    assert payload["status"] == "failed"
 
 
 def test_authorized_live_recipe_without_runtime_factory_fails_closed(

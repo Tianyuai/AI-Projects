@@ -52,14 +52,6 @@ def _load_optional_runtime_config(path: Path | None) -> RuntimeConfig | None:
     return load_runtime_config(_resolve_project_config(path))
 
 
-def _resolve_ablation_config(config_path: Path | None) -> Path:
-    if config_path is not None:
-        sibling = config_path.parent / "ablations.yaml"
-        if sibling.exists():
-            return sibling
-    return _PROJECT_CONFIG_ROOT / "ablations.yaml"
-
-
 class _SmokeFailure(RuntimeError):
     def __init__(self, code: SearchErrorCode) -> None:
         super().__init__(code)
@@ -159,18 +151,12 @@ def build_parser() -> argparse.ArgumentParser:
     canary.add_argument("--baseline", type=Path)
     canary.add_argument("--allow-live", action="store_true")
     canary.add_argument("--out", type=Path, required=True)
-    compare_recall = recall_commands.add_parser("compare", help="compare recall artifacts or bound historical evidence")
+    compare_recall = recall_commands.add_parser(
+        "compare", help="compare current and baseline recall artifacts"
+    )
     compare_recall.add_argument("--current", type=Path)
     compare_recall.add_argument("--historical", type=Path)
-    compare_recall.add_argument("--config-root", type=Path)
     compare_recall.add_argument("--out", type=Path, required=True)
-    inventory = recall_commands.add_parser(
-        "inventory-history", help="verify frozen historical recall evidence"
-    )
-    inventory.add_argument(
-        "--config-root", type=Path, default=_PROJECT_CONFIG_ROOT / "recall_experiments" / "historical"
-    )
-    inventory.add_argument("--out", type=Path, required=True)
     return parser
 
 
@@ -207,7 +193,6 @@ async def _run_smoke(args: argparse.Namespace) -> tuple[int, dict[str, object]]:
             network_authorized=bool(args.allow_network),
             lock_bytes=input_lock_bytes,
             runtime_config=runtime_config,
-            ablation_config=_resolve_ablation_config(config_path),
         )
         run_id = f"smoke-{uuid4()}"
         session = bundle.artifact_factory.start_capture(
@@ -271,7 +256,6 @@ def _run_serve(args: argparse.Namespace) -> int:
         capture_output_root=Path(args.capture_output_root),
         live_authorized=bool(args.allow_live),
         runtime_config=_load_optional_runtime_config(getattr(args, "config", None)),
-        ablation_config=_resolve_ablation_config(getattr(args, "config", None)),
     )
 
     @asynccontextmanager
@@ -373,7 +357,6 @@ def main(
                         snapshot_manifest_path=args.snapshot_manifest,
                         network_authorized=bool(args.allow_network),
                         runtime_config=runtime_config,
-                        ablation_config_path=_resolve_ablation_config(args.config),
                     )
                 )
             )
@@ -417,7 +400,6 @@ def _run_recall_command(
     """Dispatch recall composition without opening runtime state for offline paths."""
     from paper_search.recall_experiments.composition import (
         RecallTerminalError,
-        compare_historical_replays,
         compare_recall_artifacts,
         prepare_recall_run,
         run_recall_experiment,
@@ -454,16 +436,7 @@ def _run_recall_command(
         elif args.recall_command == "canary":
             path = asyncio.run(_run_canary(args, output))
         elif args.recall_command == "compare":
-            if args.config_root is not None:
-                if args.current is not None or args.historical is not None:
-                    raise RecallTerminalError("config_mismatch")
-                comparison = compare_historical_replays(
-                    inventory_path=Path.cwd() / "runs" / "_recall_history_inventory" / "source-inventory.json",
-                    config_root=args.config_root,
-                    output_path=output,
-                    workspace_root=Path.cwd(),
-                )
-            elif args.current is not None:
+            if args.current is not None:
                 comparison = compare_recall_artifacts(
                     current_run=args.current,
                     historical_run=args.historical,
@@ -473,15 +446,6 @@ def _run_recall_command(
                 raise RecallTerminalError("config_mismatch")
             path = output
             summary = {"path": str(path), "status": "complete", **comparison}
-        elif args.recall_command == "inventory-history":
-            from paper_search.recall_experiments.inventory import build_inventory
-
-            report = build_inventory(args.config_root, workspace_root=Path.cwd())
-            output.mkdir(parents=True, exist_ok=False)
-            (output / "source-inventory.json").write_text(
-                json.dumps(report, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8"
-            )
-            path = output
         else:
             raise RecallTerminalError("config_mismatch")
     except PermissionError:

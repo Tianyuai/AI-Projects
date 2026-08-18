@@ -6,19 +6,16 @@ import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
-from dataclasses import dataclass
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import Field, model_validator
 
 from paper_search.application.contracts import DependencyDiagnostic, SnapshotRef
-from paper_search.application.experiments import OptionalStageUnavailableError
 from paper_search.control.budget import BudgetExceededError, HardBudgetController, ReservationError
 from paper_search.control.pricing import ActualCostPricer
 from paper_search.domain.models import (
     BudgetReservation,
-    CandidateEvidence,
     DependencyName,
     DomainModel,
     ErrorDetail,
@@ -27,75 +24,28 @@ from paper_search.domain.models import (
     PlannerStatus,
     ProviderResult,
     QueryAnalysisResult,
-    QuerySpec,
     RankedPaper,
     ResolvedCitationEdge,
-    SubQuery,
     UsageActual,
     UsageEstimate,
     SearchMode,
-)
-from paper_search.evolution import (
-    CandidateConstraintObservation,
-    CoverageAnalyzer,
-    DeterministicRoundCostEstimator,
-    EvolutionCoordinator,
-    EvolutionStrategy,
-    MarginalGain,
-    RoundExecution,
-    RoundPlan,
-    RuleBasedNextRoundGenerator,
-    extract_strong_constraints,
 )
 from paper_search.processing.deduplicate import deduplicate_papers
 from paper_search.processing.filter import apply_hard_filters
 from paper_search.query.parser import PlannerDependencyError, QueryParser, rule_fallback
 from paper_search.query.planner import QueryPlanner
-from paper_search.ranking.embedding import (
-    EmbeddingRankingStage,
-    sanitize_embedding_model_id,
-    sanitize_embedding_warnings,
-)
 from paper_search.ranking.fusion import FusedPaper, fuse_provider_results
-from paper_search.ranking.rerank import ConstraintScoredPaper
 from paper_search.retrieval.base import SearchProvider
 from paper_search.retrieval.routing import RetrievalPolicy, route_baseline_subqueries
 
 if TYPE_CHECKING:
-    from paper_search.graph.provider_stage import AsyncCitationExpansionStage
     from paper_search.ranking.cpu_document import DocumentRankingStage
-    from paper_search.ranking.llm_stage import AsyncConstraintRerankingStage
-    from paper_search.retrieval.title_candidates import AsyncTitleCandidateStage
 
 
 Analyzer = Callable[[str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]]
 RepairAnalyzer = Callable[
     [str, str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]
 ]
-
-
-_SAFE_CITATION_WARNINGS = frozenset({"unresolved_citation_edge"})
-_SAFE_RERANK_WARNINGS = frozenset({"rerank_unavailable"})
-_SAFE_TITLE_CANDIDATE_WARNINGS = frozenset({"unavailable", "malformed"})
-_OPTIONAL_FAILURE_CODES = frozenset(
-    {"authentication_error", "integrity_failure", "snapshot_unavailable"}
-)
-
-
-def _optional_failure_reason(
-    diagnostics: list[DependencyDiagnostic],
-) -> str | None:
-    codes = {
-        error.code
-        for diagnostic in diagnostics
-        for error in diagnostic.errors
-        if error.code in _OPTIONAL_FAILURE_CODES
-    }
-    if "snapshot_unavailable" in codes:
-        return "snapshot_unavailable"
-    if codes:
-        return "dependency_failure"
-    return None
 
 
 class OrchestratorResult(DomainModel):
@@ -161,221 +111,6 @@ class OrchestratorResult(DomainModel):
 MinimalSearchResult = OrchestratorResult
 
 
-@dataclass(frozen=True)
-class _CandidateGainEvaluator:
-    def evaluate(
-        self,
-        previous_ids: frozenset[str],
-        current_ids: frozenset[str],
-        execution: RoundExecution,
-    ) -> MarginalGain:
-        del execution
-        new_count = len(current_ids - previous_ids)
-        return MarginalGain(
-            new_candidate_count=new_count,
-            new_high_relevance_count=new_count,
-            score=float(new_count),
-        )
-
-
-class _OrchestratorRoundExecutor:
-    def __init__(
-        self,
-        *,
-        single_round: MockSearchOrchestrator,
-        max_provider_results: int,
-    ) -> None:
-        self._single_round = single_round
-        self._max_provider_results = max_provider_results
-        self.results: list[OrchestratorResult] = []
-
-    async def execute(self, spec: QuerySpec, plan: RoundPlan) -> RoundExecution:
-        query = " OR ".join(subquery.text for subquery in plan.subqueries)
-        result = await self._single_round.run(
-            query,
-            max_provider_results=self._max_provider_results,
-        )
-        self.results.append(result)
-        constraints = extract_strong_constraints(spec)
-        observations = [
-            CandidateConstraintObservation(
-                paper_id=paper.canonical_id,
-                constraint=constraint,
-                matched=(
-                    constraint.normalized_value
-                    in " ".join(
-                        part
-                        for part in (paper.title, paper.abstract or "")
-                        if part
-                    ).casefold()
-                ),
-            )
-            for paper in result.papers
-            for constraint in constraints
-        ]
-        return RoundExecution(
-            round_number=plan.round_number,
-            candidates=result.papers,
-            observations=observations,
-            usage=result.usage,
-            trace=result.trace,
-        )
-
-
-class EvolutionSearchOrchestrator:
-    """Run multi-round strategies around one shared production round executor."""
-
-    def __init__(
-        self,
-        *,
-        single_round: MockSearchOrchestrator,
-        controller: HardBudgetController,
-        strategy: EvolutionStrategy,
-    ) -> None:
-        if strategy == "fixed_one_round":
-            raise ValueError("evolution wrapper requires a multi-round strategy")
-        self._single_round = single_round
-        self._controller = controller
-        self._strategy = strategy
-
-    async def run(
-        self,
-        query: str,
-        *,
-        max_provider_results: int,
-    ) -> OrchestratorResult:
-        spec = rule_fallback(query)
-        search_plan = QueryPlanner().finalize(spec, None)
-        initial_plan = RoundPlan(
-            round_number=1,
-            subqueries=search_plan.subqueries,
-        )
-        executor = _OrchestratorRoundExecutor(
-            single_round=self._single_round,
-            max_provider_results=max_provider_results,
-        )
-        coordinator = EvolutionCoordinator(
-            executor=executor,
-            coverage_analyzer=CoverageAnalyzer(covered_min_hits=1),
-            generator=RuleBasedNextRoundGenerator(),
-            estimator=DeterministicRoundCostEstimator(
-                search_calls_per_subquery=0,
-                llm_calls_per_round=0,
-                input_tokens_per_subquery=0,
-                output_tokens_per_subquery=0,
-                cost_cny_per_subquery=0.0,
-                elapsed_ms_per_subquery=0,
-            ),
-            gain_evaluator=_CandidateGainEvaluator(),
-            budget=self._controller,
-        )
-        max_rounds = 2 if self._strategy == "fixed_two_round" else max(
-            1,
-            self._controller.budget.max_iterations,
-        )
-        evolution = await coordinator.run(
-            spec=spec,
-            initial_plan=initial_plan,
-            strategy=self._strategy,
-            max_rounds=max_rounds,
-            max_subqueries=max(1, self._controller.budget.max_subqueries),
-            marginal_gain_threshold=0.0,
-        )
-        if not executor.results:
-            raise RuntimeError("evolution produced no executable round")
-        return self._aggregate(executor.results, evolution.candidates)
-
-    def _aggregate(
-        self,
-        results: list[OrchestratorResult],
-        candidates: list[Paper],
-    ) -> OrchestratorResult:
-        latest = results[-1]
-        fused_by_id = {
-            item.paper.canonical_id: item
-            for result in results
-            for item in result.fused_papers
-        }
-        ranked_by_id = {
-            item.paper.canonical_id: item
-            for result in results
-            for item in [*result.high_relevance, *result.partial_relevance]
-        }
-        high = [
-            ranked_by_id[paper.canonical_id]
-            for paper in candidates
-            if paper.canonical_id in ranked_by_id
-            and ranked_by_id[paper.canonical_id].evidence.relevance_level == "high"
-        ]
-        partial = [
-            ranked_by_id[paper.canonical_id]
-            for paper in candidates
-            if paper.canonical_id in ranked_by_id
-            and ranked_by_id[paper.canonical_id].evidence.relevance_level == "partial"
-        ]
-        fused = [
-            fused_by_id.get(
-                paper.canonical_id,
-                FusedPaper(paper=paper, score=0.0, source_ranks={}),
-            )
-            for paper in candidates
-        ]
-        return latest.model_copy(
-            update={
-                "query_analysis": results[0].query_analysis,
-                "fused_papers": fused,
-                "high_relevance": high,
-                "partial_relevance": partial,
-                "citation_edges": [
-                    edge for result in results for edge in result.citation_edges
-                ],
-                "diagnostics": [
-                    diagnostic
-                    for result in results
-                    for diagnostic in result.diagnostics
-                ],
-                "trace": [
-                    {**item, "round": round_number}
-                    for round_number, result in enumerate(results, start=1)
-                    for item in result.trace
-                ],
-                "usage": self._controller.committed_usage,
-                "stop_reason": next(
-                    (
-                        result.stop_reason
-                        for result in results
-                        if result.stop_reason
-                        in {
-                            "hard_stop",
-                            "soft_stop",
-                            "snapshot_unavailable",
-                            "dependency_failure",
-                        }
-                    ),
-                    "completed",
-                ),
-                "is_partial": any(result.is_partial for result in results),
-                "warnings": [
-                    warning for result in results for warning in result.warnings
-                ],
-                "retrieved_paper_ids": list(
-                    dict.fromkeys(
-                        paper_id
-                        for result in results
-                        for paper_id in result.retrieved_paper_ids
-                    )
-                ),
-                "post_filter_paper_ids": list(
-                    dict.fromkeys(
-                        paper_id
-                        for result in results
-                        for paper_id in result.post_filter_paper_ids
-                    )
-                ),
-            }
-        )
-
-
 class MockSearchOrchestrator:
     """Own reservations around injected mock analyzer and provider dependencies."""
 
@@ -394,10 +129,6 @@ class MockSearchOrchestrator:
         retrieval_policy: RetrievalPolicy | None = None,
         execution_mode: SearchMode = "live",
         document_ranker: DocumentRankingStage | None = None,
-        embedding_ranker: EmbeddingRankingStage | None = None,
-        citation_expander: AsyncCitationExpansionStage | None = None,
-        constraint_reranker: AsyncConstraintRerankingStage | None = None,
-        title_candidate_stage: AsyncTitleCandidateStage | None = None,
         max_output_papers: int | None = None,
         pricer: ActualCostPricer | None = None,
         provider_adapter_names: Mapping[DependencyName, str] | None = None,
@@ -420,10 +151,6 @@ class MockSearchOrchestrator:
         self._retrieval_policy = retrieval_policy
         self._execution_mode = execution_mode
         self._document_ranker = document_ranker
-        self._embedding_ranker = embedding_ranker
-        self._citation_expander = citation_expander
-        self._constraint_reranker = constraint_reranker
-        self._title_candidate_stage = title_candidate_stage
         if (
             max_output_papers is not None
             and (
@@ -638,39 +365,11 @@ class MockSearchOrchestrator:
 
         return repair
 
-    @staticmethod
-    def _ranked_paper(
-        item: ConstraintScoredPaper,
-        subqueries: list[SubQuery],
-    ) -> RankedPaper:
-        relevance_level = "high" if item.score >= 0.8 else "partial"
-        return RankedPaper(
-            paper=item.paper,
-            evidence=CandidateEvidence(
-                paper_id=item.paper.canonical_id,
-                matched_subqueries=[subquery.query_id for subquery in subqueries],
-                matched_constraints=[],
-                unmatched_constraints=[],
-                filter_reasons=[],
-                lexical_score=0.0,
-                embedding_score=0.0,
-                rerank_score=item.score,
-                constraint_coverage=item.assessment.constraint_coverage,
-                source_agreement=min(1.0, len(item.paper.sources) / 2),
-                authority_score=0.0,
-                recency_score=0.0,
-                final_score=item.score,
-                scoring_version="constraint-rerank-v1",
-                relevance_level=relevance_level,
-            ),
-        )
-
     async def run(self, query: str, *, max_provider_results: int) -> OrchestratorResult:
         warnings: list[str] = []
         trace: list[dict[str, object]] = []
         provider_results: dict[DependencyName, ProviderResult[list[Paper]]] = {}
         diagnostics: list[DependencyDiagnostic] = []
-        optional_failure_reason: str | None = None
         try:
             analysis_reservation = self._controller.reserve("query.analyze", self._analysis_estimate)
         except BudgetExceededError:
@@ -924,9 +623,7 @@ class MockSearchOrchestrator:
                         diagnostics.append(self._failure_diagnostic(name))
                     continue
                 collected.setdefault(name, []).append(result)
-                action_results[
-                    f"{name}:{subquery_id}:{search_mode}"
-                ] = result
+                action_results[f"{name}:{subquery_id}:{search_mode}"] = result
                 if name == "openalex":
                     primary_result = result
                 trace.append(
@@ -952,55 +649,6 @@ class MockSearchOrchestrator:
         )
 
         fusion_input = dict(action_results)
-        if self._title_candidate_stage is not None:
-            try:
-                title_recall = await self._title_candidate_stage.recall(
-                    analysis.query_spec,
-                    controller=self._controller,
-                )
-            except OptionalStageUnavailableError as error:
-                diagnostic = getattr(error, "diagnostic", None)
-                if isinstance(diagnostic, DependencyDiagnostic):
-                    diagnostics.append(diagnostic)
-                    optional_failure_reason = _optional_failure_reason(
-                        [diagnostic]
-                    )
-                warnings.append("title_candidates: unavailable")
-                trace.append(
-                    {
-                        "step": "title_candidates",
-                        "status": "degraded",
-                        "count": 0,
-                    }
-                )
-            else:
-                diagnostics.extend(title_recall.diagnostics)
-                optional_failure_reason = optional_failure_reason or (
-                    _optional_failure_reason(title_recall.diagnostics)
-                )
-                safe_warnings = [
-                    warning
-                    for warning in title_recall.warnings
-                    if warning in _SAFE_TITLE_CANDIDATE_WARNINGS
-                ]
-                warnings.extend(
-                    f"title_candidates: {warning}" for warning in safe_warnings
-                )
-                if title_recall.provider_result.data:
-                    fusion_input["title_candidates"] = (
-                        title_recall.provider_result
-                    )
-                trace.append(
-                    {
-                        "step": "title_candidates",
-                        "status": title_recall.status,
-                        "count": len(title_recall.provider_result.data),
-                        "titles_generated": title_recall.titles_generated,
-                        "titles_searched": title_recall.titles_searched,
-                        "truncated": title_recall.truncated,
-                    }
-                )
-
         merged = deduplicate_papers(
             [
                 paper
@@ -1035,143 +683,13 @@ class MockSearchOrchestrator:
                 {
                     "step": "document_rank",
                     "status": "applied",
-                    "model_id": sanitize_embedding_model_id(
-                        self._document_ranker.model_id
-                    ),
+                    "model_id": self._document_ranker.model_id,
                     "count": len(papers),
                 }
             )
-        if self._embedding_ranker is not None and papers:
-            embedding = self._embedding_ranker.rank(
-                analysis.query_spec.original_query,
-                papers,
-            )
-            if embedding.status == "applied":
-                papers = [item.paper for item in embedding.ranked]
-                selected_fused = [
-                    fused_by_id[paper.canonical_id] for paper in papers
-                ]
-            safe_model_id = sanitize_embedding_model_id(embedding.model_id)
-            safe_warnings = sanitize_embedding_warnings(embedding.warnings)
-            trace.append(
-                {
-                    "step": "embedding",
-                    "status": embedding.status,
-                    "model_id": safe_model_id,
-                    "device": embedding.device,
-                    "fallback_used": embedding.fallback_used,
-                    "count": len(papers),
-                }
-            )
-            warnings.extend(f"embedding: {warning}" for warning in safe_warnings)
-        citation_edges: list[ResolvedCitationEdge] = []
-        if self._citation_expander is not None and papers:
-            prior_ids = {paper.canonical_id for paper in papers}
-            try:
-                citation = await self._citation_expander.expand(
-                    [papers[0]],
-                    controller=self._controller,
-                )
-            except OptionalStageUnavailableError as error:
-                diagnostic = getattr(error, "diagnostic", None)
-                if isinstance(diagnostic, DependencyDiagnostic):
-                    diagnostics.append(diagnostic)
-                    optional_failure_reason = _optional_failure_reason(
-                        [diagnostic]
-                    )
-                warnings.append("citation: expansion_unavailable")
-                trace.append(
-                    {"step": "citation", "status": "degraded", "count": len(papers)}
-                )
-            else:
-                diagnostics.extend(getattr(citation, "diagnostics", []))
-                optional_failure_reason = optional_failure_reason or (
-                    _optional_failure_reason(
-                        getattr(citation, "diagnostics", [])
-                    )
-                )
-                citation_edges.extend(citation.edges)
-                additions = [
-                    paper for paper in citation.papers if paper.canonical_id not in prior_ids
-                ]
-                papers = [*papers, *additions]
-                safe_citation_warnings = [
-                    warning
-                    for warning in citation.warnings
-                    if warning in _SAFE_CITATION_WARNINGS
-                ]
-                warnings.extend(f"citation: {warning}" for warning in safe_citation_warnings)
-                trace.append(
-                    {
-                        "step": "citation",
-                        "status": "applied",
-                        "count": len(papers),
-                        "expanded_count": len(additions),
-                        "edge_count": len(citation.edges),
-                        "skipped_edge_count": citation.skipped_edge_count,
-                        "truncated": citation.truncated,
-                    }
-                )
         high_relevance: list[RankedPaper] = []
         partial_relevance: list[RankedPaper] = []
-        if self._constraint_reranker is not None and papers:
-            constraints = [
-                *analysis.query_spec.must_have,
-                *analysis.query_spec.should_have,
-                *analysis.query_spec.exclusions,
-            ]
-            try:
-                rerank = await self._constraint_reranker.rerank(
-                    papers,
-                    constraints,
-                    controller=self._controller,
-                )
-            except OptionalStageUnavailableError as error:
-                diagnostic = getattr(error, "diagnostic", None)
-                if isinstance(diagnostic, DependencyDiagnostic):
-                    diagnostics.append(diagnostic)
-                    optional_failure_reason = _optional_failure_reason(
-                        [diagnostic]
-                    )
-                warnings.append("rerank: rerank_unavailable")
-                trace.append(
-                    {"step": "rerank", "status": "degraded", "count": len(papers)}
-                )
-            else:
-                diagnostics.extend(getattr(rerank, "diagnostics", []))
-                optional_failure_reason = optional_failure_reason or (
-                    _optional_failure_reason(getattr(rerank, "diagnostics", []))
-                )
-                if rerank.status == "applied":
-                    papers = [item.paper for item in rerank.ranked]
-                    ranked_evidence = [
-                        self._ranked_paper(item, analysis.search_plan.subqueries)
-                        for item in rerank.ranked
-                    ]
-                    high_relevance = [
-                        item
-                        for item in ranked_evidence
-                        if item.evidence.relevance_level == "high"
-                    ]
-                    partial_relevance = [
-                        item
-                        for item in ranked_evidence
-                        if item.evidence.relevance_level == "partial"
-                    ]
-                safe_rerank_warnings = [
-                    warning for warning in rerank.warnings if warning in _SAFE_RERANK_WARNINGS
-                ]
-                warnings.extend(f"rerank: {warning}" for warning in safe_rerank_warnings)
-                trace.append(
-                    {
-                        "step": "rerank",
-                        "status": rerank.status,
-                        "count": len(papers),
-                        "processed_count": rerank.processed_count,
-                        "batch_count": rerank.batch_count,
-                        "truncated": rerank.truncated,
-                    }
-                )
+        citation_edges: list[ResolvedCitationEdge] = []
         pre_truncation_candidates = list(papers)
         if self._max_output_papers is not None and len(papers) > self._max_output_papers:
             papers = papers[: self._max_output_papers]
@@ -1186,11 +704,7 @@ class MockSearchOrchestrator:
                 }
             )
         status = self._controller.stop_status()
-        stop_reason = (
-            status
-            if status != "continue"
-            else optional_failure_reason or "completed"
-        )
+        stop_reason = status if status != "continue" else "completed"
         partial = bool(warnings) or stop_reason != "completed"
         return self._result(
             analysis,

@@ -4,7 +4,6 @@ version = "0.1.0"
 description = "Resource-aware scholarly paper search and evidence synthesis system."
 requires-python = ">=3.11,<3.12"
 dependencies = [
-    "faiss-cpu>=1.9,<2",
     "fastapi>=0.115,<1",
     "httpx>=0.28,<1",
     "numpy>=1.26,<3",
@@ -13,22 +12,11 @@ dependencies = [
     "python-dotenv>=1.0,<2",
     "pyyaml>=6,<7",
     "rank-bm25>=0.2.2,<0.3",
-    "transformers>=4.48,<5",
     "uvicorn>=0.30,<1",
 ]
 
 [project.scripts]
 paper-search = "paper_search.cli:main"
-
-[project.optional-dependencies]
-cpu = [
-    "sentence-transformers>=3.3,<6",
-    "torch==2.5.1",
-]
-cuda = [
-    "sentence-transformers>=3.3,<6",
-    "torch==2.5.1",
-]
 
 [dependency-groups]
 dev = [
@@ -61,7 +49,6 @@ addopts = "-ra -p no:cacheprovider --import-mode=importlib"
 pythonpath = ["src", "."]
 testpaths = ["tests"]
 markers = [
-    "hardware: requires an explicitly selected accelerator environment",
     "online: requires explicit external provider credentials and network",
 ]
 
@@ -74,27 +61,3 @@ python_version = "3.11"
 strict = true
 plugins = ["pydantic.mypy"]
 warn_unused_configs = true
-
-[tool.uv]
-conflicts = [
-    [
-        { extra = "cpu" },
-        { extra = "cuda" },
-    ],
-]
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cu121", extra = "cuda" },
-    { index = "pytorch-cpu", extra = "cpu" },
-]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
-explicit = true

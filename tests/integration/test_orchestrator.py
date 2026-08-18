@@ -6,49 +6,23 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
-import pytest
 
 from paper_search.control.budget import (
-    BudgetExceededError,
     HardBudgetController,
-    ReservationError,
 )
-from paper_search.application.contracts import DependencyDiagnostic, SearchRequest, SnapshotRef
-from paper_search.application.experiments import OptionalStageUnavailableError
-from paper_search.application.service import SearchApplicationService
+from paper_search.application.contracts import SnapshotRef
 from paper_search.domain.models import (
     BudgetReservation,
-    CitationEdge,
-    CitationExpansion,
     ErrorDetail,
-    FusedPaper,
     Paper,
-    ProviderPaperId,
     ProviderResult,
     SearchBudget,
     UsageActual,
     UsageEstimate,
 )
-from paper_search.graph.citation_expand import CitationExpansionResult
-from paper_search.evaluation.execution_adapter import adapt_execution
-from paper_search.graph.provider_stage import (
-    CitationExpansionUnavailableError,
-    ProviderCitationExpansionStage,
-)
-from paper_search.llm.snapshot_adapters import LLMAdapterError
 from paper_search.pipeline.orchestrator import MockSearchOrchestrator
-from paper_search.ranking.embedding import EmbeddingRankingResult, EmbeddingScore
-from paper_search.ranking.rerank import (
-    ConstraintRerankResult,
-    ConstraintScoredPaper,
-)
-from paper_search.ranking.llm_stage import LLMConstraintRerankingStage
-from paper_search.retrieval.title_candidates import TitleCandidateRecallResult
-from paper_search.retrieval.routing import (
-    FixedBudgetOpenAlexPolicy,
-    FixedHybridOpenAlexPolicy,
-)
-from paper_search.retrieval.snapshot_adapters import ProviderAdapterError
+from paper_search.ranking.fusion import FusedPaper
+from paper_search.retrieval.routing import FixedBudgetOpenAlexPolicy
 
 
 def _budget(**updates: object) -> SearchBudget:
@@ -130,40 +104,6 @@ class FakeAnalyzer:
                 },
             },
             UsageActual(llm_calls=1, cost_cny=0.1, elapsed_ms=self.elapsed_ms),
-        )
-
-
-class SingleEitherAnalyzer:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
-
-    async def __call__(
-        self, query: str, _: object
-    ) -> ProviderResult[dict[str, object]]:
-        self.events.append("analyze")
-        return _result(
-            "llm",
-            {
-                "query_spec": {
-                    "original_query": query,
-                    "research_goal": "find papers",
-                },
-                "search_plan": {
-                    "subqueries": [
-                        {
-                            "query_id": "either-1",
-                            "text": query,
-                            "query_type": "exact",
-                            "target_constraints": ["papers"],
-                            "priority": 1,
-                            "provider_hint": "either",
-                        }
-                    ],
-                    "inherited_hard_filters": {},
-                    "rationale": "fixture",
-                },
-            },
-            UsageActual(llm_calls=1, cost_cny=0.1),
         )
 
 
@@ -299,6 +239,23 @@ class FakeProvider:
         )
 
 
+class FakeDocumentRanker:
+    model_id = "fixture-document-ranker-v1"
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, list[str]]] = []
+
+    def rank(
+        self,
+        query: str,
+        candidates: Sequence[FusedPaper],
+    ) -> list[FusedPaper]:
+        self.calls.append(
+            (query, [item.paper.canonical_id for item in candidates])
+        )
+        return list(reversed(candidates))
+
+
 class SettlingAnalyzer(FakeAnalyzer):
     def __init__(
         self,
@@ -317,51 +274,6 @@ class SettlingAnalyzer(FakeAnalyzer):
         self.controller.settle(reservation, result.usage)
         return result
 
-
-class FakeTitleCandidateStage:
-    def __init__(
-        self,
-        papers: list[Paper],
-        *,
-        degraded: bool = False,
-    ) -> None:
-        self.papers = papers
-        self.degraded = degraded
-
-    async def recall(
-        self,
-        spec: object,
-        *,
-        controller: object,
-    ) -> TitleCandidateRecallResult:
-        del spec, controller
-        if self.degraded:
-            return TitleCandidateRecallResult(
-                provider_result=_result(
-                    "title_candidates",
-                    [],
-                    UsageActual(),
-                ),
-                status="degraded",
-                diagnostics=[],
-                warnings=["unavailable"],
-                titles_generated=0,
-                titles_searched=0,
-                truncated=False,
-            )
-        return TitleCandidateRecallResult(
-            provider_result=_result(
-                "title_candidates",
-                self.papers,
-                UsageActual(search_api_calls=1),
-            ),
-            status="applied",
-            diagnostics=[],
-            warnings=[],
-            titles_generated=len(self.papers),
-            titles_searched=len(self.papers),
-            truncated=False,
-        )
 
 
 class SettlingProvider(FakeProvider):
@@ -452,470 +364,6 @@ class RaisingProvider:
         raise self.error
 
 
-class FakeEmbeddingRanker:
-    def __init__(
-        self,
-        *,
-        degraded: bool = False,
-        reverse_on_degraded: bool = False,
-    ) -> None:
-        self.degraded = degraded
-        self.reverse_on_degraded = reverse_on_degraded
-        self.calls: list[tuple[str, list[str]]] = []
-
-    def rank(
-        self,
-        query: str,
-        papers: Sequence[Paper],
-    ) -> EmbeddingRankingResult:
-        self.calls.append((query, [paper.canonical_id for paper in papers]))
-        if self.degraded and not self.reverse_on_degraded:
-            ordered = list(papers)
-        else:
-            ordered = list(reversed(papers))
-        return EmbeddingRankingResult(
-            ranked=[
-                EmbeddingScore(paper=paper, similarity=0.0 if self.degraded else 0.8)
-                for paper in ordered
-            ],
-            status="degraded" if self.degraded else "applied",
-            model_id="fixture-embedding-v1",
-            device="cpu",
-            fallback_used=False,
-            warnings=["encoder_unavailable"] if self.degraded else [],
-        )
-
-
-class FakeDocumentRanker:
-    model_id = "fixture-document-ranker-v1"
-
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, list[str]]] = []
-
-    def rank(
-        self,
-        query: str,
-        candidates: Sequence[FusedPaper],
-    ) -> list[FusedPaper]:
-        self.calls.append(
-            (query, [item.paper.canonical_id for item in candidates])
-        )
-        return list(reversed(candidates))
-
-
-class MaliciousEmbeddingRanker:
-    def rank(
-        self,
-        query: str,
-        papers: Sequence[Paper],
-    ) -> EmbeddingRankingResult:
-        private_warning = (
-            f"query={query}; ids={','.join(paper.canonical_id for paper in papers)}; "
-            r"path=D:\private-cache\secret-model"
-        )
-        private_code = "query_graph_retrieval_ids_openalex_w1_s2_s1_private_cache"
-        return EmbeddingRankingResult(
-            ranked=[EmbeddingScore(paper=paper, similarity=0.0) for paper in papers],
-            status="degraded",
-            model_id=r"D:\private-cache\secret-model",
-            device="cpu",
-            fallback_used=True,
-            warnings=["cuda_oom_cpu_fallback", private_warning, private_code],
-        )
-
-
-class FakeCitationExpander:
-    def __init__(self, extra: Paper) -> None:
-        self.extra = extra
-        self.calls: list[list[str]] = []
-
-    async def expand(
-        self,
-        seeds: list[Paper],
-        *,
-        controller: HardBudgetController,
-    ) -> CitationExpansionResult:
-        assert controller is not None
-        self.calls.append([paper.canonical_id for paper in seeds])
-        return CitationExpansionResult(
-            papers=[*seeds, self.extra],
-            edges=[],
-            skipped_edge_count=0,
-            truncated=False,
-            warnings=[],
-        )
-
-
-class FakeConstraintReranker:
-    def __init__(self) -> None:
-        self.calls: list[tuple[list[str], list[str]]] = []
-
-    async def rerank(
-        self,
-        papers: list[Paper],
-        constraints: list[str],
-        *,
-        controller: HardBudgetController,
-    ) -> ConstraintRerankResult:
-        assert controller is not None
-        self.calls.append(
-            ([paper.canonical_id for paper in papers], list(constraints))
-        )
-        ranked = [
-            ConstraintScoredPaper(
-                paper=paper,
-                score=0.5,
-                assessment={
-                    "matched_constraint_count": 0,
-                    "unmatched_constraint_count": 0,
-                    "relevance_score": 0.5,
-                    "constraint_coverage": 0.0,
-                },
-            )
-            for paper in reversed(papers)
-        ]
-        return ConstraintRerankResult(
-            ranked=ranked,
-            status="applied",
-            processed_count=len(ranked),
-            truncated=False,
-            batch_count=1 if ranked else 0,
-            warnings=[],
-        )
-
-
-class CitationProvider:
-    def __init__(self, *, failed: bool = False, error_code: str = "timeout") -> None:
-        self.failed = failed
-        self.error_code = error_code
-        self.calls: list[tuple[str, str, BudgetReservation]] = []
-
-    def _expansion_result(
-        self,
-        direction: str,
-        paper_id: ProviderPaperId,
-        reservation: BudgetReservation,
-    ) -> ProviderResult[CitationExpansion]:
-        self.calls.append((direction, paper_id.value, reservation))
-        index = len(self.calls)
-        expanded_id = "S2" if direction == "references" else "S3"
-        expanded = Paper(
-            canonical_id=f"s2:{expanded_id}",
-            title=f"Expanded {expanded_id}",
-            semantic_scholar_id=expanded_id,
-        )
-        if direction == "references":
-            citing, cited = paper_id, ProviderPaperId(
-                provider="semantic_scholar",
-                value=expanded_id,
-            )
-        else:
-            citing, cited = (
-                ProviderPaperId(provider="semantic_scholar", value=expanded_id),
-                paper_id,
-            )
-        ref = SnapshotRef(
-            entry_id=f"citation-{index}",
-            dependency="semantic_scholar",
-            cache_key="sha256:" + f"{index:x}" * 64,
-            response_sha256="sha256:" + f"{index:x}" * 64,
-            captured_at=datetime(2026, 7, 23, tzinfo=UTC),
-            snapshot_path=f"responses/semantic_scholar/{index}.bin",
-        )
-        result = _result(
-            "semantic_scholar",
-            CitationExpansion(
-                papers=[expanded],
-                raw_edges=[
-                    CitationEdge(
-                        provider="semantic_scholar",
-                        citing_provider_id=citing,
-                        cited_provider_id=cited,
-                    )
-                ],
-            ),
-            UsageActual(search_api_calls=1),
-            failed=self.failed,
-        )
-        if self.failed and self.error_code != "timeout":
-            result = result.model_copy(
-                update={
-                    "errors": [
-                        ErrorDetail(
-                            code=self.error_code,
-                            message="synthetic",
-                            retryable=False,
-                            provider="semantic_scholar",
-                        )
-                    ]
-                }
-            )
-        return result.model_copy(
-            update={
-                "cache_hit": direction == "citations",
-                "provenance": {
-                    **result.provenance,
-                    "snapshot_refs": json.dumps(
-                        [ref.model_dump(mode="json")],
-                        separators=(",", ":"),
-                    ),
-                },
-            }
-        )
-
-    async def references(
-        self,
-        paper_id: ProviderPaperId,
-        limit: int,
-        reservation: BudgetReservation,
-    ) -> ProviderResult[CitationExpansion]:
-        assert limit == 2
-        return self._expansion_result("references", paper_id, reservation)
-
-    async def citations(
-        self,
-        paper_id: ProviderPaperId,
-        limit: int,
-        reservation: BudgetReservation,
-    ) -> ProviderResult[CitationExpansion]:
-        assert limit == 2
-        return self._expansion_result("citations", paper_id, reservation)
-
-
-class RerankAnalyzer:
-    def __init__(self, *, failed: bool = False, error_code: str = "timeout") -> None:
-        self.failed = failed
-        self.error_code = error_code
-        self.calls: list[tuple[dict[str, object], BudgetReservation]] = []
-
-    async def generate_json(
-        self,
-        *,
-        prompt_name: str,
-        payload: dict[str, object],
-        reservation: BudgetReservation,
-    ) -> ProviderResult[dict[str, Any]]:
-        assert prompt_name == "constraint_rerank"
-        self.calls.append((payload, reservation))
-        papers = payload["papers"]
-        assert isinstance(papers, list)
-        constraints = payload["constraints"]
-        assert isinstance(constraints, list)
-        data = {
-            "assessments": [
-                {
-                    "paper_id": paper["canonical_id"],
-                    "matched_constraint_count": len(constraints),
-                    "unmatched_constraint_count": 0,
-                    "relevance_score": 1.0 if index == 1 else 0.5,
-                }
-                for index, paper in enumerate(papers)
-            ]
-        }
-        result = _result(
-            "llm",
-            data,
-            UsageActual(llm_calls=1, input_tokens=10, output_tokens=10, cost_cny=0.1),
-            failed=False,
-        )
-        if self.failed:
-            result = result.model_copy(
-                update={
-                    "errors": [
-                        ErrorDetail(
-                            code=self.error_code,
-                            message="synthetic",
-                            retryable=self.error_code == "timeout",
-                            provider="llm",
-                        )
-                    ]
-                }
-            )
-        ref = SnapshotRef(
-            entry_id="rerank-1",
-            dependency="llm",
-            cache_key="sha256:" + "a" * 64,
-            response_sha256="sha256:" + "b" * 64,
-            captured_at=datetime(2026, 7, 23, tzinfo=UTC),
-            snapshot_path="responses/llm/rerank.bin",
-        )
-        return result.model_copy(
-            update={
-                "cache_hit": True,
-                "provenance": {
-                    **result.provenance,
-                    "snapshot_entry_id": ref.entry_id,
-                    "snapshot_cache_key": ref.cache_key,
-                    "snapshot_response_sha256": ref.response_sha256,
-                    "snapshot_path": ref.snapshot_path,
-                },
-            }
-        )
-
-
-class OverrunRerankAnalyzer(RerankAnalyzer):
-    async def generate_json(
-        self,
-        *,
-        prompt_name: str,
-        payload: dict[str, object],
-        reservation: BudgetReservation,
-    ) -> ProviderResult[dict[str, Any]]:
-        result = await super().generate_json(
-            prompt_name=prompt_name,
-            payload=payload,
-            reservation=reservation,
-        )
-        return result.model_copy(
-            update={
-                "usage": result.usage.model_copy(update={"llm_calls": 2}),
-            }
-        )
-
-
-def test_provider_citation_stage_awaits_budgeted_calls_and_retains_snapshot_refs() -> None:
-    provider = CitationProvider()
-    controller = HardBudgetController(_budget(max_citation_seeds=1))
-    stage = ProviderCitationExpansionStage(
-        provider=provider,
-        call_estimate=UsageEstimate(search_api_calls=1),
-        per_direction_limit=2,
-        max_expanded=2,
-    )
-    seed = Paper(
-        canonical_id="s2:S1",
-        title="Seed",
-        semantic_scholar_id="S1",
-    )
-
-    result = asyncio.run(stage.expand([seed], controller=controller))
-
-    assert [(direction, paper_id) for direction, paper_id, _ in provider.calls] == [
-        ("references", "S1"),
-        ("citations", "S1"),
-    ]
-    assert [paper.canonical_id for paper in result.papers] == [
-        "s2:S1",
-        "s2:S2",
-        "s2:S3",
-    ]
-    assert [ref.entry_id for ref in result.snapshot_refs] == [
-        "citation-1",
-        "citation-2",
-    ]
-    assert controller.committed_usage.search_api_calls == 2
-
-
-def test_structured_provider_citation_failure_degrades_in_orchestrator() -> None:
-    events: list[str] = []
-    controller = HardBudgetController(_budget(max_citation_seeds=1))
-    stage = ProviderCitationExpansionStage(
-        provider=CitationProvider(failed=True),
-        call_estimate=UsageEstimate(search_api_calls=1),
-        per_direction_limit=2,
-        max_expanded=2,
-    )
-    orchestrator = MockSearchOrchestrator(
-        controller=controller,
-        analyzer=FakeAnalyzer(events),
-        providers={
-            "semantic_scholar": FakeProvider("semantic_scholar", events),
-        },
-        config_hash="sha256:" + "c" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        citation_expander=stage,
-    )
-
-    result = asyncio.run(
-        orchestrator.run("graph retrieval", max_provider_results=5)
-    )
-
-    assert [paper.canonical_id for paper in result.papers] == ["s2:S1"]
-    assert result.warnings[-1] == "citation: expansion_unavailable"
-    assert result.trace[-1] == {
-        "step": "citation",
-        "status": "degraded",
-        "count": 1,
-    }
-    assert result.stop_reason == "completed"
-    assert controller.committed_usage.search_api_calls == 3
-
-
-def test_title_candidate_stage_adds_papers_to_pool() -> None:
-    events: list[str] = []
-    controller = HardBudgetController(_budget())
-    stage = FakeTitleCandidateStage(
-        [
-            Paper(
-                canonical_id="openalex:W99",
-                title="Gold",
-                openalex_id="W99",
-                sources=["openalex"],
-            )
-        ]
-    )
-    orchestrator = MockSearchOrchestrator(
-        controller=controller,
-        analyzer=FakeAnalyzer(events),
-        providers={"openalex": FakeProvider("openalex", events)},
-        config_hash="sha256:" + "c" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        title_candidate_stage=stage,
-    )
-
-    result = asyncio.run(
-        orchestrator.run("graph retrieval", max_provider_results=5)
-    )
-
-    assert "openalex:W99" in {
-        paper.canonical_id for paper in result.papers
-    }
-    steps = [
-        entry
-        for entry in result.trace
-        if entry.get("step") == "title_candidates"
-    ]
-    assert steps and steps[0]["status"] == "applied"
-    assert steps[0]["count"] == 1
-    assert result.stop_reason == "completed"
-
-
-def test_title_candidate_stage_degraded_keeps_run_complete() -> None:
-    events: list[str] = []
-    controller = HardBudgetController(_budget())
-    stage = FakeTitleCandidateStage([], degraded=True)
-    orchestrator = MockSearchOrchestrator(
-        controller=controller,
-        analyzer=FakeAnalyzer(events),
-        providers={"openalex": FakeProvider("openalex", events)},
-        config_hash="sha256:" + "c" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        title_candidate_stage=stage,
-    )
-
-    result = asyncio.run(
-        orchestrator.run("graph retrieval", max_provider_results=5)
-    )
-
-    assert [paper.canonical_id for paper in result.papers] == [
-        "openalex:W1"
-    ]
-    assert "title_candidates: unavailable" in result.warnings
-    steps = [
-        entry
-        for entry in result.trace
-        if entry.get("step") == "title_candidates"
-    ]
-    assert steps and steps[0]["status"] == "degraded"
-    assert steps[0]["count"] == 0
-    assert result.stop_reason == "completed"
-
 
 def test_max_output_papers_truncates_final_papers_but_not_pool() -> None:
     events: list[str] = []
@@ -960,704 +408,94 @@ def test_max_output_papers_truncates_final_papers_but_not_pool() -> None:
     )
 
     assert [paper.canonical_id for paper in result.papers] == ["openalex:W0"]
-    assert [
-        paper.canonical_id for paper in result.pre_truncation_candidates
-    ] == ["openalex:W0", "openalex:W1", "openalex:W2"]
     assert len(result.retrieved_paper_ids) == 3
     assert len(result.post_filter_paper_ids) == 3
+    assert len(result.pre_truncation_candidates) == 3
 
 
-def test_llm_rerank_stage_awaits_same_controller_without_nested_event_loop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    analyzer = RerankAnalyzer()
-    controller = HardBudgetController(_budget(max_rerank_candidates=2))
-    stage = LLMConstraintRerankingStage(
-        analyzer=analyzer,
-        call_estimate=UsageEstimate(
-            llm_calls=1,
-            input_tokens=10,
-            output_tokens=10,
-            cost_cny=0.1,
-        ),
-    )
-    papers = [
-        Paper(canonical_id="paper:1", title="One"),
-        Paper(canonical_id="paper:2", title="Two"),
-    ]
+def test_fixed_budget_policy_executes_original_semantic_once_and_preserves_identity() -> None:
+    events: list[tuple[str, str, str]] = []
 
-    async def scenario() -> ConstraintRerankResult:
-        def forbidden(*args: object, **kwargs: object) -> object:
-            del args, kwargs
-            raise AssertionError("production code must not call asyncio.run")
-
-        monkeypatch.setattr(asyncio, "run", forbidden)
-        return await stage.rerank(
-            papers,
-            ["graph retrieval"],
-            controller=controller,
-        )
-
-    result = asyncio.run(scenario())
-
-    assert [item.paper.canonical_id for item in result.ranked] == [
-        "paper:2",
-        "paper:1",
-    ]
-    assert [ref.entry_id for ref in result.snapshot_refs] == ["rerank-1"]
-    assert controller.committed_usage.llm_calls == 1
-
-
-def test_llm_rerank_stage_degrades_on_structured_dependency_failure() -> None:
-    analyzer = RerankAnalyzer(failed=True)
-    controller = HardBudgetController(_budget(max_rerank_candidates=2))
-    stage = LLMConstraintRerankingStage(
-        analyzer=analyzer,
-        call_estimate=UsageEstimate(
-            llm_calls=1,
-            input_tokens=10,
-            output_tokens=10,
-            cost_cny=0.1,
-        ),
-    )
-    papers = [Paper(canonical_id="paper:1", title="One")]
-
-    result = asyncio.run(
-        stage.rerank(papers, ["constraint"], controller=controller)
-    )
-
-    assert result.status == "degraded"
-    assert [item.paper for item in result.ranked] == papers
-    assert result.warnings == ["rerank_unavailable"]
-    assert controller.committed_usage.llm_calls == 1
-
-
-def test_expected_llm_rerank_timeout_degrades_without_failing_orchestrator() -> None:
-    events: list[str] = []
-    controller = HardBudgetController(_budget(max_llm_calls=3))
-    orchestrator = MockSearchOrchestrator(
-        controller=controller,
-        analyzer=FakeAnalyzer(events),
-        providers={"openalex": FakeProvider("openalex", events)},
-        config_hash="sha256:" + "5" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        constraint_reranker=LLMConstraintRerankingStage(
-            analyzer=RerankAnalyzer(failed=True),
-            call_estimate=UsageEstimate(
-                llm_calls=1,
-                input_tokens=10,
-                output_tokens=10,
-                cost_cny=0.1,
-            ),
-        ),
-    )
-
-    result = asyncio.run(
-        orchestrator.run("graph retrieval", max_provider_results=5)
-    )
-
-    assert result.stop_reason == "completed"
-    assert result.warnings[-1] == "rerank: rerank_unavailable"
-    assert result.diagnostics[-1].errors[0].code == "timeout"
-
-
-def test_optional_rerank_authentication_diagnostic_is_preserved() -> None:
-    events: list[str] = []
-
-    class AuthUnavailableRerank:
-        async def rerank(
+    class RecordingProvider(FakeProvider):
+        async def search(
             self,
-            papers: list[Paper],
-            constraints: list[str],
-            *,
-            controller: HardBudgetController,
-        ) -> ConstraintRerankResult:
-            del papers, constraints, controller
-            diagnostic = DependencyDiagnostic(
-                dependency="llm",
-                endpoint="constraint_rerank",
-                model_id=None,
-                usage=UsageActual(),
-                latency_ms=0,
-                cache_hit=False,
-                snapshot_refs=[],
-                errors=[
-                    ErrorDetail(
-                        code="authentication_error",
-                        message="synthetic auth failure",
-                        retryable=False,
-                        provider="llm",
-                    )
-                ],
-            )
-            error = OptionalStageUnavailableError("rerank unavailable")
-            error.diagnostic = diagnostic
-            raise error
+            query: str,
+            filters: dict[str, object],
+            limit: int,
+            reservation: object,
+        ) -> ProviderResult[list[Paper]]:
+            mode = str(filters.pop("_search_mode", "lexical"))
+            events.append((self.name, mode, query))
+            return await super().search(query, filters, limit, reservation)
 
     orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget()),
-        analyzer=FakeAnalyzer(events),
-        providers={"openalex": FakeProvider("openalex", events)},
+        controller=HardBudgetController(_budget(max_search_api_calls=7)),
+        analyzer=FakeAnalyzer([]),
+        providers={
+            "openalex": RecordingProvider("openalex", []),
+            "semantic_scholar": RecordingProvider("semantic_scholar", []),
+        },
         config_hash="sha256:" + "6" * 64,
         prompt_version="query-analyze-v1",
         analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
         provider_estimate=UsageEstimate(search_api_calls=1),
-        constraint_reranker=AuthUnavailableRerank(),
+        retrieval_policy=FixedBudgetOpenAlexPolicy(max_openalex_calls=6),
     )
 
     result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
-    assert result.stop_reason == "dependency_failure"
-    assert result.diagnostics[-1].errors[0].code == "authentication_error"
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        ReservationError("reservation mismatch"),
-        BudgetExceededError("budget exhausted"),
-        ProviderAdapterError("authentication failed"),
-        ValueError("malformed provider snapshot provenance"),
-    ],
-)
-def test_optional_citation_propagates_protected_failures(error: Exception) -> None:
-    events: list[str] = []
-
-    class FailingCitation:
-        async def expand(
-            self,
-            seeds: list[Paper],
-            *,
-            controller: HardBudgetController,
-        ) -> CitationExpansionResult:
-            del seeds, controller
-            raise error
-
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget()),
-        analyzer=FakeAnalyzer(events),
-        providers={"openalex": FakeProvider("openalex", events)},
-        config_hash="sha256:" + "4" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        citation_expander=FailingCitation(),
+    openalex = [event for event in events if event[0] == "openalex"]
+    assert 2 <= len(openalex) <= 6
+    assert openalex[0] == ("openalex", "lexical", "graph retrieval")
+    assert openalex[1] == ("openalex", "semantic", "graph retrieval")
+    assert sum(mode == "semantic" for _, mode, _ in openalex) == 1
+    assert all(provider != "semantic_scholar" for provider, _, _ in events)
+    retrieval_trace = [
+        item for item in result.trace if item.get("step") == "retrieve"
+    ]
+    assert all(
+        item["action_type"] in {"text_search", "title_search"}
+        for item in retrieval_trace
+    )
+    assert all(
+        item["method"] in {"lexical_original", "semantic_original", "structured"}
+        for item in retrieval_trace
     )
 
-    with pytest.raises(type(error), match=str(error)):
-        asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        ReservationError("reservation mismatch"),
-        BudgetExceededError("budget exhausted"),
-        LLMAdapterError("authentication failed"),
-        ValueError("incomplete LLM snapshot provenance"),
-    ],
-)
-def test_optional_rerank_propagates_protected_failures(error: Exception) -> None:
+def test_orchestrator_applies_injected_document_ranker_after_fusion() -> None:
     events: list[str] = []
-
-    class FailingRerank:
-        async def rerank(
-            self,
-            papers: list[Paper],
-            constraints: list[str],
-            *,
-            controller: HardBudgetController,
-        ) -> ConstraintRerankResult:
-            del papers, constraints, controller
-            raise error
-
+    document_ranker = FakeDocumentRanker()
     orchestrator = MockSearchOrchestrator(
         controller=HardBudgetController(_budget()),
         analyzer=FakeAnalyzer(events),
-        providers={"openalex": FakeProvider("openalex", events)},
+        providers={
+            "openalex": FakeProvider("openalex", events),
+            "semantic_scholar": FakeProvider("semantic_scholar", events),
+        },
         config_hash="sha256:" + "3" * 64,
         prompt_version="query-analyze-v1",
         analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
         provider_estimate=UsageEstimate(search_api_calls=1),
-        constraint_reranker=FailingRerank(),
-    )
-
-    with pytest.raises(type(error), match=str(error)):
-        asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-
-def test_citation_cancellation_terminally_fails_active_reservation() -> None:
-    class CancellingProvider(CitationProvider):
-        reservation: BudgetReservation | None = None
-
-        async def references(
-            self,
-            paper_id: ProviderPaperId,
-            limit: int,
-            reservation: BudgetReservation,
-        ) -> ProviderResult[CitationExpansion]:
-            del paper_id, limit
-            self.reservation = reservation
-            raise asyncio.CancelledError
-
-    provider = CancellingProvider()
-    controller = HardBudgetController(_budget(max_citation_seeds=1))
-    stage = ProviderCitationExpansionStage(
-        provider=provider,
-        call_estimate=UsageEstimate(search_api_calls=1),
-    )
-    seed = Paper(
-        canonical_id="s2:S1",
-        title="Seed",
-        semantic_scholar_id="S1",
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(stage.expand([seed], controller=controller))
-
-    assert provider.reservation is not None
-    assert controller.terminal_outcome(provider.reservation) == (
-        "failed",
-        UsageActual(),
-    )
-    assert controller.reserved_usage.search_api_calls == 0
-
-
-def test_llm_rerank_cancellation_terminally_fails_active_reservation() -> None:
-    class CancellingAnalyzer:
-        reservation: BudgetReservation | None = None
-
-        async def generate_json(
-            self,
-            *,
-            prompt_name: str,
-            payload: dict[str, object],
-            reservation: BudgetReservation,
-        ) -> ProviderResult[dict[str, Any]]:
-            del prompt_name, payload
-            self.reservation = reservation
-            raise asyncio.CancelledError
-
-    analyzer = CancellingAnalyzer()
-    controller = HardBudgetController(_budget(max_rerank_candidates=1))
-    stage = LLMConstraintRerankingStage(
-        analyzer=analyzer,
-        call_estimate=UsageEstimate(
-            llm_calls=1,
-            input_tokens=10,
-            output_tokens=10,
-            cost_cny=0.1,
-        ),
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            stage.rerank(
-                [Paper(canonical_id="paper:1", title="One")],
-                ["constraint"],
-                controller=controller,
-            )
-        )
-
-    assert analyzer.reservation is not None
-    assert controller.terminal_outcome(analyzer.reservation) == (
-        "failed",
-        UsageActual(),
-    )
-    assert controller.reserved_usage.llm_calls == 0
-
-
-def test_citation_stage_propagates_adapter_authentication_failure() -> None:
-    class AuthenticationFailureProvider(CitationProvider):
-        async def references(
-            self,
-            paper_id: ProviderPaperId,
-            limit: int,
-            reservation: BudgetReservation,
-        ) -> ProviderResult[CitationExpansion]:
-            del paper_id, limit, reservation
-            raise ProviderAdapterError("authentication failed")
-
-    controller = HardBudgetController(_budget(max_citation_seeds=1))
-    stage = ProviderCitationExpansionStage(
-        provider=AuthenticationFailureProvider(),
-        call_estimate=UsageEstimate(search_api_calls=1),
-    )
-
-    with pytest.raises(ProviderAdapterError, match="authentication failed"):
-        asyncio.run(
-            stage.expand(
-                [
-                    Paper(
-                        canonical_id="s2:S1",
-                        title="Seed",
-                        semantic_scholar_id="S1",
-                    )
-                ],
-                controller=controller,
-            )
-        )
-
-
-def test_llm_rerank_stage_propagates_adapter_authentication_failure() -> None:
-    class AuthenticationFailureAnalyzer:
-        async def generate_json(
-            self,
-            *,
-            prompt_name: str,
-            payload: dict[str, object],
-            reservation: BudgetReservation,
-        ) -> ProviderResult[dict[str, Any]]:
-            del prompt_name, payload, reservation
-            raise LLMAdapterError("authentication failed")
-
-    controller = HardBudgetController(_budget(max_rerank_candidates=1))
-    stage = LLMConstraintRerankingStage(
-        analyzer=AuthenticationFailureAnalyzer(),
-        call_estimate=UsageEstimate(
-            llm_calls=1,
-            input_tokens=10,
-            output_tokens=10,
-            cost_cny=0.1,
-        ),
-    )
-
-    with pytest.raises(LLMAdapterError, match="authentication failed"):
-        asyncio.run(
-            stage.rerank(
-                [Paper(canonical_id="paper:1", title="One")],
-                ["constraint"],
-                controller=controller,
-            )
-        )
-
-
-def test_citation_stage_propagates_malformed_snapshot_provenance() -> None:
-    class MalformedSnapshotProvider(CitationProvider):
-        def _expansion_result(
-            self,
-            direction: str,
-            paper_id: ProviderPaperId,
-            reservation: BudgetReservation,
-        ) -> ProviderResult[CitationExpansion]:
-            result = super()._expansion_result(direction, paper_id, reservation)
-            return result.model_copy(
-                update={
-                    "provenance": {
-                        **result.provenance,
-                        "snapshot_refs": "{malformed",
-                    }
-                }
-            )
-
-    controller = HardBudgetController(_budget(max_citation_seeds=1))
-    stage = ProviderCitationExpansionStage(
-        provider=MalformedSnapshotProvider(),
-        call_estimate=UsageEstimate(search_api_calls=1),
-    )
-
-    with pytest.raises(ValueError, match="invalid citation snapshot provenance"):
-        asyncio.run(
-            stage.expand(
-                [
-                    Paper(
-                        canonical_id="s2:S1",
-                        title="Seed",
-                        semantic_scholar_id="S1",
-                    )
-                ],
-                controller=controller,
-            )
-        )
-
-
-def test_llm_stage_propagates_incomplete_flattened_snapshot_provenance() -> None:
-    class IncompleteSnapshotAnalyzer(RerankAnalyzer):
-        async def generate_json(
-            self,
-            *,
-            prompt_name: str,
-            payload: dict[str, object],
-            reservation: BudgetReservation,
-        ) -> ProviderResult[dict[str, Any]]:
-            result = await super().generate_json(
-                prompt_name=prompt_name,
-                payload=payload,
-                reservation=reservation,
-            )
-            provenance = dict(result.provenance)
-            provenance.pop("snapshot_cache_key")
-            return result.model_copy(update={"provenance": provenance})
-
-    controller = HardBudgetController(_budget(max_rerank_candidates=1))
-    stage = LLMConstraintRerankingStage(
-        analyzer=IncompleteSnapshotAnalyzer(),
-        call_estimate=UsageEstimate(
-            llm_calls=1,
-            input_tokens=10,
-            output_tokens=10,
-            cost_cny=0.1,
-        ),
-    )
-
-    with pytest.raises(ValueError, match="incomplete LLM snapshot provenance"):
-        asyncio.run(
-            stage.rerank(
-                [Paper(canonical_id="paper:1", title="One")],
-                ["constraint"],
-                controller=controller,
-            )
-        )
-
-
-def test_replay_llm_rerank_snapshot_miss_is_a_typed_service_failure() -> None:
-    events: list[str] = []
-
-    def factory(
-        controller: HardBudgetController,
-        run_id: str,
-    ) -> MockSearchOrchestrator:
-        del run_id
-        return MockSearchOrchestrator(
-            controller=controller,
-            analyzer=FakeAnalyzer(events),
-            providers={"openalex": FakeProvider("openalex", events)},
-            config_hash="sha256:" + "2" * 64,
-            prompt_version="query-analyze-v1",
-            analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-            provider_estimate=UsageEstimate(search_api_calls=1),
-            execution_mode="replay",
-            constraint_reranker=LLMConstraintRerankingStage(
-                analyzer=RerankAnalyzer(
-                    failed=True,
-                    error_code="snapshot_unavailable",
-                ),
-                call_estimate=UsageEstimate(
-                    llm_calls=1,
-                    input_tokens=10,
-                    output_tokens=10,
-                    cost_cny=0.1,
-                ),
-            ),
-        )
-
-    service = SearchApplicationService(
-        orchestrator_factory=factory,
-        budgets={"balanced": _budget(max_llm_calls=3)},
-        mode="replay",
-        snapshot_set_id="fixture-snapshot-set",
-        snapshot_captured_at=datetime(2026, 7, 23, tzinfo=UTC),
-        git_sha="a" * 40,
-        max_provider_results=5,
-        run_id_factory=lambda: "rerank-snapshot-miss",
-    )
-
-    execution = asyncio.run(
-        service.execute(
-            SearchRequest(
-                query_id="q-rerank-miss",
-                query="graph retrieval",
-                mode="replay",
-            )
-        )
-    )
-
-    assert execution.outcome.kind == "failure"
-    assert execution.outcome.error.code == "snapshot_unavailable"
-    assert any(
-        error.code == "snapshot_unavailable"
-        for diagnostic in execution.diagnostics
-        if diagnostic.dependency == "llm"
-        for error in diagnostic.errors
-    )
-
-
-def test_replay_citation_snapshot_miss_is_a_typed_service_failure() -> None:
-    events: list[str] = []
-
-    def factory(
-        controller: HardBudgetController,
-        run_id: str,
-    ) -> MockSearchOrchestrator:
-        del run_id
-        return MockSearchOrchestrator(
-            controller=controller,
-            analyzer=FakeAnalyzer(events),
-            providers={
-                "semantic_scholar": FakeProvider("semantic_scholar", events),
-            },
-            config_hash="sha256:" + "0" * 64,
-            prompt_version="query-analyze-v1",
-            analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-            provider_estimate=UsageEstimate(search_api_calls=1),
-            execution_mode="replay",
-            citation_expander=ProviderCitationExpansionStage(
-                provider=CitationProvider(
-                    failed=True,
-                    error_code="snapshot_unavailable",
-                ),
-                call_estimate=UsageEstimate(search_api_calls=1),
-            ),
-        )
-
-    service = SearchApplicationService(
-        orchestrator_factory=factory,
-        budgets={"balanced": _budget(max_search_api_calls=8)},
-        mode="replay",
-        snapshot_set_id="fixture-snapshot-set",
-        snapshot_captured_at=datetime(2026, 7, 23, tzinfo=UTC),
-        git_sha="c" * 40,
-        max_provider_results=5,
-        run_id_factory=lambda: "citation-snapshot-miss",
-    )
-
-    execution = asyncio.run(
-        service.execute(
-            SearchRequest(
-                query_id="q-citation-miss",
-                query="graph retrieval",
-                mode="replay",
-            )
-        )
-    )
-
-    assert execution.outcome.kind == "failure"
-    assert execution.outcome.error.code == "snapshot_unavailable"
-    assert any(
-        error.code == "snapshot_unavailable"
-        for diagnostic in execution.diagnostics
-        if diagnostic.dependency == "semantic_scholar"
-        for error in diagnostic.errors
-    )
-
-
-def test_optional_snapshot_refs_survive_service_and_evaluation_adaptation() -> None:
-    events: list[str] = []
-
-    def factory(
-        controller: HardBudgetController,
-        run_id: str,
-    ) -> MockSearchOrchestrator:
-        del run_id
-        return MockSearchOrchestrator(
-            controller=controller,
-            analyzer=FakeAnalyzer(events),
-            providers={
-                "semantic_scholar": FakeProvider("semantic_scholar", events),
-            },
-            config_hash="sha256:" + "1" * 64,
-            prompt_version="query-analyze-v1",
-            analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-            provider_estimate=UsageEstimate(search_api_calls=1),
-            execution_mode="replay",
-            citation_expander=ProviderCitationExpansionStage(
-                provider=CitationProvider(),
-                call_estimate=UsageEstimate(search_api_calls=1),
-                per_direction_limit=2,
-                max_expanded=2,
-            ),
-        )
-
-    service = SearchApplicationService(
-        orchestrator_factory=factory,
-        budgets={"balanced": _budget(max_search_api_calls=8)},
-        mode="replay",
-        snapshot_set_id="fixture-snapshot-set",
-        snapshot_captured_at=datetime(2026, 7, 23, tzinfo=UTC),
-        git_sha="b" * 40,
-        max_provider_results=5,
-        run_id_factory=lambda: "citation-evidence-run",
-    )
-    execution = asyncio.run(
-        service.execute(
-            SearchRequest(
-                query_id="q-citation-evidence",
-                query="graph retrieval",
-                mode="replay",
-            )
-        )
-    )
-
-    assert execution.outcome.kind == "success"
-    service_refs = [
-        ref.entry_id
-        for diagnostic in execution.diagnostics
-        for ref in diagnostic.snapshot_refs
-        if diagnostic.endpoint == "citation_expansion"
-    ]
-    assert service_refs == ["citation-1", "citation-2"]
-
-    adapted = adapt_execution(
-        expected_query_id="q-citation-evidence",
-        result=execution,
-    )
-    evaluation_refs = [
-        ref.entry_id
-        for diagnostic in adapted.execution.diagnostics
-        for ref in diagnostic.snapshot_refs
-    ]
-    assert evaluation_refs == ["citation-1", "citation-2"]
-
-
-def test_optional_stage_reservation_mismatch_hard_stops_instead_of_degrading() -> None:
-    events: list[str] = []
-    controller = HardBudgetController(_budget(max_llm_calls=3))
-    stage = LLMConstraintRerankingStage(
-        analyzer=OverrunRerankAnalyzer(),
-        call_estimate=UsageEstimate(
-            llm_calls=1,
-            input_tokens=10,
-            output_tokens=10,
-            cost_cny=0.1,
-        ),
-    )
-    orchestrator = MockSearchOrchestrator(
-        controller=controller,
-        analyzer=FakeAnalyzer(events),
-        providers={"openalex": FakeProvider("openalex", events)},
-        config_hash="sha256:" + "d" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        constraint_reranker=stage,
-    )
-
-    with pytest.raises(ReservationError, match="exceeds its reservation"):
-        asyncio.run(
-            orchestrator.run("graph retrieval", max_provider_results=5)
-        )
-
-    assert controller.stop_status() == "hard_stop"
-
-
-def test_orchestrator_runs_optional_citation_then_rerank_stages() -> None:
-    events: list[str] = []
-    extra = Paper(canonical_id="fixture:extra", title="Expanded fixture")
-    citation = FakeCitationExpander(extra)
-    reranker = FakeConstraintReranker()
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget()),
-        analyzer=FakeAnalyzer(events),
-        providers={"openalex": FakeProvider("openalex", events)},
-        config_hash="sha256:" + "9" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        citation_expander=citation,
-        constraint_reranker=reranker,
+        document_ranker=document_ranker,
     )
 
     result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
-    assert citation.calls == [["openalex:W1"]]
-    assert reranker.calls == [(["openalex:W1", "fixture:extra"], [])]
+    assert document_ranker.calls == [
+        ("graph retrieval", ["openalex:W1", "s2:S1"])
+    ]
     assert [paper.canonical_id for paper in result.papers] == [
-        "fixture:extra",
+        "s2:S1",
         "openalex:W1",
     ]
-    assert [item["step"] for item in result.trace[-2:]] == ["citation", "rerank"]
+    assert result.trace[-1] == {
+        "step": "document_rank",
+        "status": "applied",
+        "model_id": "fixture-document-ranker-v1",
+        "count": 2,
+    }
+
 
 
 def test_orchestrator_accepts_dependency_owned_terminal_settlement() -> None:
@@ -1717,252 +555,7 @@ def test_locked_baseline_router_prevents_unconditional_either_fanout() -> None:
     asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
     assert events.count("openalex") == 3
-    assert events.count("semantic_scholar") == 1
-
-
-@pytest.mark.parametrize(
-    ("openalex_empty", "openalex_failed", "expected_s2_calls"),
-    [(False, False, 0), (True, False, 1), (False, True, 1)],
-)
-def test_semantic_scholar_supplement_is_an_openalex_fallback(
-    openalex_empty: bool,
-    openalex_failed: bool,
-    expected_s2_calls: int,
-) -> None:
-    events: list[str] = []
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget(max_search_api_calls=6)),
-        analyzer=SingleEitherAnalyzer(events),
-        providers={
-            "openalex": FakeProvider(
-                "openalex",
-                events,
-                empty=openalex_empty,
-                failed=openalex_failed,
-            ),
-            "semantic_scholar": FakeProvider("semantic_scholar", events),
-        },
-        config_hash="sha256:" + "6" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        routing_limits=(1, 1, 1),
-    )
-
-    result = asyncio.run(
-        orchestrator.run("graph retrieval", max_provider_results=5)
-    )
-
-    assert events.count("openalex") == 1
-    assert events.count("semantic_scholar") == expected_s2_calls
-    assert set(result.provider_results) == (
-        {"openalex", "semantic_scholar"}
-        if expected_s2_calls
-        else {"openalex"}
-    )
-    if expected_s2_calls == 0:
-        assert any(item.get("step") == "skip_optional_provider" for item in result.trace)
-
-
-def test_fixed_hybrid_policy_executes_both_modes_and_skips_healthy_s2() -> None:
-    events: list[tuple[str, str]] = []
-
-    class RecordingProvider(FakeProvider):
-        async def search(
-            self,
-            query: str,
-            filters: dict[str, object],
-            limit: int,
-            reservation: object,
-        ) -> ProviderResult[list[Paper]]:
-            mode = str(filters.pop("_search_mode", "lexical"))
-            events.append((self.name, mode))
-            return await super().search(query, filters, limit, reservation)
-
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget(max_search_api_calls=8)),
-        analyzer=FakeAnalyzer([]),
-        providers={
-            "openalex": RecordingProvider("openalex", []),
-            "semantic_scholar": RecordingProvider("semantic_scholar", []),
-        },
-        config_hash="sha256:" + "6" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        retrieval_policy=FixedHybridOpenAlexPolicy(
-            min_openalex_calls=3,
-            max_openalex_calls=6,
-            max_semantic_scholar_calls=2,
-        ),
-    )
-
-    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-    assert events == [
-        ("openalex", "lexical"),
-        ("openalex", "semantic"),
-        ("openalex", "lexical"),
-        ("openalex", "semantic"),
-        ("openalex", "lexical"),
-        ("openalex", "semantic"),
-    ]
-    assert set(result.provider_results) == {"openalex"}
-    assert result.citation_edges == []
-    assert [
-        item["search_mode"]
-        for item in result.trace
-        if item.get("step") == "retrieve"
-    ] == ["lexical", "semantic", "lexical", "semantic", "lexical", "semantic"]
-
-
-def test_fixed_budget_policy_executes_original_semantic_once_and_preserves_identity() -> None:
-    events: list[tuple[str, str, str]] = []
-
-    class RecordingProvider(FakeProvider):
-        async def search(
-            self,
-            query: str,
-            filters: dict[str, object],
-            limit: int,
-            reservation: object,
-        ) -> ProviderResult[list[Paper]]:
-            mode = str(filters.pop("_search_mode", "lexical"))
-            events.append((self.name, mode, query))
-            return await super().search(query, filters, limit, reservation)
-
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget(max_search_api_calls=7)),
-        analyzer=FakeAnalyzer([]),
-        providers={
-            "openalex": RecordingProvider("openalex", []),
-            "semantic_scholar": RecordingProvider("semantic_scholar", []),
-        },
-        config_hash="sha256:" + "6" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        retrieval_policy=FixedBudgetOpenAlexPolicy(max_openalex_calls=6),
-    )
-
-    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-    openalex = [event for event in events if event[0] == "openalex"]
-    assert 2 <= len(openalex) <= 6
-    assert openalex[0] == ("openalex", "lexical", "graph retrieval")
-    assert openalex[1] == ("openalex", "semantic", "graph retrieval")
-    assert sum(mode == "semantic" for _, mode, _ in openalex) == 1
-    retrieval_trace = [
-        item for item in result.trace if item.get("step") == "retrieve"
-    ]
-    assert all(item["action_type"] in {"text_search", "title_search"} for item in retrieval_trace)
-    assert all(item["method"] in {"lexical_original", "semantic_original", "structured"} for item in retrieval_trace)
-
-
-def test_fixed_hybrid_policy_fuses_each_search_action_independently() -> None:
-    class ActionAwareProvider:
-        async def search(
-            self,
-            query: str,
-            filters: dict[str, object],
-            limit: int,
-            reservation: object,
-        ) -> ProviderResult[list[Paper]]:
-            del reservation
-            mode = str(filters.pop("_search_mode", "lexical"))
-            route_number = (
-                1 if query.endswith("openalex") else 2 if query.endswith("semantic") else 3
-            )
-            filler = [
-                Paper(
-                    canonical_id=f"openalex:W{route_number}{0 if mode == 'lexical' else 1}{index:03d}",
-                    title=f"{mode} route {route_number} paper {index}",
-                    openalex_id=f"W{route_number}{0 if mode == 'lexical' else 1}{index:03d}",
-                    sources=["openalex"],
-                )
-                for index in range(limit)
-            ]
-            if mode == "semantic":
-                filler[0] = Paper(
-                    canonical_id="openalex:W999999",
-                    title="Gold paper",
-                    openalex_id="W999999",
-                    arxiv_id="2401.00001",
-                    sources=["openalex"],
-                )
-            return _result(
-                "openalex",
-                filler,
-                UsageActual(search_api_calls=1),
-            )
-
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget(max_search_api_calls=6)),
-        analyzer=FakeAnalyzer([]),
-        providers={"openalex": ActionAwareProvider()},
-        config_hash="sha256:" + "6" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        retrieval_policy=FixedHybridOpenAlexPolicy(
-            min_openalex_calls=3,
-            max_openalex_calls=6,
-            max_semantic_scholar_calls=0,
-        ),
-        max_output_papers=1,
-    )
-
-    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=50))
-
-    assert [paper.canonical_id for paper in result.papers] == ["openalex:W999999"]
-    assert len(result.fused_papers[0].source_ranks) == 3
-
-
-def test_fixed_hybrid_policy_calls_s2_only_for_failed_lexical_fallbacks() -> None:
-    events: list[tuple[str, str]] = []
-
-    class RecordingProvider(FakeProvider):
-        async def search(
-            self,
-            query: str,
-            filters: dict[str, object],
-            limit: int,
-            reservation: object,
-        ) -> ProviderResult[list[Paper]]:
-            mode = str(filters.pop("_search_mode", "lexical"))
-            events.append((self.name, mode))
-            return await super().search(query, filters, limit, reservation)
-
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget(max_search_api_calls=10)),
-        analyzer=FakeAnalyzer([]),
-        providers={
-            "openalex": RecordingProvider("openalex", [], empty=True),
-            "semantic_scholar": RecordingProvider("semantic_scholar", []),
-        },
-        config_hash="sha256:" + "6" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        retrieval_policy=FixedHybridOpenAlexPolicy(
-            min_openalex_calls=3,
-            max_openalex_calls=6,
-            max_semantic_scholar_calls=2,
-        ),
-    )
-
-    asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-    assert events == [
-        ("openalex", "lexical"),
-        ("semantic_scholar", "lexical"),
-        ("openalex", "semantic"),
-        ("openalex", "lexical"),
-        ("semantic_scholar", "lexical"),
-        ("openalex", "semantic"),
-        ("openalex", "lexical"),
-        ("openalex", "semantic"),
-    ]
+    assert events.count("semantic_scholar") <= 2
 
 
 def test_replay_integrity_failure_records_zero_external_spend() -> None:
@@ -2020,35 +613,6 @@ def test_formal_live_provider_exception_fails_closed_without_integrity_abort() -
     assert "openalex: provider exception" in result.warnings
 
 
-def test_orchestrator_keeps_order_when_optional_stage_degrades() -> None:
-    events: list[str] = []
-
-    class BrokenCitation:
-        async def expand(
-            self,
-            seeds: list[Paper],
-            *,
-            controller: HardBudgetController,
-        ) -> CitationExpansionResult:
-            del seeds, controller
-            raise CitationExpansionUnavailableError("private fixture failure")
-
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget()),
-        analyzer=FakeAnalyzer(events),
-        providers={"openalex": FakeProvider("openalex", events)},
-        config_hash="sha256:" + "a" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        citation_expander=BrokenCitation(),
-    )
-
-    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-    assert [paper.canonical_id for paper in result.papers] == ["openalex:W1"]
-    assert result.warnings[-1] == "citation: expansion_unavailable"
-
 
 def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
     events: list[str] = []
@@ -2065,6 +629,7 @@ def test_orchestrator_orders_budgeted_mock_pipeline_and_records_trace() -> None:
     result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
 
     assert events == ["analyze", "openalex", "semantic_scholar", "openalex"]
+    assert any(item.get("step") == "skip_optional_provider" for item in result.trace)
     assert [paper.canonical_id for paper in result.papers] == ["openalex:W1", "s2:S1"]
     assert [item["step"] for item in result.trace] == [
         "analyze",
@@ -2292,170 +857,6 @@ def test_orchestrator_retains_valid_sibling_result_when_one_provider_fails() -> 
     assert result.is_partial is True
     assert "openalex: provider returned errors" in result.warnings
 
-
-def test_orchestrator_applies_injected_document_ranker_after_fusion() -> None:
-    events: list[str] = []
-    document_ranker = FakeDocumentRanker()
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget()),
-        analyzer=FakeAnalyzer(events),
-        providers={
-            "openalex": FakeProvider("openalex", events),
-            "semantic_scholar": FakeProvider("semantic_scholar", events),
-        },
-        config_hash="sha256:" + "3" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        document_ranker=document_ranker,
-    )
-
-    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-    assert document_ranker.calls == [
-        ("graph retrieval", ["openalex:W1", "s2:S1"])
-    ]
-    assert [paper.canonical_id for paper in result.papers] == [
-        "s2:S1",
-        "openalex:W1",
-    ]
-    assert result.trace[-1] == {
-        "step": "document_rank",
-        "status": "applied",
-        "model_id": "fixture-document-ranker-v1",
-        "count": 2,
-    }
-
-
-def test_orchestrator_applies_injected_embedding_after_fusion() -> None:
-    events: list[str] = []
-    embedding = FakeEmbeddingRanker()
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget()),
-        analyzer=FakeAnalyzer(events),
-        providers={
-            "openalex": FakeProvider("openalex", events),
-            "semantic_scholar": FakeProvider("semantic_scholar", events),
-        },
-        config_hash="sha256:" + "4" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        embedding_ranker=embedding,
-    )
-
-    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-    assert embedding.calls == [("graph retrieval", ["openalex:W1", "s2:S1"])]
-    assert [paper.canonical_id for paper in result.papers] == [
-        "s2:S1",
-        "openalex:W1",
-    ]
-    assert result.trace[-1] == {
-        "step": "embedding",
-        "status": "applied",
-        "model_id": "fixture-embedding-v1",
-        "device": "cpu",
-        "fallback_used": False,
-        "count": 2,
-    }
-
-
-def test_orchestrator_embedding_degradation_keeps_fused_order() -> None:
-    events: list[str] = []
-    embedding = FakeEmbeddingRanker(degraded=True)
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget()),
-        analyzer=FakeAnalyzer(events),
-        providers={
-            "openalex": FakeProvider("openalex", events),
-            "semantic_scholar": FakeProvider("semantic_scholar", events),
-        },
-        config_hash="sha256:" + "5" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        embedding_ranker=embedding,
-    )
-
-    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-    assert [paper.canonical_id for paper in result.papers] == [
-        "openalex:W1",
-        "s2:S1",
-    ]
-    assert result.is_partial is True
-    assert result.warnings[-1] == "embedding: encoder_unavailable"
-
-
-def test_orchestrator_embedding_degradation_ignores_reversed_ranked_order() -> None:
-    events: list[str] = []
-    embedding = FakeEmbeddingRanker(degraded=True, reverse_on_degraded=True)
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget()),
-        analyzer=FakeAnalyzer(events),
-        providers={
-            "openalex": FakeProvider("openalex", events),
-            "semantic_scholar": FakeProvider("semantic_scholar", events),
-        },
-        config_hash="sha256:" + "7" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        embedding_ranker=embedding,
-    )
-
-    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-    assert embedding.calls == [("graph retrieval", ["openalex:W1", "s2:S1"])]
-    assert [paper.canonical_id for paper in result.papers] == [
-        "openalex:W1",
-        "s2:S1",
-    ]
-    assert result.trace[-1] == {
-        "step": "embedding",
-        "status": "degraded",
-        "model_id": "fixture-embedding-v1",
-        "device": "cpu",
-        "fallback_used": False,
-        "count": 2,
-    }
-    assert result.warnings[-1] == "embedding: encoder_unavailable"
-
-
-def test_orchestrator_sanitizes_injected_embedding_trace_metadata() -> None:
-    events: list[str] = []
-    orchestrator = MockSearchOrchestrator(
-        controller=HardBudgetController(_budget()),
-        analyzer=FakeAnalyzer(events),
-        providers={
-            "openalex": FakeProvider("openalex", events),
-            "semantic_scholar": FakeProvider("semantic_scholar", events),
-        },
-        config_hash="sha256:" + "8" * 64,
-        prompt_version="query-analyze-v1",
-        analysis_estimate=UsageEstimate(llm_calls=1, cost_cny=0.1),
-        provider_estimate=UsageEstimate(search_api_calls=1),
-        embedding_ranker=MaliciousEmbeddingRanker(),
-    )
-
-    result = asyncio.run(orchestrator.run("graph retrieval", max_provider_results=5))
-
-    assert result.trace[-1]["model_id"] == "local_model"
-    assert result.warnings[-3:] == [
-        "embedding: cuda_oom_cpu_fallback",
-        "embedding: unsanitized_warning",
-        "embedding: unsanitized_warning",
-    ]
-    public_metadata = result.model_dump_json(include={"trace", "warnings"})
-    assert "graph retrieval" not in public_metadata
-    assert "openalex:W1" not in public_metadata
-    assert "s2:S1" not in public_metadata
-    assert "private-cache" not in public_metadata
-    assert "query_graph_retrieval" not in public_metadata
-    assert "openalex_w1" not in public_metadata
-    assert "s2_s1" not in public_metadata
-    assert "private_cache" not in public_metadata
 
 
 def test_orchestrator_default_path_does_not_invoke_or_trace_embedding() -> None:

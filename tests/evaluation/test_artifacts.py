@@ -10,13 +10,8 @@ import pytest
 import yaml
 
 from paper_search.application.artifacts import FormalRunWorkspace, RunManifest
-from paper_search.application.experiments import ExperimentDefinition, ExperimentFlags
+from paper_search.application.experiments import ExperimentFlags
 from paper_search.application.locks import CandidateLock, ReplayLock, lock_sha256
-from paper_search.config import (
-    EmbeddingConfig,
-    ExperimentConfigEvidence,
-    experiment_config_hash,
-)
 from paper_search.control.ledger import LedgerReport
 from paper_search.domain.models import DependencyStatus, UsageActual, UsageEstimate
 from paper_search.evaluation.business_results import (
@@ -103,71 +98,6 @@ def _execution(query_id: str) -> EvaluationExecutionRecord:
         planner_fallback=False,
         stop_reason="completed",
     )
-
-
-def test_formal_workspace_accepts_nonbaseline_experiment_config_binding(
-    tmp_path: Path,
-) -> None:
-    candidate = _candidate_lock()
-    definition = ExperimentDefinition(
-        name="embedding",
-        flags=ExperimentFlags(embedding=True),
-        strategy="fixed-one-round",
-    )
-    evidence = ExperimentConfigEvidence(
-        experiment=definition,
-        embedding=EmbeddingConfig(enabled=True),
-    )
-    manifest = _manifest().model_copy(
-        update={
-            "config_hash": experiment_config_hash(
-                input_lock_sha256=lock_sha256(candidate),
-                evidence=evidence,
-            ),
-            "experiment_name": "embedding",
-            "optional_modules": definition.flags.model_dump(mode="python"),
-            "experiment_config": evidence,
-        }
-    )
-
-    workspace = FormalRunWorkspace(
-        runs_root=tmp_path / "runs",
-        manifest=manifest,
-        input_lock_bytes=_input_lock_bytes(),
-        nonce_factory=lambda: "nonce",
-        clock=lambda: NOW,
-    )
-
-    assert workspace.work_dir.exists()
-
-
-def test_formal_workspace_rejects_unverifiable_experiment_hash(tmp_path: Path) -> None:
-    definition = ExperimentDefinition(
-        name="embedding",
-        flags=ExperimentFlags(embedding=True),
-        strategy="fixed-one-round",
-    )
-    evidence = ExperimentConfigEvidence(
-        experiment=definition,
-        embedding=EmbeddingConfig(enabled=True),
-    )
-    manifest = _manifest().model_copy(
-        update={
-            "config_hash": SHA_B,
-            "experiment_name": "embedding",
-            "optional_modules": definition.flags.model_dump(mode="python"),
-            "experiment_config": evidence,
-        }
-    )
-
-    with pytest.raises(ValueError, match="manifest does not match"):
-        FormalRunWorkspace(
-            runs_root=tmp_path / "runs",
-            manifest=manifest,
-            input_lock_bytes=_input_lock_bytes(),
-            nonce_factory=lambda: "nonce",
-            clock=lambda: NOW,
-        )
 
 
 def test_formal_workspace_rejects_incomplete_baseline_flags(tmp_path: Path) -> None:

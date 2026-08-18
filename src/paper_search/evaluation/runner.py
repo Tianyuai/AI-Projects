@@ -1199,7 +1199,7 @@ async def _run_formal_evaluation(
         network_authorized=request.network_authorized,
         lock_bytes=inputs.lock_bytes,
         runtime_config=request.runtime_config,
-        ablation_config=request.ablation_config_path or Path("configs/ablations.yaml"),
+        ablation_config=request.ablation_config_path,
     )
     try:
         readiness = bundle.readiness_probe()

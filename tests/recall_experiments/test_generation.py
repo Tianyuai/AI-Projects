@@ -2023,134 +2023,33 @@ def test_repair_instructions_are_executable_without_initial_request_context(
     assert payload["validation_errors"][0]["repair_instruction"] == expected_instruction
 
 
-def test_title_informed_prompt_recipe_is_a_blind_four_action_text_search_method() -> None:
+def test_supported_scheme_b_recipe_is_blind_and_bounded() -> None:
     loaded = load_recall_recipe(
-        Path("configs/recall_experiments/methods/title-informed-blind-live.yaml")
+        Path("configs/recall_experiments/methods/scheme-b-blind.yaml")
     )
 
-    assert loaded.recipe.method_id == "title-informed-blind"
-    assert loaded.recipe.generator.type == "deepseek_prompt"
-    assert loaded.recipe.generator.gold_visibility == "blind"
-    assert loaded.recipe.generator.max_generated_actions == 4
-    assert loaded.recipe.retrieval.allowed_actions == ["text_search"]
-    assert loaded.recipe.retrieval.backend == "live_provider"
-    assert loaded.recipe.retrieval.max_total_actions == 4
-    assert loaded.prompt_bytes is not None
-    prompt = RecallPromptArtifact.from_yaml_bytes(loaded.prompt_bytes)
-    rendered = render_recall_prompt(prompt)
-    assert "query.original_query is the fixed content insertion point" in rendered
-    assert "anchor_full" in rendered
-    assert "subject_task" in rendered
-    assert "method_task" in rendered
-    assert "dataset_task" in rendered
-    assert "Omit a combination slot" in rendered
-    assert "Do not use Gold" in rendered
-
-
-@pytest.mark.parametrize(
-    ("recipe_name", "method_id", "prompt_version"),
-    [
-        (
-            "academic-bridge-blind-live.yaml",
-            "academic-bridge-blind",
-            "recall-academic-bridge-blind-v1",
-        ),
-        (
-            "open-evidence-blind-live.yaml",
-            "open-evidence-blind",
-            "recall-open-evidence-blind-v1",
-        ),
-    ],
-)
-def test_query_expression_canary_recipes_are_blind_three_action_text_search_methods(
-    recipe_name: str, method_id: str, prompt_version: str
-) -> None:
-    loaded = load_recall_recipe(
-        Path("configs/recall_experiments/methods") / recipe_name
-    )
-
-    assert loaded.recipe.method_id == method_id
+    assert loaded.recipe.method_id == "scheme-b-blind"
     assert loaded.recipe.generator.type == "deepseek_prompt"
     assert loaded.recipe.generator.model == "deepseek-v4-flash"
     assert loaded.recipe.generator.temperature == 0
+    assert loaded.recipe.generator.repair_attempts == 1
     assert loaded.recipe.generator.gold_visibility == "blind"
     assert loaded.recipe.generator.max_generated_actions == 3
-    assert loaded.recipe.generator.repair_attempts == 1
-    assert loaded.recipe.retrieval.allowed_actions == ["text_search"]
-    assert loaded.recipe.retrieval.backend == "live_provider"
-    assert loaded.recipe.retrieval.max_results_per_action == 50
-    assert loaded.recipe.retrieval.max_total_actions == 3
-    assert loaded.prompt_bytes is not None
-    prompt = RecallPromptArtifact.from_yaml_bytes(loaded.prompt_bytes)
-    assert prompt.version == prompt_version
-
-
-def test_open_evidence_prompt_locks_the_approved_generation_method() -> None:
-    loaded = load_recall_recipe(
-        Path("configs/recall_experiments/methods/open-evidence-blind-live.yaml")
-    )
-    assert loaded.prompt_bytes is not None
-    rendered = render_recall_prompt(RecallPromptArtifact.from_yaml_bytes(loaded.prompt_bytes))
-
-    for required_rule in (
-        "open evidence profile",
-        "protected anchors",
-        "explicit, normalized, or cautiously inferred",
-        "open-evidence:anchor",
-        "open-evidence:scholarly-bridge",
-        "open-evidence:complement",
-        "Do not fill all three slots",
-        "concept drift",
-        "weak generic terms",
-        "Do not use Gold",
-    ):
-        assert required_rule in rendered
-
-
-def test_academic_bridge_control_does_not_contain_treatment_only_rules() -> None:
-    loaded = load_recall_recipe(
-        Path("configs/recall_experiments/methods/academic-bridge-blind-live.yaml")
-    )
-    assert loaded.prompt_bytes is not None
-    rendered = render_recall_prompt(RecallPromptArtifact.from_yaml_bytes(loaded.prompt_bytes))
-
-    assert "preserve exact technical terms" in rendered
-    assert "paper-common terminology" in rendered
-    assert "open evidence profile" not in rendered
-    assert "open-evidence:complement" not in rendered
-
-
-@pytest.mark.parametrize(
-    "method_name", ["academic-bridge-blind", "open-evidence-blind"]
-)
-def test_query_expression_canary_replay_recipe_changes_only_the_backend(
-    method_name: str,
-) -> None:
-    live = load_recall_recipe(
-        Path(f"configs/recall_experiments/methods/{method_name}-live.yaml")
-    )
-    replay = load_recall_recipe(
-        Path(f"configs/recall_experiments/methods/{method_name}.yaml")
-    )
-
-    live_payload = live.recipe.model_dump(mode="json")
-    replay_payload = replay.recipe.model_dump(mode="json")
-    assert live_payload["retrieval"].pop("backend") == "live_provider"
-    assert replay_payload["retrieval"].pop("backend") == "snapshot_replay"
-    assert replay_payload == live_payload
-    assert replay.prompt_bytes == live.prompt_bytes
-    assert replay.prompt_sha256 == live.prompt_sha256
-
-
-@pytest.mark.parametrize("mode", ["oracle", "blind"])
-def test_scheme_b_exploration_recipes_lock_the_deepseek_generation_recipe(mode: str) -> None:
-    loaded = load_recall_recipe(Path(f"configs/recall_experiments/methods/scheme-b-{mode}.yaml"))
-
-    assert loaded.recipe.method_id == f"scheme-b-{mode}"
-    assert loaded.recipe.generator.type == "deepseek_prompt"
-    assert loaded.recipe.generator.model == "deepseek-v4-flash"
-    assert loaded.recipe.generator.temperature == 0
-    assert loaded.recipe.generator.repair_attempts == 1
-    assert loaded.recipe.generator.gold_visibility == mode
     assert loaded.prompt_bytes is not None
     assert loaded.prompt_sha256 is not None
+
+
+def test_supported_live_recipe_changes_only_the_backend() -> None:
+    replay = load_recall_recipe(
+        Path("configs/recall_experiments/methods/scheme-b-blind.yaml")
+    )
+    live = load_recall_recipe(
+        Path("configs/recall_experiments/methods/scheme-b-blind-live.yaml")
+    )
+
+    replay_payload = replay.recipe.model_dump(mode="json")
+    live_payload = live.recipe.model_dump(mode="json")
+    assert replay_payload["retrieval"].pop("backend") == "snapshot_replay"
+    assert live_payload["retrieval"].pop("backend") == "live_provider"
+    assert replay_payload == live_payload
+    assert replay.prompt_sha256 == live.prompt_sha256

@@ -71,6 +71,20 @@ def test_arxiv_datacite_doi_overrides_conflicting_location_identifier() -> None:
     assert paper.arxiv_id == "2309.17453"
 
 
+def test_top_level_openalex_ids_supply_arxiv_alias() -> None:
+    raw = complete_work()
+    raw["ids"] = {
+        "openalex": "https://openalex.org/W123",
+        "doi": "https://doi.org/10.1000/example",
+        "arxiv": "https://arxiv.org/abs/2401.01234v3",
+    }
+
+    paper = normalize_openalex_work(raw)
+
+    assert paper.canonical_id == "doi:10.1000/example"
+    assert paper.arxiv_id == "2401.01234"
+
+
 def test_reconstruct_abstract_orders_all_positions() -> None:
     assert reconstruct_abstract({"later": [2], "first": [0], "middle": [1]}) == (
         "first middle later"

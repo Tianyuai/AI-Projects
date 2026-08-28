@@ -67,6 +67,148 @@ def test_candidate_lock_accepts_openalex_only_routing() -> None:
     assert lock.baseline.retrieval.semantic_scholar_calls_max == 0
 
 
+def test_candidate_lock_accepts_semantic_action_prompt_v2() -> None:
+    raw = deepcopy(fixture_data("candidate.lock.yaml"))
+    raw["baseline"]["prompt_version"] = "query-analyze-semantic-actions-v2"
+
+    lock = CandidateLock.model_validate(raw)
+
+    assert lock.baseline.prompt_version == "query-analyze-semantic-actions-v2"
+
+
+def test_candidate_lock_accepts_protected_action_prompt_v3() -> None:
+    raw = deepcopy(fixture_data("candidate.lock.yaml"))
+    raw["baseline"]["prompt_version"] = "query-analyze-protected-actions-v3"
+
+    lock = CandidateLock.model_validate(raw)
+
+    assert lock.baseline.prompt_version == "query-analyze-protected-actions-v3"
+
+
+def test_candidate_lock_accepts_bounded_unconstrained_supplement() -> None:
+    raw = deepcopy(fixture_data("candidate.lock.yaml"))
+    raw["baseline"]["strategy"] = "bounded-two-stage-unconstrained"
+    raw["baseline"]["cross_vocabulary_supplement"] = {
+        "enabled": True,
+        "policy_version": "contrastive-bridge-anchor-conditioned-v2",
+        "eligible_profile": "unconstrained",
+        "strict_negation_abstention": True,
+        "max_actions": 1,
+        "max_total_openalex_actions": 7,
+        "max_additional_raw_candidates": 50,
+        "max_total_raw_candidates": 350,
+    }
+
+    lock = CandidateLock.model_validate(raw)
+
+    supplement = lock.baseline.cross_vocabulary_supplement
+    assert supplement is not None
+    assert supplement.max_total_openalex_actions == 7
+    assert supplement.strict_negation_abstention is True
+
+
+def test_lock_verifies_low_confidence_llm_supplement_prompt_artifact(
+    tmp_path: Path,
+) -> None:
+    lock_path, raw = write_lock(tmp_path, "candidate.lock.yaml")
+    root = tmp_path / "artifacts"
+    prompt_path = "configs/prompts/query_analyze_protected_actions_v3.yaml"
+    prompt_bytes = b"version: query-analyze-protected-actions-v3\n"
+    prompt_file = root / prompt_path
+    prompt_file.parent.mkdir(parents=True, exist_ok=True)
+    prompt_file.write_bytes(prompt_bytes)
+    raw["baseline"]["low_confidence_llm_supplement"] = {
+        "enabled": True,
+        "policy_version": "low-confidence-llm-lexical-supplement-v1",
+        "confidence_policy_version": "openalex-runtime-confidence-v2",
+        "prompt_version": "query-analyze-protected-actions-v3",
+        "prompt_config": {
+            "path": prompt_path,
+            "sha256": sha256(prompt_bytes),
+        },
+        "strict_negation_abstention": True,
+        "max_actions": 1,
+        "max_provider_calls": 2,
+        "max_additional_raw_candidates": 50,
+        "max_additional_deduplicated_candidates": 50,
+        "max_total_deduplicated_candidates": 250,
+        "max_input_tokens": 4000,
+        "max_output_tokens": 2000,
+        "max_llm_attempts": 3,
+    }
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    verified = load_verified_input_lock(lock_path, artifact_root=root)
+
+    binding = verified.lock.baseline.low_confidence_llm_supplement
+    assert binding is not None
+    assert verified.artifact_bytes[binding.prompt_config.path] == prompt_bytes
+
+
+def test_lock_verifies_supervised_bridge_and_pasa_alias_artifacts(
+    tmp_path: Path,
+) -> None:
+    lock_path, raw = write_lock(tmp_path, "candidate.lock.yaml")
+    root = tmp_path / "artifacts"
+    bridge_manifest = b'{"model_id":"supervised-lexical-bridge-openalex-v2"}\n'
+    bridge_model = b"hash-bound-joblib"
+    alias_map = b'{"openalex:W123":"arxiv:2401.00001"}\n'
+    payloads = {
+        "models/lexical-bridge/manifest.json": bridge_manifest,
+        "models/lexical-bridge/model.joblib": bridge_model,
+        "identity/conservative-pasa-aliases.json": alias_map,
+    }
+    for relative, payload in payloads.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    raw["baseline"]["supervised_lexical_bridge"] = {
+        "enabled": True,
+        "policy_version": "supervised-lexical-bridge-openalex-v2",
+        "manifest": {
+            "path": "models/lexical-bridge/manifest.json",
+            "sha256": sha256(bridge_manifest),
+        },
+        "model": {
+            "path": "models/lexical-bridge/model.joblib",
+            "sha256": sha256(bridge_model),
+        },
+        "max_actions": 1,
+    }
+    raw["baseline"]["pasa_identity_aliases"] = {
+        "enabled": True,
+        "policy_version": "conservative-pasa-identity-alias-v1",
+        "alias_map": {
+            "path": "identity/conservative-pasa-aliases.json",
+            "sha256": sha256(alias_map),
+        },
+        "alias_count": 1,
+    }
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    verified = load_verified_input_lock(lock_path, artifact_root=root)
+
+    bridge = verified.lock.baseline.supervised_lexical_bridge
+    aliases = verified.lock.baseline.pasa_identity_aliases
+    assert bridge is not None
+    assert aliases is not None
+    assert verified.artifact_bytes[bridge.model.path] == bridge_model
+    assert verified.artifact_bytes[aliases.alias_map.path] == alias_map
+
+
+def test_legacy_qwen_model_is_replay_only() -> None:
+    replay = deepcopy(fixture_data("replay.lock.yaml"))
+    replay["baseline"]["primary_model"] = "qwen3.7-plus"
+    replay["baseline"]["fallback_model"] = "qwen3.6-flash"
+    candidate = deepcopy(fixture_data("candidate.lock.yaml"))
+    candidate["baseline"]["primary_model"] = "qwen3.7-plus"
+    candidate["baseline"]["fallback_model"] = "qwen3.6-flash"
+
+    assert ReplayLock.model_validate(replay).baseline.primary_model == "qwen3.7-plus"
+    with pytest.raises(ValidationError, match="live locks require"):
+        CandidateLock.model_validate(candidate)
+
+
 def test_legacy_lock_canonical_identity_omits_absent_document_ranker() -> None:
     lock = CandidateLock.model_validate(fixture_data("candidate.lock.yaml"))
 
@@ -119,6 +261,87 @@ def test_enabled_document_ranker_rejects_weight_hash_mismatch(tmp_path: Path) ->
 
     with pytest.raises(ValueError, match="hash mismatch"):
         load_verified_input_lock(lock_path, artifact_root=root)
+
+
+def test_document_ranker_chain_verifies_f5_f4_and_b0_artifacts(tmp_path: Path) -> None:
+    lock_path, raw = write_lock(tmp_path, "candidate.lock.yaml")
+    root = tmp_path / "artifacts"
+    (root / "models").mkdir()
+    payloads = {
+        "models/f5.json": b"f5-manifest",
+        "models/f5.bundle": b"f5-weights",
+        "models/f4.json": b"f4-manifest",
+        "models/f4.bundle": b"f4-weights",
+        "models/b0.json": b"b0-manifest",
+        "models/b0.f64": b"b0-weights",
+    }
+    for relative, payload in payloads.items():
+        (root / relative).write_bytes(payload)
+    def binding(relative: str) -> dict[str, str]:
+        return {"path": relative, "sha256": sha256(payloads[relative])}
+    raw["baseline"]["document_ranker"] = {
+        "enabled": True,
+        "manifest": binding("models/f5.json"),
+        "weights": binding("models/f5.bundle"),
+        "fallback_manifest": binding("models/f4.json"),
+        "fallback_weights": binding("models/f4.bundle"),
+        "emergency_manifest": binding("models/b0.json"),
+        "emergency_weights": binding("models/b0.f64"),
+    }
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    verified = load_verified_input_lock(lock_path, artifact_root=root)
+
+    ranker = verified.lock.baseline.document_ranker
+    assert ranker is not None
+    assert verified.artifact_bytes[ranker.fallback_weights.path] == b"f4-weights"
+    assert verified.artifact_bytes[ranker.emergency_weights.path] == b"b0-weights"
+
+
+def test_document_ranker_primary_artifact_failure_keeps_verified_fallback_chain(
+    tmp_path: Path,
+) -> None:
+    lock_path, raw = write_lock(tmp_path, "candidate.lock.yaml")
+    root = tmp_path / "artifacts"
+    (root / "models").mkdir()
+    payloads = {
+        "models/f5.json": b"f5-manifest",
+        "models/f5.bundle": b"f5-weights",
+        "models/f4.json": b"f4-manifest",
+        "models/f4.bundle": b"f4-weights",
+        "models/b0.json": b"b0-manifest",
+        "models/b0.f64": b"b0-weights",
+    }
+    for relative, payload in payloads.items():
+        (root / relative).write_bytes(payload)
+
+    def binding(relative: str) -> dict[str, str]:
+        return {"path": relative, "sha256": sha256(payloads[relative])}
+
+    raw["baseline"]["document_ranker"] = {
+        "enabled": True,
+        "manifest": binding("models/f5.json"),
+        "weights": {
+            "path": "models/f5.bundle",
+            "sha256": ZERO_SHA256,
+        },
+        "fallback_manifest": binding("models/f4.json"),
+        "fallback_weights": binding("models/f4.bundle"),
+        "emergency_manifest": binding("models/b0.json"),
+        "emergency_weights": binding("models/b0.f64"),
+    }
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    verified = load_verified_input_lock(lock_path, artifact_root=root)
+
+    ranker = verified.lock.baseline.document_ranker
+    assert ranker is not None
+    assert ranker.weights.path not in verified.artifact_bytes
+    assert verified.ranker_artifact_failures == {
+        ranker.weights.path: "hash_mismatch",
+    }
+    assert verified.artifact_bytes[ranker.fallback_manifest.path] == b"f4-manifest"
+    assert verified.artifact_bytes[ranker.fallback_weights.path] == b"f4-weights"
 
 
 def write_artifact_root(root: Path) -> dict[str, bytes]:

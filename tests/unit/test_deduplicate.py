@@ -80,6 +80,29 @@ def test_identifier_map_merges_cross_source_aliases(tmp_path: Path) -> None:
     assert result.decisions[0].match_value == "s2:S2"
 
 
+def test_shared_arxiv_identifier_merges_different_canonical_records() -> None:
+    result = deduplicate_papers(
+        [
+            _paper(
+                "doi:10.1145/example",
+                title="Published conference version",
+                doi="10.1145/example",
+                arxiv_id="2301.01234v2",
+            ),
+            _paper(
+                "openalex:W99",
+                title="Preprint version with a different title",
+                arxiv_id="https://arxiv.org/abs/2301.01234",
+                openalex_id="W99",
+            ),
+        ]
+    )
+
+    assert len(result.papers) == 1
+    assert result.decisions[0].match_rule == "external_id"
+    assert result.decisions[0].match_value == "arxiv:2301.01234"
+
+
 def test_normalized_exact_title_merges() -> None:
     result = deduplicate_papers(
         [

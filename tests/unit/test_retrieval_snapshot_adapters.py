@@ -25,6 +25,7 @@ from paper_search.retrieval.snapshot_adapters import (
     LiveCaptureSearchProvider,
     ProviderAdapterError,
     ReplaySearchProvider,
+    SearchAttemptQuotaExceededError,
     _attempt_timeout,
 )
 from paper_search.retrieval.openalex import OPENALEX_SELECT_FIELDS
@@ -394,6 +395,7 @@ async def _capture(
     mailto: str | None = None,
     additional_api_keys: Sequence[str] = (),
     minimum_request_interval_seconds: float = 0.0,
+    attempt_gate: object | None = None,
 ) -> tuple[LiveCaptureSearchProvider, DependencyCaptureStore, SettlementSpy, httpx.AsyncClient]:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     store = DependencyCaptureStore(tmp_path / "snapshot", clock=lambda: CAPTURED_AT)
@@ -411,8 +413,41 @@ async def _capture(
         sleep=sleep,
         jitter=lambda: 0.0,
         minimum_request_interval_seconds=minimum_request_interval_seconds,
+        attempt_gate=attempt_gate,
     )
     return provider, store, controller, client
+
+
+def test_openalex_attempt_gate_stops_before_network_dispatch(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    class ExhaustedGate:
+        def claim_attempt(self) -> int:
+            raise SearchAttemptQuotaExceededError("daily key cap exhausted")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> object:
+        provider, _, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+            attempt_gate=ExhaustedGate(),
+        )
+        async with client:
+            return await provider.search("RAG", {}, 1, _reservation())
+
+    result = asyncio.run(run())
+
+    assert requests == []
+    assert result.usage.search_api_calls == 0
+    assert [error.code for error in result.errors] == ["budget_exhausted"]
 
 
 def test_semantic_scholar_live_requests_are_paced_after_each_attempt(
@@ -533,6 +568,100 @@ def test_openalex_live_and_replay_are_identical_and_refs_are_page_ordered(tmp_pa
         for name in ("works_page_1.json", "works_page_2.json")
     ]
     assert [ref["response_sha256"] for ref in refs] == expected_hashes
+
+
+def test_openalex_live_continuation_fetches_only_the_frozen_next_page(
+    tmp_path: Path,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_2.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> object:
+        provider, _, _, client = await _capture(
+            tmp_path, dependency="openalex", handler=handler
+        )
+        async with client:
+            return await provider.search_continuation(
+                "RAG",
+                {},
+                cursor="cursor-page-2",
+                limit=50,
+                reservation=_reservation(),
+            )
+
+    result = asyncio.run(run())
+
+    assert len(seen) == 1
+    assert seen[0].url.params["cursor"] == "cursor-page-2"
+    assert seen[0].url.params["per_page"] == "50"
+    assert all("gold" not in key.casefold() for key in seen[0].url.params.keys())
+    assert [paper.openalex_id for paper in result.data] == ["W126"]
+    assert result.usage.search_api_calls == 1
+
+
+def test_openalex_live_continuation_rejects_first_page_cursor(tmp_path: Path) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            content=(OPENALEX / "works_page_1.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> None:
+        provider, _, _, client = await _capture(
+            tmp_path, dependency="openalex", handler=handler
+        )
+        async with client:
+            with pytest.raises(ValueError, match="continuation cursor"):
+                await provider.search_continuation(
+                    "RAG",
+                    {},
+                    cursor="*",
+                    limit=50,
+                    reservation=_reservation(),
+                )
+
+    asyncio.run(run())
+    assert seen == []
+
+
+def test_openalex_live_continuation_never_retries_a_failed_page(
+    tmp_path: Path,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(500, content=b"{}", request=request)
+
+    async def run() -> object:
+        provider, _, _, client = await _capture(
+            tmp_path, dependency="openalex", handler=handler
+        )
+        async with client:
+            return await provider.search_continuation(
+                "RAG",
+                {},
+                cursor="cursor-page-2",
+                limit=50,
+                reservation=_reservation(),
+            )
+
+    result = asyncio.run(run())
+
+    assert len(seen) == 1
+    assert result.usage.search_api_calls == 1
+    assert [error.code for error in result.errors] == ["server_error"]
 
 
 def test_openalex_semantic_live_capture_and_replay_share_search_mode_identity(
@@ -774,6 +903,41 @@ def test_openalex_rotates_key_when_zero_budget_is_reported_only_in_json(
     assert result.errors == []
 
 
+def test_openalex_single_key_stops_immediately_when_daily_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            429,
+            json={
+                "message": "Insufficient budget.",
+                "dailyRemainingUsd": 0,
+                "prepaidRemainingUsd": 0,
+            },
+            request=request,
+        )
+
+    async def run() -> tuple[object, object]:
+        live, _, _, client = await _capture(
+            tmp_path,
+            dependency="openalex",
+            handler=handler,
+        )
+        async with client:
+            first = await live.search("RAG", {}, 1, _reservation())
+            second = await live.search("graph retrieval", {}, 1, _reservation())
+        return first, second
+
+    first, second = asyncio.run(run())
+
+    assert len(requests) == 1
+    assert [error.code for error in first.errors] == ["quota_exhausted"]
+    assert [error.code for error in second.errors] == ["quota_exhausted"]
+
+
 def test_openalex_can_rotate_past_three_exhausted_keys(tmp_path: Path) -> None:
     seen_keys: list[str] = []
 
@@ -998,6 +1162,51 @@ def test_semantic_scholar_live_and_replay_normalize_identically(tmp_path: Path) 
     assert replayed.usage != UsageActual()
 
 
+def test_semantic_scholar_semantic_mode_live_and_replay_share_identity(
+    tmp_path: Path,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(
+            200,
+            content=(S2 / "search.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> tuple[object, object]:
+        live, store, _, client = await _capture(
+            tmp_path,
+            dependency="semantic_scholar",
+            handler=handler,
+        )
+        filters = {"_search_mode": "semantic", "year_from": 2020}
+        async with client:
+            captured = await live.search("graph retrieval", filters, 2, _reservation())
+        manifest = store.seal()
+        replay = ReplaySearchProvider(
+            dependency="semantic_scholar",
+            reader=_reader(store, snapshot_set_id=manifest.snapshot_set_id),
+            clock=lambda: CAPTURED_AT,
+        )
+        replayed = await replay.search(
+            "graph retrieval",
+            filters,
+            2,
+            _reservation(0),
+        )
+        return captured, replayed
+
+    captured, replayed = asyncio.run(run())
+
+    assert seen[0].url.params["year"] == "2020-"
+    assert "_search_mode" not in seen[0].url.params
+    assert captured.data == replayed.data
+    assert captured.provenance["search_mode"] == "semantic"
+    assert replayed.provenance["search_mode"] == "semantic"
+
+
 def test_capture_identity_is_safe_and_excludes_credentials(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=(S2 / "search.json").read_bytes(), request=request)
@@ -1111,7 +1320,7 @@ def test_semantic_scholar_rate_limit_uses_extended_backoff(tmp_path: Path) -> No
 
     asyncio.run(run())
 
-    assert sleeps == [10.0, 20.0]
+    assert sleeps == [60.0, 60.0]
 
 
 def test_replay_miss_is_structured_and_has_no_network_dependency(tmp_path: Path) -> None:
@@ -1318,7 +1527,11 @@ def test_dispatched_faults_fail_closed_with_valued_attempt(
                 controller=controller,
                 clock=lambda: CAPTURED_AT,
             )
-            with pytest.raises(ProviderAdapterError, match="provider live capture failed"):
+            expected_type = "OSError" if fault == "capture" else "RuntimeError"
+            with pytest.raises(
+                ProviderAdapterError,
+                match=rf"provider live capture failed \({expected_type}\)",
+            ):
                 await provider.search("graph", {}, 2, reservation)
 
     asyncio.run(run())

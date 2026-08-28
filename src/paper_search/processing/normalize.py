@@ -102,6 +102,20 @@ def _extract_arxiv_id(raw_work: Mapping[str, object]) -> str | None:
         locations.extend(raw_locations)
 
     identifiers: set[str] = set()
+    raw_ids = raw_work.get("ids")
+    if raw_ids is not None:
+        if not isinstance(raw_ids, Mapping):
+            raise ValueError("ids must be a mapping or null")
+        arxiv_value = raw_ids.get("arxiv")
+        if isinstance(arxiv_value, str) and arxiv_value.strip():
+            try:
+                identifiers.add(
+                    normalize_paper_id(arxiv_value, kind="arxiv").removeprefix(
+                        "arxiv:"
+                    )
+                )
+            except ValueError:
+                pass
     for location in locations:
         if not isinstance(location, Mapping):
             continue

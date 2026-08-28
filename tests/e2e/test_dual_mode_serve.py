@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import runpy
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,9 @@ from paper_search.api.app import create_app
 from paper_search.application.artifacts import CaptureSession
 from paper_search.application.composition import CompositionRoot
 from paper_search.application.contracts import SearchRequest
+from paper_search.application.production_ranker_binding import (
+    bind_production_ranker_selection,
+)
 from paper_search.cli import main
 from paper_search.domain.models import StructuredSearchResponse
 from paper_search.evaluation.business_results import (
@@ -208,8 +212,29 @@ def _prepare_live_server(
 ) -> tuple[dict[str, Path], object, type[httpx.AsyncClient], Path]:
     helpers = _smoke_helpers()
     fixture = helpers["_smoke_fixture"](tmp_path)
-    fake_client = helpers["_fake_live_client_factory"](fixture)
     real_client = httpx.AsyncClient
+    live_semantic_requests: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/chat/completions"):
+            payload = fixture["llm_fixture"].read_bytes()
+        elif request.url.host == "api.openalex.org":
+            payload = fixture["openalex_fixture"].read_bytes()
+        elif request.url.host == "api.semanticscholar.org":
+            live_semantic_requests.append(dict(request.url.params))
+            payload = fixture["semantic_fixture"].read_bytes()
+        else:
+            raise AssertionError(f"unexpected fake-live URL: {request.url}")
+        return httpx.Response(
+            200,
+            content=payload,
+            headers={"content-type": "application/json"},
+            request=request,
+        )
+
+    def fake_client(**kwargs: object) -> httpx.AsyncClient:
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
     capture_root = fixture["root"] / "server-captures"
     monkeypatch.chdir(fixture["root"])
     monkeypatch.setenv("LLM_API_KEY", "fake-live-key")
@@ -337,6 +362,142 @@ def test_authorized_fake_live_publishes_one_capture_before_http_200(
     )
     assert response.json()["snapshot_set_id"] == manifest.snapshot_set_id
     assert not list(capture_root.glob(".*.incomplete"))
+
+
+def test_newly_published_live_capture_replays_identical_ranked_ids(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tmp_path = tmp_path_factory.mktemp("live-replay-parity")
+    fixture, live_server, real_client, capture_root = _prepare_live_server(
+        tmp_path, monkeypatch
+    )
+
+    async def scenario() -> tuple[list[str], list[str]]:
+        live = await _post(
+            live_server,
+            real_client,
+            {"query_id": "parity-live", "query": QUERY, "mode": "live"},
+        )
+        await live_server.aclose()  # type: ignore[attr-defined]
+        assert live.status_code == 200
+        published = capture_root / live.json()["run_id"]
+        replay_server = CompositionRoot.compose_server(
+            replay_lock_path=published / "replay.lock.yaml",
+            snapshot_manifest_path=published / "snapshot-manifest.json",
+            artifact_root=fixture["root"],
+            capture_output_root=capture_root,
+            live_authorized=False,
+            environ={},
+        )
+        try:
+            replay = await _post(
+                replay_server,
+                real_client,
+                {"query_id": "parity-replay", "query": QUERY, "mode": "replay"},
+            )
+        finally:
+            await replay_server.aclose()
+        assert replay.status_code == 200, replay.text
+        return live.json()["selected_paper_ids"], replay.json()["selected_paper_ids"]
+
+    live_ids, replay_ids = asyncio.run(scenario())
+    assert live_ids == replay_ids
+
+
+def test_promoted_f5_bundle_live_capture_replays_identical_ranked_ids(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    tmp_path = tmp_path_factory.mktemp("f5")
+    helpers = _smoke_helpers()
+    fixture = helpers["_smoke_fixture"](tmp_path)
+    fixture_root = fixture["root"]
+    selection_path = (
+        project_root / "artifacts/models/production-document-ranker-selection.json"
+    )
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    for field in ("default_manifest", "fallback_manifest", "emergency_manifest"):
+        relative_dir = Path(selection[field]).parent
+        shutil.copytree(
+            selection_path.parent / relative_dir,
+            fixture_root / "artifacts/models" / relative_dir,
+            dirs_exist_ok=True,
+        )
+    candidate_payload = yaml.safe_load(fixture["candidate_lock"].read_bytes())
+    promoted_payload = bind_production_ranker_selection(
+        candidate_payload,
+        selection,
+        selection_root="artifacts/models",
+    )
+    fixture["candidate_lock"].write_text(
+        yaml.safe_dump(promoted_payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    fake_client = helpers["_fake_live_client_factory"](fixture)
+    real_client = httpx.AsyncClient
+    capture_root = fixture_root / "c"
+    monkeypatch.chdir(fixture_root)
+    monkeypatch.setenv("LLM_API_KEY", "fake-live-key")
+    monkeypatch.setattr(composition_module.httpx, "AsyncClient", fake_client)
+    assert main(
+        [
+            "smoke",
+            "--lock",
+            str(fixture["candidate_lock"]),
+            "--output-root",
+            str(capture_root),
+            "--mode",
+            "live",
+            "--allow-network",
+        ]
+    ) == 0
+    source = next(capture_root.glob("smoke-*"))
+    live_server = CompositionRoot.compose_server(
+        replay_lock_path=source / "replay.lock.yaml",
+        snapshot_manifest_path=source / "snapshot-manifest.json",
+        artifact_root=fixture_root,
+        capture_output_root=capture_root,
+        live_authorized=True,
+        environ={"LLM_API_KEY": "fake-live-key"},
+    )
+
+    async def scenario() -> tuple[list[str], list[str]]:
+        live = await _post(
+            live_server,
+            real_client,
+            {"query_id": "promoted-f5-live", "query": QUERY, "mode": "live"},
+        )
+        await live_server.aclose()  # type: ignore[attr-defined]
+        assert live.status_code == 200
+        published = capture_root / live.json()["run_id"]
+        replay_server = CompositionRoot.compose_server(
+            replay_lock_path=published / "replay.lock.yaml",
+            snapshot_manifest_path=published / "snapshot-manifest.json",
+            artifact_root=fixture_root,
+            capture_output_root=capture_root,
+            live_authorized=False,
+            environ={},
+        )
+        try:
+            replay = await _post(
+                replay_server,
+                real_client,
+                {
+                    "query_id": "promoted-f5-replay",
+                    "query": QUERY,
+                    "mode": "replay",
+                },
+            )
+        finally:
+            await replay_server.aclose()
+        assert replay.status_code == 200, replay.text
+        return live.json()["selected_paper_ids"], replay.json()["selected_paper_ids"]
+
+    live_ids, replay_ids = asyncio.run(scenario())
+    assert live_ids == replay_ids
 
 
 def test_publication_failure_never_returns_200_or_complete_capture(

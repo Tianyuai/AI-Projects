@@ -39,6 +39,7 @@ from paper_search.retrieval.openalex import (
 )
 from paper_search.retrieval.semantic_scholar import (
     _FIELDS,
+    _semantic_scholar_search_filters,
     decode_semantic_scholar_batch,
     decode_semantic_scholar_expansion,
     decode_semantic_scholar_search,
@@ -58,6 +59,16 @@ Jitter = Callable[[], float]
 Method = Literal["GET", "POST"]
 Operation = Literal["search", "batch", "references", "citations"]
 QueryValue = str | int | float | bool | None
+
+
+class SearchAttemptQuotaExceededError(RuntimeError):
+    """A local hard quota rejected an attempt before network dispatch."""
+
+
+class SearchAttemptGate(Protocol):
+    def claim_attempt(self) -> int:
+        """Irreversibly reserve one provider request before dispatch."""
+        ...
 
 _BASE_URLS = {
     "openalex": "https://api.openalex.org",
@@ -192,6 +203,8 @@ def _aggregate_attempts(attempts: list[UsageActual]) -> UsageActual:
         search_api_calls=sum(item.search_api_calls for item in attempts),
         llm_calls=sum(item.llm_calls for item in attempts),
         input_tokens=sum(item.input_tokens for item in attempts),
+        cached_input_tokens=sum(item.cached_input_tokens for item in attempts),
+        uncached_input_tokens=sum(item.uncached_input_tokens for item in attempts),
         output_tokens=sum(item.output_tokens for item in attempts),
         cost_cny=cost,
         elapsed_ms=sum(item.elapsed_ms for item in attempts),
@@ -427,11 +440,14 @@ class LiveCaptureSearchProvider:
         sleep: Sleep | None = None,
         jitter: Jitter = random.random,
         minimum_request_interval_seconds: float = 0.0,
+        attempt_gate: SearchAttemptGate | None = None,
     ) -> None:
         if controller.formal_live is not True:
             raise ValueError("live capture requires formal-live budget enforcement")
         if minimum_request_interval_seconds < 0:
             raise ValueError("minimum request interval must not be negative")
+        if attempt_gate is not None and dependency != "openalex":
+            raise ValueError("attempt gate is only supported for OpenAlex")
         self._client = client
         self._capture_store = capture_store
         self._pricer = pricer
@@ -444,6 +460,7 @@ class LiveCaptureSearchProvider:
                 keys.append(key)
         self._api_keys = tuple(keys)
         self._key_cursor = 0
+        self._openalex_quota_exhausted = False
         self._api_key = api_key
         self._mailto = mailto
         adapter = adapter_version or _ADAPTERS[dependency]
@@ -478,6 +495,7 @@ class LiveCaptureSearchProvider:
         self._sleep = sleep or asyncio.sleep
         self._jitter = jitter
         self._minimum_request_interval_seconds = minimum_request_interval_seconds
+        self._attempt_gate = attempt_gate
         self._request_pacing_lock = asyncio.Lock()
 
     @property
@@ -524,11 +542,14 @@ class LiveCaptureSearchProvider:
         except asyncio.CancelledError as cancellation:
             operation.fail_closed()
             raise cancellation from None
-        except Exception:
+        except Exception as error:
             if not operation.dispatched:
                 raise
             operation.fail_closed()
-            raise ProviderAdapterError("provider live capture failed") from None
+            error_type = type(error).__name__
+            raise ProviderAdapterError(
+                f"provider live capture failed ({error_type})"
+            ) from None
 
     async def _request(
         self,
@@ -541,6 +562,19 @@ class LiveCaptureSearchProvider:
         remaining_calls: int,
     ) -> _RequestOutcome:
         captured_at = self._clock()
+        if self._dependency == "openalex" and self._openalex_quota_exhausted:
+            return _RequestOutcome(
+                content=None,
+                calls=0,
+                error=_error(
+                    "openalex",
+                    "quota_exhausted",
+                    "openalex daily key budget exhausted",
+                    retryable=False,
+                ),
+                captured_at=captured_at,
+                safe_headers={},
+            )
         retry_capacity = (
             max(3, len(self._api_keys)) if self._dependency == "openalex" else 3
         )
@@ -581,8 +615,6 @@ class LiveCaptureSearchProvider:
                     retryable=False,
                 )
                 break
-            operation.start_attempt()
-            attempts_made += 1
             configured_read = self._client.timeout.read
             attempt_timeout = _attempt_timeout(
                 remaining_seconds,
@@ -595,6 +627,10 @@ class LiveCaptureSearchProvider:
             try:
                 async with asyncio.timeout(attempt_timeout):
                     async with self._request_pacing_lock:
+                        if self._attempt_gate is not None:
+                            self._attempt_gate.claim_attempt()
+                        operation.start_attempt()
+                        attempts_made += 1
                         try:
                             response = await self._client.request(
                                 method,
@@ -607,6 +643,14 @@ class LiveCaptureSearchProvider:
                             )
                         finally:
                             await self._pace_after_attempt()
+            except SearchAttemptQuotaExceededError:
+                last_error = _error(
+                    self._dependency,
+                    "budget_exhausted",
+                    f"{self._dependency} daily key cap exhausted",
+                    retryable=False,
+                )
+                break
             except (TimeoutError, httpx.TimeoutException):
                 operation.finish_attempt()
                 last_error = _error(
@@ -654,25 +698,34 @@ class LiveCaptureSearchProvider:
                         request_id,
                     )
             if (
+                self._dependency == "openalex"
+                and last_error is not None
+                and last_error.code == "rate_limited"
+                and _key_quota_exhausted(response)
+            ):
+                if self._rotate_key():
+                    request_params["api_key"] = self._api_keys[self._key_cursor]
+                    continue
+                last_error = _error(
+                    self._dependency,
+                    "quota_exhausted",
+                    "openalex daily key budget exhausted",
+                    retryable=False,
+                    request_id=last_error.request_id,
+                )
+                self._openalex_quota_exhausted = True
+                break
+            if (
                 last_error is None
                 or not last_error.retryable
                 or retry_index + 1 >= attempts_allowed
             ):
                 break
             if (
-                self._dependency == "openalex"
-                and len(self._api_keys) > 1
-                and last_error.code == "rate_limited"
-                and _key_quota_exhausted(response)
-                and self._rotate_key()
-            ):
-                request_params["api_key"] = self._api_keys[self._key_cursor]
-                continue
-            if (
                 self._dependency == "semantic_scholar"
                 and last_error.code == "rate_limited"
             ):
-                delay_seconds = min(30, 10 * 2**retry_index) + self._jitter()
+                delay_seconds = 60.0 + self._jitter()
             else:
                 delay_seconds = min(8, 2**retry_index) + self._jitter()
             remaining_seconds = operation.remaining_seconds()
@@ -762,6 +815,134 @@ class LiveCaptureSearchProvider:
             lambda operation: self._semantic_search(
                 query, filters, limit, operation
             ),
+        )
+
+    async def search_continuation(
+        self,
+        query: str,
+        filters: dict[str, object],
+        *,
+        cursor: str,
+        limit: int,
+        reservation: BudgetReservation,
+    ) -> ProviderResult[list[Paper]]:
+        """Fetch exactly one frozen OpenAlex lexical continuation page."""
+        if self._dependency != "openalex":
+            raise ValueError("search continuation is only supported for OpenAlex")
+        return await self._run_live(
+            reservation,
+            lambda operation: self._openalex_search_continuation(
+                query,
+                filters,
+                cursor=cursor,
+                limit=limit,
+                operation=operation,
+            ),
+        )
+
+    async def _openalex_search_continuation(
+        self,
+        query: str,
+        filters: dict[str, object],
+        *,
+        cursor: str,
+        limit: int,
+        operation: _LiveOperation,
+    ) -> ProviderResult[list[Paper]]:
+        normalized_query = canonicalize_openalex_search_query(query)
+        if not normalized_query:
+            raise ValueError("query must not be empty")
+        if not isinstance(cursor, str) or not cursor.strip() or cursor == "*":
+            raise ValueError("a frozen OpenAlex continuation cursor is required")
+        if type(limit) is not int or not 1 <= limit <= 50:
+            raise ValueError("continuation limit must be an integer between 1 and 50")
+        provider_filters = dict(filters)
+        search_mode = provider_filters.pop("_search_mode", "lexical")
+        if search_mode != "lexical":
+            raise ValueError("OpenAlex continuation requires lexical search mode")
+        filter_value = _filter_expression(provider_filters)
+        canonical: dict[str, object] = {
+            "query": normalized_query,
+            "filters": provider_filters,
+            "limit": limit,
+            "per_page": limit,
+            "select": OPENALEX_SELECT_FIELDS,
+            "cursor": cursor,
+        }
+        if filter_value is not None:
+            canonical["filter"] = filter_value
+        identity = _identity(
+            dependency="openalex",
+            operation="search",
+            method="GET",
+            endpoint="/works",
+            adapter=self._adapter,
+            canonical_request=canonical,
+        )
+        params: dict[str, QueryValue] = {
+            "per_page": limit,
+            "select": OPENALEX_SELECT_FIELDS,
+            "cursor": cursor,
+            "search": normalized_query,
+        }
+        if filter_value is not None:
+            params["filter"] = filter_value
+        started = time.perf_counter()
+        requested_at = self._clock()
+        outcome = await self._request(
+            method="GET",
+            endpoint="/works",
+            params=params,
+            operation=operation,
+            remaining_calls=1,
+        )
+        refs: list[SnapshotRef] = []
+        hashes: list[str] = []
+        papers: list[Paper] = []
+        errors: list[ErrorDetail] = []
+        if outcome.error is not None:
+            errors.append(outcome.error)
+            refs.append(self._capture_error(identity, outcome))
+        elif outcome.content is not None:
+            refs.append(self._capture(identity, outcome))
+            hashes.append(_sha256(outcome.content))
+            try:
+                decoded = decode_openalex_page(outcome.content, limit=limit)
+            except ValueError:
+                errors.append(
+                    _error(
+                        "openalex",
+                        "invalid_response",
+                        "OpenAlex returned an invalid response",
+                        retryable=False,
+                    )
+                )
+            else:
+                papers.extend(decoded.papers)
+                errors.extend(decoded.errors)
+        if refs:
+            self._capture_store.annotate_usage(
+                refs[0].entry_id,
+                _terminal_usage(operation),
+            )
+        usage = self._settle(operation)
+        elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
+        return ProviderResult[list[Paper]](
+            data=papers,
+            usage=usage,
+            provenance={
+                "provider": "openalex",
+                "endpoint": "/works",
+                "model_id": self._adapter,
+                "requested_at": requested_at.isoformat(),
+                "response_hash": _aggregate_hash(hashes),
+                "snapshot_refs": _snapshot_provenance(refs),
+                "continuation_only": "true",
+                "continuation_rank_offset": "50",
+            },
+            cache_hit=False,
+            latency_ms=elapsed_ms,
+            errors=errors,
         )
 
     async def _openalex_search(
@@ -915,9 +1096,7 @@ class LiveCaptureSearchProvider:
             raise ValueError("query must not be empty")
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
-        unknown = set(filters).difference({"year_from", "year_to"})
-        if unknown:
-            raise ValueError(f"unknown Semantic Scholar filters: {sorted(unknown)}")
+        provider_filters, search_mode = _semantic_scholar_search_filters(filters)
         params: dict[str, QueryValue] = {
             "query": normalized_query,
             "limit": limit,
@@ -925,15 +1104,20 @@ class LiveCaptureSearchProvider:
         }
         canonical: dict[str, object] = {
             "query": normalized_query,
-            "filters": filters,
+            "filters": provider_filters,
             "limit": limit,
             "fields": _FIELDS,
         }
-        if filters:
-            year = f"{filters.get('year_from', '')}-{filters.get('year_to', '')}"
+        if search_mode == "semantic":
+            canonical["search_mode"] = search_mode
+        if provider_filters:
+            year = (
+                f"{provider_filters.get('year_from', '')}-"
+                f"{provider_filters.get('year_to', '')}"
+            )
             params["year"] = year
             canonical["year"] = year
-        return await self._semantic_papers_operation(
+        result = await self._semantic_papers_operation(
             request_operation="search",
             method="GET",
             endpoint="/paper/search",
@@ -945,6 +1129,8 @@ class LiveCaptureSearchProvider:
                 limit=limit,
             ),
         )
+        result.provenance["search_mode"] = search_mode
+        return result
 
     async def batch_details(
         self,
@@ -1580,18 +1766,19 @@ class ReplaySearchProvider:
             raise ValueError("query must not be empty")
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
-        unknown = set(filters).difference({"year_from", "year_to"})
-        if unknown:
-            raise ValueError(f"unknown Semantic Scholar filters: {sorted(unknown)}")
+        provider_filters, search_mode = _semantic_scholar_search_filters(filters)
         canonical: dict[str, object] = {
             "query": normalized_query,
-            "filters": filters,
+            "filters": provider_filters,
             "limit": limit,
             "fields": _FIELDS,
         }
-        if filters:
+        if search_mode == "semantic":
+            canonical["search_mode"] = search_mode
+        if provider_filters:
             canonical["year"] = (
-                f"{filters.get('year_from', '')}-{filters.get('year_to', '')}"
+                f"{provider_filters.get('year_from', '')}-"
+                f"{provider_filters.get('year_to', '')}"
             )
         identity = _identity(
             dependency="semantic_scholar",
@@ -1618,7 +1805,7 @@ class ReplaySearchProvider:
             errors.extend(decoded.errors)
             refs.append(ref)
             hashes.append(_sha256(content))
-        return self._result(
+        result = self._result(
             data=papers,
             endpoint="/paper/search",
             requested_at=self._clock(),
@@ -1627,6 +1814,8 @@ class ReplaySearchProvider:
             errors=errors,
             usage=usage,
         )
+        result.provenance["search_mode"] = search_mode
+        return result
 
     async def batch_details(
         self,

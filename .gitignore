@@ -6,8 +6,12 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 .uv-cache/
+/.uv-cache-codex/
 .coverage
 htmlcov/
+/.tmp*/
+*.db
+*.sqlite3
 
 # Local environment variables and secrets
 .env
@@ -17,11 +21,45 @@ htmlcov/
 # Restricted Task 2 data and human work products
 data/raw/
 data/identifier-map.json
+!data/identifier-map.json
 data/dev/gold.jsonl
 data/validation/gold.jsonl
 data/simulated_test/
 data/annotation_work/
+!data/annotation_work/
+data/annotation_work/*
+!data/annotation_work/pricing_v1.yaml
 data/training_private/
+
+# Generated and private model/validation artifacts. Only the hash-bound production
+# selection, aliases, and deployable model directories are publishable.
+/artifacts/*
+!/artifacts/identity/
+/artifacts/identity/*
+!/artifacts/identity/conservative-pasa-identity-alias-v1.json
+!/artifacts/models/
+/artifacts/models/*
+!/artifacts/models/production-document-ranker-selection.json
+!/artifacts/models/cpu-pairwise-document-ranker-expanded2385-v1/
+!/artifacts/models/cpu-pairwise-document-ranker-expanded2385-v1/**
+!/artifacts/models/gated-feature-fusion-18314-unified-context-v3-v1/
+!/artifacts/models/gated-feature-fusion-18314-unified-context-v3-v1/**
+!/artifacts/models/reliability-fusion-18314-unified-context-v3-v1/
+!/artifacts/models/reliability-fusion-18314-unified-context-v3-v1/**
+!/artifacts/models/supervised-lexical-bridge-openalex-v2/
+!/artifacts/models/supervised-lexical-bridge-openalex-v2/**
+
+# Release build workspace and superseded generated submission copies.
+/examples/.safe-replay-build/
+/deliverables/submission/code/
+/deliverables/submission/evidence/
+/deliverables/submission/提交/
+/deliverables/submission/vivaai-paper-search-evaluator-runtime/
+/deliverables/demo/
+/deliverables/project-docs/
+/deliverables/evaluator/*candidate*.lock.yaml
+/docs/evidence/
+/docs/storage-cleanup-*.md
 
 # Local provider smoke artifacts
 /experiments/smoke/

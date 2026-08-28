@@ -5,10 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_EVEN
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 import yaml
 from pydantic import ConfigDict, Field, ValidationError, model_validator
@@ -16,11 +16,19 @@ from pydantic import ConfigDict, Field, ValidationError, model_validator
 from paper_search.domain.models import (
     DependencyName,
     DomainModel,
-    MoneyCny,
     NonEmptyStr,
     Sha256,
     UsageActual,
 )
+
+
+PricingUnit = Literal[
+    "input_token",
+    "cached_input_token",
+    "uncached_input_token",
+    "output_token",
+    "request",
+]
 
 
 class PricingPolicyError(ValueError):
@@ -38,8 +46,12 @@ class PricingRate(_PolicyModel):
 
     dependency: DependencyName
     model_or_adapter: NonEmptyStr
-    unit: Literal["input_token", "output_token", "request"]
-    price_cny_per_unit: MoneyCny
+    unit: PricingUnit
+    time_band: Literal["all", "peak", "off_peak"] = "all"
+    price_cny_per_unit: Annotated[
+        Decimal,
+        Field(ge=Decimal("0"), decimal_places=9),
+    ]
 
 
 class PricingPolicy(_PolicyModel):
@@ -50,6 +62,8 @@ class PricingPolicy(_PolicyModel):
     effective_at: datetime
     source_identity: NonEmptyStr
     rounding_quantum_cny: Decimal
+    billing_schedule: Literal["beijing-weekday-peak-offpeak-v1"] | None = None
+    concurrency_limits: dict[NonEmptyStr, int] = Field(default_factory=dict)
     rates: list[PricingRate] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -58,7 +72,19 @@ class PricingPolicy(_PolicyModel):
             raise ValueError("pricing policy effective_at must include a timezone")
         if self.rounding_quantum_cny != Decimal("0.000001"):
             raise ValueError("rounding_quantum_cny must equal 0.000001")
-        keys = [(rate.dependency, rate.model_or_adapter, rate.unit) for rate in self.rates]
+        if any(
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+            for limit in self.concurrency_limits.values()
+        ):
+            raise ValueError("pricing concurrency limits must be positive integers")
+        if self.billing_schedule is None and any(
+            rate.time_band != "all" for rate in self.rates
+        ):
+            raise ValueError("time-banded rates require a billing schedule")
+        keys = [
+            (rate.dependency, rate.model_or_adapter, rate.unit, rate.time_band)
+            for rate in self.rates
+        ]
         if len(keys) != len(set(keys)):
             raise ValueError("pricing policy contains duplicate rates")
         return self
@@ -376,6 +402,9 @@ def canonical_pricing_policy_bytes(policy: PricingPolicy) -> bytes:
     def canonical_money(value: Decimal) -> str:
         return format(value.quantize(Decimal("0.000001")), "f")
 
+    def canonical_rate(value: Decimal) -> str:
+        return format(value.quantize(Decimal("0.000000001")), "f")
+
     payload: dict[str, Any] = {
         "schema_version": policy.schema_version,
         "currency": policy.currency,
@@ -387,11 +416,20 @@ def canonical_pricing_policy_bytes(policy: PricingPolicy) -> bytes:
                 "dependency": rate.dependency,
                 "model_or_adapter": rate.model_or_adapter,
                 "unit": rate.unit,
-                "price_cny_per_unit": canonical_money(rate.price_cny_per_unit),
+                "price_cny_per_unit": canonical_rate(rate.price_cny_per_unit),
+                **(
+                    {"time_band": rate.time_band}
+                    if rate.time_band != "all"
+                    else {}
+                ),
             }
             for rate in policy.rates
         ],
     }
+    if policy.billing_schedule is not None:
+        payload["billing_schedule"] = policy.billing_schedule
+    if policy.concurrency_limits:
+        payload["concurrency_limits"] = dict(sorted(policy.concurrency_limits.items()))
     rates = payload["rates"]
     assert isinstance(rates, list)
     rates.sort(
@@ -399,6 +437,7 @@ def canonical_pricing_policy_bytes(policy: PricingPolicy) -> bytes:
             rate["dependency"],
             rate["model_or_adapter"],
             rate["unit"],
+            rate.get("time_band", "all"),
         )
     )
     return json.dumps(
@@ -431,8 +470,14 @@ class ActualCostPricer:
             raise PricingPolicyError("valued_at must include a timezone")
         if self._policy.effective_at > instant:
             raise PricingPolicyError("pricing policy is not yet effective")
+        self._default_valued_at = instant
         self._rates = {
-            (rate.dependency, rate.model_or_adapter, rate.unit): rate.price_cny_per_unit
+            (
+                rate.dependency,
+                rate.model_or_adapter,
+                rate.unit,
+                rate.time_band,
+            ): rate.price_cny_per_unit
             for rate in self._policy.rates
         }
 
@@ -450,17 +495,30 @@ class ActualCostPricer:
         dependency: DependencyName,
         model_or_adapter: str,
         usage: UsageActual,
+        valued_at: datetime | None = None,
     ) -> UsageActual:
         """Return usage with an exact price or fail closed before settlement."""
 
-        units = self._billable_units(dependency, usage)
+        instant = self._validated_instant(valued_at)
+        time_band = self._time_band(instant)
+        units = self._billable_units(
+            dependency,
+            model_or_adapter,
+            usage,
+            time_band=time_band,
+        )
         if not any(quantity > 0 for _, quantity in units):
             raise PricingPolicyError("actual usage has no billable units")
         total = Decimal("0")
         for unit, quantity in units:
             if quantity == 0:
                 continue
-            rate = self._rates.get((dependency, model_or_adapter, unit))
+            rate = self._rate(
+                dependency,
+                model_or_adapter,
+                unit,
+                time_band=time_band,
+            )
             if rate is None:
                 raise PricingPolicyError(
                     f"missing pricing rate for {dependency}/{model_or_adapter}/{unit}"
@@ -471,18 +529,204 @@ class ActualCostPricer:
             raise PricingPolicyError("authoritative billed amount does not match pricing policy")
         return UsageActual.model_validate({**usage.model_dump(mode="python"), "cost_cny": valued_cost})
 
-    @staticmethod
+    def value_actual_peak(
+        self,
+        *,
+        dependency: DependencyName,
+        model_or_adapter: str,
+        usage: UsageActual,
+    ) -> UsageActual:
+        """Value estimates conservatively at peak when a split schedule applies."""
+
+        if self._policy.billing_schedule is None:
+            return self.value_actual(
+                dependency=dependency,
+                model_or_adapter=model_or_adapter,
+                usage=usage,
+            )
+        return self._value_for_band(
+            dependency=dependency,
+            model_or_adapter=model_or_adapter,
+            usage=usage,
+            time_band="peak",
+        )
+
+    def pricing_receipt(
+        self,
+        *,
+        dependency: DependencyName,
+        model_or_adapter: str,
+        usage: UsageActual,
+        valued_at: datetime | None = None,
+    ) -> dict[str, object]:
+        instant = self._validated_instant(valued_at)
+        time_band = self._time_band(instant)
+        valued = self.value_actual(
+            dependency=dependency,
+            model_or_adapter=model_or_adapter,
+            usage=usage,
+            valued_at=instant,
+        )
+        explicit = usage.cached_input_tokens + usage.uncached_input_tokens
+        rate_units = {
+            "cached_input": self._rate(
+                dependency,
+                model_or_adapter,
+                "cached_input_token",
+                time_band=time_band,
+            ),
+            "uncached_input": self._rate(
+                dependency,
+                model_or_adapter,
+                "uncached_input_token",
+                time_band=time_band,
+            ),
+            "input": self._rate(
+                dependency,
+                model_or_adapter,
+                "input_token",
+                time_band=time_band,
+            ),
+            "output": self._rate(
+                dependency,
+                model_or_adapter,
+                "output_token",
+                time_band=time_band,
+            ),
+        }
+        rates_per_million = {
+            name: format(
+                (rate * Decimal("1000000")).quantize(Decimal("0.000000001")),
+                "f",
+            )
+            for name, rate in sorted(rate_units.items())
+            if rate is not None
+        }
+        return {
+            "policy_sha256": self.policy_sha256,
+            "source_identity": self._policy.source_identity,
+            "model_or_adapter": model_or_adapter,
+            "billing_schedule": self._policy.billing_schedule or "flat",
+            "time_band": time_band,
+            "valued_at": instant.isoformat(),
+            "cached_input_tokens": usage.cached_input_tokens,
+            "uncached_input_tokens": (
+                usage.uncached_input_tokens + max(0, usage.input_tokens - explicit)
+            ),
+            "output_tokens": usage.output_tokens,
+            "cost_cny": format(valued.cost_cny or Decimal("0"), "f"),
+            "concurrency_limit": self._policy.concurrency_limits.get(model_or_adapter),
+            "rates_cny_per_million_tokens": rates_per_million,
+        }
+
+    def _validated_instant(self, valued_at: datetime | None) -> datetime:
+        instant = valued_at or self._default_valued_at
+        if instant.tzinfo is None:
+            raise PricingPolicyError("valued_at must include a timezone")
+        if self._policy.effective_at > instant:
+            raise PricingPolicyError("pricing policy is not yet effective")
+        return instant
+
+    def _time_band(self, instant: datetime) -> Literal["all", "peak", "off_peak"]:
+        if self._policy.billing_schedule is None:
+            return "all"
+        beijing = instant.astimezone(timezone(timedelta(hours=8), name="Asia/Shanghai"))
+        hour = beijing.hour + beijing.minute / 60 + beijing.second / 3600
+        peak = beijing.weekday() < 5 and (9 <= hour < 12 or 14 <= hour < 18)
+        return "peak" if peak else "off_peak"
+
+    def _rate(
+        self,
+        dependency: DependencyName,
+        model_or_adapter: str,
+        unit: PricingUnit,
+        *,
+        time_band: Literal["all", "peak", "off_peak"],
+    ) -> Decimal | None:
+        specific = self._rates.get(
+            (dependency, model_or_adapter, unit, time_band)
+        )
+        if specific is not None:
+            return specific
+        return self._rates.get((dependency, model_or_adapter, unit, "all"))
+
+    def _value_for_band(
+        self,
+        *,
+        dependency: DependencyName,
+        model_or_adapter: str,
+        usage: UsageActual,
+        time_band: Literal["all", "peak", "off_peak"],
+    ) -> UsageActual:
+        units = self._billable_units(
+            dependency,
+            model_or_adapter,
+            usage,
+            time_band=time_band,
+        )
+        if not any(quantity > 0 for _, quantity in units):
+            raise PricingPolicyError("actual usage has no billable units")
+        total = Decimal("0")
+        for unit, quantity in units:
+            if quantity == 0:
+                continue
+            rate = self._rate(
+                dependency,
+                model_or_adapter,
+                unit,
+                time_band=time_band,
+            )
+            if rate is None:
+                raise PricingPolicyError(
+                    f"missing pricing rate for {dependency}/{model_or_adapter}/{unit}"
+                )
+            total += rate * quantity
+        valued_cost = quantize_cost_cny(total, self._policy.rounding_quantum_cny)
+        if usage.cost_cny is not None and usage.cost_cny != valued_cost:
+            raise PricingPolicyError("authoritative billed amount does not match pricing policy")
+        return UsageActual.model_validate(
+            {**usage.model_dump(mode="python"), "cost_cny": valued_cost}
+        )
+
     def _billable_units(
-        dependency: DependencyName, usage: UsageActual
-    ) -> tuple[tuple[Literal["input_token", "output_token", "request"], int], ...]:
+        self,
+        dependency: DependencyName,
+        model_or_adapter: str,
+        usage: UsageActual,
+        *,
+        time_band: Literal["all", "peak", "off_peak"],
+    ) -> tuple[tuple[PricingUnit, int], ...]:
         if dependency == "llm":
             if usage.search_api_calls:
                 raise PricingPolicyError("LLM usage cannot include search API calls")
+            split_pricing = self._rate(
+                dependency,
+                model_or_adapter,
+                "uncached_input_token",
+                time_band=time_band,
+            ) is not None
+            if split_pricing:
+                explicit = usage.cached_input_tokens + usage.uncached_input_tokens
+                uncached = usage.uncached_input_tokens + max(
+                    0, usage.input_tokens - explicit
+                )
+                return (
+                    ("cached_input_token", usage.cached_input_tokens),
+                    ("uncached_input_token", uncached),
+                    ("output_token", usage.output_tokens),
+                    ("request", usage.llm_calls),
+                )
             return (
                 ("input_token", usage.input_tokens),
                 ("output_token", usage.output_tokens),
                 ("request", usage.llm_calls),
             )
-        if usage.llm_calls or usage.input_tokens or usage.output_tokens:
+        if (
+            usage.llm_calls
+            or usage.input_tokens
+            or usage.cached_input_tokens
+            or usage.uncached_input_tokens
+            or usage.output_tokens
+        ):
             raise PricingPolicyError("provider usage cannot include LLM usage")
         return (("request", usage.search_api_calls),)

@@ -7,9 +7,9 @@ import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-import joblib
+import joblib  # type: ignore[import-untyped]
 
 from paper_search.evaluation.dataset import write_frozen_bytes
 from paper_search.learning.lexical_bridge import SupervisedLexicalBridge
@@ -101,7 +101,28 @@ def load_lexical_bridge_model(
     manifest_path: Path,
 ) -> LoadedLexicalBridge:
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest_bytes = manifest_path.read_bytes()
+    except OSError:
+        raise ValueError("invalid lexical bridge deployment manifest") from None
+    try:
+        model_bytes = model_path.read_bytes()
+    except OSError:
+        raise ValueError("lexical bridge artifact is unavailable") from None
+    return load_lexical_bridge_model_bytes(
+        model_bytes=model_bytes,
+        manifest_bytes=manifest_bytes,
+    )
+
+
+def load_lexical_bridge_model_bytes(
+    *,
+    model_bytes: bytes,
+    manifest_bytes: bytes,
+) -> LoadedLexicalBridge:
+    """Restore a bridge from the exact bytes retained by an input lock."""
+
+    try:
+        manifest = json.loads(manifest_bytes)
         if manifest["schema_version"] != _SCHEMA_VERSION:
             raise ValueError
         if manifest["model_id"] != _MODEL_ID:
@@ -115,10 +136,6 @@ def load_lexical_bridge_model(
         expected_hash = str(manifest["model_sha256"])
     except (OSError, UnicodeError, ValueError, TypeError, KeyError, json.JSONDecodeError):
         raise ValueError("invalid lexical bridge deployment manifest") from None
-    try:
-        model_bytes = model_path.read_bytes()
-    except OSError:
-        raise ValueError("lexical bridge artifact is unavailable") from None
     if _sha256(model_bytes) != expected_hash:
         raise ValueError("lexical bridge artifact hash mismatch")
     try:
@@ -135,9 +152,9 @@ def load_lexical_bridge_model(
     return LoadedLexicalBridge(
         bridge=bridge,
         source_sha256=expected_hash,
-        max_expansion_terms=int(_CONFIGURATION["max_expansion_terms"]),
-        neighbors=int(_CONFIGURATION["neighbors"]),
-        min_neighbor_support=int(_CONFIGURATION["min_neighbor_support"]),
+        max_expansion_terms=cast(int, _CONFIGURATION["max_expansion_terms"]),
+        neighbors=cast(int, _CONFIGURATION["neighbors"]),
+        min_neighbor_support=cast(int, _CONFIGURATION["min_neighbor_support"]),
         manifest=manifest,
     )
 
@@ -146,4 +163,5 @@ __all__ = [
     "LoadedLexicalBridge",
     "freeze_lexical_bridge_model",
     "load_lexical_bridge_model",
+    "load_lexical_bridge_model_bytes",
 ]

@@ -154,6 +154,8 @@ class _LLMTransportConfig:
 def usage_from_response_bytes(response_bytes: bytes) -> UsageActual:
     """Measure reported token usage without interpreting assistant content."""
     input_tokens = 0
+    cached_input_tokens = 0
+    uncached_input_tokens = 0
     output_tokens = 0
     try:
         envelope = json.loads(response_bytes)
@@ -163,10 +165,23 @@ def usage_from_response_bytes(response_bytes: bytes) -> UsageActual:
         usage = envelope.get("usage")
         if isinstance(usage, Mapping):
             input_tokens = _nonnegative_int(usage.get("prompt_tokens"))
+            cached_input_tokens = _nonnegative_int(
+                usage.get("prompt_cache_hit_tokens")
+            )
+            uncached_input_tokens = _nonnegative_int(
+                usage.get("prompt_cache_miss_tokens")
+            )
+            if input_tokens == 0:
+                input_tokens = cached_input_tokens + uncached_input_tokens
+            if cached_input_tokens + uncached_input_tokens > input_tokens:
+                cached_input_tokens = 0
+                uncached_input_tokens = 0
             output_tokens = _nonnegative_int(usage.get("completion_tokens"))
     return UsageActual(
         llm_calls=1,
         input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        uncached_input_tokens=uncached_input_tokens,
         output_tokens=output_tokens,
     )
 

@@ -108,6 +108,74 @@ def test_routing_rejects_duplicate_query_ids() -> None:
         route_baseline_subqueries(duplicate)
 
 
+def test_routing_deduplicates_actual_provider_identity_and_keeps_later_bridge() -> None:
+    plan = SearchPlan(
+        subqueries=[
+            SubQuery(
+                query_id="exact",
+                text="original query",
+                query_type="exact",
+                priority=1,
+                provider_hint="either",
+                search_mode="lexical",
+            ),
+            SubQuery(
+                query_id="llm-1",
+                text="cross vocabulary action one",
+                query_type="expanded",
+                priority=2,
+                provider_hint="openalex",
+                search_mode="lexical",
+            ),
+            SubQuery(
+                query_id="llm-2",
+                text="cross vocabulary action two",
+                query_type="expanded",
+                priority=3,
+                provider_hint="openalex",
+                search_mode="lexical",
+            ),
+            SubQuery(
+                query_id="semantic-original",
+                text="original query",
+                query_type="expanded",
+                priority=4,
+                provider_hint="either",
+                search_mode="semantic",
+            ),
+            SubQuery(
+                query_id="duplicate-title",
+                text="original query",
+                query_type="decomposed",
+                action_type="title_search",
+                priority=5,
+                provider_hint="openalex",
+                search_mode="lexical",
+            ),
+            SubQuery(
+                query_id="supervised-bridge",
+                text="supervised bridge action",
+                query_type="expanded",
+                priority=6,
+                provider_hint="openalex",
+                search_mode="lexical",
+            ),
+        ],
+        inherited_hard_filters={},
+        rationale="six-slot candidate",
+    )
+
+    routes = route_baseline_subqueries(plan)
+
+    assert [item.subquery_id for item in routes] == [
+        "exact",
+        "llm-1",
+        "llm-2",
+        "semantic-original",
+        "supervised-bridge",
+    ]
+
+
 def test_priority_ties_use_query_id_as_stable_tiebreaker() -> None:
     plan = _plan("openalex", "openalex", "openalex")
     tied = plan.model_copy(

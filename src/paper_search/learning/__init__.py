@@ -50,6 +50,10 @@ from paper_search.learning.deployment import (
     build_cpu_action_analyzer_decorator,
     load_cpu_action_policy,
 )
+from paper_search.learning.pasa_training_augmentation import (
+    write_pasa_augmented_handoff,
+    write_pasa_supplement_receipt,
+)
 
 __all__ = [
     "DatasetExample",
@@ -86,4 +90,6 @@ __all__ = [
     "run_cpu_action_experiment",
     "build_cpu_action_analyzer_decorator",
     "load_cpu_action_policy",
+    "write_pasa_augmented_handoff",
+    "write_pasa_supplement_receipt",
 ]

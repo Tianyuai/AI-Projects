@@ -102,6 +102,48 @@ def test_semantic_text_search_marks_the_provider_search_mode() -> None:
     ]
 
 
+def test_semantic_text_search_caps_depth_without_reducing_lexical_depth() -> None:
+    backend = FakeSearchBackend(BackendSearchResult())
+    handler = TextSearchHandler(backend=backend)
+    semantic = TextSearchAction(
+        action_id="semantic-depth",
+        strategy="controlled-semantic",
+        action_type="text_search",
+        payload=TextSearchPayload(
+            query_text="query-adaptive semantic expression",
+            search_mode="semantic",
+        ),
+    )
+    lexical = TextSearchAction(
+        action_id="lexical-depth",
+        strategy="controlled-lexical",
+        action_type="text_search",
+        payload=TextSearchPayload(query_text="query adaptive lexical expression"),
+    )
+    context = RetrievalExecutionContext(
+        query_id="query-depth",
+        max_results_per_action=100,
+    )
+
+    asyncio.run(handler.execute(semantic, context))
+    asyncio.run(handler.execute(lexical, context))
+
+    assert backend.calls == [
+        (
+            "semantic-depth",
+            "query-adaptive semantic expression",
+            {"_search_mode": "semantic"},
+            50,
+        ),
+        (
+            "lexical-depth",
+            "query adaptive lexical expression",
+            {},
+            100,
+        ),
+    ]
+
+
 def test_text_search_module_has_no_recall_filtering_or_handler_dependencies() -> None:
     import paper_search.recall_experiments.retrieval.text_search as module
 

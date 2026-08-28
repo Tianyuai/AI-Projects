@@ -1,0 +1,32 @@
+{
+  "schema_version": "query-adaptive-high-recall-validation-gate-v1",
+  "query_count": 352,
+  "sample_role": "independent_frozen_validation",
+  "source_population": "OpenAlex+PASA mixed candidate Gold-miss auto_train",
+  "selection_uses_gold_content": false,
+  "disjoint_from": [
+    "query-adaptive-high-recall-discovery128-v1",
+    "openalex-semantic-backfill-385-v1"
+  ],
+  "thresholds": {
+    "minimum_gold_hit_query_count": 25,
+    "minimum_gold_hit_query_rate": 0.07,
+    "minimum_gold_hit_count": 25,
+    "minimum_macro_candidate_recall": 0.04,
+    "minimum_hit_query_count_by_required_stratum": {
+      "negation": 1,
+      "task": 1,
+      "unstructured": 1
+    },
+    "maximum_missing_action_identity_count": 0,
+    "maximum_final_failed_query_count": 0,
+    "maximum_llm_call_count": 0
+  },
+  "candidate_pack_requirements": {
+    "preserve_existing_candidate_members": true,
+    "deduplicate_by_production_identifier_aliases": true,
+    "freeze_only_after_gate_pass": true,
+    "test_partition_touched": false,
+    "production_lock_modified": false
+  }
+}

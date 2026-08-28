@@ -86,6 +86,7 @@ def _doi_identifier(paper: Paper) -> str | None:
 def _external_identifiers(paper: Paper, id_map: IdentifierMap | None) -> set[str]:
     candidates = (
         _doi_identifier(paper),
+        _try_normalize(paper.arxiv_id, kind="arxiv"),
         _try_normalize(paper.openalex_id, kind="openalex"),
         _try_normalize(paper.semantic_scholar_id, kind="semantic_scholar"),
         _try_normalize(paper.canonical_id),
@@ -136,9 +137,16 @@ def _ordered_union(values: Sequence[Sequence[str]]) -> list[str]:
     return result
 
 
-def _representative_rank(paper: Paper) -> tuple[int, int, int, int, int, int, int]:
+def _representative_rank(
+    paper: Paper,
+) -> tuple[int, int, int, int, int, int, int, int]:
+    doi_identifier = _doi_identifier(paper)
     return (
-        int(_doi_identifier(paper) is not None),
+        int(
+            doi_identifier is not None
+            and not doi_identifier.startswith("doi:10.48550/arxiv.")
+        ),
+        int(doi_identifier is not None),
         len(_external_identifiers(paper, None)),
         int(paper.abstract is not None),
         len(paper.authors),

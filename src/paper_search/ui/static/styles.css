@@ -102,11 +102,37 @@ select { min-width: 12rem; padding: .65rem .8rem; border: 1px solid var(--border
 .empty-state h2 { margin: .5rem 0; color: var(--text); }
 .empty-state p { max-width: 36rem; margin: auto; }
 .evidence-panel { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-block: 2rem 4rem; }
+.wide-panel { grid-column: 1 / -1; }
+.system-pipeline { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1.3rem; margin: 0; padding: 0 1rem 1rem; list-style: none; }
+.pipeline-stage { position: relative; min-width: 0; padding: .85rem; border-top: 3px solid var(--brand); border-radius: .7rem; background: var(--surface-soft); overflow-wrap: anywhere; }
+.pipeline-stage::after { position: absolute; top: 50%; right: -.95rem; color: var(--muted); content: "→"; transform: translateY(-50%); }
+.pipeline-stage:nth-child(4n)::after { content: none; }
+.pipeline-stage:last-child::after { content: none; }
+.pipeline-stage.active { border-top-color: var(--success); }
+.pipeline-stage.skipped { border-top-color: var(--muted); }
+.pipeline-stage.fallback { border-top-color: var(--warning); }
+.pipeline-index, .pipeline-stage strong, .pipeline-detail, .pipeline-status { display: block; }
+.pipeline-index { margin-bottom: .35rem; color: var(--brand); font-size: .72rem; font-weight: 800; letter-spacing: .08em; }
+.pipeline-stage strong { font-size: .85rem; line-height: 1.25; }
+.pipeline-detail { margin-top: .45rem; color: var(--muted); font-size: .72rem; line-height: 1.35; }
+.pipeline-status { margin-top: .7rem; color: var(--text); font-size: .68rem; font-weight: 750; text-transform: uppercase; }
 details { border: 1px solid var(--border); border-radius: .9rem; background: var(--surface); }
 summary { cursor: pointer; padding: 1rem; }
 summary span { display: inline-grid; margin-left: .35rem; }
 summary small { color: var(--muted); }
 .definition-grid, .diagnostics { margin: 0; padding: 0 1rem 1rem; }
+.trace-content { padding: 0 1rem 1rem; }
+.trace-content > .definition-grid { padding-inline: 0; }
+.trace-content h3 { margin: 1rem 0 .5rem; font-size: .9rem; }
+.action-list, .execution-trace { margin: 0; padding: 0 1rem 1rem 2rem; }
+.action-list li { margin-block: .45rem; }
+.action-list strong, .action-list small { display: block; }
+.action-list small { color: var(--muted); }
+.execution-trace { display: grid; gap: .65rem; }
+.trace-item { padding: .8rem; border: 1px solid var(--border); border-radius: .7rem; background: var(--surface-soft); }
+.trace-grid { display: grid; grid-template-columns: minmax(8rem, max-content) 1fr; gap: .25rem .8rem; margin: .55rem 0 0; font-size: .78rem; overflow-wrap: anywhere; }
+.trace-grid dt { color: var(--muted); font-weight: 700; text-transform: capitalize; }
+.trace-grid dd { margin: 0; }
 .definition-grid { display: grid; grid-template-columns: max-content 1fr; gap: .5rem 1rem; font-size: .8rem; overflow-wrap: anywhere; }
 .definition-grid dt { color: var(--muted); font-weight: 700; }
 .definition-grid dd { margin: 0; }
@@ -115,12 +141,20 @@ summary small { color: var(--muted); }
 .site-footer { margin-top: 4rem; padding-block: 2rem; border-top: 1px solid var(--border); color: var(--muted); font-size: .8rem; }
 [hidden] { display: none !important; }
 
+@media (max-width: 1040px) {
+  .system-pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pipeline-stage:nth-child(2n)::after { content: none; }
+}
+
 @media (max-width: 760px) {
   .mode-badge { display: none; }
   .form-actions, .section-heading { align-items: stretch; flex-direction: column; }
   .button-row, .button { width: 100%; }
   .card-grid, .evidence-panel { grid-template-columns: 1fr; }
   .evidence-row { grid-template-columns: 1fr; gap: .15rem; }
+  .system-pipeline { grid-template-columns: 1fr; gap: 1.5rem; }
+  .pipeline-stage::after, .pipeline-stage:nth-child(2n)::after, .pipeline-stage:nth-child(4n)::after { top: auto; right: auto; bottom: -1.25rem; left: 50%; content: "↓"; transform: translateX(-50%); }
+  .pipeline-stage:last-child::after { content: none; }
 }
 
 @media (prefers-color-scheme: dark) {

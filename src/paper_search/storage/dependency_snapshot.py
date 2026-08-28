@@ -79,7 +79,16 @@ _CANONICAL_REQUEST_FIELDS: dict[tuple[str, str], frozenset[str]] = {
         {"filter", "limit", "paper_id", "per_page", "select"}
     ),
     ("semantic_scholar", "search"): frozenset(
-        {"fields", "filters", "limit", "offset", "query", "venue", "year"}
+        {
+            "fields",
+            "filters",
+            "limit",
+            "offset",
+            "query",
+            "search_mode",
+            "venue",
+            "year",
+        }
     ),
     ("semantic_scholar", "batch"): frozenset({"fields", "ids"}),
     ("semantic_scholar", "citations"): frozenset(
@@ -245,6 +254,7 @@ class SnapshotEntryV2(DomainModel):
     safe_headers: dict[NonEmptyStr, NonEmptyStr]
     error: SnapshotErrorV2 | None = None
     usage: UsageActual | None = None
+    pricing_receipt: dict[NonEmptyStr, object] | None = None
 
 
 class DependencySnapshotManifestV2(DomainModel):
@@ -259,6 +269,7 @@ class SnapshotRead(DomainModel):
     response_bytes: bytes
     error: SnapshotErrorV2 | None = None
     usage: UsageActual | None = None
+    pricing_receipt: dict[NonEmptyStr, object] | None = None
 
 
 def _identity_cache_key(identity: DependencyRequestIdentity) -> str:
@@ -436,6 +447,8 @@ class DependencyCaptureStore:
         self,
         entry_id: str,
         usage: UsageActual,
+        *,
+        pricing_receipt: dict[str, object] | None = None,
     ) -> None:
         """Attach the settled usage of one captured call to its snapshot entry."""
         if self._sealed:
@@ -446,7 +459,12 @@ class DependencyCaptureStore:
             if entry.usage is not None:
                 raise ValueError("snapshot usage is already annotated")
             self._entries[index] = entry.model_copy(
-                update={"usage": UsageActual.model_validate(usage.model_dump(mode="python"))}
+                update={
+                    "usage": UsageActual.model_validate(usage.model_dump(mode="python")),
+                    "pricing_receipt": (
+                        dict(pricing_receipt) if pricing_receipt is not None else None
+                    ),
+                }
             )
             return
         raise KeyError(f"snapshot entry is unavailable: {entry_id}")
@@ -560,6 +578,7 @@ class DependencySnapshotReader:
             response_bytes=response_bytes,
             error=entry.error,
             usage=entry.usage,
+            pricing_receipt=entry.pricing_receipt,
         )
 
 

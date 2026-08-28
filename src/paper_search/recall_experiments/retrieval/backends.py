@@ -314,6 +314,82 @@ class BudgetedSearchBackend(_BudgetedProviderCall):
             infrastructure_failure=_infrastructure_failure(result.errors),
         )
 
+    async def search_continuation(
+        self,
+        action_id: str,
+        query: str,
+        filters: dict[str, object],
+        *,
+        cursor: str,
+        limit: int,
+    ) -> BackendSearchResult:
+        """Run one hash-bound OpenAlex lexical continuation under normal accounting."""
+        if not isinstance(self._provider, LiveCaptureSearchProvider):
+            raise ValueError("live OpenAlex provider is required for continuation")
+        try:
+            reservation = self._reserve(action_id)
+        except BudgetExceededError as error:
+            return BackendSearchResult(
+                errors=[
+                    _backend_error(
+                        code="budget_exhausted", message=str(error), provider="search"
+                    )
+                ],
+                infrastructure_failure=True,
+            )
+        except ReservationError as error:
+            return BackendSearchResult(
+                errors=[
+                    _backend_error(
+                        code="accounting_failure", message=str(error), provider="search"
+                    )
+                ],
+                infrastructure_failure=True,
+            )
+        result: ProviderResult[list[Paper]] | None = None
+        try:
+            result = await self._provider.search_continuation(
+                query,
+                filters,
+                cursor=cursor,
+                limit=limit,
+                reservation=reservation,
+            )
+            self._settle_or_verify(reservation, result.usage)
+        except asyncio.CancelledError:
+            self._finalize_exception(reservation)
+            raise
+        except ReservationError as error:
+            if result is None:
+                self._finalize_exception(reservation)
+            else:
+                self._fail_accounting(reservation, result.usage)
+            return BackendSearchResult(
+                errors=[
+                    _backend_error(
+                        code="accounting_failure", message=str(error), provider="search"
+                    )
+                ],
+                infrastructure_failure=True,
+            )
+        except Exception as error:
+            self._finalize_exception(reservation)
+            return BackendSearchResult(
+                errors=[
+                    _backend_error(
+                        code="provider_error", message=str(error), provider="search"
+                    )
+                ],
+                infrastructure_failure=True,
+            )
+        return BackendSearchResult(
+            hits=list(result.data),
+            usage=result.usage,
+            provenance=dict(result.provenance),
+            errors=list(result.errors),
+            infrastructure_failure=_infrastructure_failure(result.errors),
+        )
+
     def owns_live_resources(self, *, client: object, capture_store: object) -> bool:
         return isinstance(client, httpx.AsyncClient) and isinstance(
             capture_store, DependencyCaptureStore

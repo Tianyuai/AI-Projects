@@ -11,6 +11,7 @@ from paper_search.learning.lexical_bridge import (
 from paper_search.learning.lexical_bridge_deployment import (
     freeze_lexical_bridge_model,
     load_lexical_bridge_model,
+    load_lexical_bridge_model_bytes,
 )
 
 
@@ -96,6 +97,29 @@ def test_lexical_bridge_loader_rejects_tampered_artifact(tmp_path) -> None:
             model_path=model_path,
             manifest_path=manifest_path,
         )
+
+
+def test_lexical_bridge_loads_from_already_verified_bytes(tmp_path) -> None:
+    model_path = tmp_path / "lexical-bridge.joblib"
+    manifest_path = tmp_path / "lexical-bridge.json"
+    manifest = freeze_lexical_bridge_model(
+        _bridge(),
+        model_path=model_path,
+        manifest_path=manifest_path,
+        training_query_count=3,
+        raw_train_sha256=_sha256(b"raw-train"),
+        train_partition_sha256=_sha256(b"train-partition"),
+        training_oof_sha256=_sha256(b"training-oof"),
+        independent_dev_sha256=_sha256(b"independent-dev"),
+    )
+
+    loaded = load_lexical_bridge_model_bytes(
+        model_bytes=model_path.read_bytes(),
+        manifest_bytes=manifest_path.read_bytes(),
+    )
+
+    assert loaded.source_sha256 == manifest["model_sha256"]
+    assert loaded.manifest["training_query_count"] == 3
 
 
 def test_lexical_bridge_serialization_state_has_canonical_term_order() -> None:

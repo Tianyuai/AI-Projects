@@ -25,6 +25,20 @@ def _sha256(content: bytes) -> str:
     return f"sha256:{sha256(content).hexdigest()}"
 
 
+def test_context_enhanced_high_recall_recipe_pages_lexical_actions_deeper() -> None:
+    loaded = load_recall_recipe(
+        Path(
+            "configs/recall_experiments/methods/"
+            "context-enhanced-high-recall-live.yaml"
+        )
+    )
+
+    assert loaded.recipe.method_id == "context-enhanced-high-recall"
+    assert loaded.recipe.retrieval.max_results_per_action == 150
+    assert loaded.recipe.retrieval.max_total_actions == 12
+    assert loaded.recipe.generator.gold_visibility == "blind"
+
+
 def _manual_recipe(*, actions: str = "runs/actions.json") -> dict[str, object]:
     return {
         "method_id": "manual-example",

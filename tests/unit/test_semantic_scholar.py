@@ -80,6 +80,33 @@ def test_search_maps_complete_and_missing_fields_and_preserves_identity(tmp_path
     assert API_KEY not in result.model_dump_json()
 
 
+def test_search_accepts_internal_semantic_mode_without_forwarding_it(
+    tmp_path: Path,
+) -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=_bytes("search.json"), request=request)
+
+    async def run() -> object:
+        provider, client = await _provider(tmp_path, httpx.MockTransport(handler))
+        async with client:
+            return await provider.search(
+                "graph retrieval",
+                {"_search_mode": "semantic", "year_from": 2020},
+                2,
+                _reservation(),
+            )
+
+    result = asyncio.run(run())
+
+    assert seen[0].url.params["query"] == "graph retrieval"
+    assert seen[0].url.params["year"] == "2020-"
+    assert "_search_mode" not in seen[0].url.params
+    assert result.provenance["search_mode"] == "semantic"
+
+
 def test_batch_details_skips_null_entry_and_maps_relation_ids(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"

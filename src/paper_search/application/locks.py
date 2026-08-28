@@ -122,19 +122,103 @@ class DocumentRankerBinding(_LockModel):
     enabled: Literal[True]
     manifest: ArtifactBinding
     weights: ArtifactBinding
+    fallback_manifest: ArtifactBinding | None = None
+    fallback_weights: ArtifactBinding | None = None
+    emergency_manifest: ArtifactBinding | None = None
+    emergency_weights: ArtifactBinding | None = None
+
+    @model_validator(mode="after")
+    def validate_failover_chain(self) -> DocumentRankerBinding:
+        fallback = (self.fallback_manifest, self.fallback_weights)
+        emergency = (self.emergency_manifest, self.emergency_weights)
+        if (fallback[0] is None) != (fallback[1] is None):
+            raise ValueError("document ranker fallback manifest and weights must be paired")
+        if (emergency[0] is None) != (emergency[1] is None):
+            raise ValueError("document ranker emergency manifest and weights must be paired")
+        if emergency[0] is not None and fallback[0] is None:
+            raise ValueError("document ranker emergency fallback requires primary fallback")
+        return self
+
+    def artifact_bindings(self) -> tuple[ArtifactBinding, ...]:
+        bindings = [self.manifest, self.weights]
+        if self.fallback_manifest is not None and self.fallback_weights is not None:
+            bindings.extend((self.fallback_manifest, self.fallback_weights))
+        if self.emergency_manifest is not None and self.emergency_weights is not None:
+            bindings.extend((self.emergency_manifest, self.emergency_weights))
+        return tuple(bindings)
+
+
+class CrossVocabularySupplementBinding(_LockModel):
+    enabled: Literal[True]
+    policy_version: Literal["contrastive-bridge-anchor-conditioned-v2"]
+    eligible_profile: Literal["unconstrained"]
+    strict_negation_abstention: Literal[True]
+    max_actions: Literal[1]
+    max_total_openalex_actions: Literal[7]
+    max_additional_raw_candidates: Literal[50]
+    max_total_raw_candidates: Literal[350]
+
+
+class SupervisedLexicalBridgeBinding(_LockModel):
+    enabled: Literal[True]
+    policy_version: Literal["supervised-lexical-bridge-openalex-v2"]
+    manifest: ArtifactBinding
+    model: ArtifactBinding
+    max_actions: Literal[1]
+
+
+class PasaIdentityAliasesBinding(_LockModel):
+    enabled: Literal[True]
+    policy_version: Literal["conservative-pasa-identity-alias-v1"]
+    alias_map: ArtifactBinding
+    alias_count: PositiveInt
+
+
+class LowConfidenceLLMSupplementBinding(_LockModel):
+    enabled: Literal[True]
+    policy_version: Literal["low-confidence-llm-lexical-supplement-v1"]
+    confidence_policy_version: Literal["openalex-runtime-confidence-v2"]
+    prompt_version: Literal["query-analyze-protected-actions-v3"]
+    prompt_config: ArtifactBinding
+    strict_negation_abstention: Literal[True]
+    max_actions: Literal[1]
+    max_provider_calls: Literal[2]
+    max_additional_raw_candidates: Literal[50]
+    max_additional_deduplicated_candidates: Literal[50]
+    max_total_deduplicated_candidates: Literal[250]
+    max_input_tokens: Literal[4000]
+    max_output_tokens: Literal[2000]
+    max_llm_attempts: Literal[3]
 
 
 class BaselineBinding(_LockModel):
-    primary_model: Literal["deepseek-v4-flash"]
-    fallback_model: Literal["deepseek-v4-flash"]
-    prompt_version: Literal["query-analyze-v1"]
-    strategy: Literal["fixed-one-round"]
+    primary_model: Literal["deepseek-v4-flash", "qwen3.7-plus"]
+    fallback_model: Literal["deepseek-v4-flash", "qwen3.6-flash"]
+    prompt_version: Literal[
+        "query-analyze-v1",
+        "query-analyze-semantic-actions-v2",
+        "query-analyze-protected-actions-v3",
+    ]
+    strategy: Literal["fixed-one-round", "bounded-two-stage-unconstrained"]
     planner: PlannerBinding
     retrieval: RetrievalBinding
     timeout: TimeoutBinding
     retry: RetryBinding
     optional_modules: BaselineOptionalModules
     document_ranker: DocumentRankerBinding | None = None
+    cross_vocabulary_supplement: CrossVocabularySupplementBinding | None = None
+    supervised_lexical_bridge: SupervisedLexicalBridgeBinding | None = None
+    pasa_identity_aliases: PasaIdentityAliasesBinding | None = None
+    low_confidence_llm_supplement: LowConfidenceLLMSupplementBinding | None = None
+
+    @model_validator(mode="after")
+    def validate_retrieval_strategy(self) -> BaselineBinding:
+        bounded = self.strategy == "bounded-two-stage-unconstrained"
+        if bounded != (self.cross_vocabulary_supplement is not None):
+            raise ValueError(
+                "bounded two-stage strategy and cross-vocabulary supplement must be paired"
+            )
+        return self
 
 
 class _LiveInputLockBase(_LockModel):
@@ -150,6 +234,15 @@ class _LiveInputLockBase(_LockModel):
     capture_policy: CapturePolicyBinding
     project_ledger: ProjectLedgerBinding = ProjectLedgerBinding()
     approval_ref: NonEmptyStr
+
+    @model_validator(mode="after")
+    def validate_live_model(self) -> _LiveInputLockBase:
+        if (
+            self.baseline.primary_model != "deepseek-v4-flash"
+            or self.baseline.fallback_model != "deepseek-v4-flash"
+        ):
+            raise ValueError("live locks require the deepseek-v4-flash model")
+        return self
 
 
 class CandidateLock(_LiveInputLockBase):
@@ -205,28 +298,46 @@ class VerifiedInputLock:
 
     lock: CandidateLock | ValidationLock | ReplayLock
     artifact_bytes: Mapping[SafeRelativePath, bytes]
+    ranker_artifact_failures: Mapping[SafeRelativePath, str]
 
 _INPUT_LOCK_ADAPTER: TypeAdapter[CandidateLock | ValidationLock | ReplayLock] = TypeAdapter(
     InputLock
 )
 
 
-def _artifact_bindings(lock: InputLock) -> tuple[ArtifactBinding, ...]:
-    bindings = (
+def _required_artifact_bindings(lock: InputLock) -> tuple[ArtifactBinding, ...]:
+    bindings = [
         lock.frozen_data.manifest,
         lock.frozen_data.identifier_map,
         lock.baseline.planner.prompt_config,
         lock.budget_config,
         lock.pricing_policy,
         lock.quality_gates,
-    )
-    if lock.baseline.document_ranker is None:
-        return bindings
-    return (
-        *bindings,
-        lock.baseline.document_ranker.manifest,
-        lock.baseline.document_ranker.weights,
-    )
+    ]
+    bridge = lock.baseline.supervised_lexical_bridge
+    if bridge is not None:
+        bindings.extend((bridge.manifest, bridge.model))
+    aliases = lock.baseline.pasa_identity_aliases
+    if aliases is not None:
+        bindings.append(aliases.alias_map)
+    low_confidence = lock.baseline.low_confidence_llm_supplement
+    if low_confidence is not None:
+        bindings.append(low_confidence.prompt_config)
+    return tuple(bindings)
+
+
+def _ranker_artifact_pairs(
+    lock: InputLock,
+) -> tuple[tuple[ArtifactBinding, ArtifactBinding], ...]:
+    binding = lock.baseline.document_ranker
+    if binding is None:
+        return ()
+    pairs = [(binding.manifest, binding.weights)]
+    if binding.fallback_manifest is not None and binding.fallback_weights is not None:
+        pairs.append((binding.fallback_manifest, binding.fallback_weights))
+    if binding.emergency_manifest is not None and binding.emergency_weights is not None:
+        pairs.append((binding.emergency_manifest, binding.emergency_weights))
+    return tuple(pairs)
 
 
 def _preflight_artifact_root(artifact_root: Path, relative_path: SafeRelativePath) -> Path:
@@ -376,11 +487,11 @@ def _read_confined_bytes(artifact_root: Path, relative_path: SafeRelativePath) -
 
 
 def _verify_artifact_bindings(
-    lock: InputLock,
+    bindings: tuple[ArtifactBinding, ...],
     artifact_root: Path,
 ) -> dict[SafeRelativePath, bytes]:
     bytes_by_path: dict[SafeRelativePath, bytes] = {}
-    for binding in _artifact_bindings(lock):
+    for binding in bindings:
         payload = bytes_by_path.get(binding.path)
         if payload is None:
             payload = _read_confined_bytes(artifact_root, binding.path)
@@ -389,6 +500,47 @@ def _verify_artifact_bindings(
         if actual_sha256 != binding.sha256:
             raise ValueError(f"lock artifact hash mismatch: {binding.path}")
     return bytes_by_path
+
+
+def _ranker_artifact_failure_code(error: ValueError) -> str:
+    message = str(error)
+    if "hash mismatch" in message:
+        return "hash_mismatch"
+    if "does not exist" in message:
+        return "missing"
+    if "escapes artifact root" in message:
+        return "unsafe_path"
+    return "unreadable"
+
+
+def _verify_ranker_artifact_chain(
+    lock: InputLock,
+    artifact_root: Path,
+) -> tuple[dict[SafeRelativePath, bytes], dict[SafeRelativePath, str]]:
+    pairs = _ranker_artifact_pairs(lock)
+    if not pairs:
+        return {}, {}
+    verified: dict[SafeRelativePath, bytes] = {}
+    failures: dict[SafeRelativePath, str] = {}
+    first_error: ValueError | None = None
+    verified_pair_count = 0
+    for pair in pairs:
+        pair_verified = True
+        for binding in pair:
+            try:
+                payload = _verify_artifact_bindings((binding,), artifact_root)[binding.path]
+            except ValueError as error:
+                first_error = first_error or error
+                failures[binding.path] = _ranker_artifact_failure_code(error)
+                pair_verified = False
+                break
+            verified[binding.path] = payload
+        if pair_verified:
+            verified_pair_count += 1
+    if verified_pair_count == 0:
+        assert first_error is not None
+        raise first_error
+    return verified, failures
 
 
 def load_input_lock(path: Path, *, artifact_root: Path) -> InputLock:
@@ -431,10 +583,15 @@ def load_verified_input_lock_bytes(
     if not isinstance(raw, dict):
         raise ValueError("lock file must contain a mapping")
     lock = _INPUT_LOCK_ADAPTER.validate_python(raw)
-    artifact_bytes = _verify_artifact_bindings(lock, artifact_root)
+    artifact_bytes = _verify_artifact_bindings(
+        _required_artifact_bindings(lock), artifact_root
+    )
+    ranker_bytes, ranker_failures = _verify_ranker_artifact_chain(lock, artifact_root)
+    artifact_bytes.update(ranker_bytes)
     return VerifiedInputLock(
         lock=lock,
         artifact_bytes=MappingProxyType(artifact_bytes),
+        ranker_artifact_failures=MappingProxyType(ranker_failures),
     )
 
 

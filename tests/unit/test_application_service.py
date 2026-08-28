@@ -401,6 +401,31 @@ def test_service_malformed_llm_content_can_succeed_via_rules_fallback(code: str)
     assert execution.outcome.response.planner_fallback is True
 
 
+@pytest.mark.parametrize("code", ["invalid_json", "invalid_response", "empty_response"])
+def test_service_malformed_llm_content_can_succeed_via_repair(code: str) -> None:
+    malformed = ErrorDetail(
+        code=code,
+        message="malformed model content",
+        retryable=False,
+        provider="llm",
+    )
+    result = _result(
+        planner_status="repaired",
+        diagnostics=[
+            _diagnostic("llm", errors=[malformed]),
+            _diagnostic("llm"),
+            _diagnostic("openalex"),
+            _diagnostic("semantic_scholar"),
+        ],
+    )
+
+    execution = asyncio.run(_service(result).execute(_request()))
+
+    assert isinstance(execution.outcome, SearchSuccess)
+    assert execution.outcome.response.planner_status == "repaired"
+    assert execution.outcome.response.planner_fallback is False
+
+
 def test_service_maps_provider_snapshot_miss_to_snapshot_unavailable() -> None:
     miss = [
         ErrorDetail(

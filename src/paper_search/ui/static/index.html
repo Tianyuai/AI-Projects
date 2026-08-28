@@ -74,6 +74,22 @@
       </section>
 
       <section id="evidence-panel" class="evidence-panel" hidden aria-label="Run evidence">
+        <details open class="wide-panel pipeline-panel">
+          <summary><span><strong>End-to-end system pipeline</strong><small>Actual modules used from query understanding through ranked delivery and replay</small></span></summary>
+          <ol id="system-pipeline" class="system-pipeline" aria-label="Executed paper search pipeline" aria-live="polite"></ol>
+        </details>
+        <details open>
+          <summary><span><strong>Query understanding</strong><small>Parsed intent, constraints, and retrieval actions</small></span></summary>
+          <div id="query-understanding" class="trace-content"></div>
+        </details>
+        <details open>
+          <summary><span><strong>Cost</strong><small>Actual token usage, price band, and conservative accounting</small></span></summary>
+          <dl id="cost-summary" class="definition-grid"></dl>
+        </details>
+        <details class="wide-panel">
+          <summary><span><strong>Execution trace</strong><small>Providers, candidate stages, ranking, fallback, and replay evidence</small></span></summary>
+          <ol id="execution-trace" class="execution-trace"></ol>
+        </details>
         <details>
           <summary><span><strong>Provenance</strong><small>Run identity and replay information</small></span></summary>
           <dl id="provenance" class="definition-grid"></dl>

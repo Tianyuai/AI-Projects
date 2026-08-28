@@ -1,0 +1,30 @@
+{
+  "default_manifest": "gated-feature-fusion-18314-unified-context-v3-v1/manifest.json",
+  "default_manifest_sha256": "sha256:fe8945b2c346765d3fdcef11dac00a5c65547cff089cc2336fe9ccaa0c0bf8b1",
+  "default_weights": "gated-feature-fusion-18314-unified-context-v3-v1/weights.bundle",
+  "default_weights_sha256": "sha256:1e452c63cb73ed1fde78f7ca2ba612ab15d3d1f93ebe5545581b1f2ad6f5af20",
+  "emergency_fallback": "B0",
+  "emergency_manifest": "cpu-pairwise-document-ranker-expanded2385-v1/manifest.json",
+  "emergency_manifest_sha256": "sha256:b93d1ca8f34ec43314fbb2588b516d81bebe92934332aa912d0665ee273c3607",
+  "emergency_weights": "cpu-pairwise-document-ranker-expanded2385-v1/weights.f64",
+  "emergency_weights_sha256": "sha256:cdfcb93e1355eb607bf4374223d26bd05a4bc86b8c93d6e6b3f3e4fec41d39c8",
+  "fallback_manifest": "reliability-fusion-18314-unified-context-v3-v1/manifest.json",
+  "fallback_manifest_sha256": "sha256:2d9258e0d0fb9013a503092317f4d8d2d0eac5c5669ec08eab23b81733dcfd85",
+  "fallback_weights": "reliability-fusion-18314-unified-context-v3-v1/weights.bundle",
+  "fallback_weights_sha256": "sha256:4a3bc55063af2d61dda0efcabf1bac9f84ae6fbae7c01b9f9dedb09dd505cee8",
+  "fallback_activation": "artifact_or_initialization_failure_only",
+  "production_default": "F5-gated-fusion",
+  "production_fallback": "F4-reliability",
+  "promotion_evidence": "f5-18314-unified-context-v3-production-promotion-v1",
+  "promotion_evidence_sha256": "sha256:0a0bb0ce9e1c5dcff19c7416816f5bbc15f520db7f63a93998aa5eb147797dc0",
+  "large_oof_report_sha256": "sha256:7312a1de672857dde983cbf4ec39ec0961ee91a2c8491274b271b3858582e1d2",
+  "training_query_count": 18314,
+  "per_query_model_switching": false,
+  "runtime_failover_order": [
+    "F5-gated-fusion",
+    "F4-reliability",
+    "B0"
+  ],
+  "schema_version": "production-document-ranker-selection-v2",
+  "test_partition_touched": false
+}

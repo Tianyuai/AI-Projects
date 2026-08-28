@@ -306,6 +306,90 @@ def test_fixture_policy_values_llm_usage_with_exact_decimal_cost() -> None:
     assert valued.cost_cny == Decimal("0.000119")
 
 
+def test_deepseek_beijing_time_bands_value_cache_hit_miss_and_output_exactly() -> None:
+    module = pricing_module()
+    policy = module.parse_pricing_policy_bytes(
+        b"""schema_version: pricing-policy-v1
+currency: CNY
+effective_at: '2026-08-01T00:00:00Z'
+source_identity: deepseek-v4-flash-0731-public-price
+rounding_quantum_cny: '0.000001'
+billing_schedule: beijing-weekday-peak-offpeak-v1
+concurrency_limits: {deepseek-v4-flash: 2500}
+rates:
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: cached_input_token, time_band: off_peak, price_cny_per_unit: '0.00000005'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: cached_input_token, time_band: peak, price_cny_per_unit: '0.00000010'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: uncached_input_token, time_band: off_peak, price_cny_per_unit: '0.00000150'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: uncached_input_token, time_band: peak, price_cny_per_unit: '0.00000300'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: output_token, time_band: off_peak, price_cny_per_unit: '0.00000450'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: output_token, time_band: peak, price_cny_per_unit: '0.00000900'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: request, price_cny_per_unit: '0.000000'}
+"""
+    )
+    pricer = module.ActualCostPricer(
+        policy, valued_at=datetime(2026, 8, 24, 2, tzinfo=UTC)
+    )
+    usage = UsageActual(
+        llm_calls=1,
+        input_tokens=1_000_000,
+        cached_input_tokens=500_000,
+        uncached_input_tokens=500_000,
+        output_tokens=100_000,
+    )
+
+    peak = pricer.value_actual(
+        dependency="llm",
+        model_or_adapter="deepseek-v4-flash",
+        usage=usage,
+        valued_at=datetime(2026, 8, 24, 2, tzinfo=UTC),
+    )
+    off_peak = pricer.value_actual(
+        dependency="llm",
+        model_or_adapter="deepseek-v4-flash",
+        usage=usage,
+        valued_at=datetime(2026, 8, 24, 5, tzinfo=UTC),
+    )
+    conservative_estimate = pricer.value_actual_peak(
+        dependency="llm",
+        model_or_adapter="deepseek-v4-flash",
+        usage=usage,
+    )
+    receipt = pricer.pricing_receipt(
+        dependency="llm",
+        model_or_adapter="deepseek-v4-flash",
+        usage=usage,
+        valued_at=datetime(2026, 8, 24, 2, tzinfo=UTC),
+    )
+
+    assert peak.cost_cny == Decimal("2.450000")
+    assert off_peak.cost_cny == Decimal("1.225000")
+    assert conservative_estimate.cost_cny == Decimal("2.450000")
+    assert receipt["time_band"] == "peak"
+    assert receipt["concurrency_limit"] == 2500
+    assert receipt["rates_cny_per_million_tokens"] == {
+        "cached_input": "0.100000000",
+        "output": "9.000000000",
+        "uncached_input": "3.000000000",
+    }
+
+
+def test_scheduled_pricing_treats_unsplit_input_as_uncached() -> None:
+    module = pricing_module()
+    policy = module.load_pricing_policy(Path("data/annotation_work/pricing_v1.yaml"))
+    pricer = module.ActualCostPricer(
+        policy, valued_at=datetime(2026, 8, 24, 2, tzinfo=UTC)
+    )
+
+    valued = pricer.value_actual(
+        dependency="llm",
+        model_or_adapter="deepseek-v4-flash",
+        usage=UsageActual(llm_calls=1, input_tokens=1_000_000),
+        valued_at=datetime(2026, 8, 24, 2, tzinfo=UTC),
+    )
+
+    assert valued.cost_cny == Decimal("3.000000")
+
+
 def test_fixture_policy_values_provider_request_with_exact_decimal_cost() -> None:
     actual_cost_pricer, _, _, _, _, _ = pricing_api()
     pricer = actual_cost_pricer(

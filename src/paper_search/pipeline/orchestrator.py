@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from pydantic import Field, model_validator
 
@@ -24,17 +24,34 @@ from paper_search.domain.models import (
     PlannerStatus,
     ProviderResult,
     QueryAnalysisResult,
+    QuerySpec,
     RankedPaper,
     ResolvedCitationEdge,
     UsageActual,
     UsageEstimate,
     SearchMode,
 )
+from paper_search.evaluation.dataset import IdentifierMap
+from paper_search.learning.adaptive_openalex_recall import (
+    assess_openalex_recall_confidence,
+)
+from paper_search.learning.cpu_document_ranker import DocumentCandidateEvidence
 from paper_search.processing.deduplicate import deduplicate_papers
 from paper_search.processing.filter import apply_hard_filters
-from paper_search.query.parser import PlannerDependencyError, QueryParser, rule_fallback
+from paper_search.query.parser import (
+    ClassifiedQueryAnalysis,
+    PlannerDependencyError,
+    QueryParser,
+    rule_fallback,
+)
+from paper_search.query.low_confidence_supplement import (
+    LowConfidenceLLMActionSelection,
+    select_low_confidence_llm_action,
+)
 from paper_search.query.planner import QueryPlanner
+from paper_search.query.semantic_actions import PROTECTED_ACTION_PROMPT_VERSION
 from paper_search.ranking.fusion import FusedPaper, fuse_provider_results
+from paper_search.recall_experiments.contracts import RecallActionBatch
 from paper_search.retrieval.base import SearchProvider
 from paper_search.retrieval.routing import RetrievalPolicy, route_baseline_subqueries
 
@@ -46,6 +63,18 @@ Analyzer = Callable[[str, BudgetReservation], Awaitable[ProviderResult[dict[str,
 RepairAnalyzer = Callable[
     [str, str, BudgetReservation], Awaitable[ProviderResult[dict[str, Any]]]
 ]
+OpenAlexSupplementSelector = Callable[
+    [QuerySpec, Sequence[DocumentCandidateEvidence]], RecallActionBatch
+]
+
+
+class QueryPlanEnricher(Protocol):
+    """Deterministically enrich a parsed plan without another remote call."""
+
+    def enrich(
+        self,
+        analysis: ClassifiedQueryAnalysis,
+    ) -> tuple[ClassifiedQueryAnalysis, dict[str, object]]: ...
 
 
 class OrchestratorResult(DomainModel):
@@ -132,6 +161,20 @@ class MockSearchOrchestrator:
         max_output_papers: int | None = None,
         pricer: ActualCostPricer | None = None,
         provider_adapter_names: Mapping[DependencyName, str] | None = None,
+        openalex_supplement_selector: OpenAlexSupplementSelector | None = None,
+        max_total_openalex_actions: int | None = None,
+        query_plan_enricher: QueryPlanEnricher | None = None,
+        identifier_map: IdentifierMap | None = None,
+        identifier_alias_count: int = 0,
+        max_raw_candidates: int | None = None,
+        max_deduplicated_candidates: int | None = None,
+        max_additional_raw_candidates: int | None = None,
+        max_total_raw_candidates: int | None = None,
+        low_confidence_analyzer: Analyzer | None = None,
+        low_confidence_prompt_version: str | None = None,
+        low_confidence_analysis_estimate: UsageEstimate | None = None,
+        max_low_confidence_raw_candidates: int | None = None,
+        max_low_confidence_deduplicated_candidates: int | None = None,
     ) -> None:
         self._controller = controller
         self._analyzer = analyzer
@@ -163,11 +206,210 @@ class MockSearchOrchestrator:
         self._max_output_papers = max_output_papers
         self._pricer = pricer
         self._provider_adapter_names = dict(provider_adapter_names or {})
-        self._parser = QueryParser(QueryPlanner())
+        if openalex_supplement_selector is None:
+            if max_total_openalex_actions is not None:
+                raise ValueError(
+                    "max_total_openalex_actions requires an OpenAlex supplement selector"
+                )
+        elif (
+            type(max_total_openalex_actions) is not int
+            or not 1 <= max_total_openalex_actions <= 7
+        ):
+            raise ValueError(
+                "OpenAlex supplement selection requires a total action bound from one to seven"
+            )
+        self._openalex_supplement_selector = openalex_supplement_selector
+        self._max_total_openalex_actions = max_total_openalex_actions
+        self._query_plan_enricher = query_plan_enricher
+        if (
+            isinstance(identifier_alias_count, bool)
+            or not isinstance(identifier_alias_count, int)
+            or identifier_alias_count < 0
+        ):
+            raise ValueError("identifier_alias_count must be a non-negative integer")
+        self._identifier_map = identifier_map
+        self._identifier_alias_count = identifier_alias_count
+        for name, value in (
+            ("max_raw_candidates", max_raw_candidates),
+            ("max_deduplicated_candidates", max_deduplicated_candidates),
+            ("max_additional_raw_candidates", max_additional_raw_candidates),
+            ("max_total_raw_candidates", max_total_raw_candidates),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+        if (
+            max_raw_candidates is not None
+            and max_total_raw_candidates is not None
+            and max_total_raw_candidates < max_raw_candidates
+        ):
+            raise ValueError("max_total_raw_candidates cannot be below max_raw_candidates")
+        self._max_raw_candidates = max_raw_candidates
+        self._max_deduplicated_candidates = max_deduplicated_candidates
+        self._max_additional_raw_candidates = max_additional_raw_candidates
+        self._max_total_raw_candidates = max_total_raw_candidates
+        evidence_method = getattr(query_plan_enricher, "soft_concept_terms", None)
+        soft_concept_evidence = cast(
+            Callable[[str], Iterable[str]] | None,
+            evidence_method if callable(evidence_method) else None,
+        )
+        low_confidence_values = (
+            low_confidence_analyzer,
+            low_confidence_prompt_version,
+            low_confidence_analysis_estimate,
+            max_low_confidence_raw_candidates,
+            max_low_confidence_deduplicated_candidates,
+        )
+        if any(value is not None for value in low_confidence_values) and not all(
+            value is not None for value in low_confidence_values
+        ):
+            raise ValueError(
+                "low-confidence analyzer, prompt, estimate, and quotas must be configured together"
+            )
+        if (
+            low_confidence_prompt_version is not None
+            and low_confidence_prompt_version != PROTECTED_ACTION_PROMPT_VERSION
+        ):
+            raise ValueError("low-confidence supplement requires the protected v3 prompt")
+        for name, value in (
+            ("max_low_confidence_raw_candidates", max_low_confidence_raw_candidates),
+            (
+                "max_low_confidence_deduplicated_candidates",
+                max_low_confidence_deduplicated_candidates,
+            ),
+        ):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 1
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+        self._low_confidence_analyzer = low_confidence_analyzer
+        self._low_confidence_prompt_version = low_confidence_prompt_version
+        self._low_confidence_analysis_estimate = low_confidence_analysis_estimate
+        self._max_low_confidence_raw_candidates = max_low_confidence_raw_candidates
+        self._max_low_confidence_deduplicated_candidates = (
+            max_low_confidence_deduplicated_candidates
+        )
+        self._parser = QueryParser(
+            QueryPlanner(
+                prompt_version=prompt_version,
+                soft_concept_evidence=soft_concept_evidence,
+            )
+        )
+        self._low_confidence_parser = (
+            QueryParser(
+                QueryPlanner(
+                    prompt_version=cast(str, low_confidence_prompt_version),
+                    soft_concept_evidence=soft_concept_evidence,
+                )
+            )
+            if low_confidence_analyzer is not None
+            else None
+        )
+
+    @staticmethod
+    def _round_robin_cap_action_results(
+        results: Mapping[str, ProviderResult[list[Paper]]],
+        limit: int | None,
+    ) -> dict[str, ProviderResult[list[Paper]]]:
+        """Retain equal-rank evidence across actions before taking deeper ranks."""
+
+        if limit is None or sum(len(item.data) for item in results.values()) <= limit:
+            return dict(results)
+        source_ids = list(results)
+        retained: dict[str, list[Paper]] = {source_id: [] for source_id in source_ids}
+        retained_count = 0
+        max_depth = max((len(results[source_id].data) for source_id in source_ids), default=0)
+        for rank in range(max_depth):
+            for source_id in source_ids:
+                data = results[source_id].data
+                if rank >= len(data):
+                    continue
+                retained[source_id].append(data[rank])
+                retained_count += 1
+                if retained_count == limit:
+                    return {
+                        item_id: results[item_id].model_copy(
+                            update={"data": retained[item_id]}
+                        )
+                        for item_id in source_ids
+                    }
+        return dict(results)
+
+    def _openalex_candidate_evidence(
+        self,
+        action_results: Mapping[str, ProviderResult[list[Paper]]],
+        query_spec: QuerySpec,
+    ) -> list[DocumentCandidateEvidence]:
+        openalex_results = {
+            action_id: result
+            for action_id, result in action_results.items()
+            if action_id.startswith("openalex:")
+        }
+        if not openalex_results:
+            return []
+        merged = deduplicate_papers(
+            [paper for result in openalex_results.values() for paper in result.data],
+            id_map=self._identifier_map,
+        )
+        accepted_ids = {
+            item.paper.canonical_id
+            for item in apply_hard_filters(merged.papers, query_spec).accepted
+        }
+        return [
+            DocumentCandidateEvidence(
+                paper=item.paper,
+                baseline_score=item.score,
+                source_ranks=item.source_ranks,
+            )
+            for item in fuse_provider_results(
+                openalex_results,
+                method="rrf",
+                id_map=self._identifier_map,
+            )
+            if item.paper.canonical_id in accepted_ids
+        ]
+
+    def _fair_merge_nonreinforcing_fused(
+        self,
+        baseline: Sequence[FusedPaper],
+        supplemental: Sequence[FusedPaper],
+    ) -> list[FusedPaper]:
+        """Admit new supplemental members without changing baseline evidence."""
+
+        baseline_papers = [item.paper for item in baseline]
+        merged = list(baseline)
+        for candidate in supplemental:
+            if len(
+                deduplicate_papers(
+                    [*baseline_papers, candidate.paper],
+                    id_map=self._identifier_map,
+                ).papers
+            ) == len(baseline_papers):
+                continue
+            merged.append(candidate)
+        return sorted(merged, key=lambda item: item.score, reverse=True)
 
     def _fallback(self, query: str) -> QueryAnalysisResult:
         spec = rule_fallback(query)
         return QueryAnalysisResult(query_spec=spec, search_plan=QueryPlanner().finalize(spec, None))
+
+    @staticmethod
+    def _provider_search_filters(
+        inherited_hard_filters: Mapping[str, object],
+    ) -> dict[str, object]:
+        """Return only constraints supported by both remote search adapters.
+
+        Venue and exclusion constraints remain part of ``QuerySpec`` and are
+        enforced after normalization. Passing them to either provider would
+        make an otherwise valid request fail before dispatch.
+        """
+
+        return {
+            name: inherited_hard_filters[name]
+            for name in ("year_from", "year_to")
+            if name in inherited_hard_filters
+        }
 
     @staticmethod
     def _combine_provider_results(
@@ -365,6 +607,152 @@ class MockSearchOrchestrator:
 
         return repair
 
+    async def _select_low_confidence_llm_supplement(
+        self,
+        query: str,
+        analysis: ClassifiedQueryAnalysis,
+        action_results: Mapping[str, ProviderResult[list[Paper]]],
+        *,
+        diagnostics: list[DependencyDiagnostic],
+        trace: list[dict[str, object]],
+        warnings: list[str],
+    ) -> LowConfidenceLLMActionSelection | None:
+        if (
+            self._low_confidence_analyzer is None
+            or self._low_confidence_parser is None
+            or self._low_confidence_analysis_estimate is None
+            or self._low_confidence_prompt_version is None
+        ):
+            return None
+        candidates = self._openalex_candidate_evidence(
+            action_results,
+            analysis.query_spec,
+        )
+        decision = assess_openalex_recall_confidence(
+            analysis.query_spec,
+            candidates,
+        )
+        trace.append(
+            {
+                "step": "assess_low_confidence_recall",
+                **decision.model_dump(mode="json"),
+            }
+        )
+        if analysis.query_spec.exclusions:
+            trace.append(
+                {
+                    "step": "skip_llm_supplement",
+                    "reason": "strict_negation_abstention",
+                }
+            )
+            return None
+        if not decision.low_confidence:
+            trace.append(
+                {
+                    "step": "skip_llm_supplement",
+                    "reason": "production_pool_adequate",
+                }
+            )
+            return None
+        try:
+            reservation = self._controller.reserve(
+                "query.low_confidence_analyze",
+                self._low_confidence_analysis_estimate,
+            )
+        except BudgetExceededError:
+            trace.append(
+                {
+                    "step": "llm_supplement_fallback",
+                    "reason": "budget_unavailable",
+                }
+            )
+            warnings.append("low-confidence supplement: budget unavailable")
+            return None
+        try:
+            result = await self._low_confidence_analyzer(query, reservation)
+            self._settle_or_verify(reservation, result.usage)
+        except Exception:  # noqa: BLE001
+            if self._execution_mode == "replay":
+                if self._controller.terminal_outcome(reservation) is None:
+                    self._controller.release(reservation)
+                diagnostics.append(
+                    self._failure_diagnostic("llm", code="integrity_failure")
+                )
+            else:
+                self._fail_closed_if_active(reservation)
+                diagnostics.append(self._failure_diagnostic("llm"))
+            trace.append(
+                {
+                    "step": "llm_supplement_fallback",
+                    "reason": "analyzer_exception",
+                }
+            )
+            warnings.append("low-confidence supplement: analyzer exception")
+            return None
+        diagnostics.append(self._diagnostic("llm", result))
+        try:
+            candidate_analysis = await self._low_confidence_parser.parse(
+                query,
+                result,
+                repair=None,
+            )
+        except PlannerDependencyError:
+            trace.append(
+                {
+                    "step": "llm_supplement_fallback",
+                    "reason": "analysis_unavailable",
+                }
+            )
+            warnings.append("low-confidence supplement: analysis unavailable")
+            return None
+        analyze_trace: dict[str, object] = {
+            "step": "analyze_low_confidence_supplement",
+            "prompt_version": self._low_confidence_prompt_version,
+            "planner_status": candidate_analysis.planner_status,
+            "model_id": result.provenance.get("model_id", "unavailable"),
+            "cache_hit": result.cache_hit,
+            "usage": result.usage.model_dump(mode="json"),
+            "production_query_spec_retained": True,
+            "production_search_plan_retained": True,
+        }
+        raw_pricing_receipt = result.provenance.get("pricing_receipt")
+        if raw_pricing_receipt is not None:
+            try:
+                parsed_pricing_receipt = json.loads(raw_pricing_receipt)
+            except json.JSONDecodeError:
+                parsed_pricing_receipt = None
+            if isinstance(parsed_pricing_receipt, dict):
+                analyze_trace["pricing_receipt"] = parsed_pricing_receipt
+        trace.append(analyze_trace)
+        selection = select_low_confidence_llm_action(
+            analysis.query_spec,
+            analysis.search_plan,
+            candidate_analysis.search_plan,
+            decision,
+        )
+        if selection is None:
+            trace.append(
+                {
+                    "step": "skip_llm_supplement",
+                    "reason": "no_safe_novel_action",
+                }
+            )
+            return None
+        trace.append(
+            {
+                "step": "select_low_confidence_supplement",
+                "policy": "low-confidence-llm-lexical-supplement-v1",
+                "source_query_id": selection.source_query_id,
+                "query_text": selection.action.text,
+                "provider_hint": selection.action.provider_hint,
+                "search_mode": selection.action.search_mode,
+                "novel_phrase_count": selection.novel_phrase_count,
+                "novel_term_count": selection.novel_term_count,
+                "gold_features_used": False,
+            }
+        )
+        return selection
+
     async def run(self, query: str, *, max_provider_results: int) -> OrchestratorResult:
         warnings: list[str] = []
         trace: list[dict[str, object]] = []
@@ -442,10 +830,32 @@ class MockSearchOrchestrator:
             )
         if analysis.planner_status == "rules_fallback":
             warnings.append("planner_rules_fallback")
-        trace.append({"step": "analyze", "prompt_version": self._prompt_version})
+        analyze_trace: dict[str, object] = {
+            "step": "analyze",
+            "prompt_version": self._prompt_version,
+            "planner_status": analysis.planner_status,
+            "model_id": analysis_result.provenance.get("model_id", "unavailable"),
+            "cache_hit": analysis_result.cache_hit,
+            "usage": analysis_result.usage.model_dump(mode="json"),
+        }
+        raw_pricing_receipt = analysis_result.provenance.get("pricing_receipt")
+        if raw_pricing_receipt is not None:
+            try:
+                parsed_pricing_receipt = json.loads(raw_pricing_receipt)
+            except json.JSONDecodeError:
+                parsed_pricing_receipt = None
+            if isinstance(parsed_pricing_receipt, dict):
+                analyze_trace["pricing_receipt"] = parsed_pricing_receipt
+        trace.append(analyze_trace)
+        if self._query_plan_enricher is not None:
+            analysis, enrichment_receipt = self._query_plan_enricher.enrich(analysis)
+            trace.append(enrichment_receipt)
 
         collected: dict[DependencyName, list[ProviderResult[list[Paper]]]] = {}
         action_results: dict[str, ProviderResult[list[Paper]]] = {}
+        supplement_source_ids: set[str] = set()
+        llm_supplement_source_ids: set[str] = set()
+        openalex_action_attempt_count = 0
         stopped = False
         routes: list[
             tuple[
@@ -561,11 +971,13 @@ class MockSearchOrchestrator:
                     stopped = True
                     break
                 try:
-                    provider_filters = dict(
+                    provider_filters = self._provider_search_filters(
                         analysis.search_plan.inherited_hard_filters
                     )
                     if name == "openalex" and search_mode == "semantic":
                         provider_filters["_search_mode"] = search_mode
+                    if name == "openalex":
+                        openalex_action_attempt_count += 1
                     result = await self._providers[name].search(
                         subquery_text,
                         provider_filters,
@@ -631,15 +1043,301 @@ class MockSearchOrchestrator:
                         "step": "retrieve",
                         "provider": name,
                         "subquery_id": subquery_id,
+                        "query_text": subquery_text,
                         "action_type": action_type,
                         "search_mode": search_mode,
+                        "routing_reason": routing_reason,
                         "method": method,
+                        "result_count": len(result.data),
+                        "error_count": len(result.errors),
+                        "cache_hit": result.cache_hit,
+                        "response_hash": result.provenance.get(
+                            "response_hash", "unavailable"
+                        ),
                     }
                 )
                 if result.errors:
                     warnings.append(f"{name}: provider returned errors")
             if stopped:
                 break
+        if (
+            self._openalex_supplement_selector is not None
+            and self._max_total_openalex_actions is not None
+            and openalex_action_attempt_count < self._max_total_openalex_actions
+            and "openalex" in self._providers
+        ):
+            candidates = self._openalex_candidate_evidence(
+                action_results,
+                analysis.query_spec,
+            )
+            supplement = self._openalex_supplement_selector(
+                analysis.query_spec,
+                candidates,
+            )
+            remaining = self._max_total_openalex_actions - openalex_action_attempt_count
+            if len(supplement.actions) > min(1, remaining):
+                raise ValueError("OpenAlex supplement exceeded its bounded action slot")
+            existing_identities = {
+                (search_mode, " ".join(text.split()).casefold())
+                for _route_id, text, _action_type, search_mode, names, _reason, _method in routes
+                if "openalex" in names
+            }
+            for supplement_action in supplement.actions:
+                if supplement_action.action_type != "text_search":
+                    raise ValueError("OpenAlex supplement must be a text search action")
+                supplement_identity = (
+                    supplement_action.payload.search_mode,
+                    " ".join(supplement_action.payload.query_text.split()).casefold(),
+                )
+                if supplement_identity in existing_identities:
+                    trace.append(
+                        {
+                            "step": "skip_supplement",
+                            "provider": "openalex",
+                            "subquery_id": supplement_action.action_id,
+                            "reason": "duplicate_action_identity",
+                        }
+                    )
+                    continue
+                existing_identities.add(supplement_identity)
+                if self._controller.stop_status() != "continue":
+                    warnings.append("openalex supplement: budget unavailable")
+                    break
+                try:
+                    reservation = self._controller.reserve(
+                        f"openalex.search:{supplement_action.action_id}",
+                        self._provider_estimates.get(
+                            "openalex",
+                            self._provider_estimate,
+                        ),
+                    )
+                except BudgetExceededError:
+                    warnings.append("openalex supplement: budget unavailable")
+                    break
+                try:
+                    provider_filters = self._provider_search_filters(
+                        analysis.search_plan.inherited_hard_filters
+                    )
+                    if supplement_action.payload.search_mode == "semantic":
+                        provider_filters["_search_mode"] = "semantic"
+                    openalex_action_attempt_count += 1
+                    result = await self._providers["openalex"].search(
+                        supplement_action.payload.query_text,
+                        provider_filters,
+                        max_provider_results,
+                        reservation,
+                    )
+                    self._settle_or_verify(reservation, result.usage)
+                except ReservationError:
+                    self._fail_closed_if_active(reservation)
+                    raise
+                except Exception:  # noqa: BLE001
+                    if self._execution_mode == "replay":
+                        if self._controller.terminal_outcome(reservation) is None:
+                            self._controller.release(reservation)
+                        diagnostics.append(
+                            self._failure_diagnostic(
+                                "openalex",
+                                code="integrity_failure",
+                            )
+                        )
+                    elif self._controller.terminal_outcome(reservation) is None:
+                        if (
+                            self._controller.formal_live
+                            and self._pricer is not None
+                            and "openalex" in self._provider_adapter_names
+                        ):
+                            valued = self._pricer.value_actual(
+                                dependency="openalex",
+                                model_or_adapter=self._provider_adapter_names[
+                                    "openalex"
+                                ],
+                                usage=UsageActual(search_api_calls=1),
+                            )
+                            self._controller.fail_closed(reservation, valued)
+                        else:
+                            self._controller.settle(
+                                reservation,
+                                UsageActual(search_api_calls=1),
+                            )
+                    trace.append(
+                        {
+                            "step": "supplement_fallback",
+                            "provider": "openalex",
+                            "subquery_id": supplement_action.action_id,
+                            "reason": "provider_exception",
+                        }
+                    )
+                    warnings.append("openalex supplement: provider exception")
+                    continue
+                collected.setdefault("openalex", []).append(result)
+                source_id = (
+                    "openalex:"
+                    f"{supplement_action.action_id}:"
+                    f"{supplement_action.payload.search_mode}"
+                )
+                action_results[source_id] = result
+                supplement_source_ids.add(source_id)
+                trace.append(
+                    {
+                        "step": "retrieve_supplement",
+                        "provider": "openalex",
+                        "subquery_id": supplement_action.action_id,
+                        "query_text": supplement_action.payload.query_text,
+                        "action_type": supplement_action.action_type,
+                        "search_mode": supplement_action.payload.search_mode,
+                        "strategy": supplement_action.strategy,
+                        "result_count": len(result.data),
+                        "error_count": len(result.errors),
+                        "cache_hit": result.cache_hit,
+                        "response_hash": result.provenance.get(
+                            "response_hash", "unavailable"
+                        ),
+                    }
+                )
+                if result.errors:
+                    warnings.append("openalex supplement: provider returned errors")
+        llm_selection = await self._select_low_confidence_llm_supplement(
+            query,
+            analysis,
+            action_results,
+            diagnostics=diagnostics,
+            trace=trace,
+            warnings=warnings,
+        )
+        if llm_selection is not None:
+            llm_action = llm_selection.action
+            provider_names: list[DependencyName] = ["openalex"]
+            if (
+                llm_action.provider_hint == "semantic_scholar"
+                and "semantic_scholar" in self._providers
+            ):
+                provider_names.append("semantic_scholar")
+            existing_requests = {
+                (
+                    str(item.get("provider")),
+                    str(item.get("search_mode")),
+                    " ".join(str(item.get("query_text", "")).split()).casefold(),
+                )
+                for item in trace
+                if item.get("step") in {"retrieve", "retrieve_supplement"}
+            }
+            for name in provider_names:
+                request_identity = (
+                    name,
+                    llm_action.search_mode,
+                    " ".join(llm_action.text.split()).casefold(),
+                )
+                if request_identity in existing_requests:
+                    trace.append(
+                        {
+                            "step": "skip_llm_supplement",
+                            "provider": name,
+                            "reason": "duplicate_provider_action_identity",
+                        }
+                    )
+                    continue
+                existing_requests.add(request_identity)
+                if self._controller.stop_status() != "continue":
+                    warnings.append("low-confidence supplement: budget unavailable")
+                    trace.append(
+                        {
+                            "step": "llm_supplement_fallback",
+                            "provider": name,
+                            "reason": "budget_unavailable",
+                        }
+                    )
+                    break
+                try:
+                    reservation = self._controller.reserve(
+                        f"{name}.search:llm-low-confidence-v3",
+                        self._provider_estimates.get(name, self._provider_estimate),
+                    )
+                except BudgetExceededError:
+                    warnings.append("low-confidence supplement: budget unavailable")
+                    trace.append(
+                        {
+                            "step": "llm_supplement_fallback",
+                            "provider": name,
+                            "reason": "budget_unavailable",
+                        }
+                    )
+                    break
+                try:
+                    provider_filters = self._provider_search_filters(
+                        analysis.search_plan.inherited_hard_filters
+                    )
+                    if name == "openalex" and llm_action.search_mode == "semantic":
+                        provider_filters["_search_mode"] = "semantic"
+                    result = await self._providers[name].search(
+                        llm_action.text,
+                        provider_filters,
+                        max_provider_results,
+                        reservation,
+                    )
+                    self._settle_or_verify(reservation, result.usage)
+                except ReservationError:
+                    self._fail_closed_if_active(reservation)
+                    raise
+                except Exception:  # noqa: BLE001
+                    if self._execution_mode == "replay":
+                        if self._controller.terminal_outcome(reservation) is None:
+                            self._controller.release(reservation)
+                        diagnostics.append(
+                            self._failure_diagnostic(name, code="integrity_failure")
+                        )
+                    elif self._controller.terminal_outcome(reservation) is None:
+                        if (
+                            self._controller.formal_live
+                            and self._pricer is not None
+                            and name in self._provider_adapter_names
+                        ):
+                            valued = self._pricer.value_actual(
+                                dependency=name,
+                                model_or_adapter=self._provider_adapter_names[name],
+                                usage=UsageActual(search_api_calls=1),
+                            )
+                            self._controller.fail_closed(reservation, valued)
+                        else:
+                            self._controller.settle(
+                                reservation,
+                                UsageActual(search_api_calls=1),
+                            )
+                    warnings.append(f"low-confidence supplement: {name} exception")
+                    trace.append(
+                        {
+                            "step": "llm_supplement_fallback",
+                            "provider": name,
+                            "reason": "provider_exception",
+                        }
+                    )
+                    continue
+                collected.setdefault(name, []).append(result)
+                source_id = (
+                    f"{name}:llm-low-confidence-v3:{llm_action.search_mode}"
+                )
+                action_results[source_id] = result
+                llm_supplement_source_ids.add(source_id)
+                trace.append(
+                    {
+                        "step": "retrieve_llm_supplement",
+                        "provider": name,
+                        "subquery_id": llm_selection.source_query_id,
+                        "query_text": llm_action.text,
+                        "action_type": llm_action.action_type,
+                        "search_mode": llm_action.search_mode,
+                        "result_count": len(result.data),
+                        "error_count": len(result.errors),
+                        "cache_hit": result.cache_hit,
+                        "response_hash": result.provenance.get(
+                            "response_hash", "unavailable"
+                        ),
+                    }
+                )
+                if result.errors:
+                    warnings.append(
+                        f"low-confidence supplement: {name} returned errors"
+                    )
         provider_results = {
             name: self._combine_provider_results(results) for name, results in collected.items()
         }
@@ -648,54 +1346,275 @@ class MockSearchOrchestrator:
             for name, result in sorted(provider_results.items())
         )
 
-        fusion_input = dict(action_results)
-        merged = deduplicate_papers(
-            [
-                paper
-                for result in fusion_input.values()
-                for paper in result.data
-            ]
+        baseline_fusion_input = {
+            source_id: result
+            for source_id, result in action_results.items()
+            if source_id not in supplement_source_ids
+            and source_id not in llm_supplement_source_ids
+        }
+        supplemental_fusion_input = {
+            source_id: action_results[source_id]
+            for source_id in action_results
+            if source_id in supplement_source_ids
+        }
+        llm_supplemental_fusion_input = {
+            source_id: action_results[source_id]
+            for source_id in action_results
+            if source_id in llm_supplement_source_ids
+        }
+        baseline_raw_before = sum(
+            len(result.data) for result in baseline_fusion_input.values()
         )
-        trace.append({"step": "deduplicate", "count": len(merged.papers)})
+        supplemental_raw_before = sum(
+            len(result.data) for result in supplemental_fusion_input.values()
+        )
+        llm_supplemental_raw_before = sum(
+            len(result.data) for result in llm_supplemental_fusion_input.values()
+        )
+        baseline_fusion_input = self._round_robin_cap_action_results(
+            baseline_fusion_input,
+            self._max_raw_candidates,
+        )
+        supplemental_fusion_input = self._round_robin_cap_action_results(
+            supplemental_fusion_input,
+            self._max_additional_raw_candidates,
+        )
+        llm_supplemental_fusion_input = self._round_robin_cap_action_results(
+            llm_supplemental_fusion_input,
+            self._max_low_confidence_raw_candidates,
+        )
+        fusion_input = {**baseline_fusion_input, **supplemental_fusion_input}
+        if self._max_total_raw_candidates is not None:
+            fusion_input = self._round_robin_cap_action_results(
+                fusion_input,
+                self._max_total_raw_candidates,
+            )
+            baseline_fusion_input = {
+                source_id: result
+                for source_id, result in fusion_input.items()
+                if source_id not in supplement_source_ids
+            }
+            supplemental_fusion_input = {
+                source_id: result
+                for source_id, result in fusion_input.items()
+                if source_id in supplement_source_ids
+            }
+        baseline_raw_after = sum(
+            len(result.data) for result in baseline_fusion_input.values()
+        )
+        supplemental_raw_after = sum(
+            len(result.data) for result in supplemental_fusion_input.values()
+        )
+        llm_supplemental_raw_after = sum(
+            len(result.data) for result in llm_supplemental_fusion_input.values()
+        )
+        if supplement_source_ids:
+            baseline_fused = fuse_provider_results(
+                cast(
+                    Mapping[str, ProviderResult[list[Paper]]],
+                    baseline_fusion_input,
+                ),
+                method="rrf",
+                id_map=self._identifier_map,
+            )
+            supplemental_fused = fuse_provider_results(
+                cast(
+                    Mapping[str, ProviderResult[list[Paper]]],
+                    supplemental_fusion_input,
+                ),
+                method="rrf",
+                id_map=self._identifier_map,
+            )
+            fused = self._fair_merge_nonreinforcing_fused(
+                baseline_fused,
+                supplemental_fused,
+            )
+            trace.append(
+                {
+                    "step": "merge_supplement",
+                    "policy": "nonreinforcing-fair-initial-order-v1",
+                    "baseline_candidate_count": len(baseline_fused),
+                    "supplemental_candidate_count": len(supplemental_fused),
+                    "admitted_supplemental_candidate_count": (
+                        len(fused) - len(baseline_fused)
+                    ),
+                }
+            )
+        else:
+            fused = fuse_provider_results(
+                cast(Mapping[str, ProviderResult[list[Paper]]], fusion_input),
+                method="rrf",
+                id_map=self._identifier_map,
+            )
+        if (
+            self._max_deduplicated_candidates is not None
+            and len(fused) > self._max_deduplicated_candidates
+        ):
+            fused = fused[: self._max_deduplicated_candidates]
+        production_pool_count = len(fused)
+        if llm_supplement_source_ids:
+            llm_supplemental_fused = fuse_provider_results(
+                cast(
+                    Mapping[str, ProviderResult[list[Paper]]],
+                    llm_supplemental_fusion_input,
+                ),
+                method="rrf",
+                id_map=self._identifier_map,
+            )
+            fused = self._fair_merge_nonreinforcing_fused(
+                fused,
+                llm_supplemental_fused,
+            )
+            trace.append(
+                {
+                    "step": "merge_llm_supplement",
+                    "policy": "independent-nonreinforcing-quota-v1",
+                    "baseline_candidate_count": production_pool_count,
+                    "supplemental_candidate_count": len(llm_supplemental_fused),
+                    "admitted_supplemental_candidate_count": (
+                        len(fused) - production_pool_count
+                    ),
+                    "baseline_evidence_immutable": True,
+                }
+            )
+        deduplicated_before = len(fused)
+        final_deduplicated_limit = self._max_deduplicated_candidates
+        if (
+            final_deduplicated_limit is not None
+            and self._max_low_confidence_deduplicated_candidates is not None
+        ):
+            final_deduplicated_limit += (
+                self._max_low_confidence_deduplicated_candidates
+            )
+        if (
+            final_deduplicated_limit is not None
+            and len(fused) > final_deduplicated_limit
+        ):
+            fused = fused[:final_deduplicated_limit]
+        deduplication_input = [item.paper for item in fused]
+        merged = deduplicate_papers(
+            deduplication_input,
+            id_map=self._identifier_map,
+        )
+        trace.append(
+            {
+                "step": "candidate_cap",
+                "baseline_raw_before": baseline_raw_before,
+                "baseline_raw_after": baseline_raw_after,
+                "supplemental_raw_before": supplemental_raw_before,
+                "supplemental_raw_after": supplemental_raw_after,
+                "llm_supplemental_raw_before": llm_supplemental_raw_before,
+                "llm_supplemental_raw_after": llm_supplemental_raw_after,
+                "total_raw_after": (
+                    baseline_raw_after
+                    + supplemental_raw_after
+                    + llm_supplemental_raw_after
+                ),
+                "deduplicated_before": deduplicated_before,
+                "deduplicated_after": len(merged.papers),
+                "max_raw_candidates": self._max_raw_candidates,
+                "max_total_raw_candidates": self._max_total_raw_candidates,
+                "max_deduplicated_candidates": self._max_deduplicated_candidates,
+                "max_low_confidence_raw_candidates": (
+                    self._max_low_confidence_raw_candidates
+                ),
+                "max_low_confidence_deduplicated_candidates": (
+                    self._max_low_confidence_deduplicated_candidates
+                ),
+                "max_total_deduplicated_candidates": final_deduplicated_limit,
+            }
+        )
+        trace.append(
+            {
+                "step": "deduplicate",
+                "count": len(merged.papers),
+                "merge_count": len(merged.decisions),
+                "identifier_aliases_enabled": self._identifier_map is not None,
+                "identifier_alias_count": self._identifier_alias_count,
+            }
+        )
         filtered = apply_hard_filters(merged.papers, analysis.query_spec)
         trace.append({"step": "filter", "accepted": len(filtered.accepted)})
-        accepted_ids = {item.paper.canonical_id for item in filtered.accepted}
-        fused = fuse_provider_results(
-            cast(Mapping[str, ProviderResult[list[Paper]]], fusion_input),
-            method="rrf",
+        accepted_by_id = {
+            item.paper.canonical_id: item for item in filtered.accepted
+        }
+        selected_fused = [
+            item.model_copy(
+                update={
+                    "score": item.score
+                    * accepted_by_id[item.paper.canonical_id].score_multiplier
+                }
+            )
+            for item in fused
+            if item.paper.canonical_id in accepted_by_id
+        ]
+        selected_fused.sort(key=lambda item: (-item.score, item.paper.canonical_id))
+        reason_counts: dict[str, int] = {}
+        penalized_count = 0
+        for item in selected_fused:
+            accepted = accepted_by_id[item.paper.canonical_id]
+            if accepted.score_multiplier < 1.0:
+                penalized_count += 1
+            for reason in accepted.uncertainty_reasons:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        trace.append(
+            {
+                "step": "uncertainty_adjustment",
+                "candidate_count": len(selected_fused),
+                "penalized_count": penalized_count,
+                "reason_counts": dict(sorted(reason_counts.items())),
+            }
         )
-        papers = [item.paper for item in fused if item.paper.canonical_id in accepted_ids]
-        fused_by_id = {item.paper.canonical_id: item for item in fused}
-        selected_fused = [fused_by_id[paper.canonical_id] for paper in papers]
+        papers = [item.paper for item in selected_fused]
         trace.append({"step": "fuse", "count": len(papers)})
         if self._document_ranker is not None and selected_fused:
             prior_ids = [item.paper.canonical_id for item in selected_fused]
-            ranked_fused = self._document_ranker.rank(
-                analysis.query_spec.original_query,
-                selected_fused,
+            contextual_rank = getattr(self._document_ranker, "rank_with_context", None)
+            ranked_fused = (
+                contextual_rank(
+                    analysis.query_spec.original_query,
+                    selected_fused,
+                    query_spec=analysis.query_spec,
+                )
+                if callable(contextual_rank)
+                else self._document_ranker.rank(
+                    analysis.query_spec.original_query,
+                    selected_fused,
+                )
             )
             ranked_ids = [item.paper.canonical_id for item in ranked_fused]
             if len(ranked_ids) != len(prior_ids) or set(ranked_ids) != set(prior_ids):
                 raise ValueError("document ranker changed candidate identity")
             selected_fused = ranked_fused
             papers = [item.paper for item in selected_fused]
-            trace.append(
-                {
-                    "step": "document_rank",
-                    "status": "applied",
-                    "model_id": self._document_ranker.model_id,
-                    "count": len(papers),
-                }
-            )
+            rank_trace: dict[str, object] = {
+                "step": "document_rank",
+                "status": "applied",
+                "model_id": self._document_ranker.model_id,
+                "count": len(papers),
+            }
+            context_receipt = getattr(self._document_ranker, "context_receipt", None)
+            if callable(context_receipt):
+                receipt = context_receipt(
+                    analysis.query_spec.original_query,
+                    query_spec=analysis.query_spec,
+                )
+                if receipt is not None:
+                    rank_trace["query_context"] = receipt
+            deployment_role = getattr(self._document_ranker, "deployment_role", None)
+            if deployment_role is not None:
+                rank_trace["deployment_role"] = deployment_role
+            failover_receipt = getattr(self._document_ranker, "failover_receipt", None)
+            if failover_receipt:
+                rank_trace["failover_receipt"] = failover_receipt
+            trace.append(rank_trace)
         high_relevance: list[RankedPaper] = []
         partial_relevance: list[RankedPaper] = []
         citation_edges: list[ResolvedCitationEdge] = []
         pre_truncation_candidates = list(papers)
         if self._max_output_papers is not None and len(papers) > self._max_output_papers:
-            papers = papers[: self._max_output_papers]
-            selected_fused = [
-                fused_by_id[paper.canonical_id] for paper in papers
-            ]
+            selected_fused = selected_fused[: self._max_output_papers]
+            papers = [item.paper for item in selected_fused]
             trace.append(
                 {
                     "step": "truncate",

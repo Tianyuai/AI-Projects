@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from paper_search.domain.models import ErrorDetail, Paper, ProviderResult, UsageActual
+from paper_search.evaluation.dataset import IdentifierMap
 from paper_search.ranking.fusion import fuse_provider_results
 
 
@@ -139,6 +140,36 @@ def test_cross_source_duplicate_retains_ids_sources_and_rank_evidence() -> None:
     assert set(fused[0].paper.sources) == {"openalex", "semantic_scholar"}
     assert fused[0].source_ranks == {"openalex": 1, "semantic_scholar": 1}
     assert fused[0].score == pytest.approx(2 / 11)
+
+
+def test_fusion_uses_frozen_aliases_for_cross_provider_identity() -> None:
+    results = {
+        "openalex": _result(
+            "openalex",
+            [_paper("openalex:W1", openalex_id="W1", sources=["openalex"])],
+        ),
+        "semantic_scholar": _result(
+            "semantic_scholar",
+            [
+                _paper(
+                    "s2:S1",
+                    semantic_scholar_id="S1",
+                    sources=["semantic_scholar"],
+                )
+            ],
+        ),
+    }
+    aliases = IdentifierMap.from_bytes(
+        b'{"openalex:W1":"arxiv:2401.00001",'
+        b'"s2:S1":"arxiv:2401.00001"}'
+    )
+
+    fused = fuse_provider_results(results, method="rrf", id_map=aliases)
+
+    assert len(fused) == 1
+    assert fused[0].paper.openalex_id == "W1"
+    assert fused[0].paper.semantic_scholar_id == "S1"
+    assert fused[0].source_ranks == {"openalex": 1, "semantic_scholar": 1}
 
 
 def test_failed_provider_does_not_hide_valid_sibling_results() -> None:

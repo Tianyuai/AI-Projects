@@ -53,6 +53,8 @@ def _aggregate(usages: Iterable[UsageEstimate]) -> UsageEstimate:
         search_api_calls=sum(item.search_api_calls for item in items),
         llm_calls=sum(item.llm_calls for item in items),
         input_tokens=sum(item.input_tokens for item in items),
+        cached_input_tokens=sum(item.cached_input_tokens for item in items),
+        uncached_input_tokens=sum(item.uncached_input_tokens for item in items),
         output_tokens=sum(item.output_tokens for item in items),
         cost_cny=cost,
         elapsed_ms=sum(item.elapsed_ms for item in items),

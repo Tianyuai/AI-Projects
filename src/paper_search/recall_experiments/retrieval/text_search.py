@@ -25,13 +25,15 @@ class TextSearchHandler:
         if not isinstance(action, TextSearchAction):
             raise TypeError("text search handler requires a text-search action")
         filters = dict(context.provider_filters)
+        limit = context.max_results_per_action
         if action.payload.search_mode == "semantic":
             filters["_search_mode"] = "semantic"
+            limit = min(limit, 50)
         result = await self._backend.search(
             action_id=action.action_id,
             query=action.payload.query_text,
             filters=filters,
-            limit=context.max_results_per_action,
+            limit=limit,
         )
         return RetrievalActionResult(
             action_id=action.action_id,

@@ -37,6 +37,19 @@ _FIELDS = (
 )
 
 
+def _semantic_scholar_search_filters(
+    filters: dict[str, object],
+) -> tuple[dict[str, object], str]:
+    provider_filters = dict(filters)
+    search_mode = provider_filters.pop("_search_mode", "lexical")
+    if search_mode not in {"lexical", "semantic"}:
+        raise ValueError("Semantic Scholar search mode must be lexical or semantic")
+    unknown = set(provider_filters).difference({"year_from", "year_to"})
+    if unknown:
+        raise ValueError(f"unknown Semantic Scholar filters: {sorted(unknown)}")
+    return provider_filters, str(search_mode)
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -484,17 +497,15 @@ class SemanticScholarProvider:
             raise ValueError("query must not be empty")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer between 1 and 100")
-        unknown = set(filters).difference({"year_from", "year_to"})
-        if unknown:
-            raise ValueError(f"unknown Semantic Scholar filters: {sorted(unknown)}")
+        provider_filters, search_mode = _semantic_scholar_search_filters(filters)
         params: dict[str, QueryValue] = {
             "query": normalized_query,
             "limit": limit,
             "fields": _FIELDS,
         }
-        if filters:
-            start = filters.get("year_from", "")
-            end = filters.get("year_to", "")
+        if provider_filters:
+            start = provider_filters.get("year_from", "")
+            end = provider_filters.get("year_to", "")
             params["year"] = f"{start}-{end}"
         raw = await self._request(
             method="GET",
@@ -507,13 +518,15 @@ class SemanticScholarProvider:
             if raw.content is not None
             else SemanticScholarPaperDecode(papers=[], errors=[])
         )
-        return self._result(
+        result = self._result(
             data=decoded.papers,
             raw=raw,
             endpoint=_SEARCH_ENDPOINT,
             started=started,
             errors=decoded.errors,
         )
+        result.provenance["search_mode"] = search_mode
+        return result
 
     async def batch_details(
         self,

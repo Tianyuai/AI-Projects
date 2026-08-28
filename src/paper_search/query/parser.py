@@ -88,6 +88,22 @@ def _year(value: object) -> int | None:
     return None
 
 
+def _explicit_exclusions(query: str) -> list[str]:
+    boundary = r"(?=\s+(?:at|in|from|between|but|while)\b|[,.;!?]|$)"
+    patterns = (
+        rf"\b(?:without|excluding|exclude)\s+(.+?){boundary}",
+        rf"\b(?:do|does|did|must|should)\s+not\s+"
+        rf"(?:require|use|include|rely\s+on)\s+(.+?){boundary}",
+    )
+    exclusions: list[str] = []
+    for pattern in patterns:
+        exclusions.extend(
+            match.group(1).strip(" \t\r\n,.;:!?")
+            for match in re.finditer(pattern, query, flags=re.IGNORECASE)
+        )
+    return _ordered_unique(exclusions)
+
+
 def normalize_query_analysis(
     data: Mapping[str, object],
     original_query: str,
@@ -139,6 +155,9 @@ def normalize_query_analysis(
     exclusions = _ordered_unique(
         _string_list(spec.get("exclusions"))
         + _string_list(spec.get("excluded_topics"))
+        + _string_list(plan.get("exclusions"))
+        + _string_list(plan.get("excluded_topics"))
+        + _explicit_exclusions(original_query)
     )
 
     raw_subqueries = plan.get("subqueries")
@@ -155,10 +174,30 @@ def normalize_query_analysis(
     subqueries: list[dict[str, object]] = []
     for index, item in enumerate(raw_subqueries):
         text: object = None
+        query_type: object = None
+        search_mode: object = None
+        target_constraints: list[str] = []
+        provider_hint: object = "either"
+        action_type: object = "text_search"
+        priority: object = index + 1
         if isinstance(item, str):
             text = item
         elif isinstance(item, Mapping):
-            text = item.get("text") or item.get("query")
+            text = item.get("text") or item.get("query") or item.get("subquery")
+            query_type = item.get("query_type")
+            search_mode = item.get("search_mode")
+            target_constraints = _ordered_unique(
+                _constraint_strings(item.get("target_constraints"))
+            )
+            provider_hint = item.get("provider_hint", "either")
+            action_type = item.get("action_type", "text_search")
+            raw_priority = item.get("priority")
+            if (
+                isinstance(raw_priority, int)
+                and not isinstance(raw_priority, bool)
+                and raw_priority > 0
+            ):
+                priority = raw_priority
             if not isinstance(text, str) or not text.strip():
                 action = item.get("action")
                 if isinstance(action, str):
@@ -169,14 +208,31 @@ def normalize_query_analysis(
             text = None
         if not isinstance(text, str) or not text.strip():
             continue
+        normalized_text = " ".join(text.split())
+        if query_type not in {"exact", "expanded", "decomposed"}:
+            if search_mode in {"exact", "expanded", "decomposed"}:
+                query_type = search_mode
+                search_mode = "lexical"
+            elif normalized_text.casefold() == " ".join(original_query.split()).casefold():
+                query_type = "exact"
+            else:
+                query_type = "expanded"
+        if search_mode not in {"lexical", "semantic"}:
+            search_mode = "lexical"
+        if provider_hint not in {"openalex", "semantic_scholar", "either"}:
+            provider_hint = "either"
+        if action_type not in {"text_search", "title_search"}:
+            action_type = "text_search"
         subqueries.append(
             {
                 "query_id": f"sq-{index + 1}",
-                "text": " ".join(text.split()),
-                "query_type": "expanded",
-                "target_constraints": [],
-                "priority": index + 1,
-                "provider_hint": "either",
+                "text": normalized_text,
+                "query_type": query_type,
+                "action_type": action_type,
+                "target_constraints": target_constraints,
+                "priority": priority,
+                "provider_hint": provider_hint,
+                "search_mode": search_mode,
             }
         )
     if not subqueries:
@@ -235,29 +291,72 @@ def _require_content_failure(result: ProviderResult[dict[str, Any]]) -> None:
         raise PlannerDependencyError("planner dependency failure")
 
 
+def extract_explicit_year_bounds(query: str) -> tuple[int | None, int | None]:
+    """Extract publication-year bounds only when temporal syntax is explicit."""
+
+    year = r"((?:19|20)\d{2})"
+    range_match = re.search(
+        rf"\b(?:from\s+{year}\s+to|between\s+{year}\s+and)\s+{year}\b",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if range_match is not None:
+        values = [int(value) for value in range_match.groups() if value is not None]
+        return min(values), max(values)
+
+    lower_match = re.search(
+        rf"\b(?:since|after|from)\s+{year}\b",
+        query,
+        flags=re.IGNORECASE,
+    )
+    upper_match = re.search(
+        rf"\b(?:before|until|through|up\s+to)\s+{year}\b",
+        query,
+        flags=re.IGNORECASE,
+    )
+    exact_match = re.search(
+        rf"\b(?:published|appeared|released|papers?|studies|work)\s+"
+        rf"(?:in|during)\s+{year}\b",
+        query,
+        flags=re.IGNORECASE,
+    )
+    if exact_match is not None:
+        value = int(exact_match.group(1))
+        return value, value
+    return (
+        int(lower_match.group(1)) if lower_match is not None else None,
+        int(upper_match.group(1)) if upper_match is not None else None,
+    )
+
+
 def rule_fallback(query: str) -> QuerySpec:
-    """Extract only explicit years, known venues, and `without` exclusions."""
+    """Extract explicit temporal bounds, known venues, and `without` exclusions."""
     normalized = " ".join(query.split())
     if not normalized:
         raise ValueError("query must not be empty")
-    years = [int(value) for value in re.findall(r"\b(?:19|20)\d{2}\b", normalized)]
+    year_from, year_to = extract_explicit_year_bounds(normalized)
     venue_matches = [
         venue
         for venue in _KNOWN_VENUES
         if re.search(rf"\b{re.escape(venue)}\b", normalized, flags=re.IGNORECASE)
     ]
-    exclusion_match = re.search(
-        r"\bwithout\s+(.+?)(?=\s+(?:at|in|from|between)\b|[,.;]|$)",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-    exclusions = [exclusion_match.group(1).strip()] if exclusion_match else []
+    if year_from is None and year_to is None:
+        for venue in venue_matches:
+            venue_year = re.search(
+                rf"\b{re.escape(venue)}\s+((?:19|20)\d{{2}})\b",
+                normalized,
+                flags=re.IGNORECASE,
+            )
+            if venue_year is not None:
+                year_from = year_to = int(venue_year.group(1))
+                break
+    exclusions = _explicit_exclusions(normalized)
     return QuerySpec(
         original_query=normalized,
         research_goal=normalized,
         topics=[normalized],
-        year_from=min(years) if years else None,
-        year_to=max(years) if years else None,
+        year_from=year_from,
+        year_to=year_to,
         venues=venue_matches,
         must_have=[normalized],
         exclusions=exclusions,
@@ -279,7 +378,16 @@ class QueryParser:
         status: PlannerStatus,
     ) -> ClassifiedQueryAnalysis:
         analysis = QueryAnalysisResult.model_validate(data)
-        spec = analysis.query_spec.model_copy(update={"original_query": " ".join(query.split())})
+        normalized_query = " ".join(query.split())
+        spec = analysis.query_spec.model_copy(
+            update={
+                "original_query": normalized_query,
+                "exclusions": _ordered_unique(
+                    list(analysis.query_spec.exclusions)
+                    + _explicit_exclusions(normalized_query)
+                ),
+            }
+        )
         return ClassifiedQueryAnalysis(
             query_spec=spec,
             search_plan=self._planner.finalize(spec, analysis.search_plan),
@@ -353,5 +461,6 @@ __all__ = [
     "ClassifiedQueryAnalysis",
     "PlannerDependencyError",
     "QueryParser",
+    "extract_explicit_year_bounds",
     "rule_fallback",
 ]

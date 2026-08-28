@@ -34,7 +34,7 @@ Sleep = Callable[[float], Awaitable[None]]
 Jitter = Callable[[], float]
 QueryValue = str | int | float | bool | None
 OPENALEX_SELECT_FIELDS = (
-    "id,doi,title,display_name,abstract_inverted_index,authorships,publication_year,"
+    "id,ids,doi,title,display_name,abstract_inverted_index,authorships,publication_year,"
     "primary_location,locations,cited_by_count,is_retracted"
 )
 _ENDPOINT = "/works"

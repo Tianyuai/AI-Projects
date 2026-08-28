@@ -14,6 +14,11 @@ from paper_search.recall_experiments.canary_runtime import (
 from paper_search.recall_experiments.recipes import load_recall_recipe
 
 
+class _AttemptGate:
+    def claim_attempt(self) -> int:
+        return 1
+
+
 def _write_profile(tmp_path: Path) -> Path:
     profile = tmp_path / "runtime.yaml"
     profile.write_text(
@@ -120,6 +125,66 @@ def test_runtime_secrets_fail_closed_when_required_key_is_missing(tmp_path: Path
         resolve_runtime_secrets(profile, environ={})
 
 
+def test_runtime_secrets_can_bind_one_explicit_openalex_key_slot(
+    tmp_path: Path,
+) -> None:
+    profile = RecallRuntimeProfile(
+        schema_version="recall-runtime-profile-v1",
+        env_file=tmp_path / "unused.env",
+        pricing_policy=tmp_path / "pricing.yaml",
+        budget=tmp_path / "budget.yaml",
+        capture_responses=True,
+        llm_model="deepseek-v4-flash",
+        llm_reservation_input_tokens=2500,
+        llm_reservation_output_tokens=1000,
+    )
+    environ = {
+        "LLM_API_KEY": "llm-secret",
+        "OPENALEX_API_KEY": "openalex-slot-1",
+        "OPENALEX_API_KEY_2": "openalex-slot-2",
+        "OPENALEX_API_KEY_3": "openalex-slot-3",
+        "SEMANTIC_SCHOLAR_API_KEY": "s2-secret",
+    }
+
+    secrets = resolve_runtime_secrets(
+        profile,
+        environ=environ,
+        openalex_key_slot=3,
+    )
+
+    assert secrets.openalex_api_key.get_secret_value() == "openalex-slot-3"
+    assert secrets.additional_openalex_api_keys == ()
+    assert "openalex-slot-3" not in secrets.model_dump_json()
+
+
+@pytest.mark.parametrize("slot", [0, 4])
+def test_runtime_secrets_reject_unavailable_openalex_key_slot(
+    tmp_path: Path,
+    slot: int,
+) -> None:
+    profile = RecallRuntimeProfile(
+        schema_version="recall-runtime-profile-v1",
+        env_file=tmp_path / "unused.env",
+        pricing_policy=tmp_path / "pricing.yaml",
+        budget=tmp_path / "budget.yaml",
+        capture_responses=True,
+        llm_model="deepseek-v4-flash",
+        llm_reservation_input_tokens=2500,
+        llm_reservation_output_tokens=1000,
+    )
+
+    with pytest.raises(ValueError, match="OpenAlex key slot"):
+        resolve_runtime_secrets(
+            profile,
+            environ={
+                "LLM_API_KEY": "llm-secret",
+                "OPENALEX_API_KEY": "openalex-slot-1",
+                "SEMANTIC_SCHOLAR_API_KEY": "s2-secret",
+            },
+            openalex_key_slot=slot,
+        )
+
+
 def test_fixed_factory_builds_one_owned_live_runtime_without_dispatch(tmp_path: Path) -> None:
     (tmp_path / "pricing.yaml").write_bytes(
         Path("configs/pricing_v1.yaml").read_bytes()
@@ -188,6 +253,38 @@ def test_factory_can_select_semantic_scholar_as_search_provider(tmp_path: Path) 
         )
     finally:
         asyncio.run(bundle.aclose())
+
+
+def test_factory_forwards_openalex_attempt_gate_to_search_provider(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pricing.yaml").write_bytes(
+        Path("data/annotation_work/pricing_v1.yaml").read_bytes()
+    )
+    (tmp_path / "budget.yaml").write_bytes(Path("configs/budget_low.yaml").read_bytes())
+    (tmp_path / "secrets.env").write_text(
+        "LLM_API_KEY=llm-test\nOPENALEX_API_KEY=oa-test\n"
+        "SEMANTIC_SCHOLAR_API_KEY=s2-test\n",
+        encoding="utf-8",
+    )
+    profile = load_runtime_profile(_write_profile(tmp_path))
+
+    with pytest.raises(ValueError, match="only supported for OpenAlex"):
+        asyncio.run(
+            build_live_runtime_bundle(
+                profile=profile,
+                secrets=resolve_runtime_secrets(profile, environ={}),
+                loaded_recipe=load_recall_recipe(
+                    Path(
+                        "configs/recall_experiments/methods/"
+                        "scheme-b-blind-live.yaml"
+                    )
+                ),
+                capture_root=tmp_path / "capture-s2-gated",
+                search_dependency="semantic_scholar",
+                openalex_attempt_gate=_AttemptGate(),
+            )
+        )
 
 
 def test_runtime_model_is_independent_of_a_fixed_action_method(tmp_path: Path) -> None:

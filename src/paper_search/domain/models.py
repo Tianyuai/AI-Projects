@@ -243,9 +243,17 @@ class UsageEstimate(DomainModel):
     search_api_calls: StrictNonNegativeInt = 0
     llm_calls: StrictNonNegativeInt = 0
     input_tokens: StrictNonNegativeInt = 0
+    cached_input_tokens: StrictNonNegativeInt = 0
+    uncached_input_tokens: StrictNonNegativeInt = 0
     output_tokens: StrictNonNegativeInt = 0
     cost_cny: MoneyCny | None = None
     elapsed_ms: StrictNonNegativeInt = 0
+
+    @model_validator(mode="after")
+    def validate_input_token_breakdown(self) -> UsageEstimate:
+        if self.cached_input_tokens + self.uncached_input_tokens > self.input_tokens:
+            raise ValueError("cache token breakdown cannot exceed input_tokens")
+        return self
 
 
 class UsageActual(UsageEstimate):

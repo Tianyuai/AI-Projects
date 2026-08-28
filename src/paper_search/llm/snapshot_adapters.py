@@ -165,6 +165,8 @@ def _aggregate(usages: list[UsageActual]) -> UsageActual:
         search_api_calls=sum(item.search_api_calls for item in usages),
         llm_calls=sum(item.llm_calls for item in usages),
         input_tokens=sum(item.input_tokens for item in usages),
+        cached_input_tokens=sum(item.cached_input_tokens for item in usages),
+        uncached_input_tokens=sum(item.uncached_input_tokens for item in usages),
         output_tokens=sum(item.output_tokens for item in usages),
         cost_cny=cost,
         elapsed_ms=sum(item.elapsed_ms for item in usages),
@@ -242,6 +244,21 @@ def _error_result(
             )
         ],
     )
+
+
+def _with_pricing_receipt(
+    result: ProviderResult[dict[str, Any]],
+    receipt: dict[str, object] | None,
+) -> ProviderResult[dict[str, Any]]:
+    if receipt is None:
+        return result
+    provenance = dict(result.provenance)
+    provenance["pricing_receipt"] = json.dumps(
+        receipt,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return result.model_copy(update={"provenance": provenance})
 
 
 def _status_error(status_code: int) -> tuple[str, str, bool]:
@@ -336,6 +353,7 @@ class LiveCaptureLLMAnalyzer:
         )
         measured_attempts: list[UsageActual] = []
         valued_attempts: list[UsageActual] = []
+        pricing_receipt: dict[str, object] | None = None
         terminal: ProviderResult[dict[str, Any]] | None = None
         in_flight_started: float | None = None
         dispatch_unaccounted = False
@@ -391,9 +409,18 @@ class LiveCaptureLLMAnalyzer:
                         dependency="llm",
                         model_or_adapter=self._client.model_id,
                         usage=measured,
+                        valued_at=requested_at,
                     )
                 )
                 accumulated = _aggregate(valued_attempts)
+                receipt_method = getattr(self._pricer, "pricing_receipt", None)
+                if callable(receipt_method):
+                    pricing_receipt = receipt_method(
+                        dependency="llm",
+                        model_or_adapter=self._client.model_id,
+                        usage=accumulated,
+                        valued_at=requested_at,
+                    )
 
                 if response is not None and response.status_code == 200:
                     decoded = self._decoder.decode(
@@ -422,6 +449,7 @@ class LiveCaptureLLMAnalyzer:
                         self._capture_store.annotate_usage(
                             snapshot_ref.entry_id,
                             accumulated,
+                            pricing_receipt=pricing_receipt,
                         )
                         decoded_with_ref = self._decoder.decode(
                             response_bytes,
@@ -452,6 +480,7 @@ class LiveCaptureLLMAnalyzer:
                         self._capture_store.annotate_usage(
                             snapshot_ref.entry_id,
                             accumulated,
+                            pricing_receipt=pricing_receipt,
                         )
                         decoded_with_ref = self._decoder.decode(
                             response_bytes,
@@ -503,6 +532,7 @@ class LiveCaptureLLMAnalyzer:
                 self._capture_store.annotate_usage(
                     snapshot_ref.entry_id,
                     accumulated,
+                    pricing_receipt=pricing_receipt,
                 )
                 terminal = _error_result(
                     code=code,
@@ -517,6 +547,7 @@ class LiveCaptureLLMAnalyzer:
                     snapshot_ref=snapshot_ref,
                 )
 
+            terminal = _with_pricing_receipt(terminal, pricing_receipt)
             self._controller.settle(reservation, terminal.usage)
             return terminal
         except asyncio.CancelledError as cancellation:
@@ -626,7 +657,7 @@ class ReplayLLMAnalyzer:
                 usage=UsageActual(),
             )
         if snapshot.error is not None:
-            return _error_result(
+            return _with_pricing_receipt(_error_result(
                 code=snapshot.error.code,
                 message=snapshot.error.message,
                 retryable=snapshot.error.retryable,
@@ -636,7 +667,7 @@ class ReplayLLMAnalyzer:
                 prompt_version=self._prompt_version,
                 usage=snapshot.usage or UsageActual(),
                 snapshot_ref=snapshot.ref,
-            )
+            ), snapshot.pricing_receipt)
         decoded = self._decoder.decode(
             snapshot.response_bytes,
             model_id=self._model_id,
@@ -646,6 +677,12 @@ class ReplayLLMAnalyzer:
         )
         provenance = dict(decoded.provenance)
         provenance["snapshot_set_id"] = self._reader.snapshot_set_id
+        if snapshot.pricing_receipt is not None:
+            provenance["pricing_receipt"] = json.dumps(
+                snapshot.pricing_receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         return decoded.model_copy(
             update={
                 "usage": snapshot.usage or UsageActual(),

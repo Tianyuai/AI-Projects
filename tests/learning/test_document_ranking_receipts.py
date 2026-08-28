@@ -44,6 +44,28 @@ def _write_receipt(
     )
 
 
+def _write_generation(
+    root: Path, query_id: str, action_ids: list[str], *, policy: str
+) -> None:
+    target = root / "openalex" / "batch-0001" / "generation" / "attempt-01"
+    target.mkdir(parents=True, exist_ok=True)
+    (target / f"{query_id}.json").write_text(
+        json.dumps(
+            {
+                "attempt_status": "succeeded",
+                "query_id": query_id,
+                "actions": [{"action_id": action_id} for action_id in action_ids],
+                "generation_provenance": {
+                    "candidate_policy": policy,
+                    "gold_visibility": "blind",
+                    "max_openalex_actions": "6",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_supplemental_loader_pairs_training_receipts_and_excludes_target_ids(
     tmp_path: Path,
 ) -> None:
@@ -289,3 +311,85 @@ def test_evaluation_loader_requires_development_partition_and_frozen_folds(
     )
 
     assert [(fold, query.query_id) for fold, query in folded] == [(3, "q-dev")]
+
+
+def test_evaluation_loader_combines_multiple_frozen_receipt_roots(
+    tmp_path: Path,
+) -> None:
+    partition = tmp_path / "auto_dev.jsonl"
+    partition.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "query_id": query_id,
+                    "query": "graph retrieval",
+                    "gold_paper_ids": [paper_id],
+                    "role": "development",
+                    "split": "auto_dev",
+                }
+            )
+            for query_id, paper_id in (("q1", "openalex:W1"), ("q2", "openalex:W2"))
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {"sample": [{"query_id": "q1", "fold": 1}, {"query_id": "q2", "fold": 2}]}
+        ),
+        encoding="utf-8",
+    )
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    _write_receipt(first, "q1", [("anchor", [_paper("openalex:W1", "one")])])
+    _write_receipt(second, "q2", [("anchor", [_paper("openalex:W2", "two")])])
+    _write_receipt(second, "q1", [("wrong", [_paper("openalex:W9", "wrong")])])
+
+    folded = load_folded_document_ranking_evaluation_queries(
+        manifest_path=manifest,
+        partition_path=partition,
+        receipt_roots=(first, second),
+        required_action_ids=frozenset({"anchor"}),
+    )
+
+    assert [query.query_id for _fold, query in folded] == ["q1", "q2"]
+    assert folded[0][1].candidates[0].paper.title == "one"
+
+
+def test_evaluation_loader_accepts_deduplicated_core4_action_sets(
+    tmp_path: Path,
+) -> None:
+    partition = tmp_path / "dev.jsonl"
+    partition.write_text(
+        json.dumps(
+            {
+                "query_id": "q1",
+                "query": "SlipCover",
+                "gold_paper_ids": ["openalex:W1"],
+                "role": "development",
+                "split": "auto_dev",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"sample": [{"query_id": "q1", "fold": 1}]}))
+    root = tmp_path / "receipts"
+    action_ids = ["anchor", "text-1", "semantic-original"]
+    _write_generation(root, "q1", action_ids, policy="core4-semantic-boolean-v1")
+    _write_receipt(
+        root,
+        "q1",
+        [(action_id, [_paper("openalex:W1", "SlipCover")]) for action_id in action_ids],
+    )
+
+    folded = load_folded_document_ranking_evaluation_queries(
+        manifest_path=manifest,
+        partition_path=partition,
+        receipt_root=root,
+        required_candidate_policy="core4-semantic-boolean-v1",
+    )
+
+    assert folded[0][1].query_id == "q1"

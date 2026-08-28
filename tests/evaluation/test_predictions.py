@@ -15,16 +15,37 @@ from paper_search.domain.models import (
     SubQuery,
     UsageActual,
 )
-from paper_search.evaluation.dataset import PredictionRecord, read_jsonl
+from paper_search.evaluation.dataset import IdentifierMap, PredictionRecord, read_jsonl
 from paper_search.evaluation.official_adapter import (
     InternalPredictionRecord,
     adapt_prediction_record,
 )
 from paper_search.evaluation.predictions import (
+    paper_matches_evaluation_ids,
     prediction_from_response,
     write_prediction_records,
     write_response_predictions,
 )
+
+
+def test_paper_matching_can_use_a_frozen_verified_identifier_map() -> None:
+    paper = Paper(
+        canonical_id="doi:10.1109/cvpr.2018.00454",
+        doi="10.1109/cvpr.2018.00454",
+        openalex_id="W2620998106",
+        title="Deep Mutual Learning",
+    )
+    identifier_map = IdentifierMap.from_bytes(
+        b'{"doi:10.1109/cvpr.2018.00454":"arxiv:1706.00384",'
+        b'"openalex:W2620998106":"arxiv:1706.00384"}\n'
+    )
+
+    assert not paper_matches_evaluation_ids(paper, ["arxiv:1706.00384"])
+    assert paper_matches_evaluation_ids(
+        paper,
+        ["arxiv:1706.00384"],
+        identifier_map=identifier_map,
+    )
 
 
 def _response(

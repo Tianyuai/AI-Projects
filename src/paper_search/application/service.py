@@ -144,10 +144,14 @@ class SearchApplicationService:
 
     @staticmethod
     def _failure_code(result: OrchestratorResult) -> SearchErrorCode | None:
-        llm_errors = {
-            error.code
+        llm_diagnostics = [
+            diagnostic
             for diagnostic in result.diagnostics
             if diagnostic.dependency == "llm"
+        ]
+        llm_errors = {
+            error.code
+            for diagnostic in llm_diagnostics
             for error in diagnostic.errors
             if not (
                 diagnostic.endpoint == "constraint_rerank"
@@ -158,10 +162,15 @@ class SearchApplicationService:
             return "snapshot_unavailable"
         if "integrity_failure" in llm_errors:
             return "integrity_failure"
-        if llm_errors and not (
+        malformed_recovered = llm_errors.issubset(_MALFORMED_LLM_CODES) and (
             result.planner_status == "rules_fallback"
-            and llm_errors.issubset(_MALFORMED_LLM_CODES)
-        ):
+            or (
+                result.planner_status == "repaired"
+                and len(llm_diagnostics) >= 2
+                and not llm_diagnostics[-1].errors
+            )
+        )
+        if llm_errors and not malformed_recovered:
             return "dependency_failure"
 
         provider_error_codes = {

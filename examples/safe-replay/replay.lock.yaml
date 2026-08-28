@@ -1,0 +1,72 @@
+schema_version: integrated-lock-v1
+lock_kind: replay
+created_at: 2026-07-30 00:00:00+00:00
+source_capture_run_id: capture-run-001
+source_git_sha: task2-fixture-commit
+runtime_allow_live: true
+frozen_data:
+  manifest:
+    path: data/manifest.json
+    sha256: sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
+  identifier_map:
+    path: data/identifier-map.json
+    sha256: sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
+  split: validation
+  query_count: 2
+  partition_sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000
+baseline:
+  primary_model: deepseek-v4-flash
+  fallback_model: deepseek-v4-flash
+  prompt_version: query-analyze-v1
+  strategy: fixed-one-round
+  planner:
+    prompt_config:
+      path: configs/prompts/query_analyze.yaml
+      sha256: sha256:7bd54e4a9009c0a66b516b260b0324d841dc490f8c344f24716099c9c4e0e5e2
+    normal_subqueries_min: 3
+    normal_subqueries_max: 5
+    configured_subqueries_max: 6
+    repair_attempts: 1
+    rules_fallback_enabled: true
+  retrieval:
+    openalex_endpoint: /works
+    semantic_scholar_endpoint: /graph/v1/paper/search
+    openalex_calls_min: 3
+    openalex_calls_max: 6
+    semantic_scholar_calls_max: 2
+    max_results_per_subquery: 50
+    max_raw_candidates: 300
+    max_deduplicated_candidates: 200
+    max_output_papers: 50
+  timeout:
+    connect_seconds: 5
+    read_seconds: 20
+    write_seconds: 20
+    pool_seconds: 5
+  retry:
+    max_attempts: 3
+    retryable_statuses:
+    - 429
+    - 5xx
+    retry_timeouts: true
+    backoff_rule: min(8,2^retry_index)+jitter[0,1)
+  optional_modules:
+    embedding: false
+    citation_expansion: false
+    constraint_reranking: false
+    fixed_two_round: false
+    adaptive_evolution: false
+budget_config:
+  path: configs/budget_balanced.yaml
+  sha256: sha256:4041783f059d58d9f7e3949b95a60ceab94e6bafb114457064618adf0de358ac
+pricing_policy:
+  path: configs/pricing_v1.yaml
+  sha256: sha256:b6a0685d20827da74353f7e915d42838a6cf78c1daaf4a94951f3aa555b4f6ff
+quality_gates:
+  path: configs/quality_gates_v1.yaml
+  sha256: sha256:ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356
+capture_policy:
+  snapshot_schema: dependency-snapshot-v2
+  capture_policy_sha256: sha256:0000000000000000000000000000000000000000000000000000000000000000
+snapshot_set_id: sha256:86c4683fbb209a1b0aa19625c183b581806ebe1db7d7603ea450d30f7c0b321f
+snapshot_manifest_sha256: sha256:8dfa8ba2896d4f37f153f1901191e39e96e859e3671473ed10b558993f245ade

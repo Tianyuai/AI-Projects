@@ -31,7 +31,10 @@ from paper_search.recall_experiments.retrieval.backends import (
     BudgetedCitationBackend,
     BudgetedSearchBackend,
 )
-from paper_search.retrieval.snapshot_adapters import LiveCaptureSearchProvider
+from paper_search.retrieval.snapshot_adapters import (
+    LiveCaptureSearchProvider,
+    SearchAttemptGate,
+)
 from paper_search.storage.dependency_snapshot import DependencyCaptureStore
 from paper_search.domain.models import Sha256
 
@@ -161,6 +164,7 @@ def resolve_runtime_secrets(
     profile: RecallRuntimeProfile,
     *,
     environ: Mapping[str, str] | None = None,
+    openalex_key_slot: int | None = None,
 ) -> RecallRuntimeSecrets:
     process = os.environ if environ is None else environ
     dotenv = dotenv_values(profile.env_file)
@@ -183,9 +187,19 @@ def resolve_runtime_secrets(
         if item is None:
             break
         additional.append(SecretStr(item))
+    openalex_api_key = SecretStr(required["openalex_api_key"] or "")
+    if openalex_key_slot is not None:
+        configured = [openalex_api_key, *additional]
+        if (
+            type(openalex_key_slot) is not int
+            or not 1 <= openalex_key_slot <= len(configured)
+        ):
+            raise ValueError("OpenAlex key slot is unavailable")
+        openalex_api_key = configured[openalex_key_slot - 1]
+        additional = []
     return RecallRuntimeSecrets(
         llm_api_key=SecretStr(required["llm_api_key"] or ""),
-        openalex_api_key=SecretStr(required["openalex_api_key"] or ""),
+        openalex_api_key=openalex_api_key,
         semantic_scholar_api_key=SecretStr(required["semantic_scholar_api_key"] or ""),
         additional_openalex_api_keys=tuple(additional),
     )
@@ -199,6 +213,7 @@ async def build_live_runtime_bundle(
     capture_root: Path,
     client: httpx.AsyncClient | None = None,
     search_dependency: Literal["openalex", "semantic_scholar"] = "openalex",
+    openalex_attempt_gate: SearchAttemptGate | None = None,
 ) -> RecallLiveRuntimeBundle:
     """Build the only approved live runtime from verified, secret-free profile inputs."""
     if profile.capture_responses is not True:
@@ -242,6 +257,7 @@ async def build_live_runtime_bundle(
                 if search_dependency == "semantic_scholar"
                 else profile.openalex_minimum_request_interval_seconds
             ),
+            attempt_gate=openalex_attempt_gate,
         )
         citation_dependency = search_dependency
         citation_provider = search_provider

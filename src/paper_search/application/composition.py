@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Awaitable, Callable, Mapping
+import json
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 from uuid import uuid4
 
 import httpx
@@ -52,7 +53,9 @@ from paper_search.domain.models import (
     BudgetReservation,
     DependencyName,
     DependencyStatus,
+    FusedPaper,
     ProviderResult,
+    QuerySpec,
     SearchMode,
     SearchBudget,
     SafeRelativePath,
@@ -65,6 +68,16 @@ from paper_search.llm.prompt_artifacts import render_prompt_system_message
 from paper_search.llm.snapshot_adapters import (
     LiveCaptureLLMAnalyzer,
     ReplayLLMAnalyzer,
+)
+from paper_search.evaluation.dataset import IdentifierMap
+from paper_search.learning.cross_vocabulary_bridge import (
+    select_production_cross_vocabulary_supplement,
+)
+from paper_search.learning.lexical_bridge_deployment import (
+    load_lexical_bridge_model_bytes,
+)
+from paper_search.learning.production_query_expansion import (
+    SupervisedLexicalBridgePlanEnricher,
 )
 from paper_search.pipeline.orchestrator import (
     MockSearchOrchestrator,
@@ -199,7 +212,11 @@ class ApplicationBundle:
     optional_modules: dict[str, bool]
     experiment_config: None
     source_git_sha: str
-    prompt_version: Literal["query-analyze-v1"]
+    prompt_version: Literal[
+        "query-analyze-v1",
+        "query-analyze-semantic-actions-v2",
+        "query-analyze-protected-actions-v3",
+    ]
     mode_binding: ModeBinding
     _owns_artifact_factory: bool = field(default=True, repr=False, compare=False)
 
@@ -303,7 +320,7 @@ def _live_estimates(
         budget.max_elapsed_seconds * 1_000,
         lock.baseline.retry.max_attempts * lock.baseline.timeout.read_seconds * 1_000,
     )
-    llm_usage = pricer.value_actual(
+    llm_usage = pricer.value_actual_peak(
         dependency="llm",
         model_or_adapter=lock.baseline.primary_model,
         usage=UsageActual(
@@ -334,6 +351,33 @@ def _live_estimates(
     return analysis, provider_estimates
 
 
+def _low_confidence_analysis_estimate(
+    controller: HardBudgetController,
+    *,
+    lock: InputLock,
+    pricer: ActualCostPricer,
+) -> UsageEstimate | None:
+    binding = lock.baseline.low_confidence_llm_supplement
+    if binding is None:
+        return None
+    elapsed_ms = min(
+        controller.budget.max_elapsed_seconds * 1_000,
+        binding.max_llm_attempts * lock.baseline.timeout.read_seconds * 1_000,
+    )
+    usage = pricer.value_actual_peak(
+        dependency="llm",
+        model_or_adapter=lock.baseline.primary_model,
+        usage=UsageActual(
+            llm_calls=binding.max_llm_attempts,
+            input_tokens=binding.max_input_tokens * binding.max_llm_attempts,
+            output_tokens=binding.max_output_tokens * binding.max_llm_attempts,
+        ),
+    )
+    return UsageEstimate.model_validate(
+        {**usage.model_dump(mode="python"), "elapsed_ms": elapsed_ms}
+    )
+
+
 def _confined_manifest_path(path: Path, *, artifact_root: Path) -> Path:
     root = artifact_root.resolve(strict=True)
     try:
@@ -359,17 +403,157 @@ def _prompt_system_message(prompt_bytes: bytes) -> str:
     return render_prompt_system_message(prompt_bytes)
 
 
+class _DeploymentDocumentRankingStage:
+    """Expose immutable deployment selection without changing rank semantics."""
+
+    def __init__(
+        self,
+        stage: DocumentRankingStage,
+        *,
+        deployment_role: str,
+        failover_receipt: list[dict[str, str]],
+    ) -> None:
+        self._stage = stage
+        self.model_id = stage.model_id
+        self.deployment_role = deployment_role
+        self.failover_receipt = [dict(item) for item in failover_receipt]
+
+    def rank(
+        self, query: str, candidates: Sequence[FusedPaper]
+    ) -> list[FusedPaper]:
+        return self._stage.rank(query, candidates)
+
+    def rank_with_context(
+        self,
+        query: str,
+        candidates: Sequence[FusedPaper],
+        *,
+        query_spec: QuerySpec,
+    ) -> list[FusedPaper]:
+        contextual_rank = getattr(self._stage, "rank_with_context", None)
+        if callable(contextual_rank):
+            return cast(
+                list[FusedPaper],
+                contextual_rank(query, candidates, query_spec=query_spec),
+            )
+        return self._stage.rank(query, candidates)
+
+    def context_receipt(
+        self, query: str, *, query_spec: QuerySpec
+    ) -> dict[str, object] | None:
+        receipt = getattr(self._stage, "context_receipt", None)
+        if not callable(receipt):
+            return None
+        return cast(dict[str, object] | None, receipt(query, query_spec=query_spec))
+
+
 def _locked_document_ranker(
     lock: InputLock,
     artifact_bytes: Mapping[SafeRelativePath, bytes],
+    artifact_failures: Mapping[SafeRelativePath, str],
 ) -> DocumentRankingStage | None:
     binding = lock.baseline.document_ranker
     if binding is None:
         return None
-    return load_cpu_document_ranking_stage_bytes(
-        artifact_bytes[binding.manifest.path],
-        artifact_bytes[binding.weights.path],
+    candidates = [
+        ("F5-gated-fusion", binding.manifest, binding.weights),
+    ]
+    if binding.fallback_manifest is not None and binding.fallback_weights is not None:
+        candidates.append(
+            ("F4-reliability", binding.fallback_manifest, binding.fallback_weights)
+        )
+    if binding.emergency_manifest is not None and binding.emergency_weights is not None:
+        candidates.append(
+            ("B0", binding.emergency_manifest, binding.emergency_weights)
+        )
+    failover_receipt: list[dict[str, str]] = []
+    initialization_errors: list[str] = []
+    for role, manifest_binding, weights_binding in candidates:
+        missing = next(
+            (
+                item
+                for item in (manifest_binding, weights_binding)
+                if item.path not in artifact_bytes
+            ),
+            None,
+        )
+        if missing is not None:
+            failover_receipt.append(
+                {
+                    "role": role,
+                    "reason": artifact_failures.get(missing.path, "unavailable"),
+                }
+            )
+            continue
+        try:
+            stage = load_cpu_document_ranking_stage_bytes(
+                artifact_bytes[manifest_binding.path],
+                artifact_bytes[weights_binding.path],
+            )
+        except (TypeError, ValueError) as error:
+            initialization_errors.append(f"{role}: {error}")
+            failover_receipt.append(
+                {"role": role, "reason": "initialization_failure"}
+            )
+            continue
+        return _DeploymentDocumentRankingStage(
+            stage,
+            deployment_role=role,
+            failover_receipt=failover_receipt,
+        )
+    raise ValueError(
+        "no deployable document ranker in verified chain: "
+        + " | ".join(initialization_errors or ["artifacts unavailable"])
     )
+
+
+def _locked_query_plan_enricher(
+    lock: InputLock,
+    artifact_bytes: Mapping[SafeRelativePath, bytes],
+) -> SupervisedLexicalBridgePlanEnricher | None:
+    binding = lock.baseline.supervised_lexical_bridge
+    if binding is None:
+        return None
+    loaded = load_lexical_bridge_model_bytes(
+        model_bytes=artifact_bytes[binding.model.path],
+        manifest_bytes=artifact_bytes[binding.manifest.path],
+    )
+    return SupervisedLexicalBridgePlanEnricher(
+        loaded,
+        max_total_subqueries=lock.baseline.planner.configured_subqueries_max,
+    )
+
+
+def load_locked_identifier_map(
+    lock: InputLock,
+    artifact_bytes: Mapping[SafeRelativePath, bytes],
+) -> tuple[IdentifierMap | None, int]:
+    """Load the exact combined identifier aliases bound by an input lock."""
+
+    binding = lock.baseline.pasa_identity_aliases
+    if binding is None:
+        return None, 0
+    base_map = IdentifierMap.from_bytes(
+        artifact_bytes[lock.frozen_data.identifier_map.path],
+        source="frozen identifier map",
+    )
+    pasa_map = IdentifierMap.from_bytes(
+        artifact_bytes[binding.alias_map.path],
+        source="frozen PASA identity aliases",
+    )
+    if len(pasa_map.resolved_pairs()) != binding.alias_count:
+        raise ValueError("frozen PASA identity alias count mismatch")
+    maps = [base_map, pasa_map]
+    combined: dict[str, str] = {}
+    for identifier_map in maps:
+        for alias, target in identifier_map.resolved_pairs():
+            existing = combined.get(alias)
+            if existing is not None and existing != target:
+                raise ValueError(f"conflicting frozen identifier alias: {alias}")
+            combined[alias] = target
+    payload = json.dumps(combined, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    resolved = IdentifierMap.from_bytes(payload, source="combined frozen identifier aliases")
+    return resolved, len(resolved.resolved_pairs())
 
 
 def _replay_readiness(binding: ModeBinding) -> Callable[[], ReadyHealthResponse]:
@@ -441,6 +625,9 @@ def _replay_factory(
     config_hash: Sha256,
     analyzer_decorator: AnalyzerDecorator | None,
     document_ranker: DocumentRankingStage | None,
+    query_plan_enricher: SupervisedLexicalBridgePlanEnricher | None,
+    identifier_map: IdentifierMap | None,
+    identifier_alias_count: int,
 ) -> Callable[[HardBudgetController, str], SearchOrchestrator]:
     def create(
         controller: HardBudgetController,
@@ -458,6 +645,19 @@ def _replay_factory(
             prompt_artifact_sha256=lock.baseline.planner.prompt_config.sha256,
             prompt_version=lock.baseline.prompt_version,
         )
+        low_confidence_binding = lock.baseline.low_confidence_llm_supplement
+        low_confidence_analyzer: QueryAnalyzer | None = None
+        if low_confidence_binding is not None:
+            low_confidence_analyzer = _AnalyzerBridge(
+                ReplayLLMAnalyzer(
+                    reader=reader,
+                    model_id=lock.baseline.primary_model,
+                    prompt_artifact_sha256=(
+                        low_confidence_binding.prompt_config.sha256
+                    ),
+                    prompt_version=low_confidence_binding.prompt_version,
+                )
+            )
         providers = {
             "openalex": ReplaySearchProvider(dependency="openalex", reader=reader),
             "semantic_scholar": ReplaySearchProvider(
@@ -488,6 +688,54 @@ def _replay_factory(
             execution_mode="replay",
             document_ranker=document_ranker,
             max_output_papers=lock.baseline.retrieval.max_output_papers,
+            openalex_supplement_selector=(
+                select_production_cross_vocabulary_supplement
+                if lock.baseline.cross_vocabulary_supplement is not None
+                else None
+            ),
+            max_total_openalex_actions=(
+                lock.baseline.cross_vocabulary_supplement.max_total_openalex_actions
+                if lock.baseline.cross_vocabulary_supplement is not None
+                else None
+            ),
+            query_plan_enricher=query_plan_enricher,
+            identifier_map=identifier_map,
+            identifier_alias_count=identifier_alias_count,
+            max_raw_candidates=lock.baseline.retrieval.max_raw_candidates,
+            max_deduplicated_candidates=(
+                lock.baseline.retrieval.max_deduplicated_candidates
+            ),
+            max_additional_raw_candidates=(
+                lock.baseline.cross_vocabulary_supplement.max_additional_raw_candidates
+                if lock.baseline.cross_vocabulary_supplement is not None
+                else None
+            ),
+            max_total_raw_candidates=(
+                lock.baseline.cross_vocabulary_supplement.max_total_raw_candidates
+                if lock.baseline.cross_vocabulary_supplement is not None
+                else None
+            ),
+            low_confidence_analyzer=low_confidence_analyzer,
+            low_confidence_prompt_version=(
+                low_confidence_binding.prompt_version
+                if low_confidence_binding is not None
+                else None
+            ),
+            low_confidence_analysis_estimate=_low_confidence_analysis_estimate(
+                controller,
+                lock=lock,
+                pricer=pricer,
+            ),
+            max_low_confidence_raw_candidates=(
+                low_confidence_binding.max_additional_raw_candidates
+                if low_confidence_binding is not None
+                else None
+            ),
+            max_low_confidence_deduplicated_candidates=(
+                low_confidence_binding.max_additional_deduplicated_candidates
+                if low_confidence_binding is not None
+                else None
+            ),
         )
         return orchestrator
 
@@ -576,8 +824,12 @@ class _LiveOrchestratorFactory:
         credentials: _LiveCredentials,
         artifact_factory: ArtifactFactory,
         prompt_instructions: str | None = None,
+        low_confidence_prompt_instructions: str | None = None,
         analyzer_decorator: AnalyzerDecorator | None = None,
         document_ranker: DocumentRankingStage | None = None,
+        query_plan_enricher: SupervisedLexicalBridgePlanEnricher | None = None,
+        identifier_map: IdentifierMap | None = None,
+        identifier_alias_count: int = 0,
     ) -> None:
         self._lock = lock
         self._config_hash = config_hash
@@ -585,8 +837,14 @@ class _LiveOrchestratorFactory:
         self._credentials = credentials
         self._artifact_factory = artifact_factory
         self._prompt_instructions = prompt_instructions
+        self._low_confidence_prompt_instructions = (
+            low_confidence_prompt_instructions
+        )
         self._analyzer_decorator = analyzer_decorator
         self._document_ranker = document_ranker
+        self._query_plan_enricher = query_plan_enricher
+        self._identifier_map = identifier_map
+        self._identifier_alias_count = identifier_alias_count
 
     def __repr__(self) -> str:
         return "_LiveOrchestratorFactory(credentials=**********)"
@@ -627,6 +885,30 @@ class _LiveOrchestratorFactory:
             prompt_artifact_sha256=(lock.baseline.planner.prompt_config.sha256),
             prompt_instructions=self._prompt_instructions,
         )
+        low_confidence_binding = lock.baseline.low_confidence_llm_supplement
+        low_confidence_analyzer: QueryAnalyzer | None = None
+        if low_confidence_binding is not None:
+            low_confidence_client = OpenAICompatibleLLMClient(
+                client=client,
+                base_url=_LLM_BASE_URL,
+                model=lock.baseline.primary_model,
+                api_key=self._credentials.llm.get_secret_value(),
+                prompt_version=low_confidence_binding.prompt_version,
+            )
+            low_confidence_analyzer = _AnalyzerBridge(
+                LiveCaptureLLMAnalyzer(
+                    client=low_confidence_client,
+                    capture_store=capture_store,
+                    pricer=self._pricer,
+                    controller=controller,
+                    prompt_artifact_sha256=(
+                        low_confidence_binding.prompt_config.sha256
+                    ),
+                    prompt_instructions=(
+                        self._low_confidence_prompt_instructions
+                    ),
+                )
+            )
         providers = {
             "openalex": LiveCaptureSearchProvider(
                 dependency="openalex",
@@ -687,6 +969,54 @@ class _LiveOrchestratorFactory:
             execution_mode="live",
             document_ranker=self._document_ranker,
             max_output_papers=lock.baseline.retrieval.max_output_papers,
+            openalex_supplement_selector=(
+                select_production_cross_vocabulary_supplement
+                if lock.baseline.cross_vocabulary_supplement is not None
+                else None
+            ),
+            max_total_openalex_actions=(
+                lock.baseline.cross_vocabulary_supplement.max_total_openalex_actions
+                if lock.baseline.cross_vocabulary_supplement is not None
+                else None
+            ),
+            query_plan_enricher=self._query_plan_enricher,
+            identifier_map=self._identifier_map,
+            identifier_alias_count=self._identifier_alias_count,
+            max_raw_candidates=lock.baseline.retrieval.max_raw_candidates,
+            max_deduplicated_candidates=(
+                lock.baseline.retrieval.max_deduplicated_candidates
+            ),
+            max_additional_raw_candidates=(
+                lock.baseline.cross_vocabulary_supplement.max_additional_raw_candidates
+                if lock.baseline.cross_vocabulary_supplement is not None
+                else None
+            ),
+            max_total_raw_candidates=(
+                lock.baseline.cross_vocabulary_supplement.max_total_raw_candidates
+                if lock.baseline.cross_vocabulary_supplement is not None
+                else None
+            ),
+            low_confidence_analyzer=low_confidence_analyzer,
+            low_confidence_prompt_version=(
+                low_confidence_binding.prompt_version
+                if low_confidence_binding is not None
+                else None
+            ),
+            low_confidence_analysis_estimate=_low_confidence_analysis_estimate(
+                controller,
+                lock=lock,
+                pricer=self._pricer,
+            ),
+            max_low_confidence_raw_candidates=(
+                low_confidence_binding.max_additional_raw_candidates
+                if low_confidence_binding is not None
+                else None
+            ),
+            max_low_confidence_deduplicated_candidates=(
+                low_confidence_binding.max_additional_deduplicated_candidates
+                if low_confidence_binding is not None
+                else None
+            ),
         )
         return _LiveRunOrchestrator(
             orchestrator=orchestrator,
@@ -913,7 +1243,19 @@ class CompositionRoot:
         locked_config_hash = lock_sha256(lock)
         experiment_config = None
         config_hash = locked_config_hash
-        document_ranker = _locked_document_ranker(lock, verified.artifact_bytes)
+        document_ranker = _locked_document_ranker(
+            lock,
+            verified.artifact_bytes,
+            verified.ranker_artifact_failures,
+        )
+        query_plan_enricher = _locked_query_plan_enricher(
+            lock,
+            verified.artifact_bytes,
+        )
+        identifier_map, identifier_alias_count = load_locked_identifier_map(
+            lock,
+            verified.artifact_bytes,
+        )
         budget_profile = _locked_budget_profile(lock.budget_config.path)
         budgets: dict[str, SearchBudget] = {
             budget_profile: parse_budget_bytes(verified.artifact_bytes[lock.budget_config.path]),
@@ -954,6 +1296,9 @@ class CompositionRoot:
                 config_hash=config_hash,
                 analyzer_decorator=analyzer_decorator,
                 document_ranker=document_ranker,
+                query_plan_enricher=query_plan_enricher,
+                identifier_map=identifier_map,
+                identifier_alias_count=identifier_alias_count,
             )
             readiness_probe = _replay_readiness(binding)
             snapshot_captured_at = _snapshot_manifest_time(manifest_path)
@@ -985,8 +1330,20 @@ class CompositionRoot:
                 prompt_instructions=_prompt_system_message(
                     verified.artifact_bytes[lock.baseline.planner.prompt_config.path]
                 ),
+                low_confidence_prompt_instructions=(
+                    _prompt_system_message(
+                        verified.artifact_bytes[
+                            lock.baseline.low_confidence_llm_supplement.prompt_config.path
+                        ]
+                    )
+                    if lock.baseline.low_confidence_llm_supplement is not None
+                    else None
+                ),
                 analyzer_decorator=analyzer_decorator,
                 document_ranker=document_ranker,
+                query_plan_enricher=query_plan_enricher,
+                identifier_map=identifier_map,
+                identifier_alias_count=identifier_alias_count,
             )
 
             binding = ModeBinding(
@@ -1027,7 +1384,7 @@ class CompositionRoot:
             optional_modules=experiment_definition.flags.model_dump(mode="python"),
             experiment_config=experiment_config,
             source_git_sha=lock.source_git_sha,
-            prompt_version="query-analyze-v1",
+            prompt_version=lock.baseline.prompt_version,
             mode_binding=binding,
             _owns_artifact_factory=artifact_factory is None,
         )

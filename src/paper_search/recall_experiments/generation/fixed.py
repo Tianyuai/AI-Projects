@@ -14,6 +14,8 @@ from paper_search.recall_experiments.validation import validate_action_batch
 class FixedActionGenerator:
     """Validate and freeze one immutable action payload for every expected query."""
 
+    generator_type = "fixed_actions"
+
     def __init__(
         self,
         actions_by_query: Mapping[str, bytes | str | Mapping[str, object]],

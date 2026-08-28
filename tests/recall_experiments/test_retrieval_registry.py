@@ -249,6 +249,57 @@ def test_live_search_backend_can_explicitly_bind_semantic_scholar(
     asyncio.run(run())
 
 
+def test_budgeted_openalex_backend_executes_one_frozen_continuation_page(
+    tmp_path: Path,
+) -> None:
+    controller = HardBudgetController(_budget(), formal_live=True)
+    pricer = ActualCostPricer(
+        load_pricing_policy(Path("tests/fixtures/pricing/pricing-policy-test-v1.yaml")),
+        valued_at=datetime(2026, 8, 1, tzinfo=UTC),
+    )
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            content=Path("tests/fixtures/openalex/works_page_2.json").read_bytes(),
+            request=request,
+        )
+
+    async def run() -> BackendSearchResult:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            provider = LiveCaptureSearchProvider(
+                dependency="openalex",
+                client=client,
+                capture_store=DependencyCaptureStore(tmp_path / "snapshot-continuation"),
+                pricer=pricer,
+                controller=controller,
+            )
+            backend = BudgetedSearchBackend(
+                provider=provider,
+                controller=controller,
+                call_estimate=UsageEstimate(
+                    search_api_calls=1, cost_cny=Decimal("0.01")
+                ),
+            )
+            return await backend.search_continuation(
+                "depth-page-2",
+                "retrieval augmented generation",
+                {},
+                cursor="cursor-page-2",
+                limit=50,
+            )
+
+    result = asyncio.run(run())
+
+    assert len(requests) == 1
+    assert requests[0].url.params["cursor"] == "cursor-page-2"
+    assert [paper.openalex_id for paper in result.hits] == ["W126"]
+    assert result.usage.search_api_calls == 1
+    assert result.infrastructure_failure is False
+
+
 def test_live_retrieval_backends_reject_wrong_role_or_controller(
     tmp_path: Path,
 ) -> None:

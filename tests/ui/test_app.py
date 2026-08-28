@@ -22,6 +22,10 @@ def test_browser_assets_are_present_and_semantic() -> None:
         'id="results"',
         'id="provenance"',
         'id="diagnostics"',
+        'id="query-understanding"',
+        'id="system-pipeline"',
+        'id="execution-trace"',
+        'id="cost-summary"',
         'src="/static/app.js"',
         'href="/static/styles.css"',
     ):
@@ -75,8 +79,57 @@ def test_browser_script_renders_success_partial_and_typed_error_state() -> None:
         "payload.code",
         "payload.detail",
         "Loading search results",
+        "query_analysis",
+        "search_trace",
+        "pricing_receipt",
+        "cached_input_tokens",
+        "uncached_input_tokens",
+        "deployment_role",
+        "failover_receipt",
+        "Retrieval rationale",
+        "target_constraints",
+        "Assess recall confidence",
+        "Generate supplemental retrieval action",
+        "Select safe supplemental action",
+        "Retrieve low-confidence supplement",
+        "Merge independent supplement quota",
+        "Natural-language query",
+        "LLM understanding",
+        "QuerySpec + controlled search plan",
+        "Supervised vocabulary bridge",
+        "OpenAlex + Semantic Scholar",
+        "Adaptive supplemental recall",
+        "Identity, filtering, and fusion",
+        "PASA-derived production aliases",
+        "F5 → F4 → B0 ranking",
+        "Structured delivery + replay",
     ):
         assert expected in script
+
+
+def test_browser_pipeline_is_derived_from_runtime_evidence() -> None:
+    script = _static_file("app.js").read_text(encoding="utf-8")
+
+    for expected in (
+        "function renderSystemPipeline(payload)",
+        "payload.search_trace ?? []",
+        "payload.query_analysis ?? {}",
+        "payload.dependency_status ?? []",
+        "payload.selected_paper_ids ?? []",
+        "payload.snapshot_set_id",
+        "renderSystemPipeline(payload)",
+    ):
+        assert expected in script
+
+
+def test_browser_pipeline_layout_is_readable_across_breakpoints() -> None:
+    styles = _static_file("styles.css").read_text(encoding="utf-8")
+
+    assert ".system-pipeline { display: grid; grid-template-columns: repeat(4" in styles
+    assert "@media (max-width: 1040px)" in styles
+    assert "grid-template-columns: repeat(2" in styles
+    assert "@media (max-width: 760px)" in styles
+    assert "grid-template-columns: 1fr" in styles
 
 
 def test_ui_module_only_installs_routes_and_never_imports_evaluation_pipeline() -> None:

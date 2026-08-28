@@ -13,3 +13,38 @@ tests/fixtures/formal_run/**/executions.jsonl text eol=crlf
 tests/fixtures/formal_run/**/run.json text eol=crlf
 tests/fixtures/formal_run/**/snapshot-manifest.json text eol=crlf
 tests/fixtures/formal_run/**/snapshots/responses/**/*.bin -text
+
+# Keep source and documentation stable across Windows/Linux clones.
+*.py text eol=lf
+*.md text eol=lf
+*.jsonl text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.toml text eol=lf
+*.sha256 text eol=lf
+.env.example text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+uv.lock text eol=lf
+
+# These files are authenticated byte-for-byte by the production lock or model
+# selection. Disable checkout-time newline conversion so their SHA-256 bindings
+# remain valid on every platform.
+deliverables/evaluator/*.lock.yaml binary
+data/identifier-map.json -text
+data/annotation_work/pricing_v1.yaml -text
+configs/budget_balanced.yaml binary
+configs/quality_gates_v1.yaml -text
+configs/prompts/query_analyze.yaml binary
+configs/prompts/query_analyze_protected_actions_v3.yaml -text
+artifacts/identity/conservative-pasa-identity-alias-v1.json -text
+artifacts/models/production-document-ranker-selection.json binary
+artifacts/models/**/manifest.json -text
+artifacts/models/**/*.bundle binary
+artifacts/models/**/*.joblib binary
+artifacts/models/**/*.f64 binary
+examples/safe-replay/**/*.bin binary
+examples/safe-replay/**/*.yaml binary
+examples/safe-replay/**/*.json binary
+*.zip binary

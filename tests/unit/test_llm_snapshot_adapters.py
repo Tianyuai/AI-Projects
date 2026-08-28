@@ -854,6 +854,9 @@ def test_replay_uses_identical_decoder_zero_cost_and_snapshot_provenance(
     assert replay_result.usage == live_result.usage
     assert replay_result.usage != UsageActual()
     assert replay_result.provenance["snapshot_set_id"] == manifest.snapshot_set_id
+    assert json.loads(replay_result.provenance["pricing_receipt"]) == json.loads(
+        live_result.provenance["pricing_receipt"]
+    )
     assert "snapshot_entry_id" in replay_result.provenance
 
 

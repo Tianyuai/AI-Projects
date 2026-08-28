@@ -31,6 +31,8 @@ from paper_search.domain.models import (
 from paper_search.llm.snapshot_adapters import ReplayLLMAnalyzer
 from paper_search.learning.adapters import QueryPolicyAnalyzerAdapter
 from paper_search.learning.deployment import build_cpu_action_analyzer_decorator
+from paper_search.learning.lexical_bridge import LexicalBridgeExample, SupervisedLexicalBridge
+from paper_search.learning.lexical_bridge_deployment import freeze_lexical_bridge_model
 from paper_search.retrieval.snapshot_adapters import ReplaySearchProvider
 from paper_search.pipeline.orchestrator import OrchestratorResult
 from paper_search.storage.dependency_snapshot import DependencyCaptureStore
@@ -244,6 +246,262 @@ def test_replay_composition_explicitly_enables_locked_document_ranker(
     )
 
 
+def test_replay_composition_loads_frozen_query_bridge_and_pasa_aliases(
+    composition_fixture: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    artifact_root = composition_fixture["artifact_root"]
+    bridge = SupervisedLexicalBridge.fit(
+        [
+            LexicalBridgeExample(
+                query="multimodal representation learning",
+                gold_titles=("Cross modal retrieval with aligned embeddings",),
+            ),
+            LexicalBridgeExample(
+                query="multi modal representation alignment",
+                gold_titles=("Cross modal retrieval using joint embeddings",),
+            ),
+            LexicalBridgeExample(
+                query="protein structure prediction",
+                gold_titles=("Protein folding with geometric networks",),
+            ),
+        ],
+        representation="word_char",
+        learning_objective="neighbor_idf",
+    )
+    model_path = artifact_root / "models/lexical-bridge.joblib"
+    manifest_path = artifact_root / "models/lexical-bridge.json"
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest = freeze_lexical_bridge_model(
+        bridge,
+        model_path=model_path,
+        manifest_path=manifest_path,
+        training_query_count=3,
+        raw_train_sha256=_sha256(b"raw-train"),
+        train_partition_sha256=_sha256(b"train-partition"),
+        training_oof_sha256=_sha256(b"training-oof"),
+        independent_dev_sha256=_sha256(b"independent-dev"),
+    )
+    alias_payload = b'{"openalex:W1":"s2:S1"}'
+    alias_sha = _write_artifact(
+        artifact_root,
+        "identity/pasa-aliases.json",
+        alias_payload,
+    )
+    raw = yaml.safe_load(composition_fixture["replay_lock"].read_bytes())
+    raw["baseline"]["supervised_lexical_bridge"] = {
+        "enabled": True,
+        "policy_version": "supervised-lexical-bridge-openalex-v2",
+        "manifest": {
+            "path": "models/lexical-bridge.json",
+            "sha256": _sha256(manifest_path.read_bytes()),
+        },
+        "model": {
+            "path": "models/lexical-bridge.joblib",
+            "sha256": manifest["model_sha256"],
+        },
+        "max_actions": 1,
+    }
+    raw["baseline"]["pasa_identity_aliases"] = {
+        "enabled": True,
+        "policy_version": "conservative-pasa-identity-alias-v1",
+        "alias_map": {
+            "path": "identity/pasa-aliases.json",
+            "sha256": alias_sha,
+        },
+        "alias_count": 1,
+    }
+    lock_path = tmp_path / "replay-extensions.lock.yaml"
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    bundle = CompositionRoot.compose(
+        lock_path=lock_path,
+        mode="replay",
+        artifact_root=artifact_root,
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load((artifact_root / "configs/budget_balanced.yaml").read_bytes())
+    )
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        "locked-production-extensions",
+    )
+
+    assert orchestrator._query_plan_enricher is not None  # noqa: SLF001
+    assert orchestrator._identifier_alias_count == 1  # noqa: SLF001
+    assert orchestrator._identifier_map.resolve("openalex:W1") == "s2:S1"  # noqa: SLF001
+
+
+def test_replay_composition_selects_f4_when_f5_hash_verification_fails(
+    composition_fixture: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    root = composition_fixture["artifact_root"]
+    primary_manifest = b"invalid-f5-manifest"
+    primary_weights = b"invalid-f5-weights"
+    _write_artifact(root, "models/f5.json", primary_manifest)
+    _write_artifact(root, "models/f5.bundle", primary_weights)
+    raw = yaml.safe_load(
+        composition_fixture["replay_ranked_lock"].read_text(encoding="utf-8")
+    )
+    current = raw["baseline"]["document_ranker"]
+    raw["baseline"]["document_ranker"] = {
+        "enabled": True,
+        "manifest": {
+            "path": "models/f5.json",
+            "sha256": _sha256(primary_manifest),
+        },
+        "weights": {
+            "path": "models/f5.bundle",
+            "sha256": "sha256:" + "0" * 64,
+        },
+        "fallback_manifest": current["manifest"],
+        "fallback_weights": current["weights"],
+    }
+    lock_path = tmp_path / "replay-f5-hash-failure.lock.yaml"
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    bundle = CompositionRoot.compose(
+        lock_path=lock_path,
+        mode="replay",
+        artifact_root=root,
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load((root / "configs/budget_balanced.yaml").read_bytes())
+    )
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        "f5-to-f4-fallback",
+    )
+
+    stage = orchestrator._document_ranker  # noqa: SLF001
+    assert stage is not None
+    assert stage.deployment_role == "F4-reliability"
+    assert stage.failover_receipt == [
+        {
+            "role": "F5-gated-fusion",
+            "reason": "hash_mismatch",
+        }
+    ]
+
+
+def test_replay_composition_enables_bounded_cross_vocabulary_supplement(
+    composition_fixture: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    raw = yaml.safe_load(
+        composition_fixture["replay_lock"].read_text(encoding="utf-8")
+    )
+    raw["baseline"]["strategy"] = "bounded-two-stage-unconstrained"
+    raw["baseline"]["cross_vocabulary_supplement"] = {
+        "enabled": True,
+        "policy_version": "contrastive-bridge-anchor-conditioned-v2",
+        "eligible_profile": "unconstrained",
+        "strict_negation_abstention": True,
+        "max_actions": 1,
+        "max_total_openalex_actions": 7,
+        "max_additional_raw_candidates": 50,
+        "max_total_raw_candidates": 350,
+    }
+    lock_path = tmp_path / "bounded-two-stage-replay.lock.yaml"
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    bundle = CompositionRoot.compose(
+        lock_path=lock_path,
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load(
+            (
+                composition_fixture["artifact_root"]
+                / "configs/budget_balanced.yaml"
+            ).read_bytes()
+        )
+    )
+
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        "bounded-cross-vocabulary",
+    )
+
+    assert orchestrator._openalex_supplement_selector is not None  # noqa: SLF001
+    assert orchestrator._max_total_openalex_actions == 7  # noqa: SLF001
+    assert orchestrator._max_raw_candidates == 300  # noqa: SLF001
+    assert orchestrator._max_additional_raw_candidates == 50  # noqa: SLF001
+    assert orchestrator._max_total_raw_candidates == 350  # noqa: SLF001
+    assert orchestrator._max_deduplicated_candidates == 200  # noqa: SLF001
+
+
+def test_replay_composition_enables_locked_low_confidence_llm_supplement(
+    composition_fixture: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    root = composition_fixture["artifact_root"]
+    prompt_path = "configs/prompts/query_analyze_protected_actions_v3.yaml"
+    prompt_bytes = b"""name: query_analyze
+version: query-analyze-protected-actions-v3
+instructions:
+  - Preserve every hard constraint.
+"""
+    prompt_sha256 = _write_artifact(root, prompt_path, prompt_bytes)
+    raw = yaml.safe_load(composition_fixture["replay_lock"].read_text(encoding="utf-8"))
+    raw["baseline"]["low_confidence_llm_supplement"] = {
+        "enabled": True,
+        "policy_version": "low-confidence-llm-lexical-supplement-v1",
+        "confidence_policy_version": "openalex-runtime-confidence-v2",
+        "prompt_version": "query-analyze-protected-actions-v3",
+        "prompt_config": {"path": prompt_path, "sha256": prompt_sha256},
+        "strict_negation_abstention": True,
+        "max_actions": 1,
+        "max_provider_calls": 2,
+        "max_additional_raw_candidates": 50,
+        "max_additional_deduplicated_candidates": 50,
+        "max_total_deduplicated_candidates": 250,
+        "max_input_tokens": 4000,
+        "max_output_tokens": 2000,
+        "max_llm_attempts": 3,
+    }
+    lock_path = tmp_path / "low-confidence-llm-replay.lock.yaml"
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    bundle = CompositionRoot.compose(
+        lock_path=lock_path,
+        mode="replay",
+        artifact_root=root,
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+        environ={},
+    )
+    budget = SearchBudget.model_validate(
+        yaml.safe_load((root / "configs/budget_balanced.yaml").read_bytes())
+    )
+
+    orchestrator = bundle.service._orchestrator_factory(  # noqa: SLF001
+        HardBudgetController(budget, formal_live=False),
+        "low-confidence-llm-supplement",
+    )
+
+    assert orchestrator._low_confidence_analyzer is not None  # noqa: SLF001
+    assert (  # noqa: SLF001
+        orchestrator._low_confidence_prompt_version
+        == "query-analyze-protected-actions-v3"
+    )
+    assert orchestrator._max_low_confidence_raw_candidates == 50  # noqa: SLF001
+    assert (  # noqa: SLF001
+        orchestrator._max_low_confidence_deduplicated_candidates == 50
+    )
+
+
 def test_live_composition_explicitly_enables_locked_document_ranker(
     composition_fixture: dict[str, Path],
 ) -> None:
@@ -379,6 +637,38 @@ def test_replay_composition_binds_one_snapshot_and_pure_readiness(
     ]
     assert all(status.cache_hit for status in first.dependencies)
     assert first.last_authorized_probe_at is None
+
+
+def test_replay_composition_reports_semantic_action_prompt_version(
+    composition_fixture: dict[str, Path],
+) -> None:
+    prompt_relative = "configs/prompts/query_analyze_semantic_actions_v2.yaml"
+    prompt_payload = Path(prompt_relative).read_bytes()
+    prompt_sha256 = _write_artifact(
+        composition_fixture["artifact_root"],
+        prompt_relative,
+        prompt_payload,
+    )
+    raw = yaml.safe_load(composition_fixture["replay_lock"].read_bytes())
+    raw["baseline"]["prompt_version"] = "query-analyze-semantic-actions-v2"
+    raw["baseline"]["planner"]["prompt_config"] = {
+        "path": prompt_relative,
+        "sha256": prompt_sha256,
+    }
+    lock_path = composition_fixture["replay_lock"].with_name(
+        "replay-semantic-actions-v2.lock.yaml"
+    )
+    lock_path.write_text(yaml.safe_dump(raw, sort_keys=False), encoding="utf-8")
+
+    bundle = CompositionRoot.compose(
+        lock_path=lock_path,
+        mode="replay",
+        artifact_root=composition_fixture["artifact_root"],
+        output_root=composition_fixture["output_root"],
+        snapshot_manifest_path=composition_fixture["manifest_path"],
+    )
+
+    assert bundle.prompt_version == "query-analyze-semantic-actions-v2"
 
 
 @pytest.mark.parametrize("manifest_case", ["missing", "mismatched", "outside"])
@@ -791,6 +1081,8 @@ def test_live_requests_use_priced_estimates_and_isolated_sealed_resources(
         assert estimates["openalex"].cost_cny != estimates["semantic_scholar"].cost_cny
         assert kwargs["routing_limits"] == (3, 6, 2)
         assert kwargs.get("retrieval_policy") is None
+        assert kwargs["max_raw_candidates"] == 300
+        assert kwargs["max_deduplicated_candidates"] == 200
 
 
 def test_snapshot_binding_is_immutable_after_composition(

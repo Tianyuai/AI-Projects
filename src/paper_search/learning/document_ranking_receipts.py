@@ -43,6 +43,9 @@ def _read_training_partition(path: Path) -> dict[str, dict[str, Any]]:
 
 def _successful_receipts(
     roots: Sequence[Path],
+    *,
+    required_action_ids: Set[str] | None = None,
+    required_candidate_policy: str | None = None,
 ) -> dict[str, dict[str, Any]]:
     if not roots:
         raise ValueError("supplemental receipt roots must not be empty")
@@ -56,6 +59,48 @@ def _successful_receipts(
                 query_id = str(payload["query_id"])
                 if not isinstance(payload.get("results"), list):
                     raise ValueError(f"invalid retrieval receipt for {query_id}")
+                if required_action_ids is not None and {
+                    str(result.get("action_id"))
+                    for result in payload["results"]
+                    if isinstance(result, dict)
+                } != set(required_action_ids):
+                    continue
+                if required_candidate_policy is not None:
+                    parts = list(path.parts)
+                    retrieval_index = len(parts) - 3
+                    if parts[retrieval_index] != "retrieval":
+                        continue
+                    parts[retrieval_index] = "generation"
+                    generation_path = Path(*parts)
+                    if not generation_path.is_file():
+                        continue
+                    generation = json.loads(
+                        generation_path.read_text(encoding="utf-8")
+                    )
+                    provenance = generation.get("generation_provenance")
+                    actions = generation.get("actions")
+                    if not isinstance(provenance, dict) or not isinstance(actions, list):
+                        continue
+                    action_ids = [
+                        str(action.get("action_id"))
+                        for action in actions
+                        if isinstance(action, dict)
+                    ]
+                    result_ids = [
+                        str(result.get("action_id"))
+                        for result in payload["results"]
+                        if isinstance(result, dict)
+                    ]
+                    if (
+                        generation.get("attempt_status") != "succeeded"
+                        or provenance.get("candidate_policy")
+                        != required_candidate_policy
+                        or provenance.get("gold_visibility") != "blind"
+                        or not 0 < len(action_ids) <= 6
+                        or len(action_ids) != len(set(action_ids))
+                        or set(result_ids) != set(action_ids)
+                    ):
+                        continue
                 selected[query_id] = payload
     return selected
 
@@ -211,7 +256,10 @@ def load_folded_document_ranking_evaluation_queries(
     *,
     manifest_path: Path,
     partition_path: Path,
-    receipt_root: Path,
+    receipt_root: Path | None = None,
+    receipt_roots: Sequence[Path] = (),
+    required_action_ids: Set[str] | None = None,
+    required_candidate_policy: str | None = None,
 ) -> list[tuple[int, DocumentRankingQuery]]:
     """Load frozen auto_dev receipts for evaluation only."""
 
@@ -227,7 +275,14 @@ def load_folded_document_ranking_evaluation_queries(
             raise ValueError("evaluation partition query ids must be unique")
         partition[query_id] = row
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    receipts = _successful_receipts([receipt_root])
+    roots = [*(([receipt_root]) if receipt_root is not None else []), *receipt_roots]
+    if len(roots) != len(set(roots)):
+        raise ValueError("evaluation receipt roots must be unique")
+    receipts = _successful_receipts(
+        roots,
+        required_action_ids=required_action_ids,
+        required_candidate_policy=required_candidate_policy,
+    )
     output: list[tuple[int, DocumentRankingQuery]] = []
     seen: set[str] = set()
     for selected in manifest.get("sample", []):

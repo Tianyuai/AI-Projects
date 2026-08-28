@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from paper_search.domain.models import QuerySpec, SearchPlan, SubQuery
+from paper_search.query.semantic_actions import (
+    PROTECTED_ACTION_PROMPT_VERSION,
+    SEMANTIC_ACTION_PROMPT_VERSION,
+    filter_lexical_action_candidates,
+    filter_semantic_action_candidates,
+)
+from paper_search.query.protected_action_mix import select_protected_action_mix
 
 
 def _ordered_unique(values: Iterable[str]) -> list[str]:
@@ -84,8 +91,74 @@ def _rule_subqueries(spec: QuerySpec) -> list[SubQuery]:
     ]
 
 
+def _semantic_rule_subqueries(spec: QuerySpec) -> list[SubQuery]:
+    """Provide three no-drift fallbacks without reusing unverified model terms."""
+
+    constraints = _target_constraints(spec)
+    return [
+        SubQuery(
+            query_id="semantic-rule-exact",
+            text=spec.original_query,
+            query_type="exact",
+            target_constraints=constraints,
+            priority=1,
+            provider_hint="either",
+            search_mode="lexical",
+        ),
+        SubQuery(
+            query_id="semantic-rule-original-semantic",
+            text=spec.original_query,
+            query_type="expanded",
+            target_constraints=constraints,
+            priority=2,
+            provider_hint="either",
+            search_mode="semantic",
+        ),
+        SubQuery(
+            query_id="semantic-rule-original-title",
+            text=spec.original_query,
+            query_type="decomposed",
+            action_type="title_search",
+            target_constraints=constraints,
+            priority=3,
+            provider_hint="openalex",
+            search_mode="lexical",
+        ),
+    ]
+
+
+def _protected_rule_subqueries(spec: QuerySpec) -> list[SubQuery]:
+    """Bounded lexical fail-safe actions used only to fill the five-slot bank."""
+
+    rules = _rule_subqueries(spec)
+    constraints = _target_constraints(spec)
+    return [
+        *rules,
+        SubQuery(
+            query_id="protected-rule-original-title",
+            text=spec.original_query,
+            query_type="decomposed",
+            action_type="title_search",
+            target_constraints=constraints,
+            priority=4,
+            provider_hint="openalex",
+            search_mode="lexical",
+        ),
+    ]
+
+
 class QueryPlanner:
     """Canonicalize a model plan or build a deterministic rules-only plan."""
+
+    def __init__(
+        self,
+        *,
+        prompt_version: str = "query-analyze-v1",
+        soft_concept_evidence: Callable[[str], Iterable[str]] | None = None,
+    ) -> None:
+        self._semantic_actions = prompt_version == SEMANTIC_ACTION_PROMPT_VERSION
+        self._protected_actions = prompt_version == PROTECTED_ACTION_PROMPT_VERSION
+        self._soft_concept_evidence = soft_concept_evidence
 
     def finalize(
         self,
@@ -107,7 +180,59 @@ class QueryPlanner:
             indexed = list(enumerate(plan.subqueries))
             indexed.sort(key=lambda item: (item[1].priority, item[0], item[1].query_id))
             candidates.extend(item for _, item in indexed)
-        if len(candidates) < 3:
+        if self._protected_actions:
+            evidence: tuple[str, ...] = ()
+            if self._soft_concept_evidence is not None:
+                try:
+                    evidence = tuple(self._soft_concept_evidence(spec.original_query))
+                except Exception:  # fail closed at the local model boundary
+                    evidence = ()
+            lexical = filter_lexical_action_candidates(
+                spec,
+                candidates,
+                soft_concept_evidence=evidence,
+            )
+            lexical.extend(_protected_rule_subqueries(spec))
+            lexical_plan = SearchPlan(
+                subqueries=lexical[:limit],
+                inherited_hard_filters={},
+                rationale="Protected lexical action bank",
+            )
+            semantic = filter_semantic_action_candidates(
+                spec,
+                (item for item in candidates if item.search_mode == "semantic"),
+                soft_concept_evidence=evidence,
+            )
+            semantic_plan = SearchPlan(
+                subqueries=semantic or [_semantic_rule_subqueries(spec)[1]],
+                inherited_hard_filters={},
+                rationale="Single semantic challenger",
+            )
+            mixed = select_protected_action_mix(
+                spec,
+                lexical_plan,
+                semantic_plan,
+                max_planner_actions=limit,
+            )
+            candidates = [item.action for item in mixed.actions]
+        elif self._semantic_actions:
+            evidence: tuple[str, ...] = ()
+            if self._soft_concept_evidence is not None:
+                try:
+                    evidence = tuple(self._soft_concept_evidence(spec.original_query))
+                except Exception:  # fail closed at the local model boundary
+                    evidence = ()
+            fallback = _semantic_rule_subqueries(spec)
+            candidates = [
+                fallback[0],
+                *filter_semantic_action_candidates(
+                    spec,
+                    candidates,
+                    soft_concept_evidence=evidence,
+                ),
+                *fallback[1:],
+            ]
+        elif len(candidates) < 3:
             candidates.extend(_rule_subqueries(spec))
 
         selected: list[SubQuery] = []

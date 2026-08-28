@@ -18,7 +18,7 @@
   },
   "partition_sha256": "sha256:19b3ba1a584ab488ecb0aed1b10a63726880d9747e407099b9963656f1588fc4",
   "project_receipt_count": 2,
-  "project_receipts_sha256": "sha256:e4ed78750cb88a746fddaa1292a8dd4347c594cb5cf0f4552b8707cdf086bc6f",
+  "project_receipts_sha256": "sha256:ac2f091421fc10fc22ad63f4df83e7003192b13f4839ffa00a3853376dc3f25e",
   "prompt_version": "query-analyze-v1",
   "readiness_summary": [
     {

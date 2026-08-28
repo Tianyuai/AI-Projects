@@ -7,7 +7,12 @@ from datetime import UTC, datetime
 import pytest
 
 from paper_search.domain.models import ErrorDetail, ProviderResult, UsageActual
-from paper_search.query.parser import PlannerDependencyError, QueryParser
+from paper_search.query.parser import (
+    PlannerDependencyError,
+    QueryParser,
+    normalize_query_analysis,
+    rule_fallback,
+)
 from paper_search.query.planner import QueryPlanner
 
 
@@ -140,6 +145,261 @@ def test_flexible_model_payload_is_normalized_to_primary_analysis() -> None:
         item.query_type in {"exact", "expanded", "decomposed"}
         for item in result.search_plan.subqueries
     )
+
+
+def test_semantic_action_aliases_and_plan_exclusions_are_normalized() -> None:
+    query = (
+        "Find molecular property prediction with graph attention networks "
+        "without 3D conformers"
+    )
+    payload: dict[str, object] = {
+        "query_spec": {
+            "original_query": query,
+            "research_goal": "Find the requested molecular prediction studies.",
+            "subqueries": [
+                {
+                    "subquery": query,
+                    "search_mode": "semantic",
+                    "target_constraints": ["graph attention networks"],
+                },
+                {
+                    "subquery": (
+                        "graph attention networks message passing molecular "
+                        "property prediction"
+                    ),
+                    "search_mode": "expanded",
+                    "target_constraints": [
+                        "graph attention networks",
+                        "molecular property prediction",
+                    ],
+                    "provider_hint": "openalex",
+                    "priority": 4,
+                },
+                {
+                    "text": "molecular property prediction 2D graph",
+                    "query_type": "decomposed",
+                    "search_mode": "lexical",
+                    "target_constraints": ["molecular property prediction"],
+                },
+            ],
+        },
+        "search_plan": {
+            "exclusions": ["methods that require 3D conformers"],
+            "rationale": "Use grounded terminology bridges.",
+        },
+    }
+
+    normalized = normalize_query_analysis(payload, query)
+    normalized_spec = normalized["query_spec"]
+    normalized_plan = normalized["search_plan"]
+    assert isinstance(normalized_spec, dict)
+    assert isinstance(normalized_plan, dict)
+    assert normalized_spec["exclusions"] == [
+        "methods that require 3D conformers",
+        "3D conformers",
+    ]
+
+    subqueries = normalized_plan["subqueries"]
+    assert isinstance(subqueries, list)
+    assert subqueries[0]["text"] == query
+    assert subqueries[0]["query_type"] == "exact"
+    assert subqueries[0]["search_mode"] == "semantic"
+    assert subqueries[0]["target_constraints"] == ["graph attention networks"]
+    assert subqueries[1]["query_type"] == "expanded"
+    assert subqueries[1]["search_mode"] == "lexical"
+    assert subqueries[1]["provider_hint"] == "openalex"
+    assert subqueries[1]["priority"] == 4
+    assert subqueries[2]["query_type"] == "decomposed"
+    assert subqueries[2]["search_mode"] == "lexical"
+
+
+def test_verbose_model_exclusion_cannot_bypass_strict_negation_abstention() -> None:
+    query = (
+        "Find empirical studies that predict molecular properties with graph "
+        "attention networks but do not require 3D conformers."
+    )
+    expanded = (
+        "graph attention networks molecular property prediction without 3D conformers"
+    )
+    alternative = (
+        "graph attention networks molecular property prediction using 2D representations"
+    )
+    payload: dict[str, object] = {
+        "query_spec": {
+            "original_query": query,
+            "research_goal": "Find the requested molecular property studies.",
+            "subqueries": [
+                {
+                    "text": query,
+                    "search_mode": "lexical",
+                    "target_constraints": [
+                        "graph attention networks",
+                        "molecular properties",
+                        "3D conformers",
+                    ],
+                },
+                {
+                    "text": expanded,
+                    "search_mode": "expanded",
+                    "target_constraints": [
+                        "graph attention networks",
+                        "3D conformers",
+                    ],
+                },
+                {
+                    "text": alternative,
+                    "search_mode": "expanded",
+                    "target_constraints": ["graph attention networks"],
+                },
+            ],
+        },
+        "search_plan": {
+            "exclusions": ["methods that require 3D conformers"],
+            "rationale": "Keep the negative condition as an exclusion.",
+        },
+    }
+
+    result = asyncio.run(
+        QueryParser(
+            QueryPlanner(prompt_version="query-analyze-semantic-actions-v2")
+        ).parse(query, _provider_result(payload))
+    )
+
+    assert result.planner_status == "primary"
+    assert "3D conformers" in result.query_spec.exclusions
+    assert expanded not in [item.text for item in result.search_plan.subqueries]
+    assert alternative not in [item.text for item in result.search_plan.subqueries]
+
+
+def test_strict_valid_payload_also_applies_negation_abstention() -> None:
+    query = (
+        "Find empirical studies that predict molecular properties with graph "
+        "attention networks but do not require 3D conformers."
+    )
+    alternative = (
+        "graph attention networks for molecular property prediction using "
+        "2D representations"
+    )
+    payload = _valid_payload(query)
+    spec = payload["query_spec"]
+    plan = payload["search_plan"]
+    assert isinstance(spec, dict)
+    assert isinstance(plan, dict)
+    spec.update(
+        {
+            "research_goal": "Find graph attention molecular prediction studies.",
+            "topics": ["molecular property prediction"],
+            "methods": ["graph attention networks"],
+            "tasks": ["molecular property prediction"],
+            "year_from": None,
+            "year_to": None,
+            "venues": [],
+            "must_have": ["graph attention networks"],
+            "exclusions": ["methods requiring 3D conformers"],
+        }
+    )
+    plan["subqueries"] = [
+        {
+            "query_id": "model-1",
+            "text": query,
+            "query_type": "exact",
+            "target_constraints": ["graph attention networks"],
+            "priority": 1,
+            "provider_hint": "either",
+        },
+        {
+            "query_id": "model-2",
+            "text": alternative,
+            "query_type": "decomposed",
+            "target_constraints": ["graph attention networks"],
+            "priority": 2,
+            "provider_hint": "either",
+            "search_mode": "semantic",
+        },
+    ]
+
+    result = asyncio.run(
+        QueryParser(
+            QueryPlanner(prompt_version="query-analyze-semantic-actions-v2")
+        ).parse(query, _provider_result(payload))
+    )
+
+    assert result.planner_status == "primary"
+    assert result.query_spec.exclusions == [
+        "methods requiring 3D conformers",
+        "3D conformers",
+    ]
+    assert alternative not in [item.text for item in result.search_plan.subqueries]
+
+
+def test_live_method_bridge_shape_reaches_primary_semantic_gate() -> None:
+    query = (
+        "Which papers use weakly supervised optimal transport to adapt medical "
+        "image segmentation models across hospitals?"
+    )
+    payload: dict[str, object] = {
+        "query_spec": {
+            "original_query": query,
+            "research_goal": (
+                "Identify papers that employ weakly supervised optimal transport "
+                "for adapting medical image segmentation models across hospitals."
+            ),
+            "subqueries": [
+                {
+                    "subquery": query,
+                    "search_mode": "semantic",
+                    "target_constraints": [
+                        "weakly supervised optimal transport",
+                        "medical image segmentation",
+                        "across hospitals",
+                    ],
+                },
+                {
+                    "subquery": (
+                        "weakly supervised optimal transport domain adaptation "
+                        "medical image segmentation"
+                    ),
+                    "search_mode": "expanded",
+                    "target_constraints": [
+                        "weakly supervised optimal transport",
+                        "medical image segmentation",
+                    ],
+                },
+                {
+                    "subquery": (
+                        "Wasserstein distance weakly supervised segmentation "
+                        "cross-domain medical imaging"
+                    ),
+                    "search_mode": "expanded",
+                    "target_constraints": ["weakly supervised", "segmentation"],
+                },
+            ],
+        },
+        "search_plan": {
+            "exclusions": [],
+            "rationale": "Preserve anchors while bridging terminology.",
+        },
+    }
+
+    result = asyncio.run(
+        QueryParser(
+            QueryPlanner(prompt_version="query-analyze-semantic-actions-v2")
+        ).parse(query, _provider_result(payload))
+    )
+
+    assert result.planner_status == "primary"
+    actions = {item.text: item for item in result.search_plan.subqueries}
+    bridge = (
+        "weakly supervised optimal transport domain adaptation medical image "
+        "segmentation"
+    )
+    assert bridge in actions
+    assert actions[bridge].query_type == "expanded"
+    assert actions[bridge].search_mode == "lexical"
+    assert actions[bridge].target_constraints == [
+        "weakly supervised optimal transport",
+        "medical image segmentation",
+    ]
 
 
 def test_flexible_model_payload_with_two_subqueries_is_supplemented() -> None:
@@ -448,6 +708,56 @@ def test_failed_repair_uses_deterministic_rule_fallback() -> None:
     assert first.query_spec.exclusions == ["surveys"]
     assert 3 <= len(first.search_plan.subqueries) <= 5
     assert first.planner_status == "rules_fallback"
+
+
+@pytest.mark.parametrize(
+    ("query", "expected"),
+    [
+        ("Which retrieval systems work without dense encoders?", "dense encoders"),
+        ("Which retrieval systems work excluding dense encoders?", "dense encoders"),
+    ],
+)
+def test_rule_fallback_normalizes_explicit_exclusion_boundaries(
+    query: str, expected: str
+) -> None:
+    spec = rule_fallback(query)
+
+    assert spec.exclusions == [expected]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What are the sources that mentioned the Algonauts 2023 challenge?",
+        "Which papers performed best on the COCO 2017 dataset?",
+        "Which studies found errors in the CoNLL 2003 benchmark?",
+    ],
+)
+def test_rule_fallback_does_not_treat_entity_years_as_publication_filters(
+    query: str,
+) -> None:
+    spec = rule_fallback(query)
+
+    assert spec.year_from is None
+    assert spec.year_to is None
+
+
+@pytest.mark.parametrize(
+    ("query", "year_from", "year_to"),
+    [
+        ("a comprehensive review of the field up to 2020", None, 2020),
+        ("recent advances in reinforcement learning since 2021", 2021, None),
+    ],
+)
+def test_rule_fallback_preserves_explicit_temporal_year_direction(
+    query: str,
+    year_from: int | None,
+    year_to: int | None,
+) -> None:
+    spec = rule_fallback(query)
+
+    assert spec.year_from == year_from
+    assert spec.year_to == year_to
 
 
 @pytest.mark.parametrize("code", ["timeout", "network_error", "authentication_error"])

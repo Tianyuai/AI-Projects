@@ -1,0 +1,23 @@
+name: query_analyze
+version: query-analyze-semantic-actions-v2
+temperature: 0
+response_model: QueryAnalysisResult
+instructions:
+  - Preserve the original query and all explicit hard constraints.
+  - |
+    Return exactly one JSON object with this shape (do not move subqueries into query_spec):
+    {"query_spec":{"original_query":"...","research_goal":"...","topics":[],"methods":[],"tasks":[],"datasets":[],"domains":[],"year_from":null,"year_to":null,"venues":[],"must_have":[],"should_have":[],"exclusions":[],"ambiguities":[]},"search_plan":{"subqueries":[{"query_id":"sq-1","text":"...","query_type":"exact","action_type":"text_search","target_constraints":["exact span copied from the query"],"priority":1,"provider_hint":"either","search_mode":"lexical"}],"inherited_hard_filters":{},"rationale":"..."}}
+    query_type must be exact, expanded, or decomposed; provider_hint must be openalex, semantic_scholar, or either; search_mode must be lexical or semantic.
+  - Every string value must be valid JSON. Never place literal double quotation marks inside string values; paraphrase without quotes. Use an empty ambiguities list when no ambiguity materially changes retrieval.
+  - Write research_goal as one faithful sentence describing the target papers, the technical relation, and the requested evidence; do not return a category label.
+  - Keep the original query as the first exact lexical subquery, then generate two to four distinct retrieval hypotheses.
+  - Each additional retrieval hypothesis must express one useful literature-side formulation such as an acronym or full name, established alternative terminology, or a task-method-domain relation decomposition.
+  - >-
+    Every additional subquery must retain at least two original concept anchors. Explicit methods, datasets, entities, venues, years, and exclusions are hard constraints: preserve their original wording and list their exact spans in target_constraints.
+  - Soft conceptual terms may be inflectionally normalized or rewritten into established literature-side terminology. The deterministic executor will admit such a rewrite only when it is supported by original-query concept alignment or the frozen supervised lexical bridge; unsupported semantic drift must be rejected.
+  - Use expanded for terminology bridges and decomposed for relation-focused expressions; use semantic search_mode only when lexical wording is likely to differ in the literature.
+  - Add no more than three genuinely unsupported novel content terms to any subquery and avoid generic terms that do not narrow the target literature.
+  - Keep exclusions as constraints and never turn an excluded condition into a positive retrieval requirement.
+  - Never output a DOI, URL, OpenAlex identifier, Semantic Scholar identifier, Gold identifier, or guessed paper title.
+  - Explain in rationale which query meaning each retrieval hypothesis preserves and how its wording differs.
+  - If no faithful cross-vocabulary formulation is available, use a conservative decomposition grounded entirely in the original query.

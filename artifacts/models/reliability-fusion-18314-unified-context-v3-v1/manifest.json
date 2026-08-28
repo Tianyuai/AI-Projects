@@ -1,0 +1,112 @@
+{
+  "baseline_manifest": {
+    "current_model_sha256": "sha256:0e208e6fbf9832f9bab4c52f5fdb7d4861586d37e883dfe0277289bed486d3ff",
+    "development_labels_used_for_training": false,
+    "dimension": 16384,
+    "epochs": 12,
+    "expansion_oof_sha256": "sha256:e5c661b93285a2c102ea38dd1161217e321d18c7614b62f686cbd32859baa71d",
+    "hard_negative_limit": 100,
+    "l2": 1e-06,
+    "learned_weight": 0.5,
+    "learning_rate": 0.05,
+    "model_id": "cpu-pairwise-document-ranker-v1",
+    "model_sha256": "sha256:cdfcb93e1355eb607bf4374223d26bd05a4bc86b8c93d6e6b3f3e4fec41d39c8",
+    "preference_pair_count": 123507,
+    "replacement_authorized": true,
+    "schema_version": "cpu-pairwise-document-ranker-manifest-v1",
+    "seed": 20260818,
+    "supplemental_training_query_count": 2000,
+    "target_training_query_count": 385,
+    "test_partition_touched": false,
+    "training_query_count": 2385
+  },
+  "components": {
+    "baseline_weights": {
+      "length": 131072,
+      "sha256": "sha256:cdfcb93e1355eb607bf4374223d26bd05a4bc86b8c93d6e6b3f3e4fec41d39c8"
+    },
+    "constraint_labels": {
+      "length": 0,
+      "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "f5_weights": {
+      "length": 16399,
+      "sha256": "sha256:233bb07d117a582d6616faafcd16e64194b26d490a527e714276aa44bb086e2c"
+    },
+    "task_labels": {
+      "length": 0,
+      "sha256": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "emergency_fallback": "B0",
+  "f5_manifest": {
+    "abstract_route_isolated": false,
+    "abstract_used_for_constraint_evidence": true,
+    "abstract_used_for_scoring": false,
+    "candidate_pool_identity_unchanged": true,
+    "candidate_source_search_repeated": false,
+    "constraint_text_evidence": true,
+    "development_labels_used_for_training": false,
+    "dimension_per_family": 2048,
+    "experiment_id": "S4-F4-reliability-18314-production-fallback",
+    "family_caps": {
+      "reliability": 0.08
+    },
+    "family_weight_sha256": {
+      "reliability": "sha256:859a0e02f0fd15b8445346f7a7564ee87c106e80c9fc49a0470b51535fb9bcdf"
+    },
+    "feature_families": [
+      "reliability"
+    ],
+    "gated": true,
+    "maximum_total_residual": 0.35,
+    "model_id": "gated-feature-fusion-document-ranker-research-v1",
+    "online_requests_made": 0,
+    "preference_pair_count_by_family": {
+      "reliability": 761665
+    },
+    "production_promotion_authorized": false,
+    "runtime_context_scoring": true,
+    "schema_version": "gated-feature-fusion-research-manifest-v1",
+    "task_provenance_allowed_statuses": [
+      "base_accepted",
+      "reviewed",
+      "runtime_deterministic"
+    ],
+    "test_partition_touched": false,
+    "title_diagnostic_only": false,
+    "title_used_for_constraint_evidence": true,
+    "title_used_for_scoring": false,
+    "training_input_sha256": "sha256:308d355a0823a66a84db658ab7e760b7c42d3d9abb9fb8c272e3706c3d44934e",
+    "training_package_sha256": "sha256:1fc28e4f311bec9ba4f2ea310f91458f2baa068509717bd83000bb7d4149f699",
+    "training_query_count": 18314,
+    "training_query_count_by_family": {
+      "reliability": 6361
+    },
+    "weights_sha256": "sha256:233bb07d117a582d6616faafcd16e64194b26d490a527e714276aa44bb086e2c"
+  },
+  "feature_families": [
+    "reliability"
+  ],
+  "method": "F4-reliability",
+  "model_id": "gated-feature-fusion-document-ranker-research-v1",
+  "model_sha256": "sha256:4a3bc55063af2d61dda0efcabf1bac9f84ae6fbae7c01b9f9dedb09dd505cee8",
+  "production_default": "F5-gated-fusion",
+  "production_fallback": "F4-reliability",
+  "production_role": "performance_fallback",
+  "promotion": {
+    "large_oof_all_overall_deltas_positive_vs_b0": true,
+    "large_oof_overall_deltas_vs_b0": {
+      "mrr": 4.50390806999712e-05,
+      "ndcg_at_10": 0.0001254841369829618,
+      "recall_at_10": 0.00033951387697156443,
+      "recall_at_5": 0.00012285683083979038,
+      "recall_at_50": 5.460303592880189e-05
+    },
+    "large_oof_query_count": 18314,
+    "large_oof_report_sha256": "sha256:7312a1de672857dde983cbf4ec39ec0961ee91a2c8491274b271b3858582e1d2"
+  },
+  "schema_version": "gated-feature-fusion-production-manifest-v1",
+  "test_partition_touched": false,
+  "training_query_count": 18314
+}

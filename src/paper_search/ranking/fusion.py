@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Literal
 
 from paper_search.domain.models import FusedPaper, Paper, ProviderResult
+from paper_search.evaluation.dataset import IdentifierMap
 from paper_search.processing.deduplicate import deduplicate_papers
 
 __all__ = ["FusedPaper", "FusionMethod", "fuse_provider_results"]
@@ -21,6 +22,7 @@ def fuse_provider_results(
     method: FusionMethod | str,
     rrf_k: int = 60,
     provider_weights: Mapping[str, float] | None = None,
+    id_map: IdentifierMap | None = None,
 ) -> list[FusedPaper]:
     """Merge duplicates and combine source ranks with deterministic tie breaks."""
     if method not in {"rrf", "weighted"}:
@@ -43,7 +45,7 @@ def fuse_provider_results(
     if not flattened:
         return []
 
-    deduplicated = deduplicate_papers(flattened)
+    deduplicated = deduplicate_papers(flattened, id_map=id_map)
     member_to_representative = {paper.canonical_id: paper.canonical_id for paper in flattened}
     for decision in deduplicated.decisions:
         for member in decision.member_ids:

@@ -54,6 +54,37 @@ def test_production_document_candidates_apply_filter_without_reordering_rrf() ->
     assert [row.paper.canonical_id for row in candidates] == ["openalex:W5"]
 
 
+def test_production_document_candidates_use_one_deterministic_merge_order() -> None:
+    first_seen = Paper(
+        canonical_id="doi:10.1000/first",
+        doi="10.1000/first",
+        arxiv_id="2210.03568",
+        title="Shared paper title",
+        abstract="First complete publisher record.",
+        publication_year=2022,
+        is_retracted=False,
+    )
+    sorts_first = Paper(
+        canonical_id="doi:10.1000/second",
+        doi="10.1000/second",
+        arxiv_id="2210.03568",
+        title="Shared paper title",
+        abstract="Second complete publisher record.",
+        publication_year=2022,
+        is_retracted=False,
+    )
+
+    candidates = build_production_document_candidates(
+        "shared paper",
+        [("z-source", [first_seen]), ("a-source", [sorts_first])],
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0].paper.canonical_id == "doi:10.1000/second"
+    assert candidates[0].paper.arxiv_id == "2210.03568"
+    assert candidates[0].source_ranks == {"a-source": 1, "z-source": 1}
+
+
 def test_pairwise_document_ranker_promotes_relevant_text_without_changing_pool() -> None:
     positive = _paper(
         "openalex:W10",

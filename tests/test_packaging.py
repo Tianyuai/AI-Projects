@@ -13,6 +13,9 @@ def test_project_declares_only_supported_runtime_dependencies() -> None:
 
     assert project["scripts"] == {"paper-search": "paper_search.cli:main"}
     assert any(item.startswith("rank-bm25") for item in dependencies)
+    assert any(item.startswith("joblib") for item in dependencies)
+    assert any(item.startswith("scikit-learn") for item in dependencies)
+    assert any(item.startswith("scipy") for item in dependencies)
     assert not any(
         item.startswith(prefix)
         for item in dependencies

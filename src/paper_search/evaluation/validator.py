@@ -24,6 +24,7 @@ from paper_search.application.locks import (
 )
 from paper_search.control.ledger import (
     DEV_RUN_CAP_CNY,
+    LedgerReceipt,
     PROJECT_HARD_CAP_CNY,
     PROJECT_SOFT_STOP_CNY,
     REQUEST_HARD_CAP_CNY,
@@ -230,9 +231,13 @@ def _diagnostics_sha256(diagnostics: object) -> str:
 
 
 def _receipts_sha256(receipts: object) -> str:
+    normalized = [
+        receipt.model_dump(mode="json")
+        for receipt in TypeAdapter(list[LedgerReceipt]).validate_python(receipts)
+    ]
     encoded = (
         json.dumps(
-            receipts,
+            normalized,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),

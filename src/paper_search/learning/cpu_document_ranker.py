@@ -18,7 +18,7 @@ from paper_search.domain.models import (
     UsageActual,
 )
 from paper_search.evaluation.dataset import normalize_paper_id, write_frozen_bytes
-from paper_search.evaluation.predictions import paper_evaluation_id
+from paper_search.evaluation.predictions import paper_matches_evaluation_ids
 from paper_search.learning.candidates import query_content_terms
 from paper_search.processing.deduplicate import deduplicate_papers
 from paper_search.processing.filter import apply_hard_filters
@@ -107,7 +107,11 @@ def build_production_document_candidates(
     """Mirror production's merge/filter-before-RRF candidate selection order."""
 
     merged = deduplicate_papers(
-        [paper for _action_id, papers in action_results for paper in papers]
+        [
+            paper
+            for _action_id, papers in sorted(action_results, key=lambda item: item[0])
+            for paper in papers
+        ]
     )
     accepted_ids = {
         item.paper.canonical_id
@@ -234,7 +238,7 @@ class CpuPairwiseDocumentRanker:
             rows = [
                 (
                     candidate,
-                    paper_evaluation_id(candidate.paper) in gold,
+                    paper_matches_evaluation_ids(candidate.paper, gold),
                     _feature_values(
                         query=query.query,
                         candidate=candidate,

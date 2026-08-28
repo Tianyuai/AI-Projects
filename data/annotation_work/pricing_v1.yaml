@@ -1,0 +1,22 @@
+schema_version: pricing-policy-v1
+currency: CNY
+effective_at: '2026-08-07T00:00:00Z'
+source_identity: deepseek-v4-flash-0731-public-price-beijing-bands
+rounding_quantum_cny: '0.000001'
+billing_schedule: beijing-weekday-peak-offpeak-v1
+concurrency_limits: {deepseek-v4-flash: 2500}
+# Peak: Beijing time Monday-Friday 09:00-12:00 and 14:00-18:00.
+# Off-peak: all other times. Prices below are exact CNY/token conversions.
+rates:
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: cached_input_token, time_band: off_peak, price_cny_per_unit: '0.00000005'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: cached_input_token, time_band: peak, price_cny_per_unit: '0.00000010'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: uncached_input_token, time_band: off_peak, price_cny_per_unit: '0.00000150'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: uncached_input_token, time_band: peak, price_cny_per_unit: '0.00000300'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: output_token, time_band: off_peak, price_cny_per_unit: '0.00000450'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: output_token, time_band: peak, price_cny_per_unit: '0.00000900'}
+  - {dependency: llm, model_or_adapter: deepseek-v4-flash, unit: request, price_cny_per_unit: '0.000000'}
+  - {dependency: llm, model_or_adapter: qwen3.7-plus, unit: input_token, price_cny_per_unit: '0.000002'}
+  - {dependency: llm, model_or_adapter: qwen3.7-plus, unit: output_token, price_cny_per_unit: '0.000008'}
+  - {dependency: llm, model_or_adapter: qwen3.7-plus, unit: request, price_cny_per_unit: '0.000000'}
+  - {dependency: openalex, model_or_adapter: openalex-works-v1, unit: request, price_cny_per_unit: '0.000000'}
+  - {dependency: semantic_scholar, model_or_adapter: semantic-graph-v1, unit: request, price_cny_per_unit: '0.000000'}

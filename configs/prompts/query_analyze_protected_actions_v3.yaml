@@ -1,0 +1,23 @@
+name: query_analyze
+version: query-analyze-protected-actions-v3
+temperature: 0
+response_model: QueryAnalysisResult
+instructions:
+  - Preserve the original query and all explicit hard constraints.
+  - |
+    Return exactly one JSON object with this shape (do not move subqueries into query_spec):
+    {"query_spec":{"original_query":"...","research_goal":"...","topics":[],"methods":[],"tasks":[],"datasets":[],"domains":[],"year_from":null,"year_to":null,"venues":[],"must_have":[],"should_have":[],"exclusions":[],"ambiguities":[]},"search_plan":{"subqueries":[{"query_id":"lexical-1","text":"...","query_type":"expanded","action_type":"text_search","target_constraints":["exact span copied from the query"],"priority":1,"provider_hint":"either","search_mode":"lexical"}],"inherited_hard_filters":{},"rationale":"..."}}
+    query_type must be exact, expanded, or decomposed; provider_hint must be openalex, semantic_scholar, or either; search_mode must be lexical or semantic.
+  - Every string value must be valid JSON. Never place literal double quotation marks inside string values; paraphrase without quotes. Use an empty ambiguities list when no ambiguity materially changes retrieval.
+  - Write research_goal as one faithful sentence describing the target papers, the technical relation, and the requested evidence; do not return a category label.
+  - Generate three or four independent lexical retrieval actions using distinct literature-side technical phrases, acronym or full-name variants, and task-method-domain decompositions.
+  - Generate at most one semantic challenger after the lexical actions, and only when it provides a grounded cross-vocabulary formulation not already expressed by a lexical action.
+  - Do not add the original query as a title-search fallback or as another exact action; the deterministic executor supplies bounded fail-safe actions when required.
+  - >-
+    Each action must retain at least two original concept anchors. Explicit methods, datasets, entities, venues, and years are hard constraints: preserve their original wording and list their exact spans in target_constraints.
+  - Soft conceptual terms may be inflectionally normalized or rewritten into established literature-side terminology. The executor admits a rewrite only when original-query alignment or the frozen supervised lexical bridge supports it.
+  - For a negation query, preserve every exclusion in query_spec and target_constraints, do not use an excluded phrase as a positive search term, and emit no semantic challenger.
+  - Use expanded for terminology bridges and decomposed for relation-focused expressions. Use semantic search_mode only for the optional semantic challenger; all other actions must be lexical.
+  - Add no more than three unsupported novel content terms to an action and avoid generic terms that do not narrow the target literature.
+  - Never output a DOI, URL, OpenAlex identifier, Semantic Scholar identifier, Gold identifier, or guessed paper title.
+  - Explain in rationale how the lexical actions differ and which grounded cross-vocabulary gap the optional challenger covers.

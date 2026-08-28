@@ -4,14 +4,16 @@ import asyncio
 
 import pytest
 
+from paper_search.learning import candidate_ceiling
 from paper_search.learning.candidate_ceiling import (
     Core4SemanticBooleanQueryGenerator,
     FullCandidatePoolQueryGenerator,
+    QueryAdaptiveHighRecallGenerator,
     freeze_ceiling_batch,
     select_ceiling_batch,
 )
 from paper_search.query.parser import rule_fallback
-from paper_search.domain.models import Paper
+from paper_search.domain.models import Paper, QuerySpec
 from paper_search.recall_experiments.contracts import (
     RecallGenerationContext,
     RetrievalActionResult,
@@ -166,6 +168,39 @@ def test_v2_candidate_pool_emits_semantic_and_boolean_phrase_families() -> None:
     assert validated_semantic.payload.search_mode == "semantic"
 
 
+def test_context_enhanced_pool_uses_frozen_task_method_and_dataset_terms() -> None:
+    assert hasattr(candidate_ceiling, "ContextEnhancedCandidatePoolQueryGenerator")
+    generator_type = candidate_ceiling.ContextEnhancedCandidatePoolQueryGenerator
+    query = "Find papers about robust visual recognition."
+    context = RecallGenerationContext(
+        query_id="q-context",
+        original_query=query,
+        query_spec=rule_fallback(query).model_copy(
+            update={
+                "tasks": ["image classification"],
+                "methods": ["vision transformer"],
+                "datasets": ["ImageNet-C"],
+            }
+        ),
+    )
+
+    result = asyncio.run(
+        generator_type(max_candidates=12).generate(context)
+    )
+
+    texts = {
+        action.payload.query_text
+        for action in result.action_batch.actions
+        if action.action_type == "text_search"
+    }
+    assert "image classification vision transformer" in texts
+    assert "image classification ImageNet-C" in texts
+    assert result.provenance["candidate_policy"] == (
+        "context-enhanced-candidate-pool-v1"
+    )
+    assert result.provenance["context_source"] == "frozen_query_spec"
+
+
 def test_core4_semantic_boolean_generator_freezes_a_prime_action_identity() -> None:
     query = (
         "Which paper proposed graph diffusion networks for information retrieval "
@@ -212,6 +247,83 @@ def test_core4_semantic_boolean_leaves_budget_unused_without_valid_boolean() -> 
     assert actions[0].action_id == "ceiling-candidate-anchor"
     assert actions[-1].action_id == "ceiling-candidate-semantic-original"
     assert all(action.action_id != "ceiling-candidate-boolean-relaxed" for action in actions)
+
+
+def test_query_adaptive_high_recall_uses_frozen_context_without_boolean_noise() -> None:
+    query = (
+        "Which papers use Vision Transformer (ViT) for image classification on "
+        "ImageNet-C without supervised fine tuning?"
+    )
+    spec = QuerySpec(
+        original_query=query,
+        research_goal=query,
+        methods=["vision transformer"],
+        tasks=["image classification"],
+        datasets=["ImageNet-C"],
+        exclusions=["supervised fine tuning"],
+    )
+    context = RecallGenerationContext(
+        query_id="q-universal",
+        original_query=query,
+        query_spec=rule_fallback(query),
+    )
+
+    result = asyncio.run(
+        QueryAdaptiveHighRecallGenerator(
+            frozen_query_specs={"q-universal": spec}
+        ).generate(context)
+    )
+
+    actions = result.action_batch.actions
+    assert [action.action_id for action in actions] == [
+        "high-recall-original-lexical",
+        "high-recall-original-semantic",
+        "high-recall-topic-lexical",
+        "high-recall-entity-lexical",
+        "high-recall-context-semantic",
+        "high-recall-topic-semantic",
+    ]
+    identities = {
+        (
+            action.action_type,
+            action.payload.search_mode,
+            action.payload.query_text.casefold(),
+        )
+        for action in actions
+    }
+    assert len(actions) == len(identities) == 6
+    assert actions[0].payload.query_text == query
+    assert actions[0].payload.search_mode == "lexical"
+    assert actions[1].payload.query_text == query
+    assert actions[1].payload.search_mode == "semantic"
+    assert sum(action.payload.search_mode == "semantic" for action in actions) >= 2
+    assert any("image classification" in action.payload.query_text for action in actions)
+    assert any("imagenet-c" in action.payload.query_text.casefold() for action in actions)
+    assert all(" AND " not in action.payload.query_text for action in actions)
+    assert all(" OR " not in action.payload.query_text for action in actions)
+    assert result.provenance["context_source"] == "frozen_unified_context"
+    assert result.provenance["gold_visibility"] == "blind"
+    assert result.provenance["candidate_policy"] == "query-adaptive-high-recall-v2"
+
+
+def test_query_adaptive_high_recall_rejects_query_context_mismatch() -> None:
+    query = "Find papers about graph retrieval"
+    context = RecallGenerationContext(
+        query_id="q-mismatch",
+        original_query=query,
+        query_spec=rule_fallback(query),
+    )
+    spec = QuerySpec(
+        original_query="Different query",
+        research_goal="Different query",
+    )
+
+    with pytest.raises(ValueError, match="frozen query context does not match"):
+        asyncio.run(
+            QueryAdaptiveHighRecallGenerator(
+                frozen_query_specs={"q-mismatch": spec}
+            ).generate(context)
+        )
 
 
 def test_v2_prf_adds_only_cross_paper_supported_terms() -> None:

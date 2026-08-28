@@ -9,10 +9,33 @@ import httpx
 import pytest
 
 from paper_search.domain.models import BudgetReservation, UsageEstimate
-from paper_search.llm.client import LLMResponseDecoder, OpenAICompatibleLLMClient
+from paper_search.llm.client import (
+    LLMResponseDecoder,
+    OpenAICompatibleLLMClient,
+    usage_from_response_bytes,
+)
 
 
 API_KEY = "unit-test-secret"
+
+
+def test_usage_parser_preserves_deepseek_cache_hit_and_miss_tokens() -> None:
+    usage = usage_from_response_bytes(
+        json.dumps(
+            {
+                "usage": {
+                    "prompt_tokens": 12,
+                    "prompt_cache_hit_tokens": 7,
+                    "prompt_cache_miss_tokens": 5,
+                    "completion_tokens": 3,
+                }
+            }
+        ).encode("utf-8")
+    )
+
+    assert usage.input_tokens == 12
+    assert usage.cached_input_tokens == 7
+    assert usage.uncached_input_tokens == 5
 
 
 def _reservation() -> BudgetReservation:

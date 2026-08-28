@@ -1,0 +1,3 @@
+{"query_id":"public-001","query":"Find papers on retrieval-augmented generation for scientific question answering."}
+{"query_id":"public-002","query":"List non-survey papers published since 2022 that evaluate graph neural networks on the Cora dataset."}
+{"query_id":"hidden-003","query":"Which works study efficient long-context inference for large language models?"}

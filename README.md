@@ -19,7 +19,7 @@
 </div>
 
 > [!TIP]
-> **评委最短路径：**运行下方零网络 Replay，查看生成的论文标识与顺序，再进入浏览器 UI 检查 QuerySpec、召回动作、候选治理、排序、成本和来源轨迹。整个过程不需要 API 密钥。
+> 评委最短路径：运行下方零网络 Replay，查看生成的论文标识与顺序，再进入浏览器 UI 检查 QuerySpec、召回动作、候选治理、排序、成本和来源轨迹。整个过程不需要 API 密钥。
 
 <p align="center">
   <img src="docs/assets/vivaai-ui-replay.png" alt="VivaAI 零网络回放界面：论文结果与端到端执行轨迹" width="100%">

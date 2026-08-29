@@ -176,6 +176,32 @@ def test_exclusion_phrase_does_not_match_across_title_and_abstract() -> None:
     assert result.rejected == []
 
 
+def test_explicit_survey_exclusion_matches_singular_title_forms() -> None:
+    result = apply_hard_filters(
+        [
+            _paper(title="A Survey of Scientific Question Answering"),
+            _paper(title="A Review of Retrieval-Augmented Generation"),
+        ],
+        _query(exclusions=["surveys", "review articles"]),
+    )
+
+    assert result.accepted == []
+    assert [item.reason_code for item in result.rejected] == [
+        "excluded_term",
+        "excluded_term",
+    ]
+
+
+def test_plural_exclusion_does_not_singularize_mass_nouns() -> None:
+    result = apply_hard_filters(
+        [_paper(title="New advances in scientific question answering")],
+        _query(exclusions=["news"]),
+    )
+
+    assert len(result.accepted) == 1
+    assert result.rejected == []
+
+
 @pytest.mark.parametrize("venue", ["", "   ", "---"])
 def test_ambiguous_venue_is_downweighted_not_removed(venue: str) -> None:
     result = apply_hard_filters(

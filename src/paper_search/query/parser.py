@@ -97,11 +97,35 @@ def _explicit_exclusions(query: str) -> list[str]:
     )
     exclusions: list[str] = []
     for pattern in patterns:
-        exclusions.extend(
-            match.group(1).strip(" \t\r\n,.;:!?")
-            for match in re.finditer(pattern, query, flags=re.IGNORECASE)
-        )
+        for match in re.finditer(pattern, query, flags=re.IGNORECASE):
+            value = match.group(1).strip(" \t\r\n,.;:!?")
+            # Coordinated noun phrases are separate hard exclusions. Keep the
+            # original wording of each item so the audit trail remains clear.
+            exclusions.extend(
+                part.strip(" \t\r\n,.;:!?")
+                for part in re.split(r"\s+(?:and|or)\s+", value, flags=re.IGNORECASE)
+                if part.strip(" \t\r\n,.;:!?")
+            )
     return _ordered_unique(exclusions)
+
+
+def _explicit_method_task(query: str) -> tuple[list[str], list[str]]:
+    """Extract only a syntax-delimited method/task relation from the query."""
+
+    relation_patterns = (
+        r"\b(?:apply|applies|applied|applying|use|uses|used|using|"
+        r"employ|employs|employed|employing)\s+(.+?)\s+"
+        r"(?:to|for)\s+(.+?)(?=\s+(?:excluding|without|but|while|"
+        r"since|before|after|published)\b|[,.;!?]|$)",
+    )
+    for pattern in relation_patterns:
+        match = re.search(pattern, query, flags=re.IGNORECASE)
+        if match is not None:
+            method = " ".join(match.group(1).strip().split())
+            task = " ".join(match.group(2).strip().split())
+            if method and task:
+                return [method], [task]
+    return [], []
 
 
 def normalize_query_analysis(
@@ -351,10 +375,13 @@ def rule_fallback(query: str) -> QuerySpec:
                 year_from = year_to = int(venue_year.group(1))
                 break
     exclusions = _explicit_exclusions(normalized)
+    methods, tasks = _explicit_method_task(normalized)
     return QuerySpec(
         original_query=normalized,
         research_goal=normalized,
         topics=[normalized],
+        methods=methods,
+        tasks=tasks,
         year_from=year_from,
         year_to=year_to,
         venues=venue_matches,
@@ -379,9 +406,29 @@ class QueryParser:
     ) -> ClassifiedQueryAnalysis:
         analysis = QueryAnalysisResult.model_validate(data)
         normalized_query = " ".join(query.split())
+        explicit_year_from, explicit_year_to = extract_explicit_year_bounds(
+            normalized_query
+        )
+        explicit_methods, explicit_tasks = _explicit_method_task(normalized_query)
         spec = analysis.query_spec.model_copy(
             update={
                 "original_query": normalized_query,
+                "methods": _ordered_unique(
+                    [*analysis.query_spec.methods, *explicit_methods]
+                ),
+                "tasks": _ordered_unique(
+                    [*analysis.query_spec.tasks, *explicit_tasks]
+                ),
+                "year_from": (
+                    explicit_year_from
+                    if explicit_year_from is not None
+                    else analysis.query_spec.year_from
+                ),
+                "year_to": (
+                    explicit_year_to
+                    if explicit_year_to is not None
+                    else analysis.query_spec.year_to
+                ),
                 "exclusions": _ordered_unique(
                     list(analysis.query_spec.exclusions)
                     + _explicit_exclusions(normalized_query)

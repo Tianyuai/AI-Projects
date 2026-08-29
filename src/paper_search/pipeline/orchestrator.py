@@ -828,6 +828,12 @@ class MockSearchOrchestrator:
                 diagnostics=diagnostics,
                 planner_status="rules_fallback",
             )
+        if analysis.planner_status == "repaired":
+            warnings = [
+                warning
+                for warning in warnings
+                if warning != "analysis: analyzer returned errors"
+            ]
         if analysis.planner_status == "rules_fallback":
             warnings.append("planner_rules_fallback")
         analyze_trace: dict[str, object] = {

@@ -68,6 +68,21 @@ def _normalize_optional_text(value: str | None) -> str | None:
         return None
 
 
+def _exclusion_variants(term: str) -> tuple[str, ...]:
+    """Return conservative lexical variants for explicit exclusion terms."""
+
+    normalized = normalize_title(term)
+    variants = [normalized]
+    first = normalized.split(" ", 1)[0]
+    if first in {"survey", "surveys", "review", "reviews"}:
+        variants.append(first.removesuffix("s"))
+    return tuple(dict.fromkeys(variants))
+
+
+def _contains_exclusion(field: str, term: str) -> bool:
+    return any(variant in field for variant in _exclusion_variants(term))
+
+
 def _rejection_reason(paper: Paper, query: QuerySpec) -> tuple[str, str] | None:
     if paper.is_retracted is True:
         return "retracted", "Paper is marked as retracted."
@@ -90,7 +105,7 @@ def _rejection_reason(paper: Paper, query: QuerySpec) -> tuple[str, str] | None:
         if normalized_abstract is not None:
             searchable_fields.append(normalized_abstract)
         if any(
-            normalize_title(term) in field
+            _contains_exclusion(field, term)
             for term in query.exclusions
             for field in searchable_fields
         ):

@@ -1933,6 +1933,8 @@ def test_orchestrator_repairs_malformed_analysis_once_before_fallback() -> None:
     assert result.query_analysis.query_spec.research_goal == "find repaired papers"
     assert controller.committed_usage.llm_calls == 2
     assert result.stop_reason == "completed"
+    assert result.is_partial is False
+    assert result.warnings == []
 
 
 def test_orchestrator_can_repair_when_cost_reservation_reaches_decimal_cap() -> None:

@@ -760,6 +760,39 @@ def test_rule_fallback_preserves_explicit_temporal_year_direction(
     assert spec.year_to == year_to
 
 
+def test_valid_analysis_reconciles_explicit_runtime_constraints() -> None:
+    query = (
+        "Find empirical papers published since 2021 that apply "
+        "retrieval-augmented generation to scientific question answering, "
+        "excluding surveys and review articles."
+    )
+    payload = _valid_payload(query)
+    spec = payload["query_spec"]
+    assert isinstance(spec, dict)
+    spec.update(
+        {
+            "research_goal": "Find empirical scientific question answering papers.",
+            "topics": ["scientific question answering"],
+            "methods": [],
+            "tasks": [],
+            "year_from": None,
+            "year_to": None,
+            "exclusions": [],
+        }
+    )
+
+    result = asyncio.run(
+        QueryParser(QueryPlanner()).parse(query, _provider_result(payload))
+    )
+
+    assert result.query_spec.year_from == 2021
+    assert result.query_spec.year_to is None
+    assert result.query_spec.methods == ["retrieval-augmented generation"]
+    assert result.query_spec.tasks == ["scientific question answering"]
+    exclusions = {value.casefold() for value in result.query_spec.exclusions}
+    assert {"surveys", "review articles"}.issubset(exclusions)
+
+
 @pytest.mark.parametrize("code", ["timeout", "network_error", "authentication_error"])
 def test_transport_or_authentication_failure_cannot_become_rules_fallback(
     code: str,
